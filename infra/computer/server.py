@@ -23,6 +23,7 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 from urllib.parse import urlparse
 
 MAX_JSON = 2 * 1024 * 1024
@@ -31,6 +32,16 @@ MAX_READ = 256 * 1024
 MAX_ARCHIVE = 256 * 1024 * 1024
 MAX_FILES = 10000
 EXCLUDED = {"node_modules", ".cache", "__pycache__", ".venv"}
+
+
+class ComputerHTTPServer(ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer normally resolves the host's FQDN for metadata. Cloudflare
+        # container hostnames can be 64-character IDs, exceeding IDNA's 63-byte
+        # label limit. Binding this private port does not require DNS discovery.
+        TCPServer.server_bind(self)
+        self.server_name = "timber-computer"
+        self.server_port = self.server_address[1]
 
 
 class Computer:
@@ -481,4 +492,4 @@ if __name__ == "__main__":
     if not token:
         raise SystemExit("BOTSPACE_COMPUTER_TOKEN must be configured")
     machine = Computer(Path(os.environ.get("BOTSPACE_WORKSPACE", "/workspace")), Path(os.environ.get("BOTSPACE_STATE", "/state")))
-    ThreadingHTTPServer(("0.0.0.0", 8080), create_handler(machine, token)).serve_forever()
+    ComputerHTTPServer(("0.0.0.0", 8080), create_handler(machine, token)).serve_forever()

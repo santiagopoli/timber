@@ -17,6 +17,18 @@ async function action(stub: DurableObjectStub, botId: string, operationId: strin
 }
 
 describe("real ComputerDO journal recovery without a container", () => {
+  it("returns an actionable 503 before journaling an action when its container is not configured", async () => {
+    const botId = crypto.randomUUID();
+    const stub = bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
+    const response = await stub.fetch("https://computer.internal/actions", {
+      method: "POST", body: JSON.stringify({botId, operationId: "not-started", action: {type: "listFiles"}}),
+    });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({error: {code: "computer_not_configured", message: "The cloud computer binding is not configured."}});
+    const record = await runInDurableObject(stub, (_instance, state) => state.storage.get("operation:not-started"));
+    expect(record).toBeUndefined();
+  });
+
   it("does not replay an action whose outcome was unknown before object eviction", async () => {
     const botId = crypto.randomUUID();
     const stub = bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));

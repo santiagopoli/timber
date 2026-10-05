@@ -10,7 +10,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
-from http.server import ThreadingHTTPServer
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("computer_server", Path(__file__).parents[1] / "server.py")
 server = importlib.util.module_from_spec(spec)
@@ -179,7 +179,7 @@ class ComputerTests(unittest.TestCase):
             self.computer.restore(self.malicious_archive([("a", "b"), ("b", "a")]))
 
     def test_http_management_requires_token(self):
-        http = ThreadingHTTPServer(("127.0.0.1", 0), server.create_handler(self.computer, "test-token"))
+        http = server.ComputerHTTPServer(("127.0.0.1", 0), server.create_handler(self.computer, "test-token"))
         thread = threading.Thread(target=http.serve_forever, daemon=True)
         thread.start()
         try:
@@ -198,6 +198,24 @@ class ComputerTests(unittest.TestCase):
         finally:
             http.shutdown()
             http.server_close()
+
+    def test_http_server_starts_with_a_cloudflare_hostname_too_long_for_idna(self):
+        hostname = "a" * 64
+        def reject_fqdn(_host):
+            return hostname.encode("idna").decode()
+        with patch("socket.getfqdn", side_effect=reject_fqdn) as lookup:
+            http = server.ComputerHTTPServer(("0.0.0.0", 0), server.create_handler(self.computer, "test-token"))
+            thread = threading.Thread(target=http.serve_forever, daemon=True)
+            thread.start()
+            try:
+                request = urllib.request.Request(f"http://127.0.0.1:{http.server_port}/health", headers={"Authorization": "Bearer test-token"})
+                with urllib.request.urlopen(request) as response:
+                    self.assertTrue(json.load(response)["ok"])
+                self.assertEqual(http.server_name, "timber-computer")
+                lookup.assert_not_called()
+            finally:
+                http.shutdown()
+                http.server_close()
 
 
 if __name__ == "__main__":

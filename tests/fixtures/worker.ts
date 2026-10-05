@@ -8,7 +8,7 @@ export class KeylessChatGPTAuthDO extends ChatGPTAuthDO {
 }
 export {default, WorkspaceDO, BotDO} from "../../apps/api/src/index";
 export {ComputerDO as RealComputerDO} from "../../packages/computer/src/index";
-export const computerFixtureControl: {gate?: Promise<void>; status?: ComputerResult["status"]} = {};
+export const computerFixtureControl: {gate?: Promise<void>; status?: ComputerResult["status"]; failure?: {status: number; body: unknown}} = {};
 
 /** Test-only effects journal. This does not launch a container or implement tools. */
 export class ComputerDO extends DurableObject {
@@ -22,6 +22,7 @@ export class ComputerDO extends DurableObject {
     if (path === "/status") return Response.json({id: input.botId, provider: "cloudflare", state: "running", capabilities: ["exec", "checkpoint"]});
     if (path === "/touch") return Response.json({ok: true});
     if (path !== "/actions") return new Response("Not found", {status: 404});
+    if (computerFixtureControl.failure) return Response.json(computerFixtureControl.failure.body, {status: computerFixtureControl.failure.status});
     const previous = this.ctx.storage.sql.exec<{action: string; result: string}>("SELECT action,result FROM effects WHERE id=?", input.operationId).toArray()[0];
     if (previous) {
       if (previous.action !== JSON.stringify(input.action)) return new Response("Conflict", {status: 409});

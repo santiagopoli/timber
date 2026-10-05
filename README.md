@@ -198,10 +198,15 @@ integration tests use signed fixtures and simulated model responses.
 
 The desktop Docker smoke passed in GitHub Actions: Chromium, verified Unicode
 input, PNG screenshot, shell deduplication, checkpoint checksum and file restore.
-Cloudflare rejected container activation because the account did not have Workers
-Paid. The **Cloudflare** computer and cold-start/restore performance therefore
-remain unverified until that prerequisite is enabled and
-`npm run smoke -- --computer` passes. A desktop running in CI does not establish
-that its cloud deployment works.
+With Containers enabled, a separate authenticated Cloudflare smoke on 2026-10-05
+passed real file write/read, terminal execution, operation deduplication, PNG
+capture stored in R2, checkpoint, suspend, and file recovery in a fresh container.
+It uses the same ComputerDO and bootstrap server as production. This caught and
+fixed Python's startup failure on Cloudflare's 64-character container hostname.
+Fresh provisioning plus workspace restore took 132 seconds in that single run;
+bootstrap remains a temporary deployment mode, not a fast cold-start target.
+The fix is deployed to `timber-api`; rerun `SMOKE_TIMEOUT_MS=600000 npm run smoke
+-- --computer` with the owner's local credentials to verify the full production
+API and model flow. The isolated computer test does not validate ChatGPT OAuth.
 
 No credentials belong in this repository.

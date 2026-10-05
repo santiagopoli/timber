@@ -32,6 +32,12 @@ port; the API does not publish a generic container proxy. The token is not a mod
 provider or R2 credential. The shell and desktop share the VM trust boundary and
 must not be treated as mutually isolated users.
 
+The HTTP listener uses fixed server metadata instead of resolving the container's
+hostname. Cloudflare can assign a 64-character hostname that Python's default
+HTTPServer rejects during its IDNA/FQDN lookup, before accepting requests.
+Startup failures propagate as safe, stage-specific API errors (normally HTTP 503)
+and fixed diagnostic codes in Worker logs, without leaking credentials or commands.
+
 Official deployment guidance:
 
 - https://developers.cloudflare.com/containers/api/durable-object-container/
