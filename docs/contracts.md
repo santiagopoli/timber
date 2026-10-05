@@ -86,6 +86,11 @@ click/type/key/scroll also require explicit approval in initial secure MVP; the 
 can directly invoke actions as the human. User action approvals are persisted; do not
 keep an unbounded promise waiting for approval. The runtime returns a pending-approval
 result and resumes with the decision after user input. No automatically replayed exec.
+Concurrent recovery requests share one in-flight approval finalizer. The terminal
+approval result and continuation input are persisted atomically; stale finalizers
+cannot overwrite a terminal approval or rewind a later continuation. Provider
+exceptions retain only reviewed diagnostic codes/messages, still mark the outcome
+unconfirmed, and never authorize an automatic retry of the effect.
 
 ## Storage / lifecycle
 Workspace path /workspace, one writer via ComputerDO. Root package/tool image version

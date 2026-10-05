@@ -183,12 +183,15 @@
   function actionSummary(action) { return JSON.stringify(action.type === 'type' ? { type: 'type', text: `[${String(action.text || '').length} characters hidden]` } : action, null, 2); }
   async function loadApprovals(version = generation) {
     const id = selected?.id, sequence = ++approvalsRequest; if (!id) return; const result = await request(`${botPath(id)}/approvals`); if (!validView(version) || sequence !== approvalsRequest) return;
-    approvals = result.approvals.filter((approval) => ['pending', 'executing'].includes(approval.status)); $('approvals').replaceChildren();
+    const interrupted = result.approvals.filter((approval) => approval.status === 'interrupted').sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 5);
+    approvals = [...result.approvals.filter((approval) => ['pending', 'executing'].includes(approval.status)), ...interrupted]; $('approvals').replaceChildren();
     const pending = approvals.filter((approval) => approval.status === 'pending').length;
     $('approval-count').textContent = String(pending); $('approval-shortcut').hidden = !pending;
     for (const approval of approvals) {
-      const card = el('article', 'approval'); card.dataset.approvalId = approval.id;
-      card.append(el('h3', '', approval.status === 'executing' ? 'Approved action is executing' : 'Review this action'), el('pre', '', actionSummary(approval.action)), el('p', 'hint', `Expires ${date(approval.expiresAt)}`));
+      const card = el('article', 'approval'); card.dataset.approvalId = approval.id; card.dataset.approvalStatus = approval.status;
+      if (approval.status === 'interrupted') {
+        card.append(el('h3', '', `Interrupted action · ${approval.action.type}`), el('pre', '', actionSummary(approval.action)), el('p', 'hint', `Operation ID: ${approval.operationId}`), el('p', 'error', approval.result?.error || 'The action ended without a confirmed result.'), el('p', 'hint', 'This action may have partially completed. Inspect its effects before retrying. It will not be retried automatically.'));
+      } else card.append(el('h3', '', approval.status === 'executing' ? 'Approved action is executing' : 'Review this action'), el('pre', '', actionSummary(approval.action)), el('p', 'hint', `Expires ${date(approval.expiresAt)}`));
       if (approval.status === 'pending') {
         const controls = el('div', 'row');
         for (const decision of ['deny', 'approve']) { const button = el('button', decision === 'deny' ? 'quiet' : '', decision === 'approve' ? 'Approve action' : 'Deny'); button.type = 'button'; button.addEventListener('click', () => guarded(async () => { for (const item of controls.querySelectorAll('button')) item.disabled = true; try { await request(`${botPath(id)}/approvals/${encodeURIComponent(approval.id)}`, { method: 'POST', body: { decision } }); } finally { if (validView(version)) await Promise.all([loadApprovals(version), loadRuns(version)]); } })); controls.append(button); }

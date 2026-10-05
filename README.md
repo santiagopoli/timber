@@ -178,6 +178,14 @@ and leaves it for inspection. `--computer` additionally verifies a write/read,
 shell deduplication, screenshot artifact, checkpoint, suspend and restored file.
 For the slower bootstrap mode, set `SMOKE_TIMEOUT_MS=600000`.
 
+If an approved action is interrupted, the conversation retains a read-only card
+with its stored action, operation ID and diagnostic (the five most recent
+interruptions). Do not repeat the original task until its effects are checked:
+inspect the relevant workspace file or take a fresh screenshot. An interruption
+means the outcome was not confirmed, not that the action had no effect. Polling
+the console coalesces recovery of an executing approval; it does not launch a
+second approval execution or reset a later continuation.
+
 For a text-only cloud check with the model verified on the initial Free account:
 
 ```sh

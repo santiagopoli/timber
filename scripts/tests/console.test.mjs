@@ -75,6 +75,37 @@ test('approval navigation works across panels and hides secure typing text', asy
   });
 });
 
+test('recent interrupted approvals expose safe diagnostics without replay controls or effects', async () => {
+  await withPage(async ({page, login, state}) => {
+    const interrupted = Array.from({length: 8}, (_, i) => ({
+      id: `interrupted-approval-${i}`, botId: BOT_A, runId: 'interrupted-run', operationId: `interrupted-operation-${i}`,
+      status: 'interrupted', createdAt: new Date(Date.UTC(2026, 9, 5, 10, i)).toISOString(), expiresAt: '2026-10-05T14:00:00Z',
+      action: i === 7 ? {type: 'type', text: 'test-only-private-typing'} : {type: 'exec', command: 'printf test'},
+      result: {operationId: `interrupted-operation-${i}`, status: 'interrupted', error: `Stored interruption ${i}: inspect existing effects. <img src=x onerror=alert(1)>`},
+    }));
+    state.approvals.set(BOT_A, interrupted); await login();
+    const cards = page.locator('#approvals [data-approval-status="interrupted"]');
+    assert.equal(await cards.count(), 5, 'only the five most recent interrupted approvals are shown');
+    assert.equal(await cards.first().getAttribute('data-approval-id'), interrupted[7].id);
+    assert.equal(await page.locator(`[data-approval-id="${interrupted[2].id}"]`).count(), 0);
+    for (const approval of interrupted.slice(3)) {
+      const card = page.locator(`[data-approval-id="${approval.id}"]`), text = await card.innerText();
+      assert.ok(text.includes(`Interrupted action · ${approval.action.type}`));
+      assert.ok(text.includes(`Operation ID: ${approval.operationId}`));
+      assert.ok(text.includes(approval.result.error), 'stored diagnostic is visible as text');
+      assert.match(text, /Inspect its effects before retrying/);
+      assert.equal(await card.locator('button, a, input, img').count(), 0, 'diagnostic cards are read-only and cannot inject markup');
+    }
+    assert.equal((await cards.first().innerText()).includes('test-only-private-typing'), false);
+    assert.equal(await page.locator('#approval-shortcut').isVisible(), false, 'interrupted actions are not pending decisions');
+    await page.locator('#tab-activity').click();
+    await Promise.all([page.waitForResponse(response => response.url().endsWith('/approvals')), page.locator('#refresh-history').click()]);
+    await page.locator('#tab-conversation').click(); assert.equal(await cards.count(), 5);
+    assert.equal(state.calls.some(call => call.method !== 'GET'), false, 'loading and refreshing diagnostics never retries or decides an action');
+    assert.equal(state.actions.length, 0);
+  });
+});
+
 test('computer actions require explicit screen input and preserve responsive progress and file paths', async () => {
   await withPage(async ({page, login, state}) => {
     await login(); await page.locator('#tab-computer').click();

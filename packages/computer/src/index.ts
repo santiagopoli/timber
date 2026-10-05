@@ -221,7 +221,12 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         result = {operationId,status:"interrupted",error:"Computer connection or persistence failed; the action may have completed. Inspect effects before submitting a new operation."};
       }
       await this.ctx.storage.put<OperationRecord>(key, {digest,result});
-      await this.touch();
+      // The effect's outcome is now durable. Failure to renew its idle lifetime
+      // must not replace that known result with an uncertain transport failure.
+      try { await this.touch(); }
+      catch (error) {
+        console.error("computer.failure", {stage:"post_result_touch",code:safeError(error).code});
+      }
       return result;
     }).finally(() => this.flights.delete(flightKey));
     this.flights.set(flightKey, work);

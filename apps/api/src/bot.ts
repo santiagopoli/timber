@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Approval, Bot, BotEvent, ComputerAction, ComputerResult, ComputerStatus, Message, Run, RunPage, RunStatus } from "@botspace/contracts";
-import { createCloudComputerProvider, touchCloudComputer, suspendCloudComputer } from "@botspace/computer";
+import { createCloudComputerProvider, touchCloudComputer, suspendCloudComputer, ComputerProviderError } from "@botspace/computer";
 import { createPiRuntime, type AgentRuntime } from "@botspace/runtime";
 import type { Env } from "./env";
 import { ApiError, errorResponse, json } from "./errors";
@@ -21,6 +21,7 @@ export class BotDO extends DurableObject<Env> {
   private admitting=new Map<string,Promise<void>>();
   private observing=new Set<string>();
   private recovering?:Promise<void>;
+  private finishingApprovals=new Map<string,Promise<void>>();
   private streams=0;
   private lastComputerTouch=0;
   private suspending?:Promise<ComputerStatus>;
@@ -305,9 +306,13 @@ export class BotDO extends DurableObject<Env> {
     }
     if(decision==="deny") {
       approval.status="denied";
-      this.saveApproval(approval);
-      this.emit("approval.updated",{approval},approval.runId);
-      await this.resumeAfterApproval(approval);
+      let continuation:string|undefined;
+      this.ctx.storage.transactionSync(()=>{
+        this.saveApproval(approval);
+        this.emit("approval.updated",{approval},approval.runId);
+        continuation=this.queueApprovalContinuation(approval);
+      });
+      if(continuation) await this.admit(continuation);
       return approval;
     }
     approval.status="executing";
@@ -330,34 +335,58 @@ export class BotDO extends DurableObject<Env> {
       this.invalidateApproval(approval,"The computer changed after this action was requested. Request a new action based on its current screen.");
     }
   }
-  private async finishApproval(approval:Approval):Promise<void> {
-    let result:ComputerResult;
-    try {result=await this.computer.exec(approval.botId,approval.operationId,approval.action);}
-    catch {result={operationId:approval.operationId,status:"interrupted",error:"Could not establish whether the action completed. Do not retry automatically."};}
-    const completed:Approval={...approval,result,status:result.status==="completed"?"completed":result.status==="interrupted"?"interrupted":"failed"};
-    this.saveApproval(completed);
-    this.emit("approval.updated",{approval:completed},approval.runId,`approval-result:${approval.id}`);
-    this.emit("tool.completed",{operationId:approval.operationId,actionType:approval.action.type,result},approval.runId,`tool:${approval.operationId}`);
-    if(result.status==="interrupted") {
-      if(terminal.has(this.getRun(approval.runId).status)) return;
-      this.updateStatus(approval.runId,"interrupted","An approved action was interrupted. Check its effects before retrying.");
-      return;
-    }
-    await this.resumeAfterApproval(completed);
+  private finishApproval(approval:Approval):Promise<void> {
+    const existing=this.finishingApprovals.get(approval.id);
+    if(existing) return existing;
+    const work=this.finishApprovalOnce(approval.id).finally(()=>this.finishingApprovals.delete(approval.id));
+    this.finishingApprovals.set(approval.id,work);
+    return work;
   }
-  private async resumeAfterApproval(approval:Approval):Promise<void> {
-    const run=this.getRun(approval.runId);
+  private async finishApprovalOnce(id:string):Promise<void> {
+    const row=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM approvals WHERE id=?",id).toArray()[0];
+    if(!row) return;
+    const approval=JSON.parse(row.data) as Approval;
+    // Recovery can hold an older snapshot. A terminal decision is immutable.
+    if(approval.status!=="executing") return;
+    let result:ComputerResult;
+    let providerDiagnostic:string|undefined;
+    try {result=await this.computer.exec(approval.botId,approval.operationId,approval.action);}
+    catch(error) {
+      console.error("approval.failure",{code:error instanceof ComputerProviderError?error.code:"computer_unavailable",actionType:approval.action.type});
+      if(error instanceof ComputerProviderError) providerDiagnostic=`${error.code}: ${error.publicMessage} The action outcome is unconfirmed. Do not retry automatically.`;
+      result={operationId:approval.operationId,status:"interrupted",error:providerDiagnostic??"Could not establish whether the action completed. Do not retry automatically."};
+    }
+    let continuation:string|undefined;
+    this.ctx.storage.transactionSync(()=>{
+      const currentRow=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM approvals WHERE id=?",id).toArray()[0];
+      if(!currentRow || (JSON.parse(currentRow.data) as Approval).status!=="executing") return;
+      const completed:Approval={...approval,result,status:result.status==="completed"?"completed":result.status==="interrupted"?"interrupted":"failed"};
+      this.saveApproval(completed);
+      this.emit("approval.updated",{approval:completed},approval.runId,`approval-result:${approval.id}`);
+      this.emit("tool.completed",{operationId:approval.operationId,actionType:approval.action.type,result},approval.runId,`tool:${approval.operationId}`);
+      if(result.status==="interrupted") {
+        if(!terminal.has(this.getRun(approval.runId).status)) this.updateStatus(approval.runId,"interrupted",providerDiagnostic??"An approved action was interrupted. Check its effects before retrying.");
+      } else continuation=this.queueApprovalContinuation(completed);
+    });
+    if(continuation) await this.admit(continuation);
+  }
+  /** Called in the same transaction as the decision/result, so a restart cannot
+   * leave a finished approval without its durable continuation input. */
+  private queueApprovalContinuation(approval:Approval):string|undefined {
+    const row=this.getRunRow(approval.runId),run=JSON.parse(row.data) as Run;
     if(terminal.has(run.status)) return;
     const nativeOperationId=`approval:${approval.id}`;
+    const existing=this.ctx.storage.sql.exec<Submission>("SELECT * FROM submissions WHERE operation_id=?",nativeOperationId).toArray()[0];
+    // A late duplicate must not reset a running/waiting state or rewind the bot
+    // from a newer continuation to this older one.
+    if(existing) return row.native_operation_id===nativeOperationId?nativeOperationId:undefined;
     const text=approval.status==="denied"
       ? `The user denied action ${approval.id}. Do not execute it. Explain or continue using allowed alternatives.`
       : `The user approved action ${approval.id}. The platform already executed exactly the stored action. Do not repeat it. Result: ${JSON.stringify(approval.result)}. Continue the original task.`;
-    this.ctx.storage.transactionSync(()=>{
-      this.ctx.storage.sql.exec("INSERT OR IGNORE INTO submissions (operation_id,run_id,text) VALUES (?,?,?)",nativeOperationId,run.id,text);
-      this.ctx.storage.sql.exec("UPDATE runs SET native_operation_id=? WHERE id=?",nativeOperationId,run.id);
-      this.updateStatus(run.id,"queued");
-    });
-    await this.admit(nativeOperationId);
+    this.ctx.storage.sql.exec("INSERT INTO submissions (operation_id,run_id,text) VALUES (?,?,?)",nativeOperationId,run.id,text);
+    this.ctx.storage.sql.exec("UPDATE runs SET native_operation_id=? WHERE id=?",nativeOperationId,run.id);
+    this.updateStatus(run.id,"queued");
+    return nativeOperationId;
   }
   private async cancelRun(id:string):Promise<Run> {
     const row=this.getRunRow(id),run=JSON.parse(row.data) as Run;
