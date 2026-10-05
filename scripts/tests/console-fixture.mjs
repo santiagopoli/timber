@@ -1,0 +1,95 @@
+/** Local-only HTTP fixture for browser regression tests. Never deployed. */
+import {createServer} from 'node:http';
+import {readFile} from 'node:fs/promises';
+import {randomUUID} from 'node:crypto';
+import {deflateSync} from 'node:zlib';
+
+export const TEST_TOKEN = 'console-browser-test-token-only';
+export const BOT_A = '10000000-0000-4000-8000-000000000001';
+export const BOT_B = '10000000-0000-4000-8000-000000000002';
+const active = new Set(['queued', 'running', 'waiting_approval']);
+function png() {
+  const chunk = (type, bytes) => {
+    const data = Buffer.concat([Buffer.from(type), bytes]); let crc = 0xffffffff;
+    for (const byte of data) {crc ^= byte; for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);}
+    const head = Buffer.alloc(4), tail = Buffer.alloc(4); head.writeUInt32BE(bytes.length); tail.writeUInt32BE((crc ^ 0xffffffff) >>> 0);
+    return Buffer.concat([head, data, tail]);
+  };
+  const header = Buffer.alloc(13); header.writeUInt32BE(1280); header.writeUInt32BE(800, 4); header[8] = 8; header[9] = 2;
+  const pixels = Buffer.alloc((1280 * 3 + 1) * 800, 80); for (let y = 0; y < 800; y++) pixels[y * (1280 * 3 + 1)] = 0;
+  return Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]), chunk('IHDR', header), chunk('IDAT', deflateSync(pixels)), chunk('IEND', Buffer.alloc(0))]);
+}
+const image = png();
+export async function createConsoleFixture({port = 0} = {}) {
+  const date = '2026-10-05T10:00:00.000Z';
+  const state = {
+    rejectAuth: false, actionGate: null, readsGate: null, failures: [], actions: [], calls: [], streams: new Set(), events: [],
+    bots: [
+      {id: BOT_A, name: 'Ada', instructions: 'Research and turn findings into useful notes.', model: 'gpt-6.1-sol', runtime: 'pi', createdAt: date, updatedAt: date},
+      {id: BOT_B, name: 'Linus', instructions: 'Help build and maintain software.', model: 'gpt-6.1-sol', runtime: 'pi', createdAt: date, updatedAt: date},
+    ],
+    messages: new Map([[BOT_A, [
+      {id: 'message-one', botId: BOT_A, role: 'user', text: 'Organize the research notes and prepare a summary.', createdAt: date},
+      {id: 'message-two', botId: BOT_A, role: 'assistant', text: 'The notes are ready. **Three themes** stood out:\n\n- Persistent conversations\n- Reusable computers\n- Portable workspaces\n\n```sh\ncat notes/summary.md\n```', createdAt: date},
+    ]], [BOT_B, []]]),
+    runs: new Map([[BOT_A, []], [BOT_B, []]]), approvals: new Map([[BOT_A, []], [BOT_B, []]]),
+  };
+  state.emit = (botId, type, data, runId) => {
+    const event = {id: state.events.length + 1, botId, type, data, runId, createdAt: new Date().toISOString()}; state.events.push(event);
+    for (const stream of state.streams) if (stream.botId === botId) stream.response.write(`id: ${event.id}\ndata: ${JSON.stringify(event)}\n\n`);
+  };
+  const server = createServer(async (request, response) => {
+    try {
+      const url = new URL(request.url, 'http://fixture'), path = url.pathname;
+      const json = (data, status = 200) => {response.writeHead(status, {'content-type': 'application/json', 'cache-control': 'no-store'}); response.end(JSON.stringify(data));};
+      if (path.startsWith('/console/')) {
+        const filename = path === '/console/' ? 'index.html' : path.slice('/console/'.length);
+        if (!['index.html', 'console.js', 'console.css'].includes(filename)) {response.writeHead(404).end(); return;}
+        const data = await readFile(new URL(`../../apps/console/${filename}`, import.meta.url));
+        response.writeHead(200, {'content-type': filename.endsWith('.js') ? 'text/javascript' : filename.endsWith('.css') ? 'text/css' : 'text/html', 'content-security-policy': "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob: data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"}); response.end(data); return;
+      }
+      if (state.rejectAuth || request.headers.authorization !== `Bearer ${TEST_TOKEN}`) return json({error: {code: 'unauthorized', message: 'Token rejected.'}}, 401);
+      let body; if (!['GET', 'HEAD'].includes(request.method)) {let raw = ''; for await (const chunk of request) raw += chunk; body = raw ? JSON.parse(raw) : {};}
+      state.calls.push({path: request.url, method: request.method, body});
+      if (path === '/v1/connections/chatgpt') return json({connected: true, status: 'verified', model: 'gpt-6.1-sol', verifiedAt: date});
+      if (path === '/v1/bots') {
+        if (request.method === 'GET') return json({bots: state.bots});
+        const bot = {id: randomUUID(), ...body, runtime: 'pi', createdAt: date, updatedAt: date}; state.bots.unshift(bot); state.messages.set(bot.id, []); state.runs.set(bot.id, []); state.approvals.set(bot.id, []); return json({bot}, 201);
+      }
+      const match = /^\/v1\/bots\/([^/]+)(.*)$/.exec(path); if (!match) return json({}, 404);
+      const [, id, tail] = match, bot = state.bots.find(bot => bot.id === id); if (!bot) return json({}, 404);
+      if (!tail) {if (request.method === 'PATCH') Object.assign(bot, body); return json({bot});}
+      if (tail === '/messages') {
+        if (request.method === 'GET') {const snapshot = structuredClone(state.messages.get(id)); if (state.readsGate) await state.readsGate; return json({messages: snapshot});}
+        const run = {id: randomUUID(), botId: id, operationId: body.operationId, status: 'queued', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()}; state.runs.get(id).unshift(run); state.messages.get(id).push({id: randomUUID(), botId: id, runId: run.id, role: 'user', text: body.text, createdAt: run.createdAt}); return json({run}, 202);
+      }
+      if (tail === '/runs') {
+        const all = state.runs.get(id), offset = Number(url.searchParams.get('before') || 0), limit = Number(url.searchParams.get('limit') || 30);
+        return json({runs: all.slice(offset, offset + limit), activeRuns: all.filter(run => active.has(run.status)), nextCursor: offset + limit < all.length ? String(offset + limit) : null});
+      }
+      if (tail.startsWith('/runs/')) {const run = state.runs.get(id).find(run => run.id === tail.split('/')[2]); if (!run) return json({}, 404); if (tail.endsWith('/cancel')) {run.status = 'cancelled'; run.updatedAt = new Date().toISOString();} return json({run});}
+      if (tail === '/approvals') return json({approvals: state.approvals.get(id)});
+      if (tail.startsWith('/approvals/')) {const approval = state.approvals.get(id).find(item => item.id === tail.split('/')[2]); approval.status = body.decision === 'deny' ? 'denied' : 'completed'; return json({approval});}
+      if (tail === '/events') {
+        response.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache'}); response.write(': connected\n\n');
+        for (const event of state.events) if (event.botId === id && event.id > Number(url.searchParams.get('after') || 0)) response.write(`id: ${event.id}\ndata: ${JSON.stringify(event)}\n\n`);
+        const stream = {botId: id, response}; state.streams.add(stream); response.on('close', () => state.streams.delete(stream)); return;
+      }
+      if (tail === '/computer') return json({computer: {id, provider: 'cloudflare', state: 'running', capabilities: ['exec', 'readFile', 'writeFile', 'listFiles', 'screenshot', 'click']}});
+      if (tail === '/computer/actions') {
+        state.actions.push({botId: id, ...body}); if (state.actionGate) await state.actionGate;
+        const {action, operationId} = body;
+        const result = {operationId, status: 'completed'};
+        if (action.type === 'screenshot') Object.assign(result, {artifactId: '10000000-0000-4000-8000-000000000099', mimeType: 'image/png'});
+        if (action.type === 'listFiles') result.output = JSON.stringify(action.path === 'notes' ? [{name: 'summary.md', kind: 'file'}] : [{name: 'notes', kind: 'directory'}, {name: 'readme.txt', kind: 'file'}]);
+        if (action.type === 'readFile') result.output = `Contents of ${action.path}`;
+        if (action.type === 'exec') Object.assign(result, {output: '/workspace\n', exitCode: 0, checkpointId: 'fixture-checkpoint'});
+        return json({result});
+      }
+      if (tail.startsWith('/artifacts/')) {response.writeHead(200, {'content-type': 'image/png'}).end(image); return;}
+      return json({error: {code: 'not_found', message: 'Unknown fixture route.'}}, 404);
+    } catch (error) {state.failures.push(String(error)); response.writeHead(500).end('{}');}
+  });
+  await new Promise(resolve => server.listen(port, '127.0.0.1', resolve));
+  return {state, url: `http://127.0.0.1:${server.address().port}/console/`, close: async () => {for (const {response} of state.streams) response.end(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve));}};
+}

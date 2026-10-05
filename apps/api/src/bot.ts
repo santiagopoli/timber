@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import type { Approval, Bot, BotEvent, ComputerAction, ComputerResult, ComputerStatus, Message, Run, RunStatus } from "@botspace/contracts";
+import type { Approval, Bot, BotEvent, ComputerAction, ComputerResult, ComputerStatus, Message, Run, RunPage, RunStatus } from "@botspace/contracts";
 import { createCloudComputerProvider, touchCloudComputer, suspendCloudComputer } from "@botspace/computer";
 import { createPiRuntime, type AgentRuntime } from "@botspace/runtime";
 import type { Env } from "./env";
@@ -30,6 +30,7 @@ export class BotDO extends DurableObject<Env> {
     ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS config (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, fingerprint TEXT NOT NULL, native_operation_id TEXT NOT NULL, data TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS runs_status_idx ON runs (json_extract(data,'$.status'));
       CREATE TABLE IF NOT EXISTS submissions (operation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, text TEXT NOT NULL, admitted INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, source_key TEXT UNIQUE, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, fingerprint TEXT NOT NULL, data TEXT NOT NULL);
@@ -75,6 +76,34 @@ export class BotDO extends DurableObject<Env> {
     return row;
   }
   private getRun(id:string):Run {return JSON.parse(this.getRunRow(id).data);}
+  private listRuns(url:URL):RunPage {
+    const limitRaw=url.searchParams.get("limit");
+    const limit=limitRaw===null?30:Number(limitRaw);
+    if((limitRaw!==null && !/^\d+$/.test(limitRaw)) || !Number.isSafeInteger(limit) || limit<1 || limit>100) {
+      throw new ApiError(400,"invalid_limit","limit must be an integer from 1 to 100.");
+    }
+    const beforeRaw=url.searchParams.get("before");
+    let before:number|undefined;
+    if(beforeRaw!==null) {
+      before=Number(beforeRaw);
+      if(!/^\d+$/.test(beforeRaw) || !Number.isSafeInteger(before) || before<=0) {
+        throw new ApiError(400,"invalid_cursor","before must be a positive safe integer cursor.");
+      }
+    }
+    type PageRow = {cursor:number;data:string};
+    // One extra row determines whether another page exists, without COUNT(*) or OFFSET.
+    const rows=before===undefined
+      ? this.ctx.storage.sql.exec<PageRow>("SELECT rowid AS cursor,data FROM runs ORDER BY rowid DESC LIMIT ?",limit+1).toArray()
+      : this.ctx.storage.sql.exec<PageRow>("SELECT rowid AS cursor,data FROM runs WHERE rowid<? ORDER BY rowid DESC LIMIT ?",before,limit+1).toArray();
+    const page=rows.slice(0,limit);
+    // Active runs can be older than the requested page. Admission permits at most 16.
+    const activeRows=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM runs WHERE json_extract(data,'$.status') IN ('queued','running','waiting_approval') ORDER BY rowid DESC LIMIT 16").toArray();
+    return {
+      runs:page.map(row=>JSON.parse(row.data) as Run),
+      activeRuns:activeRows.map(row=>JSON.parse(row.data) as Run),
+      nextCursor:rows.length>limit?String(page[page.length-1].cursor):null,
+    };
+  }
   private findRun(nativeOperationId:string):RunRow|undefined {
     return this.ctx.storage.sql.exec<RunRow>("SELECT runs.* FROM runs JOIN submissions ON submissions.run_id=runs.id WHERE submissions.operation_id=?",nativeOperationId).toArray()[0];
   }
@@ -405,6 +434,7 @@ export class BotDO extends DurableObject<Env> {
         return json({messages});
       }
       if(path==="/messages" && request.method==="POST") return json({run:await this.createRun(parseMessage(await body(request)))},202);
+      if(path==="/runs" && request.method==="GET") return json(this.listRuns(url));
       const runRoute=/^\/runs\/([^/]+)(\/cancel)?$/.exec(path);
       if(runRoute && UUID.test(runRoute[1])) {
         if(request.method==="GET" && !runRoute[2]) return json({run:this.getRun(runRoute[1])});

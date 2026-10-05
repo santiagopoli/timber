@@ -35,6 +35,17 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
 - PATCH /v1/bots/:id {name?,instructions?} -> {bot:Bot}
 - GET /v1/bots/:id/messages -> {messages:Message[]}
 - POST /v1/bots/:id/messages {text,operationId} -> 202 {run:Run}
+- GET /v1/bots/:id/runs?limit=30&before=<cursor>
+  -> {runs:Run[],activeRuns:Run[],nextCursor:string|null}. Runs are newest-created
+  first, with stable SQLite rowid pagination. `limit` defaults to 30 and accepts
+  digit strings representing integers 1..100; `before`, if present, must be a
+  digit string representing a positive safe integer. Invalid values return 400.
+  Pass `nextCursor` unchanged as `before` for the next older page; null means no
+  older page remains. New runs inserted between requests do not shift older pages.
+  `activeRuns` independently contains all admitted queued/running/waiting_approval
+  runs (at most 16), newest-created first, even if absent from the requested page;
+  it can overlap `runs`. Listing makes no new inference calls beyond the existing
+  recovery of already accepted runs. Authentication and bot membership checks apply.
 - GET /v1/bots/:id/runs/:runId -> {run:Run}
 - POST /v1/bots/:id/runs/:runId/cancel -> {run:Run}
 - GET /v1/bots/:id/events?after=cursor -> SSE id, event=event, JSON BotEvent.

@@ -20,6 +20,18 @@ jobs:
           python-version: '3.12'
       - run: npm ci
       - run: npm run check
+      - name: Exercise admin console in Chromium
+        env:
+          CONSOLE_CHROMIUM_PATH: /usr/bin/google-chrome
+          CONSOLE_SCREENSHOT_DIR: test-results/console
+        run: npm run test:console
+      - name: Retain console screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: console-screenshots
+          path: test-results/console
+          if-no-files-found: ignore
       - name: Build Worker bundle
         run: npx wrangler deploy --config apps/api/wrangler.jsonc --dry-run --outdir .wrangler/dry-run --containers-rollout=none
   desktop-image:

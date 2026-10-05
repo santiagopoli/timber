@@ -112,6 +112,12 @@ try {
   report('user message persists without duplication');
   await checkEvents(); report('authenticated durable SSE replay');
   await waitForRun(first.run.id); report('real model run completed');
+  const runs = await call(path('/runs?limit=1'));
+  assert.equal(runs.runs[0]?.id, first.run.id, 'latest run appears in the admin history');
+  assert.equal(runs.runs[0].status, 'completed');
+  assert.ok(!runs.activeRuns.some((run) => run.id === first.run.id), 'completed run is no longer active');
+  assert.equal(runs.nextCursor, null, 'single-run history has no next page');
+  report('run history and active-state projection');
 
   const history = await call(path('/messages'));
   assert.equal(history.messages.filter((message) => message.role === 'user' && message.text === input.text).length, 1, 'one user message persisted');

@@ -26,6 +26,7 @@ other engines can implement these boundaries without changing bot identity.
 
 - Create and rename bots; edit instructions; persistent conversation per bot.
 - Durable asynchronous runs with streamed events, reconnect cursors and cancellation.
+- Paginated run history with active runs returned independently of the history page.
 - Replaceable agent engine, initially the durable Pi harness with `gpt-6.1-sol`
   through Sign in with ChatGPT plan sharing.
 - Host-owned OAuth connection, encrypted credentials, serialized token renewal,
@@ -36,6 +37,21 @@ other engines can implement these boundaries without changing bot identity.
   that prevent a repeated request from executing a completed action twice.
 - Workspace checkpoints in R2, restore on cold start, explicit suspend and idle stop.
 - Protected API, developer console and CLI smoke tests.
+
+The admin console provides bot search, creation and configuration dialogs, a
+conversation with code blocks and per-bot drafts, a Runs panel with cancellation,
+and an approval indicator available from every panel. Reconnecting restores active
+runs even when newer runs have already finished. Older event replay cannot move a
+completed run back to running.
+
+The computer panel shows elapsed time during pending actions, clickable workspace
+files, readable terminal output, and raw results on demand. Screenshot clicking is
+opt-in and maps the displayed image to desktop coordinates. Optional screenshot
+refresh happens after a successful desktop action; there is no background polling
+that wakes computers. Connection settings hold ChatGPT setup and verification.
+The layout supports desktop and mobile, light and dark appearance, and keyboard
+tab navigation. Credentials and drafts stay in memory; only the bot ID is kept in
+the URL fragment for reopening a selection.
 
 This is a single-owner development MVP. There is no multi-user login, native iOS
 client, inter-bot delegation, routine scheduling, Hermes adapter, local execution
@@ -59,6 +75,20 @@ real loopback callbacks, and the Python server with real shell processes and
 files. External model inference and cloud containers are separate
 smoke checks. GitHub Actions also builds the desktop Docker image and exercises
 real Chromium/X11, keyboard input, screenshots and checkpoints.
+
+Run the browser regressions separately:
+
+```sh
+npx playwright install chromium --only-shell
+npm run test:console
+```
+
+These use real Chromium with local HTTP API fixtures, with no model or cloud
+charges. They cover bot editing, draft isolation, stale SSE, active-run recovery,
+pagination, approvals, screenshot input, files, session expiry, and mobile layout.
+The independent Worker suite tests the real API and Durable Objects. To use an
+installed Chrome instead, set `CONSOLE_CHROMIUM_PATH` to its executable; CI uses
+the runner's installed Chrome. CI retains screenshots as `console-screenshots`.
 
 ## Deploy to Cloudflare
 
