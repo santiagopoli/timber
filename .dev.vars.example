@@ -1,0 +1,2 @@
+# Local development only. Generate your own value with: openssl rand -hex 32
+BOTSPACE_API_TOKEN=replace-with-a-random-development-token

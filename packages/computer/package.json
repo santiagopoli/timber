@@ -1,0 +1,9 @@
+{
+  "name": "@botspace/computer",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": { "@botspace/contracts": "*" },
+  "scripts": { "test": "python3 -m unittest discover -s ../../infra/computer/tests -v" }
+}

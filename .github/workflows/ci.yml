@@ -1,0 +1,41 @@
+name: Verify backend
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: npm ci
+      - run: npm run check
+      - name: Build Worker bundle
+        run: npx wrangler deploy --config apps/api/wrangler.jsonc --dry-run --outdir .wrangler/dry-run --containers-rollout=none
+  desktop-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build desktop computer
+        run: docker build --file infra/computer/Dockerfile --tag timber-computer:ci infra/computer
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Exercise real desktop image
+        shell: bash
+        run: |
+          export COMPUTER_TEST_TOKEN="$(openssl rand -hex 32)"
+          trap 'docker rm -f timber-image-smoke >/dev/null 2>&1 || true' EXIT
+          docker run -d --name timber-image-smoke --shm-size=512m -p 127.0.0.1:8080:8080 -e BOTSPACE_COMPUTER_TOKEN="$COMPUTER_TEST_TOKEN" timber-computer:ci
+          node scripts/smoke-computer.mjs

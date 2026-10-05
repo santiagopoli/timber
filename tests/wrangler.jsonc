@@ -1,0 +1,18 @@
+{
+  "name": "botspace-tests",
+  "main": "./fixtures/worker.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "BOTSPACE_API_TOKEN": "test-only-botspace-owner-token-000000",
+    "BOTSPACE_DEFAULT_MODEL": "@cf/test/mock"
+  },
+  "durable_objects": {"bindings": [
+    {"name": "WORKSPACE", "class_name": "WorkspaceDO"},
+    {"name": "BOT", "class_name": "BotDO"},
+    {"name": "COMPUTER", "class_name": "ComputerDO"},
+    {"name": "REAL_COMPUTER", "class_name": "RealComputerDO"}
+  ]},
+  "migrations": [{"tag": "v1", "new_sqlite_classes": ["WorkspaceDO", "BotDO", "ComputerDO", "RealComputerDO"]}],
+  "r2_buckets": [{"binding": "FILES", "bucket_name": "botspace-test-files"}]
+}
