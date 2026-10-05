@@ -15,19 +15,23 @@
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tests/tsconfig.json",
     "test": "vitest run --config tests/vitest.config.ts",
     "test:computer": "python3 -m unittest discover -s infra/computer/tests -v",
-    "check": "npm run typecheck && npm test && npm run test:runtime && npm run test:computer",
+    "check": "npm run typecheck && npm test && npm run test:runtime && npm run test:computer && npm run test:chatgpt-cli",
     "deploy": "wrangler deploy --config apps/api/wrangler.jsonc",
     "smoke": "node scripts/smoke.mjs",
     "deploy:bootstrap": "wrangler deploy --config apps/api/wrangler.bootstrap.jsonc",
     "test:runtime": "vitest run --config packages/runtime/vitest.config.ts",
     "access:setup": "node scripts/set-access-token.mjs",
-    "access:copy": "node scripts/copy-access-token.mjs"
+    "access:copy": "node scripts/copy-access-token.mjs",
+    "chatgpt:login": "node scripts/chatgpt-login.mjs",
+    "chatgpt:status": "node scripts/chatgpt-status.mjs",
+    "test:chatgpt-cli": "node --test scripts/tests/chatgpt-login.test.mjs"
   },
   "dependencies": {
-    "agents": "0.26.0",
+    "@cloudflare/sandbox": "1.0.0",
     "@earendil-works/pi-ai": "1.0.3",
     "@earendil-works/pi-durable": "1.0.3",
-    "@cloudflare/sandbox": "1.0.0"
+    "agents": "0.26.0",
+    "jose": "6.2.12"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "1.3.6",

@@ -54,7 +54,7 @@ export function parseBotInput(value:unknown,patch=false):{name?:string;instructi
   if(data.model!==undefined) {
     if(patch) invalid("model cannot be changed in this milestone.");
     output.model=string(data.model,"model",180);
-    if(!/^@cf\/[A-Za-z0-9._/-]+$/.test(output.model)) invalid("model must be a Workers AI @cf/ model identifier.");
+    if(output.model!=="gpt-6.1-sol" && !/^@cf\/[A-Za-z0-9._/-]+$/.test(output.model)) invalid("model must be gpt-6.1-sol or an explicit Workers AI @cf/ model identifier.");
   }
   if(patch && !Object.keys(output).length) invalid("Provide name or instructions.");
   return output;

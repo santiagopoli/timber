@@ -8,7 +8,9 @@ that conversation. v1 is cloud-only; no iOS implementation in this milestone.
 ## Deployment
 - One Cloudflare Worker, WorkspaceDO registry, BotDO per bot, ComputerDO per bot.
 - SQLite-backed DOs; R2 bucket FILES for immutable checkpoints and artifacts.
-- Workers AI binding AI; first engine Pi through official PiHarness.
+- First engine Pi through official PiHarness. Default model gpt-6.1-sol via
+  the user's explicitly authorized ChatGPT plan. Explicit @cf/ models retain
+  Workers AI. No automatic fallback to separately billed inference.
 - ComputerDO owns one reusable Linux desktop container, lazily started.
 - Private single-owner MVP. BOTSPACE_API_TOKEN is a Worker secret; every /v1
   API request requires Authorization: Bearer token. Health is public and
@@ -20,6 +22,13 @@ that conversation. v1 is cloud-only; no iOS implementation in this milestone.
 ## HTTP surface
 JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
 - GET /health -> {ok:true,service:"botspace"}
+- GET /v1/connections/chatgpt -> {connected,hostId,account?,model,status,verifiedAt?}
+- POST /v1/connections/chatgpt imports the locally completed OAuth registration;
+  requires owner auth, validates OpenAI signed identity and direct-plan permission.
+- DELETE /v1/connections/chatgpt revokes and clears credentials, returns status
+  with revoked:boolean. A failed remote revocation is explicit.
+- POST /v1/connections/chatgpt/verify performs one small real inference and only
+  returns {ok:true,model} after response.completed.
 - GET /v1/bots -> {bots:Bot[]}
 - POST /v1/bots {name,instructions?,model?} -> 201 {bot:Bot}
 - GET /v1/bots/:id -> {bot:Bot}
@@ -42,6 +51,12 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   scoped to bot prefix. Generated HTML/SVG are attachments, never same-origin code.
 
 ## Internal boundaries
+ChatGPTAuthDO stores one owner's encrypted OAuth registration separately from bots
+and workspace archives, serializes rotating-token refresh, and injects tokens only
+in requests to api.openai.com. It exposes no token-read route. Pi receives a fetch
+transport port, never OAuth credentials. OAuth is completed on the user's local
+loopback callback and imported over the authenticated HTTPS API. No iOS app.
+
 Shared types live in @botspace/contracts. Runtime implementer owns its concrete
 types and exports createPiRuntime({owner,ai,model,instructions,tools,...}) or agrees
 an integration API with backend implementer immediately. Pi native recovery owns

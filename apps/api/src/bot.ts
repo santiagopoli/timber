@@ -40,6 +40,12 @@ export class BotDO extends DurableObject<Env> {
       owner:this,
       storage:ctx.storage,
       ai:env.AI,
+      ...(env.CHATGPT?{chatgpt:{fetch:async(request:Request)=>{
+        const url=new URL(request.url);
+        if(url.href!=="https://api.openai.com/v1/responses" || request.method!=="POST") throw new Error("Unsupported ChatGPT inference route");
+        const connection=env.CHATGPT!.get(env.CHATGPT!.idFromName("owner"));
+        return connection.fetch(new Request("https://chatgpt/responses",{method:"POST",headers:{"content-type":"application/json"},body:request.body,signal:request.signal}));
+      }}}:{}),
       getBot:async()=>this.bot(),
       tools:{
         execute:async(input)=>this.executeTool(input),

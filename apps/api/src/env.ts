@@ -2,6 +2,8 @@ export interface Env {
   WORKSPACE: DurableObjectNamespace;
   BOT: DurableObjectNamespace;
   COMPUTER: DurableObjectNamespace;
+  CHATGPT?: DurableObjectNamespace;
+  CHATGPT_CREDENTIAL_KEY?: string;
   FILES: R2Bucket;
   AI: Ai;
   ASSETS?: Fetcher;

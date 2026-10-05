@@ -20,7 +20,7 @@ export class WorkspaceDO extends DurableObject<Env> {
       if(path==="/" && request.method==="POST") {
         const input=parseBotInput(await body(request));
         const now=new Date().toISOString();
-        const bot:Bot={id:crypto.randomUUID(),name:input.name!,instructions:input.instructions??"",model:input.model??this.env.BOTSPACE_DEFAULT_MODEL??"@cf/moonshotai/kimi-k2.7-code",runtime:"pi",createdAt:now,updatedAt:now};
+        const bot:Bot={id:crypto.randomUUID(),name:input.name!,instructions:input.instructions??"",model:input.model??this.env.BOTSPACE_DEFAULT_MODEL??"gpt-6.1-sol",runtime:"pi",createdAt:now,updatedAt:now};
         this.ctx.storage.sql.exec("INSERT INTO bots (id,data) VALUES (?,?)",bot.id,JSON.stringify(bot));
         return json({bot},201);
       }

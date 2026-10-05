@@ -37,6 +37,8 @@ export interface PiRuntimeOptions<Env extends object> {
   owner: DurableObject<Env>;
   storage: DurableObjectStorage;
   ai: AISettings['binding'];
+  /** Host-owned OAuth transport; the runtime never receives account credentials. */
+  chatgpt?: { fetch(request: Request): Promise<Response> };
   getBot(): Promise<Pick<Bot, 'name' | 'instructions' | 'model'>>;
   tools: RuntimeTools;
   onEvent?(event: RuntimeEvent): void | Promise<void>;

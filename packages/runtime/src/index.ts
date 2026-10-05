@@ -9,11 +9,12 @@ import { Lifecycle, LifecycleCapability } from 'agents/lifecycle';
 import { createAI } from 'agents/models/pi-ai';
 import { classifyFailure, normalizeEntries, textContent } from './normalize.js';
 import { computerTools } from './tools.js';
+import { CHATGPT_MODEL, chatgptModel, createChatGPTProvider } from './chatgpt.js';
 import type { AgentRuntime, PendingApproval, PiRuntimeOptions, RuntimeEvent, RuntimeMessage, RuntimeOperation, RuntimeOperationResult, RuntimeReceipt } from './types.js';
 
 export type { AgentRuntime, RuntimeOperation, RuntimeOperationResult, RuntimeReceipt, RuntimePendingOperation, PendingApproval, PiRuntimeOptions, RuntimeEvent, RuntimeMessage, RuntimeToolRequest, RuntimeToolResult, RuntimeTools } from './types.js';
 export { normalizeEntries, textContent } from './normalize.js';
-export const DEFAULT_MODEL = '@cf/moonshotai/kimi-k2.7-code';
+export const DEFAULT_MODEL = CHATGPT_MODEL;
 
 /** Durable budgets count logical tasks once, including after object eviction. */
 export function createBudget(storage: Pick<DurableObjectStorage, 'sql'>, limits: { generation: number; tool: number }) {
@@ -37,6 +38,12 @@ export function createBudget(storage: Pick<DurableObjectStorage, 'sql'>, limits:
 
 export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<Env>): AgentRuntime {
   const ai = createAI({ binding: options.ai });
+  const chatgpt = createChatGPTProvider(options.chatgpt);
+  const resolveModel = (id: string) => {
+    if (id === CHATGPT_MODEL) return chatgptModel;
+    if (id.startsWith('@cf/')) return ai(id);
+    throw new Error('Unknown model: choose gpt-6.1-sol or an explicit @cf/ model');
+  };
   const consume = createBudget(options.storage, {
     generation: Math.min(Math.max(options.maxGenerations ?? 12, 1), 100),
     tool: Math.min(Math.max(options.maxToolCalls ?? 24, 1), 200),
@@ -75,13 +82,13 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
   };
 
   const harness = new PiHarness({
-    defaults: { model: ai(options.defaultModel ?? DEFAULT_MODEL), thinkingLevel: 'low' },
+    defaults: { model: resolveModel(options.defaultModel ?? DEFAULT_MODEL), thinkingLevel: 'low' },
     harness: async (context) => {
       storage = context.storage;
       background = context.context;
       const models = createModels();
-      models.setProvider({
-        ...ai.provider,
+      for (const provider of [ai.provider, chatgpt]) models.setProvider({
+        ...provider,
         streamSimple(model, context, streamOptions) {
           const output = createAssistantMessageEventStream();
           void (async () => {
@@ -93,7 +100,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
               if (paused(operationId)) throw new Error('Run is paused awaiting human approval');
               consume(operationId, 'generation', String(live.run.taskId));
               policyBlocked = false;
-              const upstream = ai.provider.streamSimple(model, context, {
+              const upstream = provider.streamSimple(model, context, {
                 ...streamOptions, maxTokens: Math.min(streamOptions?.maxTokens ?? 4096, 4096),
               });
               for await (const event of upstream) output.push(event);
@@ -134,7 +141,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
         } }],
         tools: computerTools({
           tools: options.tools, operationForCall, consume, paused, pause,
-          imageInputSupported: async () => ai((await options.getBot()).model).input.includes('image'),
+          imageInputSupported: async () => resolveModel((await options.getBot()).model).input.includes('image'),
         }),
       });
       native = await Harness.open(context.storage, {
@@ -207,7 +214,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
           eventKey: `${event.type}:${event.toolCallId}`, data: { toolCallId: event.toolCallId, toolName: event.toolName } });
         break;
       case 'task_failed':
-        await emit({ type: 'runtime.error', operationId: activeOperationId, eventKey: `task:failed:${String(event.taskId)}`, data: { message: event.message } });
+        await emit({ type: 'runtime.error', operationId: activeOperationId, eventKey: `task:failed:${String(event.taskId)}`, data: { ...classifyFailure('model_error', event.message) } });
         break;
       // Private reasoning, raw model payloads, and native implementation events stay internal.
     }
@@ -228,7 +235,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
   return {
     async submit(text: string, input: { operationId: string }): Promise<RuntimeReceipt> {
       const bot = await options.getBot();
-      await harness.session().setModel(ai(bot.model));
+      await harness.session().setModel(resolveModel(bot.model));
       const result = await harness.submit(text, { operationId: input.operationId });
       return { operationId: result.operationId, accepted: result.accepted };
     },

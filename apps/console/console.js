@@ -4,6 +4,7 @@
   let token = '', bots = [], selected = null, currentRun = null, cursor = 0;
   let streamController = null, screenUrl = null, artifact = null, refreshTimer = null;
   let generation = 0, computerBusy = false;
+  let authSession = 0, chatGPTConnected = false, chatGPTBusy = false, chatGPTAccount = null;
   const events = [];
   const pendingMessages = new Map(), pendingActions = new Map();
   let draftRunId = null;
@@ -46,7 +47,11 @@
     $('screenshot-time').textContent = '';
   }
   function disconnect() {
-    generation++; token = ''; selected = null; currentRun = null; bots = [];
+    generation++; authSession++; token = ''; selected = null; currentRun = null; bots = [];
+    chatGPTConnected = false; chatGPTAccount = null;
+    $('chatgpt-status').textContent = 'Connection not checked.'; $('chatgpt-account').textContent = ''; $('chatgpt-account').hidden = true;
+    $('chatgpt-verification').textContent = 'Model access has not been verified.'; $('chatgpt-error').textContent = '';
+    $('verify-chatgpt').disabled = true; $('disconnect-chatgpt').hidden = true;
     streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
     events.length = 0; pendingMessages.clear(); pendingActions.clear(); clearDraft(); $('token').value = ''; $('type-text').value = '';
     $('messages').replaceChildren(); $('approvals').replaceChildren(); $('activity-list').replaceChildren();
@@ -67,6 +72,31 @@
       const info = el('span'); info.append(el('span', 'bot-name', bot.name), el('small', '', bot.runtime));
       button.append(info); button.addEventListener('click', () => guarded(() => selectBot(bot))); $('bot-list').append(button);
     }
+  }
+  function renderChatGPT(status) {
+    chatGPTConnected = status.connected === true;
+    const account = status.account ? `${status.account.clientId}:${status.account.subject}` : null;
+    if (account !== chatGPTAccount || !chatGPTConnected) $('chatgpt-verification').textContent = 'Model access has not been verified.';
+    chatGPTAccount = account;
+    if (chatGPTConnected && status.status === 'verified' && Number.isFinite(Date.parse(status.verifiedAt))) $('chatgpt-verification').textContent = `gpt-6.1-sol last verified ${new Date(status.verifiedAt).toLocaleString()}.`;
+    $('chatgpt-status').textContent = chatGPTConnected ? 'Connected to your ChatGPT account.' : 'Not connected. Run the local login command.';
+    $('chatgpt-account').textContent = status.account?.email || ''; $('chatgpt-account').hidden = !status.account?.email;
+    $('verify-chatgpt').disabled = chatGPTBusy || !chatGPTConnected;
+    $('disconnect-chatgpt').hidden = !chatGPTConnected;
+  }
+  async function chatGPTTask(task) {
+    if (chatGPTBusy) return;
+    const session = authSession; chatGPTBusy = true; $('chatgpt-error').textContent = '';
+    for (const id of ['refresh-chatgpt', 'verify-chatgpt', 'disconnect-chatgpt']) $(id).disabled = true;
+    try { await task(session); }
+    catch (error) { if (session === authSession) $('chatgpt-error').textContent = errorText(error); }
+    finally {
+      chatGPTBusy = false; $('refresh-chatgpt').disabled = false; $('disconnect-chatgpt').disabled = false; $('verify-chatgpt').disabled = !chatGPTConnected;
+    }
+  }
+  async function loadChatGPT(session = authSession) {
+    const status = await request('/v1/connections/chatgpt');
+    if (session === authSession) renderChatGPT(status);
   }
   async function loadBots() { const result = await request('/v1/bots'); bots = result.bots; renderBots(); }
   async function selectBot(bot) {
@@ -275,14 +305,40 @@
   function bindForm(id, fn) { $(id).addEventListener('submit', (event) => { event.preventDefault(); void guarded(fn); }); }
   $('connect-form').addEventListener('submit', async (event) => {
     event.preventDefault(); const button = event.submitter; button.disabled = true; $('login-error').textContent = '';
-    token = $('token').value.trim();
+    authSession++; token = $('token').value.trim();
     try {
       await loadBots(); $('token').value = ''; $('login').hidden = true; $('app').hidden = false; $('disconnect').hidden = false; $('connection').textContent = 'Authenticated';
+      void chatGPTTask(loadChatGPT);
       if (bots.length) await selectBot(bots[0]);
     } catch (error) { token = ''; $('login-error').textContent = errorText(error); }
     finally { button.disabled = false; }
   });
   $('disconnect').addEventListener('click', disconnect);
+  $('refresh-chatgpt').addEventListener('click', () => chatGPTTask(loadChatGPT));
+  $('copy-chatgpt-login').addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText('npm run chatgpt:login'); $('chatgpt-verification').textContent = 'Login command copied. Run it in your local Timber checkout.'; }
+    catch { $('chatgpt-error').textContent = 'Copy the login command above and run it in your local Timber checkout.'; }
+  });
+  $('verify-chatgpt').addEventListener('click', () => chatGPTTask(async (session) => {
+    $('chatgpt-verification').textContent = 'Testing gpt-6.1-sol with one small real request…';
+    try {
+      const result = await request('/v1/connections/chatgpt/verify', { method: 'POST', body: {} });
+      if (session !== authSession) return;
+      if (result.ok !== true || result.model !== 'gpt-6.1-sol') throw new Error('The backend did not confirm gpt-6.1-sol access.');
+      $('chatgpt-verification').textContent = 'Verified: gpt-6.1-sol completed a real request.';
+    } catch (error) {
+      if (session === authSession) $('chatgpt-verification').textContent = 'Model access was not verified.';
+      throw error;
+    }
+  }));
+  $('disconnect-chatgpt').addEventListener('click', () => chatGPTTask(async (session) => {
+    const status = await request('/v1/connections/chatgpt', { method: 'DELETE' });
+    if (session !== authSession) return;
+    renderChatGPT(status);
+    $('chatgpt-verification').textContent = status.revoked === true
+      ? 'ChatGPT disconnected and its renewable session revoked.'
+      : 'Cloud credentials removed. Remote revocation was not confirmed; disconnect Timber in ChatGPT Settings.';
+  }));
   $('reload-bots').addEventListener('click', () => guarded(loadBots));
   bindForm('create-form', async () => {
     const button = $('create-form').querySelector('button'); button.disabled = true;

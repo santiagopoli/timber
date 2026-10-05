@@ -1,5 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
 import type { ComputerAction, ComputerResult } from "@botspace/contracts";
+import { ChatGPTAuthDO } from "../../apps/api/src/chatgpt";
+import type { Env } from "../../apps/api/src/env";
+export { ChatGPTAuthDO };
+export class KeylessChatGPTAuthDO extends ChatGPTAuthDO {
+  constructor(ctx: DurableObjectState, env: Env) {super(ctx, {...env, CHATGPT_CREDENTIAL_KEY: undefined});}
+}
 export {default, WorkspaceDO, BotDO} from "../../apps/api/src/index";
 export {ComputerDO as RealComputerDO} from "../../packages/computer/src/index";
 export const computerFixtureControl: {gate?: Promise<void>; status?: ComputerResult["status"]} = {};

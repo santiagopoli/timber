@@ -1,5 +1,8 @@
 import { DurableObject } from 'cloudflare:workers';
 import { createPiRuntime, DEFAULT_MODEL } from '../src/index.js';
+import { responsesFixture } from './responses-fixture.js';
+
+const CF_MODEL = '@cf/moonshotai/kimi-k2.7-code';
 
 /** Fake ONLY the external inference transport; Pi, lifecycle and SQLite are real. */
 export class HarnessProbe extends DurableObject {
@@ -8,8 +11,14 @@ export class HarnessProbe extends DurableObject {
     super(ctx, env);
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS calls(id INTEGER PRIMARY KEY AUTOINCREMENT, input TEXT)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS projected(id INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT)');
+    ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY,value TEXT)');
     this.runtime = createPiRuntime({
-      owner: this, storage: ctx.storage,
+      owner: this, storage: ctx.storage, defaultModel: CF_MODEL,
+      chatgpt: { fetch: async request => {
+        const input = await request.json<{ input: Record<string, unknown>[] }>();
+        ctx.storage.sql.exec('INSERT INTO calls(input) VALUES(?)', JSON.stringify({ ...input, fixtureUrl: request.url, fixtureHeaders: Object.fromEntries(request.headers) }));
+        return responsesFixture(input);
+      } },
       ai: { run: async (_model: string, input: { messages: { role: string; content: unknown }[] }) => {
         ctx.storage.sql.exec('INSERT INTO calls(input) VALUES(?)', JSON.stringify(input));
         const user = input.messages.filter(message => message.role === 'user').at(-1);
@@ -26,15 +35,19 @@ export class HarnessProbe extends DurableObject {
         ];
         return new Response(chunks.map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
       } } as unknown as Ai,
-      getBot: async () => ({ name: 'Ada', instructions: 'Your private instruction is amber-lantern.', model: DEFAULT_MODEL }),
-      tools: { execute: async ({ operationId, action }) => action.type === 'readFile' ? { operationId, status: 'completed', output: 'test file' } : { status: 'pending_approval', approvalId: 'approval-fixture' } },
+      getBot: async () => ({ name: 'Ada', instructions: 'Your private instruction is amber-lantern.', model: ctx.storage.sql.exec<{ value: string }>('SELECT value FROM config WHERE key=?', 'model').toArray()[0]?.value ?? CF_MODEL }),
+      tools: {
+        execute: async ({ operationId, action }) => action.type === 'readFile' ? { operationId, status: 'completed', output: 'test file' } : action.type === 'screenshot' ? { operationId, status: 'completed', artifactId: 'test.png' } : { status: 'pending_approval', approvalId: 'approval-fixture' },
+        readImage: async () => ({ data: 'aW1hZ2U=', mimeType: 'image/png' }),
+      },
       onEvent: event => { ctx.storage.sql.exec('INSERT INTO projected(event) VALUES(?)', JSON.stringify(event)); },
     });
   }
   async onRequest(request: Request) {
     const path = new URL(request.url).pathname;
     if (path === '/submit') {
-      const input = await request.json<{ text: string; operationId: string }>();
+      const input = await request.json<{ text: string; operationId: string; chatgpt?: boolean }>();
+      if (input.chatgpt) this.ctx.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)', 'model', DEFAULT_MODEL);
       return Response.json(await this.runtime.submit(input.text, { operationId: input.operationId }));
     }
     if (path === '/wait') return Response.json(await this.runtime.wait(new URL(request.url).searchParams.get('id')!));

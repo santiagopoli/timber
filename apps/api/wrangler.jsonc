@@ -20,7 +20,7 @@
     "binding": "AI"
   },
   "vars": {
-    "BOTSPACE_DEFAULT_MODEL": "@cf/moonshotai/kimi-k2.7-code"
+    "BOTSPACE_DEFAULT_MODEL": "gpt-6.1-sol"
   },
   "durable_objects": {
     "bindings": [
@@ -35,6 +35,10 @@
       {
         "name": "COMPUTER",
         "class_name": "ComputerDO"
+      },
+      {
+        "name": "CHATGPT",
+        "class_name": "ChatGPTAuthDO"
       }
     ]
   },
@@ -45,6 +49,12 @@
         "WorkspaceDO",
         "BotDO",
         "ComputerDO"
+      ]
+    },
+    {
+      "tag": "v2-chatgpt",
+      "new_sqlite_classes": [
+        "ChatGPTAuthDO"
       ]
     }
   ],
@@ -75,5 +85,6 @@
       ],
       "fallthrough": true
     }
-  ]
+  ],
+  "preview_urls": false
 }

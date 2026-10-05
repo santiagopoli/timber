@@ -29,6 +29,18 @@ export function normalizeEntries(entries: readonly EntryRecord[]): RuntimeMessag
 /** Publish an actionable failure category without copying provider bodies or prompts. */
 export function classifyFailure(reason: string, detail: unknown): { errorCode: string; publicMessage: string } {
   const text = typeof detail === 'string' ? detail : '';
+  if (/chatgpt_not_connected|chatgpt_reauthorization_required|chatgpt_reauthentication_required|chatgpt_connection_expired|subscription_sharing_invalid_user/.test(text)) {
+    return { errorCode: 'chatgpt_not_connected', publicMessage: 'Connect ChatGPT before running this bot.' };
+  }
+  if (/subscription_sharing_usage_limit_exceeded|chatgpt_allowance_exhausted/.test(text)) {
+    return { errorCode: 'chatgpt_allowance_exhausted', publicMessage: 'Your ChatGPT usage allowance is exhausted. Check your ChatGPT usage before retrying.' };
+  }
+  if (/subscription_sharing_usage_unavailable/.test(text)) {
+    return { errorCode: 'chatgpt_usage_unavailable', publicMessage: 'ChatGPT plan usage is temporarily unavailable. Retry later.' };
+  }
+  if (/chatgpt_output_limit/.test(text)) {
+    return { errorCode: 'model_output_limit', publicMessage: 'The model response exceeded this bot’s output limit.' };
+  }
   if (/paid(?:\s+access|\s+plan|\s+account)|billing|payment|insufficient\s+(?:balance|credits)|free\s+(?:tier|plan)/i.test(text)) {
     return { errorCode: 'model_billing_required', publicMessage: 'The selected model requires paid Workers AI access or available billing credits.' };
   }
@@ -36,10 +48,10 @@ export function classifyFailure(reason: string, detail: unknown): { errorCode: s
     return { errorCode: 'model_unavailable', publicMessage: 'The selected model is not available to this runtime or account.' };
   }
   if (/rate.?limit|too many requests|quota/i.test(text)) {
-    return { errorCode: 'model_rate_limited', publicMessage: 'Workers AI refused the request because a rate or usage limit was reached.' };
+    return { errorCode: 'model_rate_limited', publicMessage: 'The model provider refused the request because a rate or usage limit was reached.' };
   }
   if (/unauthorized|authentication|forbidden|permission|access.denied/i.test(text)) {
-    return { errorCode: 'model_access_denied', publicMessage: 'Workers AI denied access to the selected model.' };
+    return { errorCode: 'model_access_denied', publicMessage: 'The model provider denied access to the selected model.' };
   }
   if (/timeout|timed out|deadline/i.test(text)) {
     return { errorCode: 'model_timeout', publicMessage: 'The model request exceeded its time limit.' };

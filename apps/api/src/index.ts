@@ -5,6 +5,7 @@ import { UUID } from "./validation";
 import type { Bot } from "@botspace/contracts";
 export { WorkspaceDO } from "./workspace";
 export { BotDO } from "./bot";
+export { ChatGPTAuthDO } from "./chatgpt";
 export { ComputerDO } from "@botspace/computer";
 
 function internalRequest(request:Request,url:string):Request {
@@ -33,6 +34,13 @@ export default {
       }
       const owner=await authenticate(request,env.BOTSPACE_API_TOKEN);
       if(!url.pathname.startsWith("/v1/")) throw new ApiError(404,"not_found","Endpoint not found.");
+      if(url.pathname==="/v1/connections/chatgpt" || url.pathname==="/v1/connections/chatgpt/verify") {
+        const verification=url.pathname.endsWith("/verify");
+        if(verification?request.method!=="POST":!["GET","POST","DELETE"].includes(request.method)) throw new ApiError(405,"method_not_allowed","Method not allowed.");
+        if(!env.CHATGPT) throw new ApiError(503,"chatgpt_not_configured","ChatGPT connections are not configured on this server.");
+        const connection=env.CHATGPT.get(env.CHATGPT.idFromName(owner));
+        return connection.fetch(internalRequest(request,`https://chatgpt/${verification?"verify":""}`));
+      }
       const registry=env.WORKSPACE.get(env.WORKSPACE.idFromName(owner));
       if(url.pathname==="/v1/bots") {
         if(!["GET","POST"].includes(request.method)) throw new ApiError(405,"method_not_allowed","Method not allowed.");

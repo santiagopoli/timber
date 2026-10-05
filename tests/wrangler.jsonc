@@ -5,14 +5,17 @@
   "compatibility_flags": ["nodejs_compat"],
   "vars": {
     "BOTSPACE_API_TOKEN": "test-only-botspace-owner-token-000000",
-    "BOTSPACE_DEFAULT_MODEL": "@cf/test/mock"
+    "BOTSPACE_DEFAULT_MODEL": "@cf/test/mock",
+    "CHATGPT_CREDENTIAL_KEY": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   },
   "durable_objects": {"bindings": [
     {"name": "WORKSPACE", "class_name": "WorkspaceDO"},
     {"name": "BOT", "class_name": "BotDO"},
     {"name": "COMPUTER", "class_name": "ComputerDO"},
-    {"name": "REAL_COMPUTER", "class_name": "RealComputerDO"}
+    {"name": "REAL_COMPUTER", "class_name": "RealComputerDO"},
+    {"name": "CHATGPT", "class_name": "ChatGPTAuthDO"},
+    {"name": "KEYLESS_CHATGPT", "class_name": "KeylessChatGPTAuthDO"}
   ]},
-  "migrations": [{"tag": "v1", "new_sqlite_classes": ["WorkspaceDO", "BotDO", "ComputerDO", "RealComputerDO"]}],
+  "migrations": [{"tag": "v1", "new_sqlite_classes": ["WorkspaceDO", "BotDO", "ComputerDO", "RealComputerDO", "ChatGPTAuthDO", "KeylessChatGPTAuthDO"]}],
   "r2_buckets": [{"binding": "FILES", "bucket_name": "botspace-test-files"}]
 }

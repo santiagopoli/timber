@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import type { EntryRecord, ToolExecutionApi } from '@earendil-works/pi-durable';
 import { classifyFailure, normalizeEntries, textContent } from '../src/normalize.js';
 import { computerTools, executeComputerTool, type ToolBridge } from '../src/tools.js';
+import { chatgptModel, chatgptPayload, createChatGPTProvider } from '../src/chatgpt.js';
+import { createModels } from '@earendil-works/pi-ai/models';
 
 const api = { taskId: 'task-17', callId: 'call-42' } as unknown as ToolExecutionApi;
 const context = { name: 'test', abortSignal: new AbortController().signal, get: () => undefined } as unknown as Parameters<ToolExecutionApi['agent']>[0];
@@ -82,5 +84,29 @@ describe('safe inference failure classification', () => {
     const result = classifyFailure('model_error', 'secret-value 123');
     expect(result.errorCode).toBe('model_request_failed');
     expect(JSON.stringify(result)).not.toContain('secret-value');
+  });
+});
+
+describe('ChatGPT subscription boundary', () => {
+  it('fails without a host connection and never uses global fetch or an API key fallback', async () => {
+    const network = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('Unexpected network access'));
+    try {
+      const provider = createChatGPTProvider(undefined);
+      const models = createModels();
+      models.setProvider(provider);
+      const stream = models.streamSimple(chatgptModel, { messages: [{ role: 'user', content: 'Hello', timestamp: 0 }] });
+      const result = await stream.result();
+      expect(result.stopReason).toBe('error');
+      expect(classifyFailure('model_error', result.errorMessage).errorCode).toBe('chatgpt_not_connected');
+      expect(network).not.toHaveBeenCalled();
+    } finally { network.mockRestore(); }
+  });
+  it('removes unsupported SDK fields and rejects foreign tool namespaces', () => {
+    const payload = chatgptPayload({ input: [{ role: 'system', content: 'Instruction' }], model: 'other', max_output_tokens: 7, previous_response_id: 'old', metadata: { private: true }, tools: [] });
+    expect(payload).toMatchObject({ model: 'gpt-6.1-sol', store: false, stream: true, input: [{ role: 'developer', content: 'Instruction' }] });
+    expect(payload).not.toHaveProperty('metadata');
+    expect(payload).not.toHaveProperty('max_output_tokens');
+    expect(payload).not.toHaveProperty('previous_response_id');
+    expect(() => chatgptPayload({ input: [{ type: 'function_call', namespace: 'other' }] })).toThrow('chatgpt_invalid_tool_namespace');
   });
 });
