@@ -25,3 +25,24 @@ export function normalizeEntries(entries: readonly EntryRecord[]): RuntimeMessag
     }];
   }));
 }
+
+/** Publish an actionable failure category without copying provider bodies or prompts. */
+export function classifyFailure(reason: string, detail: unknown): { errorCode: string; publicMessage: string } {
+  const text = typeof detail === 'string' ? detail : '';
+  if (/paid(?:\s+access|\s+plan|\s+account)|billing|payment|insufficient\s+(?:balance|credits)|free\s+(?:tier|plan)/i.test(text)) {
+    return { errorCode: 'model_billing_required', publicMessage: 'The selected model requires paid Workers AI access or available billing credits.' };
+  }
+  if (reason === 'no_model' || /(?:model.*(?:not found|does not exist|unavailable)|unknown model)/i.test(text)) {
+    return { errorCode: 'model_unavailable', publicMessage: 'The selected model is not available to this runtime or account.' };
+  }
+  if (/rate.?limit|too many requests|quota/i.test(text)) {
+    return { errorCode: 'model_rate_limited', publicMessage: 'Workers AI refused the request because a rate or usage limit was reached.' };
+  }
+  if (/unauthorized|authentication|forbidden|permission|access.denied/i.test(text)) {
+    return { errorCode: 'model_access_denied', publicMessage: 'Workers AI denied access to the selected model.' };
+  }
+  if (/timeout|timed out|deadline/i.test(text)) {
+    return { errorCode: 'model_timeout', publicMessage: 'The model request exceeded its time limit.' };
+  }
+  return { errorCode: reason === 'aborted' ? 'run_aborted' : 'model_request_failed', publicMessage: reason === 'aborted' ? 'The run was stopped before an answer completed.' : 'The model request failed before an answer completed.' };
+}

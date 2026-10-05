@@ -5,6 +5,12 @@ export type { RuntimeEvent, RuntimeToolRequest } from "../../packages/runtime/sr
 
 type Result = {operationId: string; session: "1"; status: "done" | "unanswered"; text?: string; reason?: string};
 type Operation = {text: string; status: "queued" | "running" | "done" | "unanswered"; result?: Result};
+const fixtureEvents = new Map<string, (type: string, data: Record<string, unknown>) => Promise<void>>();
+export async function emitFixtureRuntimeEvent(operationId: string, type: string, data: Record<string, unknown>) {
+  const emit = fixtureEvents.get(operationId);
+  if (!emit) throw new Error("Unknown fixture operation");
+  await emit(type, data);
+}
 
 export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<Env>) {
   const pending = new Map<string, Promise<Result>>();
@@ -20,6 +26,15 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
     await options.storage.put(key(operationId), operation);
     await emit(operationId, "run.started", {});
     await new Promise(resolve => setTimeout(resolve, 15));
+    if (["fixture:model-error", "fixture:model-error-late"].includes(operation.text)) {
+      const result: Result = {operationId, session: "1", status: "unanswered", reason: "model_error"};
+      await options.storage.put(key(operationId), {...operation, status: "unanswered", result});
+      if (operation.text === "fixture:model-error") await emit(operationId, "run.failed", {
+        reason: "model_error", errorCode: "model_billing_required",
+        publicMessage: "This model requires a paid Cloudflare Workers plan.",
+      });
+      return result;
+    }
     if (["fixture:approval", "fixture:gui-approval"].includes(operation.text)) {
       const result = await options.tools.execute({
         operationId: `fixture-tool:${operationId}`, runOperationId: operationId,
@@ -44,6 +59,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
   }
   return {
     async submit(text: string, input: {operationId: string}) {
+      fixtureEvents.set(input.operationId, (type, data) => emit(input.operationId, type, data));
       const existing = await options.storage.get(key(input.operationId));
       if (!existing) await options.storage.put(key(input.operationId), {text, status: "queued"});
       return {operationId: input.operationId, session: "1" as const, accepted: !existing};

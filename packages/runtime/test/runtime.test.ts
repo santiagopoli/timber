@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { EntryRecord, ToolExecutionApi } from '@earendil-works/pi-durable';
-import { normalizeEntries, textContent } from '../src/normalize.js';
+import { classifyFailure, normalizeEntries, textContent } from '../src/normalize.js';
 import { computerTools, executeComputerTool, type ToolBridge } from '../src/tools.js';
 
 const api = { taskId: 'task-17', callId: 'call-42' } as unknown as ToolExecutionApi;
@@ -68,5 +68,19 @@ describe('public transcript projection', () => {
   it('uses stable message identities for restart reconciliation', () => {
     const entries = [{ id: '12', conversationId: '1', kind: 'assistant', model: [{ role: 'assistant', content: [{ type: 'text', text: 'Saved' }], timestamp: 0 }] }] as unknown as EntryRecord[];
     expect(normalizeEntries(entries)).toEqual([{ id: 'pi:12:0', role: 'assistant', text: 'Saved', createdAt: '1970-01-01T00:00:00.000Z' }]);
+  });
+});
+
+
+describe('safe inference failure classification', () => {
+  it('reports paid model access without exposing the upstream error body', () => {
+    const result = classifyFailure('model_error', 'This model requires a Workers Paid plan. Body contains private user material.');
+    expect(result.errorCode).toBe('model_billing_required');
+    expect(JSON.stringify(result)).not.toContain('private user material');
+  });
+  it('keeps unknown provider failures generic', () => {
+    const result = classifyFailure('model_error', 'secret-value 123');
+    expect(result.errorCode).toBe('model_request_failed');
+    expect(JSON.stringify(result)).not.toContain('secret-value');
   });
 });

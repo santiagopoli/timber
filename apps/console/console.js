@@ -91,6 +91,7 @@
     currentRun = run;
     $('run-status').textContent = run ? run.status.replaceAll('_', ' ') : 'Ready';
     $('cancel-run').hidden = !run || terminal.has(run.status);
+    $('run-error').textContent = run?.error || ''; $('run-error').hidden = !run?.error;
     if (run && terminal.has(run.status) && draftRunId === run.id) clearDraft();
   }
   async function loadMessages(version = generation) {

@@ -52,3 +52,14 @@ it('enforces a durable generation budget on an endlessly tool-calling model', as
   const state = await (await request('/inspect')).json<{ calls: unknown[] }>();
   expect(state.calls).toHaveLength(12);
 });
+
+it('projects a safe billing failure from a real provider error response', async () => {
+  await request('/submit', { text: 'billing-fixture', operationId: 'billing-id' });
+  const result = await (await request('/wait?id=billing-id')).json<{ status: string }>();
+  expect(result.status).toBe('unanswered');
+  const state = await (await request('/inspect')).json<{ events: { event: string }[] }>();
+  const failure = state.events.map(row => JSON.parse(row.event)).find(event => event.type === 'run.failed');
+  expect(failure.data.errorCode).toBe('model_billing_required');
+  expect(failure.data.publicMessage).toContain('paid Workers AI');
+  expect(JSON.stringify(failure)).not.toContain('Private example detail');
+});

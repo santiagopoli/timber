@@ -230,13 +230,26 @@ class Computer:
                 elif len(output) < MAX_OUTPUT:
                     output.extend(data[:MAX_OUTPUT - len(output)])
         selector.close()
-        proc.stdout.close()
         try:
             code = proc.wait(timeout=max(0.1, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             timed_out = True
             os.killpg(proc.pid, signal.SIGKILL)
             code = proc.wait(timeout=5)
+        if timed_out:
+            # A busy host can deschedule this reader across the deadline while
+            # output is already buffered. Retain those bytes after killing the
+            # process group; never wait on a detached child that kept the pipe.
+            os.set_blocking(proc.stdout.fileno(), False)
+            while len(output) < MAX_OUTPUT:
+                try:
+                    data = os.read(proc.stdout.fileno(), min(16384, MAX_OUTPUT - len(output)))
+                except BlockingIOError:
+                    break
+                if not data:
+                    break
+                output.extend(data)
+        proc.stdout.close()
         text = output.decode(errors="replace")
         if len(output) == MAX_OUTPUT:
             text += "\n[output truncated at 128 KiB]"

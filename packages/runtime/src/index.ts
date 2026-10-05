@@ -7,7 +7,7 @@ import {
 import { PiHarness, type PiHarnessContext } from 'agents/harness/pi';
 import { Lifecycle, LifecycleCapability } from 'agents/lifecycle';
 import { createAI } from 'agents/models/pi-ai';
-import { normalizeEntries, textContent } from './normalize.js';
+import { classifyFailure, normalizeEntries, textContent } from './normalize.js';
 import { computerTools } from './tools.js';
 import type { AgentRuntime, PendingApproval, PiRuntimeOptions, RuntimeEvent, RuntimeMessage, RuntimeOperation, RuntimeOperationResult, RuntimeReceipt } from './types.js';
 
@@ -190,7 +190,10 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
         if (!record.requestId || record.type !== 'input') break;
         const type = ({ queued: 'run.queued', placed: 'run.started', done: 'run.completed', unanswered: 'run.failed' } as const)[record.status];
         const data: Record<string, unknown> = {};
-        if (record.status === 'unanswered') data.reason = record.reason;
+        if (record.status === 'unanswered') {
+          data.reason = record.reason;
+          Object.assign(data, classifyFailure(record.reason, record.detail));
+        }
         if (record.status === 'done') {
           const answer = await storage.entry(record.answer, background);
           data.text = answer ? normalizeEntries([answer.entry]).filter(message => message.role === 'assistant').map(message => message.text).join('\n') : '';

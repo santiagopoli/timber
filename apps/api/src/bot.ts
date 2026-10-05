@@ -105,7 +105,12 @@ export class BotDO extends DurableObject<Env> {
     // Do not expose raw provider error strings, which may contain request details.
     const data=event.type==="runtime.error"?{message:"The runtime reported an error."}:event.data;
     this.emit(event.type,data,run.id,event.eventKey?`runtime:${event.eventKey}`:undefined);
-    if(row.native_operation_id!==event.operationId || terminal.has(run.status)) return;
+    if(row.native_operation_id!==event.operationId) return;
+    // A durable terminal event may provide a safe diagnostic after wait() already
+    // projected a generic error. It must never undo user cancellation or success.
+    const genericInterruption=run.status==="interrupted" && ["The agent run was interrupted before a final answer.","The agent run was interrupted."].includes(run.error??"");
+    const enrichFailure=event.type==="run.failed" && typeof event.data.publicMessage==="string" && (run.status==="failed" || genericInterruption);
+    if(terminal.has(run.status) && !enrichFailure) return;
     if(Date.now()-this.lastComputerTouch>60_000) {
       this.lastComputerTouch=Date.now();
       this.ctx.waitUntil(touchCloudComputer(this.env.COMPUTER,run.botId).catch(()=>{}));
@@ -114,10 +119,20 @@ export class BotDO extends DurableObject<Env> {
     if(event.type==="run.completed") await this.completeOperation(event.operationId!,"done",typeof event.data.text==="string"?event.data.text:undefined);
     if(event.type==="run.failed") {
       if(this.hasPendingApproval(run.id)) this.updateStatus(run.id,"waiting_approval");
-      else this.updateStatus(run.id,"interrupted","The agent run was interrupted before a final answer.");
+      else {
+        const failure=this.operationFailure(typeof event.data.reason==="string"?event.data.reason:undefined,typeof event.data.publicMessage==="string"?event.data.publicMessage:undefined);
+        this.updateStatus(run.id,failure.status,failure.error);
+      }
     }
   }
-  private async completeOperation(nativeOperationId:string,status:string,text?:string):Promise<void> {
+  private operationFailure(reason?:string,publicMessage?:string):{status:"failed"|"interrupted";error:string} {
+    const failed=reason!==undefined && ["model_error","tool_error","task_error","task_failed","budget_exceeded"].includes(reason);
+    return {
+      status:failed?"failed":"interrupted",
+      error:publicMessage?.slice(0,800) ?? (reason==="model_error"?"The model could not complete this request.":failed?"The agent encountered an execution error.":"The agent run was interrupted before a final answer."),
+    };
+  }
+  private async completeOperation(nativeOperationId:string,status:string,text?:string,reason?:string):Promise<void> {
     const row=this.findRun(nativeOperationId);
     if(!row) return;
     const run=JSON.parse(row.data) as Run;
@@ -126,7 +141,8 @@ export class BotDO extends DurableObject<Env> {
     if(this.hasPendingApproval(run.id)) {this.updateStatus(run.id,"waiting_approval");return;}
     // The provider checkpoints file mutations before returning their results.
     // Read-only/GUI turns must not stop a warm browser just to copy its profile.
-    this.updateStatus(run.id,status==="done"?"completed":"interrupted",status==="done"?undefined:"The agent run was interrupted before a final answer.");
+    if(status==="done") this.updateStatus(run.id,"completed");
+    else {const failure=this.operationFailure(reason);this.updateStatus(run.id,failure.status,failure.error);}
   }
 
   private async createRun(input:{text:string;operationId:string}):Promise<Run> {
@@ -182,7 +198,7 @@ export class BotDO extends DurableObject<Env> {
     this.ctx.waitUntil((async()=>{
       try {
         const result=await this.runtime.wait(nativeOperationId);
-        await this.completeOperation(nativeOperationId,result.status,result.text);
+        await this.completeOperation(nativeOperationId,result.status,result.text,result.reason);
       } catch {const row=this.findRun(nativeOperationId);if(row) {const run=JSON.parse(row.data) as Run;if(!terminal.has(run.status) && run.status!=="waiting_approval") this.updateStatus(run.id,"interrupted","The agent run was interrupted.");}}
       finally {this.observing.delete(nativeOperationId);}
     })());

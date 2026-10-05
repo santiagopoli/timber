@@ -98,6 +98,17 @@ and leaves it for inspection. `--computer` additionally verifies a write/read,
 shell deduplication, screenshot artifact, checkpoint, suspend and restored file.
 For the slower bootstrap mode, set `SMOKE_TIMEOUT_MS=600000`.
 
+For a text-only cloud check with the model verified on the initial Free account:
+
+```sh
+SMOKE_MODEL=@cf/meta/llama-3.3-70b-instruct-fp8-fast npm run smoke
+```
+
+This explicitly selects Llama for the new smoke bot. It does not change the
+vision-capable default or enable cloud containers.
+In the console, enter the same model ID in the optional Model field when creating
+a bot to try text conversations before enabling Workers Paid.
+
 `npm run dev` runs the Worker locally. Real computer tools still need a supported
 container environment; this command is not an implementation of the future local
 computer provider. The automated tests are the credential-free local test path.
@@ -126,10 +137,19 @@ for archive limits and [API contracts](docs/contracts.md) for endpoints.
 
 ## Initial deployment status
 
-The initial Worker and R2 bucket were deployed. Cloudflare rejected container
-activation because the account did not have Workers Paid. The cloud computer and
-cold-start/restore performance therefore remain unverified until that prerequisite
-is enabled and `npm run smoke -- --computer` passes. Local tests are not evidence
-of a working cloud desktop.
+The initial Worker and R2 bucket were deployed. The developer console is at
+https://timber-api.santiagopoli.workers.dev/console/ and requires the client token.
+The real cloud smoke passed using the explicit Llama model above: authentication,
+named bot persistence, deduplication, replayable SSE, actual inference and persisted
+assistant response. The default Kimi model was rejected with HTTP 403 because it
+requires Workers Paid; this is reported as a model failure with a billing message.
+
+The desktop Docker smoke passed in GitHub Actions: Chromium, verified Unicode
+input, PNG screenshot, shell deduplication, checkpoint checksum and file restore.
+Cloudflare rejected container activation because the account did not have Workers
+Paid. The **Cloudflare** computer and cold-start/restore performance therefore
+remain unverified until that prerequisite is enabled and
+`npm run smoke -- --computer` passes. A desktop running in CI does not establish
+that its cloud deployment works.
 
 No credentials belong in this repository.

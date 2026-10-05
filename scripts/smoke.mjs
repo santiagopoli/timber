@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 
 const args = new Set(process.argv.slice(2));
 if (args.has('--help')) {
-  console.log('Setup: npm run access:setup\nRun: npm run smoke [-- --computer]\nOr set API_URL and BOTSPACE_API_TOKEN in the environment. Environment values override the private local client configuration.\nCreates one uniquely named bot and leaves it for inspection. --computer starts its cloud computer and checks files, terminal, screenshot, checkpoint and restoration after suspension. Model and container usage may be billed.');
+  console.log('Setup: npm run access:setup\nRun: npm run smoke [-- --computer]\nOr set API_URL and BOTSPACE_API_TOKEN in the environment. Environment values override the private local client configuration. SMOKE_MODEL optionally selects a Workers AI model.\nCreates one uniquely named bot and leaves it for inspection. --computer starts its cloud computer and checks files, terminal, screenshot, checkpoint and restoration after suspension. Model and container usage may be billed.');
   process.exit(0);
 }
 for (const arg of args) if (arg !== '--computer') throw new Error(`Unknown argument: ${arg}`);
@@ -98,7 +98,7 @@ try {
 
   const marker = `BOTSPACE_SMOKE_${randomUUID().replaceAll('-', '').slice(0, 12).toUpperCase()}`;
   const name = `Smoke ${new Date().toISOString().slice(0, 19)} ${marker.slice(-6)}`;
-  const { bot } = await call('/v1/bots', { method: 'POST', body: { name, instructions: 'You are a backend smoke-test bot. Follow the requested text response exactly. Do not use tools for this check.' }, expected: 201 });
+  const { bot } = await call('/v1/bots', { method: 'POST', body: { name, instructions: 'You are a backend smoke-test bot. Follow the requested text response exactly. Do not use tools for this check.', ...(process.env.SMOKE_MODEL ? { model: process.env.SMOKE_MODEL } : {}) }, expected: 201 });
   botId = bot.id; assert.ok(botId); assert.equal(bot.name, name); report(`named bot created (${botId})`);
   const list = await call('/v1/bots'); assert.ok(list.bots.some((item) => item.id === botId));
   const reread = await call(path()); assert.equal(reread.bot.id, botId); report('bot registry and persistent identity');
@@ -107,6 +107,10 @@ try {
   const first = await call(path('/messages'), { method: 'POST', body: input, expected: 202 });
   const duplicate = await call(path('/messages'), { method: 'POST', body: input, expected: 202 });
   assert.equal(duplicate.run.id, first.run.id, 'same operationId returns same run'); report('message submission idempotency');
+  const pendingHistory = await call(path('/messages'));
+  assert.equal(pendingHistory.messages.filter((message) => message.role === 'user' && message.text === input.text).length, 1, 'one user message persists regardless of model availability');
+  report('user message persists without duplication');
+  await checkEvents(); report('authenticated durable SSE replay');
   await waitForRun(first.run.id); report('real model run completed');
 
   const history = await call(path('/messages'));
@@ -115,7 +119,6 @@ try {
   const historyAgain = await call(path('/messages'));
   assert.deepEqual(historyAgain.messages.map((message) => message.id), history.messages.map((message) => message.id), 'message IDs persist across reads');
   report('model response and persistent conversation');
-  await checkEvents(); report('authenticated durable SSE replay');
 
   if (args.has('--computer')) {
     const before = await call(path('/computer')); assert.equal(before.computer.provider, 'cloudflare');

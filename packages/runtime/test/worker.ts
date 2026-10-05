@@ -14,6 +14,7 @@ export class HarnessProbe extends DurableObject {
         ctx.storage.sql.exec('INSERT INTO calls(input) VALUES(?)', JSON.stringify(input));
         const user = input.messages.filter(message => message.role === 'user').at(-1);
         const text = JSON.stringify(user?.content);
+        if (text.includes('billing-fixture')) return Response.json({ success: false, errors: [{ code: 5035, message: 'This model is not available on the Workers Free plan. Private example detail must not be projected.' }] }, { status: 403 });
         const toolRequest = text.includes('request-exec') || text.includes('request-loop');
         const readCall = { index: 0, id: 'call-read-1', type: 'function', function: { name: 'read_file', arguments: '{"path":"/workspace/test.txt"}' } };
         const execCall = { index: text.includes('mixed') ? 1 : 0, id: 'call-fixture-1', type: 'function', function: { name: 'exec', arguments: '{"command":"echo fixture"}' } };

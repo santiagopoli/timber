@@ -5,6 +5,7 @@ import type { Approval, Bot, BotEvent, Message, Run } from "@botspace/contracts"
 import type { Env } from "../apps/api/src/env";
 import worker from "../apps/api/src/index";
 import { computerFixtureControl } from "./fixtures/worker";
+import { emitFixtureRuntimeEvent } from "./fixtures/runtime";
 
 const token = "test-only-botspace-owner-token-000000";
 const bindings = env as unknown as Env;
@@ -101,6 +102,46 @@ describe("Worker authentication and durable bot identities", () => {
 });
 
 describe("durable runs and approval boundaries with deterministic external adapters", () => {
+  it("classifies a native model error as failed and preserves its safe diagnostic", async () => {
+    const bot = await createBot();
+    const run = await submit(bot, "fixture:model-error");
+    const failed = await waitRun(bot, run, "failed");
+    expect(failed.error).toBe("This model requires a paid Cloudflare Workers plan.");
+  });
+
+  it("enriches a generic wait failure when the safe diagnostic arrives later", async () => {
+    const bot = await createBot();
+    const run = await submit(bot, "fixture:model-error-late");
+    expect((await waitRun(bot, run, "failed")).error).toBe("The model could not complete this request.");
+    await runInDurableObject(bindings.BOT.get(bindings.BOT.idFromName(`owner:${bot.id}`)), async () => {
+      await emitFixtureRuntimeEvent(run.operationId, "run.failed", {
+        reason: "model_error", errorCode: "model_billing_required",
+        publicMessage: "This model requires a paid Cloudflare Workers plan.",
+      });
+    });
+    expect((await waitRun(bot, run, "failed")).error).toBe("This model requires a paid Cloudflare Workers plan.");
+  });
+
+  it.each(["completed", "cancelled"] as const)("does not overwrite %s with a late model-error diagnostic", async (terminalStatus) => {
+    const bot = await createBot();
+    const run = await submit(bot, terminalStatus === "cancelled" ? "fixture:approval" : "successful answer");
+    if (terminalStatus === "cancelled") {
+      await getApproval(bot);
+      const response = await fetchApi(`/v1/bots/${bot.id}/runs/${run.id}/cancel`, {method: "POST"});
+      expect(response.status).toBe(200);
+      await response.text();
+    }
+    await waitRun(bot, run, terminalStatus);
+    await runInDurableObject(bindings.BOT.get(bindings.BOT.idFromName(`owner:${bot.id}`)), async () => {
+      await emitFixtureRuntimeEvent(run.operationId, "run.failed", {
+        reason: "model_error", errorCode: "model_billing_required",
+        publicMessage: "This model requires a paid Cloudflare Workers plan.",
+      });
+    });
+    const current = await waitRun(bot, run, terminalStatus);
+    expect(current.error).toBeUndefined();
+  });
+
   it("deduplicates concurrent submissions and rejects reuse with different input", async () => {
     const bot = await createBot();
     const operationId = crypto.randomUUID();

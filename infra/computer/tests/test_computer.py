@@ -84,10 +84,32 @@ class ComputerTests(unittest.TestCase):
         self.assertFalse((self.root / "outside").exists())
 
     def test_timeout_kills_command_and_retains_partial_output(self):
-        result = self.action("timeout", type="exec", command="printf ready; sleep 10; touch too-late", timeoutMs=50)
+        import os
+        import select
+        import signal
+        from unittest.mock import patch
+
+        real_popen = server.subprocess.Popen
+
+        def start_after_output_is_ready(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            # CI login-shell startup can itself exceed a 50 ms timeout. Start
+            # this test's deadline only once the real child has emitted output.
+            # Readiness does not consume it; run_shell must still capture it.
+            readable, _, _ = select.select([process.stdout], [], [], 10)
+            if not readable:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
+                process.stdout.close()
+                self.fail("Test shell did not produce initial output")
+            return process
+
+        with patch.object(server.subprocess, "Popen", side_effect=start_after_output_is_ready):
+            result = self.action("timeout", type="exec", command="printf ready; sleep 10; touch too-late", timeoutMs=100)
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["output"], "ready")
         self.assertIn("timed out", result["error"])
+        self.assertLess(result["exitCode"], 0)
         self.assertFalse((self.computer.workspace / "too-late").exists())
 
     def test_output_is_bounded(self):
