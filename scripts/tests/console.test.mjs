@@ -15,13 +15,193 @@ after(async () => {await browser?.close();});
 async function withPage(work, options = {}) {
   const fixture = await createConsoleFixture();
   const context = await browser.newContext({viewport: {width: 1440, height: 1050}, colorScheme: 'light', ...options});
-  const page = await context.newPage(), errors = [];
+  const page = await context.newPage(), errors = [], cspViolations = [];
+  await page.exposeFunction('__consoleTestCspViolation', violation => cspViolations.push(violation));
+  await page.addInitScript(() => document.addEventListener('securitypolicyviolation', event => {
+    void globalThis.__consoleTestCspViolation({directive: event.effectiveDirective, resource: event.blockedURI});
+  }));
   page.on('pageerror', error => errors.push(error.message)); page.setDefaultTimeout(6000);
   const login = async () => {await page.goto(fixture.url); await page.locator('#token').fill(TEST_TOKEN); await page.locator('#connect-form button').click(); await page.locator('#bot-workspace').waitFor({state: 'visible'}); await page.locator('#stream-state').filter({hasText: 'Live'}).waitFor({state: 'attached'});};
-  try {await work({...fixture, page, context, login}); assert.deepEqual(errors, [], 'no uncaught browser errors'); assert.deepEqual(fixture.state.failures, [], 'fixture requests completed');}
+  try {await work({...fixture, page, context, login}); assert.deepEqual(errors, [], 'no uncaught browser errors'); assert.deepEqual(cspViolations, [], 'bundled conversation works within the production content security policy'); assert.deepEqual(fixture.state.failures, [], 'fixture requests completed');}
   finally {await context.close(); await fixture.close();}
 }
 const until = async (page, id, text) => page.locator(id).filter({hasText: text}).waitFor();
+const sentMessages = (state, botId) => state.calls.filter(call => call.method === 'POST' && call.path === `/v1/bots/${botId}/messages`);
+const sendMessage = page => page.locator('#message-form').getByRole('button', {name: /^Send(?: message)?(?:\s|$)/}).click();
+
+test('message acceptance is visible immediately and slow history refresh cannot lose a newer draft', async () => {
+  await withPage(async ({page, login, state}) => {
+    await login();
+    let accept, refresh;
+    state.messageResponseGates.set(BOT_A, new Promise(resolve => {accept = resolve;}));
+    state.readsGate = new Promise(resolve => {refresh = resolve;});
+    await page.locator('#message').fill('First accepted request');
+    await sendMessage(page);
+    await until(page, '#messages [data-operation-id]', 'Sending');
+    await page.locator('#message-form').dispatchEvent('submit');
+    await page.locator('#message').fill('My next unsent draft');
+    const response = page.waitForResponse(item => item.request().method() === 'POST' && item.url().endsWith('/messages'));
+    const historyRequest = page.waitForRequest(item => item.method() === 'GET' && item.url().endsWith(`/bots/${BOT_A}/messages`));
+    accept(); await response;
+    assert.equal(sentMessages(state, BOT_A).length, 1, 'in-flight duplicate submission is ignored');
+    await until(page, '#messages [data-operation-id]', 'Queued');
+    await historyRequest;
+    assert.equal(await page.locator('#message').inputValue(), 'My next unsent draft');
+    assert.equal(await page.locator('#message-form [type="submit"]').isDisabled(), false, 'POST acceptance releases the composer independently of GET refresh');
+    assert.equal(state.runs.get(BOT_A).length, 1);
+    state.readsGate = null; refresh();
+    await page.locator('[data-message-id]').filter({hasText: 'First accepted request'}).waitFor();
+    assert.equal(await page.locator('#messages').getByText('First accepted request', {exact: true}).count(), 1, 'receipt is reconciled with the canonical user message');
+    assert.equal(await page.locator('#message').inputValue(), 'My next unsent draft');
+  });
+});
+
+test('an accepted message with a lost response retries explicitly with the original operation ID', async () => {
+  await withPage(async ({page, login, state}) => {
+    await login(); await page.clock.install();
+    let loseResponse = true;
+    await page.route(`**/v1/bots/${BOT_A}/messages`, async route => {
+      if (route.request().method() !== 'POST' || !loseResponse) return route.continue();
+      loseResponse = false;
+      await route.fetch(); // The backend accepted it, but the client never receives the response.
+      return route.abort('failed');
+    });
+    await page.locator('#message').fill('Preserve this operation after a lost response'); await sendMessage(page);
+    await until(page, '#messages [data-operation-id]', 'Delivery unknown');
+    await page.clock.fastForward(10_000);
+    assert.equal(sentMessages(state, BOT_A).length, 1, 'uncertain delivery never retries without user action');
+    const original = sentMessages(state, BOT_A)[0].body;
+    await page.clock.resume();
+    await page.getByRole('button', {name: 'Retry sending', exact: true}).click();
+    await page.locator('[data-message-id]').filter({hasText: original.text}).waitFor();
+    const attempts = sentMessages(state, BOT_A);
+    assert.equal(attempts.length, 2);
+    assert.deepEqual(attempts[1].body, original, 'retry keeps both captured text and idempotency key');
+    assert.equal(state.runs.get(BOT_A).length, 1);
+    assert.equal(state.messages.get(BOT_A).filter(message => message.text === original.text).length, 1);
+    assert.equal(await page.locator('#messages').getByText(original.text, {exact: true}).count(), 1);
+  });
+});
+
+test('a pending send stays scoped to its bot while another bot sends and keeps a newer draft', async () => {
+  await withPage(async ({page, login, state}) => {
+    await login(); let release;
+    state.messageResponseGates.set(BOT_A, new Promise(resolve => {release = resolve;}));
+    await page.locator('#message').fill('Task captured for Ada'); await sendMessage(page);
+    await until(page, '#messages [data-operation-id]', 'Sending');
+    await page.locator('#message').fill('Ada next draft');
+    await page.locator(`[data-bot-id="${BOT_B}"]`).click(); await until(page, '#selected-name', 'Linus');
+    assert.equal(await page.locator('#message').inputValue(), '');
+    await page.locator('#message').fill('Independent task for Linus'); await sendMessage(page);
+    await page.locator('[data-message-id]').filter({hasText: 'Independent task for Linus'}).waitFor();
+    await page.locator('#message').fill('Linus next draft');
+    const completed = page.waitForResponse(item => item.request().method() === 'POST' && item.url().endsWith(`/bots/${BOT_A}/messages`));
+    release(); await completed;
+    assert.equal(await page.locator('#message').inputValue(), 'Linus next draft');
+    assert.equal((await page.locator('#messages').innerText()).includes('Task captured for Ada'), false);
+    await page.locator(`[data-bot-id="${BOT_A}"]`).click(); await until(page, '#selected-name', 'Ada');
+    await page.locator('[data-message-id]').filter({hasText: 'Task captured for Ada'}).waitFor();
+    assert.equal(await page.locator('#message').inputValue(), 'Ada next draft');
+    assert.equal(sentMessages(state, BOT_A).length, 1); assert.equal(sentMessages(state, BOT_B).length, 1);
+    assert.notEqual(sentMessages(state, BOT_A)[0].body.operationId, sentMessages(state, BOT_B)[0].body.operationId);
+  });
+});
+
+test('sending newer text does not discard the retry identity of an earlier uncertain message', async () => {
+  await withPage(async ({page, login, state}) => {
+    await login(); let firstAttempt;
+    await page.route(`**/v1/bots/${BOT_A}/messages`, async route => {
+      if (route.request().method() === 'POST' && !firstAttempt) {firstAttempt = route.request().postDataJSON(); return route.abort('failed');}
+      return route.continue();
+    });
+    await page.locator('#message').fill('Earlier request not yet delivered'); await sendMessage(page);
+    await until(page, '#messages [data-operation-id]', 'Delivery unknown');
+    await page.locator('#message').fill('A newer separate request'); await sendMessage(page);
+    await page.locator('[data-message-id]').filter({hasText: 'A newer separate request'}).waitFor();
+    await page.getByRole('button', {name: 'Retry sending', exact: true}).click();
+    await page.locator('[data-message-id]').filter({hasText: firstAttempt.text}).waitFor();
+    const delivered = sentMessages(state, BOT_A);
+    assert.equal(delivered.length, 2);
+    assert.deepEqual(delivered.find(call => call.body.text === firstAttempt.text).body, firstAttempt);
+    assert.notEqual(delivered.find(call => call.body.text !== firstAttempt.text).body.operationId, firstAttempt.operationId);
+    assert.equal(state.runs.get(BOT_A).length, 2);
+    assert.equal(state.messages.get(BOT_A).filter(message => message.text === firstAttempt.text).length, 1);
+  });
+});
+
+test('a malformed acceptance response cannot confirm delivery or discard its retry identity', async () => {
+  await withPage(async ({page, login, state}) => {
+    await login(); let original;
+    await page.route(`**/v1/bots/${BOT_A}/messages`, async route => {
+      if (route.request().method() !== 'POST' || original) return route.continue();
+      original = route.request().postDataJSON();
+      return route.fulfill({status: 202, contentType: 'application/json', body: JSON.stringify({run: {
+        id: 'foreign-run', botId: BOT_B, operationId: original.operationId, status: 'queued',
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      }})});
+    });
+    await page.locator('#message').fill('Require a matching bot receipt'); await sendMessage(page);
+    await until(page, '#messages [data-operation-id]', 'Delivery unknown');
+    assert.equal(state.runs.get(BOT_A).length, 0);
+    await page.getByRole('button', {name: 'Retry sending', exact: true}).click();
+    await page.locator('[data-message-id]').filter({hasText: original.text}).waitFor();
+    assert.equal(sentMessages(state, BOT_A).length, 1);
+    assert.deepEqual(sentMessages(state, BOT_A)[0].body, original);
+    assert.equal(state.runs.get(BOT_A).length, 1);
+  });
+});
+
+test('an accepted queued message can retry admission after reconnect without duplicating its conversation entry', async () => {
+  await withPage(async ({page, login, state}) => {
+    const text = 'Persisted task waiting for runtime admission';
+    const run = {id: 'queued-admission-run', botId: BOT_A, operationId: 'queued-admission-operation', status: 'queued',
+      error: 'Runtime admission is unavailable. Retry this message to resume the same request.', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()};
+    state.runs.set(BOT_A, [run]);
+    state.messages.set(BOT_A, [{id: 'queued-admission-message', botId: BOT_A, runId: run.id, role: 'user', text, createdAt: run.createdAt}]);
+    state.messageOperations.set(`${BOT_A}:${run.operationId}`, {text, run});
+    await login();
+    await page.getByRole('button', {name: 'Retry sending', exact: true}).waitFor();
+    assert.equal(sentMessages(state, BOT_A).length, 0, 'restoring accepted work never resends automatically');
+    await page.locator('#message').fill('Preserve my next unsent task');
+    delete run.error;
+    const accepted = page.waitForResponse(response => response.request().method() === 'POST' && response.url().endsWith('/messages'));
+    await page.getByRole('button', {name: 'Retry sending', exact: true}).click(); await accepted;
+    await page.getByRole('button', {name: 'Retry sending', exact: true}).waitFor({state: 'hidden'});
+    assert.deepEqual(sentMessages(state, BOT_A).map(call => call.body), [{text, operationId: run.operationId}]);
+    assert.equal(state.runs.get(BOT_A).length, 1); assert.equal(state.messages.get(BOT_A).length, 1);
+    assert.equal(await page.locator('#messages').getByText(text, {exact: true}).count(), 1);
+    assert.equal(await page.locator('#message').inputValue(), 'Preserve my next unsent task');
+  });
+});
+
+test('runtime admission can be retried from a new accepted receipt before history finishes syncing', async () => {
+  await withPage(async ({page, login, state}) => {
+    await login(); let refresh, first = true;
+    state.readsGate = new Promise(resolve => {refresh = resolve;});
+    await page.route(`**/v1/bots/${BOT_A}/messages`, async route => {
+      if (route.request().method() !== 'POST' || !first) return route.continue();
+      first = false;
+      const response = await route.fetch(), result = await response.json();
+      result.run.error = 'Runtime admission is unavailable. Retry this message to resume the same request.';
+      Object.assign(state.runs.get(BOT_A)[0], result.run);
+      return route.fulfill({response, json: result});
+    });
+    await page.locator('#message').fill('Accepted before the runtime was available'); await sendMessage(page);
+    await until(page, '#messages [data-operation-id]', 'Queued');
+    await page.getByRole('button', {name: 'Retry sending', exact: true}).waitFor();
+    await page.locator('#message').fill('A new unsent draft stays mine');
+    delete state.runs.get(BOT_A)[0].error;
+    const retried = page.waitForResponse(response => response.request().method() === 'POST' && response.url().endsWith('/messages'));
+    await page.getByRole('button', {name: 'Retry sending', exact: true}).click(); await retried;
+    assert.equal(sentMessages(state, BOT_A).length, 2);
+    assert.deepEqual(sentMessages(state, BOT_A)[1].body, sentMessages(state, BOT_A)[0].body);
+    assert.equal(state.runs.get(BOT_A).length, 1);
+    assert.equal(await page.locator('#message').inputValue(), 'A new unsent draft stays mine');
+    state.readsGate = null; refresh();
+    await page.locator('[data-message-id]').filter({hasText: 'Accepted before the runtime was available'}).waitFor();
+    assert.equal(await page.locator('#messages').getByText('Accepted before the runtime was available', {exact: true}).count(), 1);
+  });
+});
 
 test('bot administration, isolated drafts, safe message rendering and session clearing', async () => {
   await withPage(async ({page, login, state}) => {
@@ -29,7 +209,7 @@ test('bot administration, isolated drafts, safe message rendering and session cl
     await login();
     await until(page, '#selected-name', 'Ada');
     assert.equal(await page.locator('#messages img').count(), 0, 'model text cannot inject HTML');
-    assert.equal(await page.locator('#messages strong').innerText(), 'Three themes');
+    assert.equal(await page.locator('#messages strong, #messages [data-streamdown="strong"]').innerText(), 'Three themes');
     assert.match(await page.locator('#messages pre').innerText(), /cat notes/);
     await page.locator('#message').fill('Draft only for Ada');
     await page.locator('#bot-search').fill('Linus'); assert.equal(await page.locator('.bot-item').count(), 1);
@@ -41,7 +221,7 @@ test('bot administration, isolated drafts, safe message rendering and session cl
     await page.locator('#new-bot').click(); await page.locator('#bot-name').fill('Grace'); await page.locator('#bot-instructions').fill('Review software.'); await page.locator('#create-form [type=submit]').click(); await until(page, '#selected-name', 'Grace');
     assert.equal(state.bots[0].name, 'Grace'); assert.match(page.url(), /#bot=/);
     const storage = await page.evaluate(() => ({local: {...localStorage}, session: {...sessionStorage}})); assert.equal(JSON.stringify(storage).includes(TEST_TOKEN), false);
-    await page.locator('#disconnect').click(); await page.locator('#login').waitFor({state: 'visible'}); assert.equal(await page.locator('#token').inputValue(), ''); assert.equal(await page.locator('#messages').innerText(), '');
+    await page.locator('#disconnect').click(); await page.locator('#login').waitFor({state: 'visible'}); assert.equal(await page.locator('#token').inputValue(), ''); assert.deepEqual((await page.locator('#messages').allTextContents()).filter(text => text.trim()), [], 'disconnect clears or unmounts conversation content');
     await login(); assert.equal(await page.locator('#message').inputValue(), '', 'drafts removed on disconnect');
     await page.reload(); await page.locator('#login').waitFor({state: 'visible'}); assert.equal(await page.locator('#app').isVisible(), false);
   });
@@ -162,7 +342,7 @@ test('approvals appear chronologically inline with messages on desktop and mobil
     assert.match(await page.locator('#current-approval pre').innerText(), /printf current-request/);
     const layout = await page.evaluate(() => ({history: document.querySelector('#messages').getBoundingClientRect().bottom, approval: document.querySelector('#current-approval').getBoundingClientRect().top, composer: document.querySelector('#message-form').getBoundingClientRect().top}));
     assert.ok(layout.approval < layout.history && layout.composer > layout.approval);
-    assert.equal(await page.locator('#messages > #current-approval').count(), 1, 'current approval is a timeline entry, not a separate stack');
+    assert.equal(await page.locator('#messages #current-approval').count(), 1, 'current approval stays inside the conversation timeline');
     assert.equal(await page.locator('#approvals').count(), 0);
     if (process.env.CONSOLE_SCREENSHOT_DIR) {await mkdir(process.env.CONSOLE_SCREENSHOT_DIR, {recursive: true}); await page.screenshot({path: `${process.env.CONSOLE_SCREENSHOT_DIR}/approval-${width}.png`});}
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
@@ -182,7 +362,7 @@ test('timeline ties preserve user request, approval, then answer and retain a re
       ...Array.from({length: 30}, (_, i) => ({id: `later-${i}`, botId: BOT_A, role: 'assistant', text: `Later message ${i}. ${'History text. '.repeat(15)}`, createdAt: '2026-10-06T12:00:00Z'})),
     ]);
     await login();
-    const order = await page.locator('#messages').evaluate(node => [...node.children].map(item => item.dataset.messageId || item.dataset.timelineApproval));
+    const order = await page.locator('#messages').evaluate(node => [...node.querySelectorAll('[data-message-id], [data-timeline-approval]')].map(item => item.dataset.messageId || item.dataset.timelineApproval));
     assert.deepEqual(order.slice(0, 5), ['tie-user', approval.id, 'tie-answer', 'tie-user-second', 'tie-answer-second'], 'tied approval follows its request while canonical message order is preserved');
     await page.locator('#messages').evaluate(node => {node.scrollTop = 160;});
     const before = await page.locator('#messages').evaluate(node => node.scrollTop);
@@ -206,7 +386,7 @@ test('streamed Markdown preserves recovered prefixes, open fences, replay order 
     await until(page, '#streaming-text pre', '/workspace');
     const partial = 'La salida de `uname -a && pwd` es:\n\n```text\nLinux fixture-kernel\n/workspace\n<img src=x onerror=alert(1)>';
     assert.equal(await page.locator('#streaming-text p code').innerText(), 'uname -a && pwd');
-    assert.equal(await page.locator('#streaming-text pre code').textContent(), 'Linux fixture-kernel\n/workspace\n<img src=x onerror=alert(1)>', 'an unfinished fence is already a multiline code block');
+    assert.equal(await page.locator('#streaming-text pre code').innerText(), 'Linux fixture-kernel\n/workspace\n<img src=x onerror=alert(1)>', 'an unfinished fence is already a multiline code block');
     assert.equal(await page.locator('#streaming-text img').count(), 0);
     state.emit(BOT_A, 'runtime.snapshot', {busy: true, partialText: partial}, run.id);
     state.deliver(firstDelta); state.deliver(prefix);
@@ -216,7 +396,7 @@ test('streamed Markdown preserves recovered prefixes, open fences, replay order 
     assert.equal((await page.locator('#streaming-text').innerText()).split('La salida').length - 1, 1, 'snapshot replaces instead of duplicating the prefix');
     assert.equal(await page.locator('#streaming-text p').count(), 2); assert.equal(await page.locator('#streaming-text li').count(), 2);
     assert.match(await page.locator('#streaming-text p').last().textContent(), /`?0`?\.\nAhora preparo/);
-    assert.equal(await page.locator('#streaming-text pre code').textContent(), 'Linux fixture-kernel\n/workspace\n<img src=x onerror=alert(1)>');
+    assert.equal(await page.locator('#streaming-text pre code').innerText(), 'Linux fixture-kernel\n/workspace\n<img src=x onerror=alert(1)>');
     const recovered = page.waitForResponse(response => response.url().includes('/events?after=')); await page.locator('#reconnect-stream').evaluate(node => node.click()); await recovered;
     assert.equal(await page.locator('#streaming-text p').first().innerText(), 'La salida de uname -a && pwd es:');
     await page.locator('#streaming-message').scrollIntoViewIfNeeded();
@@ -225,7 +405,7 @@ test('streamed Markdown preserves recovered prefixes, open fences, replay order 
     state.messages.set(BOT_A, [user, final]); state.emit(BOT_A, 'message.created', {message: final}, run.id);
     run.status = 'completed'; run.updatedAt = final.createdAt; state.emit(BOT_A, 'run.updated', {run}, run.id);
     await page.locator('#streaming-message').waitFor({state: 'hidden'}); await until(page, '[data-message-id="stream-final"]', 'Servidor pendiente');
-    assert.equal(await page.locator('[data-message-id="stream-final"]').count(), 1); assert.equal(await page.locator('#messages pre code').textContent(), 'Linux fixture-kernel\n/workspace\n<img src=x onerror=alert(1)>');
+    assert.equal(await page.locator('[data-message-id="stream-final"]').count(), 1); assert.equal(await page.locator('#messages pre code').innerText(), 'Linux fixture-kernel\n/workspace\n<img src=x onerror=alert(1)>');
     state.emit(BOT_A, 'runtime.snapshot', {busy: true, partialText: 'stale ghost'}, run.id); state.emit(BOT_A, 'message.delta', {delta: 'must not return'}, run.id);
     assert.equal(await page.locator('#streaming-message').isVisible(), false); assert.equal(await page.locator('#messages img').count(), 0);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);

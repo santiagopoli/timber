@@ -15,3 +15,4 @@ __pycache__/
 *.key
 .local/
 test-results/
+apps/console/dist/

@@ -1,10 +1,44 @@
-import { exports } from 'cloudflare:workers';
-import { abortAllDurableObjects, reset } from 'cloudflare:test';
+import { env, exports } from 'cloudflare:workers';
+import { abortAllDurableObjects, reset, runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, expect, it } from 'vitest';
+import type { HarnessProbe } from './worker.js';
 let probeId: string;
 beforeEach(() => { probeId = crypto.randomUUID(); });
 const request = (path: string, input?: unknown) => exports.default.fetch(`https://test${path}`, { headers: { 'content-type': 'application/json', 'x-probe-id': probeId }, ...(input ? { method: 'POST', body: JSON.stringify(input) } : {}) });
 afterEach(async () => { await reset(); });
+it('persists one admission wake across eviction and preserves a backoff scheduled by its callback', async () => {
+  const namespace = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE;
+  let stub = namespace.getByName(probeId);
+  await runInDurableObject(stub, async (instance, state) => {
+    state.storage.sql.exec('INSERT INTO config(key,value) VALUES(?,?)', 'admissionRescheduleOnce', 'input-to-retry');
+    await instance.runtime.scheduleAdmissionRetry('input-to-retry', 60_000);
+    await instance.runtime.scheduleAdmissionRetry('input-to-retry', 60_000);
+    const jobs = state.storage.sql.exec<{ id: string; singleflight: number; retry_options: string }>(
+      "SELECT id,singleflight,retry_options FROM cf_agents_jobs WHERE capability='botspace-admission'",
+    ).toArray();
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]).toMatchObject({ id: 'botspace:admission:input-to-retry', singleflight: 1 });
+    expect(JSON.parse(jobs[0]!.retry_options)).toEqual({ maxAttempts: 1 });
+  });
+  for (const expectedWakes of [1, 2]) {
+    await abortAllDurableObjects();
+    stub = namespace.getByName(probeId);
+    await runInDurableObject(stub, (_instance, state) => {
+      expect(state.storage.sql.exec("SELECT id FROM cf_agents_jobs WHERE capability='botspace-admission'").toArray()).toHaveLength(1);
+      // Advance the durable queue itself; the physical alarm helper does not change its due times.
+      state.storage.sql.exec("UPDATE cf_agents_jobs SET time=0 WHERE capability='botspace-admission'");
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await runInDurableObject(stub, (_instance, state) => {
+      expect(state.storage.sql.exec('SELECT operation_id FROM admission_wakes').toArray()).toEqual(
+        Array.from({ length: expectedWakes }, () => ({ operation_id: 'input-to-retry' })),
+      );
+      expect(state.storage.sql.exec("SELECT id FROM cf_agents_jobs WHERE capability='botspace-admission'").toArray()).toHaveLength(2 - expectedWakes);
+      expect(state.storage.sql.exec('SELECT id FROM calls').toArray()).toHaveLength(0);
+      expect(state.storage.sql.exec('SELECT id FROM tool_calls').toArray()).toHaveLength(0);
+    });
+  }
+});
 it('runs the real PiHarness with named instructions, durable inputs and normalized events', async () => {
   const receipt = await (await request('/submit', { text: 'hello', operationId: 'op-1' })).json<{ accepted: boolean }>();
   expect(receipt.accepted).toBe(true);

@@ -35,6 +35,15 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
 - PATCH /v1/bots/:id {name?,instructions?,computerApprovalMode?} -> {bot:Bot}
 - GET /v1/bots/:id/messages -> {messages:Message[]}
 - POST /v1/bots/:id/messages {text,operationId} -> 202 {run:Run}
+  The receipt confirms durable storage of the user input. A busy bot processes
+  subsequent inputs in order. Transient engine admission failures stay queued
+  with a fixed diagnostic and retry through the shared Lifecycle alarm using the
+  same operation ID (five total attempts, with 1/2/4/8-second backoff). A lost
+  engine receipt is reconciled against native durable state before resubmission.
+  After exhaustion, an identical POST explicitly retries that saved input without
+  duplicating its message. This only resets unadmitted delivery failures, including
+  the exact legacy admission-failure state. It never resets actual model/tool
+  failures or replays cancelled or interrupted effects.
 - GET /v1/bots/:id/runs?limit=30&before=<cursor>
   -> {runs:Run[],activeRuns:Run[],nextCursor:string|null}. Runs are newest-created
   first, with stable SQLite rowid pagination. `limit` defaults to 30 and accepts

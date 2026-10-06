@@ -12,6 +12,7 @@ export class HarnessProbe extends DurableObject {
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS calls(id INTEGER PRIMARY KEY AUTOINCREMENT, input TEXT)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS tool_calls(id INTEGER PRIMARY KEY AUTOINCREMENT, input TEXT)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS projected(id INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT)');
+    ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS admission_wakes(id INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY,value TEXT)');
     this.runtime = createPiRuntime({
       owner: this, storage: ctx.storage, defaultModel: CF_MODEL,
@@ -53,6 +54,13 @@ export class HarnessProbe extends DurableObject {
         readImage: async () => ({ data: 'aW1hZ2U=', mimeType: 'image/png' }),
       },
       onEvent: event => { ctx.storage.sql.exec('INSERT INTO projected(event) VALUES(?)', JSON.stringify(event)); },
+      onAdmissionRetry: async operationId => {
+        ctx.storage.sql.exec('INSERT INTO admission_wakes(operation_id) VALUES(?)', operationId);
+        if (this.setting('admissionRescheduleOnce') === operationId) {
+          ctx.storage.sql.exec('DELETE FROM config WHERE key=?', 'admissionRescheduleOnce');
+          await this.runtime.scheduleAdmissionRetry(operationId, 60_000);
+        }
+      },
     });
   }
   private setting(key: string) { return this.ctx.storage.sql.exec<{ value: string }>('SELECT value FROM config WHERE key=?', key).toArray()[0]?.value; }

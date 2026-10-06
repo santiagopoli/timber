@@ -100,9 +100,21 @@ npx playwright install chromium --only-shell
 npm run test:console
 ```
 
+The conversation uses the official AI Elements source components, React and
+Streamdown inside the existing admin console. Vite builds the static files with
+`npm run build:console`; both deploy commands build these assets automatically.
+For `npm run dev`, build the console first. The API Worker serves
+`apps/console/dist` at `/console/`; no additional UI server or model gateway is
+required. Component provenance and licenses are in
+`apps/console/THIRD_PARTY_NOTICES.md`.
+
 These use real Chromium with local HTTP API fixtures, with no model or cloud
 charges. They cover bot editing, draft isolation, stale SSE, active-run recovery,
 pagination, approvals, screenshot input, files, session expiry, and mobile layout.
+They also cover immediate message receipts, slow history refreshes, lost responses,
+same-ID retries, double submission and strict content security policy. The backend
+tests durable input delivery retries after an agent restart, multiple queued
+messages and new questions while an older approval remains pending.
 The independent Worker suite tests the real API and Durable Objects. To use an
 installed Chrome instead, set `CONSOLE_CHROMIUM_PATH` to its executable; CI uses
 the runner's installed Chrome. CI retains screenshots as `console-screenshots`.

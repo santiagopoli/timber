@@ -5,7 +5,7 @@ import {
   type AgentEvent, type AgentEventStream, type HookApi, type Storage, type SubmissionId,
 } from '@earendil-works/pi-durable';
 import { PiHarness, type PiHarnessContext } from 'agents/harness/pi';
-import { Lifecycle, LifecycleCapability } from 'agents/lifecycle';
+import { Lifecycle, LifecycleCapability, type LifecycleJobContext } from 'agents/lifecycle';
 import { createAI } from 'agents/models/pi-ai';
 import { classifyFailure, normalizeEntries, textContent } from './normalize.js';
 import { computerTools } from './tools.js';
@@ -247,9 +247,30 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
       });
     }
   }
-  Lifecycle.install(options.owner).use(harness).use(new Projection());
+  class AdmissionRetries extends LifecycleCapability {
+    constructor() { super('botspace-admission'); }
+    async schedule(operationId: string, delayMs: number): Promise<void> {
+      if (!options.onAdmissionRetry) throw new Error('Admission retry handler is not configured');
+      if (!operationId || !Number.isFinite(delayMs) || delayMs < 0) throw new Error('Invalid admission retry');
+      await this.lifecycle.jobs.push({
+        id: `botspace:admission:${operationId}`, fn: 'retry', payload: { operationId },
+        time: Date.now() + delayMs, singleflight: true, retry: { maxAttempts: 1 },
+      });
+    }
+    async onJob({ job }: LifecycleJobContext): Promise<void> {
+      const payload = job.payload as { operationId?: unknown } | null;
+      if (job.fn !== 'retry' || typeof payload?.operationId !== 'string' || !options.onAdmissionRetry) return;
+      const operationId = payload.operationId;
+      // The host reconciles its durable outbox and chooses the next bounded retry.
+      // Re-pushing this same job from the callback preserves the newer wake.
+      await this.lifecycle.runInHostContext(() => options.onAdmissionRetry!(operationId));
+    }
+  }
+  const admissionRetries = new AdmissionRetries();
+  Lifecycle.install(options.owner).use(harness).use(new Projection()).use(admissionRetries);
 
   return {
+    scheduleAdmissionRetry: (operationId, delayMs) => admissionRetries.schedule(operationId, delayMs),
     async submit(text: string, input: { operationId: string }): Promise<RuntimeReceipt> {
       const bot = await options.getBot();
       await harness.session().setModel(resolveModel(bot.model));

@@ -9,11 +9,16 @@ import { body, fingerprint, operationId, parseAction, parseMessage, UUID } from 
 type JsonRow = {data:string};
 type RunRow = JsonRow & {id:string;operation_id:string;fingerprint:string;native_operation_id:string};
 type Submission = {operation_id:string;run_id:string;text:string;admitted:number};
+type AdmissionRetry = {attempts:number;next_at:number};
 type RuntimeProjection = {type:string;data:Record<string,unknown>;operationId?:string;eventKey?:string};
 const terminal = new Set<RunStatus>(["completed","failed","cancelled","interrupted"]);
 const automatic = new Set<ComputerAction["type"]>(["readFile","listFiles","screenshot","checkpoint"]);
 const gui = new Set<ComputerAction["type"]>(["navigate","click","type","key","scroll"]);
 const timestamp = ()=>new Date().toISOString();
+const legacyAdmissionFailure="The agent runtime could not accept this run.";
+const admissionPending="Message saved. Delivery to the agent is being retried.";
+const admissionExhausted="Message saved, but delivery to the agent could not be confirmed. Retry this message to resume delivery.";
+const maxAdmissionAttempts=5;
 
 export class BotDO extends DurableObject<Env> {
   private runtime:AgentRuntime;
@@ -33,6 +38,7 @@ export class BotDO extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, fingerprint TEXT NOT NULL, native_operation_id TEXT NOT NULL, data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS runs_status_idx ON runs (json_extract(data,'$.status'));
       CREATE TABLE IF NOT EXISTS submissions (operation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, text TEXT NOT NULL, admitted INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS admission_retries (operation_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL, next_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, source_key TEXT UNIQUE, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, fingerprint TEXT NOT NULL, data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS approvals_status_expiry_idx ON approvals (json_extract(data,'$.status'),json_extract(data,'$.expiresAt'));
@@ -51,6 +57,7 @@ export class BotDO extends DurableObject<Env> {
       }}}:{}),
       getBot:async()=>this.currentBot(),
       getApprovalContext:async()=>this.approvalContext(),
+      onAdmissionRetry:async(operationId)=>this.admit(operationId),
       tools:{
         execute:async(input)=>this.executeTool(input),
         readImage:async(artifactId)=>this.readImage(artifactId),
@@ -226,6 +233,16 @@ export class BotDO extends DurableObject<Env> {
     const existing=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs WHERE operation_id=?",input.operationId).toArray()[0];
     if(existing) {
       if(existing.fingerprint!==hash) throw new ApiError(409,"idempotency_conflict","operationId was already used with different input.");
+      const run=JSON.parse(existing.data) as Run;
+      const submission=this.ctx.storage.sql.exec<Submission>("SELECT * FROM submissions WHERE operation_id=?",existing.native_operation_id).toArray()[0];
+      // An explicit retry can reopen only a known input-delivery failure. Model,
+      // tool, cancellation and interrupted-effect outcomes remain terminal.
+      if(submission && !submission.admitted && ((run.status==="failed" && run.error===legacyAdmissionFailure) || (run.status==="queued" && run.error===admissionExhausted))) {
+        this.ctx.storage.transactionSync(()=>{
+          this.ctx.storage.sql.exec("DELETE FROM admission_retries WHERE operation_id=?",existing.native_operation_id);
+          this.updateStatus(run.id,"queued");
+        });
+      }
       await this.admit(existing.native_operation_id);
       return this.getRun(existing.id);
     }
@@ -255,22 +272,44 @@ export class BotDO extends DurableObject<Env> {
   private async admitOnce(nativeOperationId:string):Promise<void> {
     const submission=this.ctx.storage.sql.exec<Submission>("SELECT * FROM submissions WHERE operation_id=?",nativeOperationId).toArray()[0];
     if(!submission) return;
-    const run=this.getRun(submission.run_id);
-    if(terminal.has(run.status) || run.status==="waiting_approval") return;
+    const row=this.getRunRow(submission.run_id),run=JSON.parse(row.data) as Run;
+    if(row.native_operation_id!==nativeOperationId || terminal.has(run.status) || run.status==="waiting_approval") return;
+    const retry=this.ctx.storage.sql.exec<AdmissionRetry>("SELECT attempts,next_at FROM admission_retries WHERE operation_id=?",nativeOperationId).toArray()[0];
+    if(!submission.admitted && retry && (retry.attempts>=maxAdmissionAttempts || retry.next_at>Date.now())) return;
     try {
       if(!submission.admitted) {
         await this.runtime.submit(submission.text,{operationId:nativeOperationId});
         this.ctx.storage.sql.exec("UPDATE submissions SET admitted=1 WHERE operation_id=?",nativeOperationId);
+        this.ctx.storage.sql.exec("DELETE FROM admission_retries WHERE operation_id=?",nativeOperationId);
+        const current=this.getRunRow(run.id),latest=JSON.parse(current.data) as Run;
+        if(current.native_operation_id===nativeOperationId && latest.status==="queued" && [admissionPending,admissionExhausted].includes(latest.error??"")) this.updateStatus(run.id,"queued");
       }
       this.observe(nativeOperationId);
     } catch {
-      const current=this.getRunRow(run.id),latest=JSON.parse(current.data) as Run;
       // Admission may settle after an approval replaced this native input or the
       // user cancelled it. A stale failure cannot terminate the newer input.
-      if(current.native_operation_id===nativeOperationId && !terminal.has(latest.status) && latest.status!=="waiting_approval") {
-        this.updateStatus(run.id,"failed","The agent runtime could not accept this run.");
+      if(!this.canAdmit(nativeOperationId,run.id)) return;
+      // A lost receipt does not mean Pi rejected the input. Reconcile its durable
+      // record before retrying the same idempotent input; never restart a tool.
+      let known:Awaited<ReturnType<AgentRuntime["operation"]>>|undefined;
+      try {known=await this.runtime.operation(nativeOperationId);} catch {/* Keep delivery unconfirmed. */}
+      if(!this.canAdmit(nativeOperationId,run.id)) return;
+      if(known && known.status!=="missing") {
+        this.ctx.storage.sql.exec("UPDATE submissions SET admitted=1 WHERE operation_id=?",nativeOperationId);
+        this.ctx.storage.sql.exec("DELETE FROM admission_retries WHERE operation_id=?",nativeOperationId);
+        if(known.status==="done" || known.status==="unanswered") await this.completeOperation(nativeOperationId,known.status,known.text,known.reason);
+        else {this.updateStatus(run.id,known.status==="running"?"running":"queued");this.observe(nativeOperationId);}
+        return;
       }
+      const attempts=(retry?.attempts??0)+1,delayMs=1000*2**(attempts-1);
+      this.ctx.storage.sql.exec("INSERT INTO admission_retries(operation_id,attempts,next_at) VALUES(?,?,?) ON CONFLICT(operation_id) DO UPDATE SET attempts=excluded.attempts,next_at=excluded.next_at",nativeOperationId,attempts,Date.now()+delayMs);
+      this.updateStatus(run.id,"queued",attempts<maxAdmissionAttempts?admissionPending:admissionExhausted);
+      if(attempts<maxAdmissionAttempts) await this.runtime.scheduleAdmissionRetry(nativeOperationId,delayMs);
     }
+  }
+  private canAdmit(nativeOperationId:string,runId:string):boolean {
+    const current=this.getRunRow(runId),run=JSON.parse(current.data) as Run;
+    return current.native_operation_id===nativeOperationId && !terminal.has(run.status) && run.status!=="waiting_approval";
   }
   private observe(nativeOperationId:string):void {
     if(this.observing.has(nativeOperationId)) return;

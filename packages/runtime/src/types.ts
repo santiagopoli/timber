@@ -54,6 +54,8 @@ export interface PiRuntimeOptions<Env extends object> {
   getApprovalContext?(): Promise<RuntimeApprovalContext>;
   tools: RuntimeTools;
   onEvent?(event: RuntimeEvent): void | Promise<void>;
+  /** Wake the host's durable input outbox; attempts and backoff remain host-owned. */
+  onAdmissionRetry?(operationId: string): Promise<void>;
   defaultModel?: string;
   maxGenerations?: number;
   maxToolCalls?: number;
@@ -66,6 +68,8 @@ export interface RuntimeOperation { operationId: string; status: 'queued' | 'run
 export interface RuntimePendingOperation { operationId: string; status: 'queued' | 'running'; }
 export interface AgentRuntime {
   submit(text: string, input: { operationId: string }): Promise<RuntimeReceipt>;
+  /** Persist one replaceable wake for this input; never replay a tool or await inference. */
+  scheduleAdmissionRetry(operationId: string, delayMs: number): Promise<void>;
   wait(operationId: string): Promise<RuntimeOperationResult>;
   pending(): Promise<RuntimePendingOperation[]>;
   cancel(operationId?: string): Promise<boolean>;

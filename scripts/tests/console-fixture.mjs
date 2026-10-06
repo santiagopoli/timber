@@ -1,6 +1,8 @@
 /** Local-only HTTP fixture for browser regression tests. Never deployed. */
 import {createServer} from 'node:http';
 import {readFile} from 'node:fs/promises';
+import {resolve, extname, sep} from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {randomUUID} from 'node:crypto';
 import {deflateSync} from 'node:zlib';
 
@@ -20,10 +22,14 @@ function png() {
   return Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]), chunk('IHDR', header), chunk('IDAT', deflateSync(pixels)), chunk('IEND', Buffer.alloc(0))]);
 }
 const image = png();
+const consoleRoot = fileURLToPath(new URL('../../apps/console/dist/', import.meta.url));
+const assetTypes = new Map([['.html', 'text/html'], ['.js', 'text/javascript'], ['.css', 'text/css'], ['.svg', 'image/svg+xml'], ['.png', 'image/png'], ['.woff', 'font/woff'], ['.woff2', 'font/woff2'], ['.ttf', 'font/ttf'], ['.wasm', 'application/wasm']]);
 export async function createConsoleFixture({port = 0} = {}) {
+  // Exercise the same bundled React island and asset graph that is deployed.
+  await readFile(resolve(consoleRoot, 'index.html'));
   const date = '2026-10-05T10:00:00.000Z';
   const state = {
-    rejectAuth: false, actionGate: null, readsGate: null, patchGate: null, patchError: null, approvalGate: null, approvalError: null, approvalStatus: null, computerStates: new Map(), computerStatusGate: null, failures: [], actions: [], calls: [], streams: new Set(), events: [],
+    rejectAuth: false, actionGate: null, readsGate: null, messageGates: new Map(), messageResponseGates: new Map(), messageOperations: new Map(), patchGate: null, patchError: null, approvalGate: null, approvalError: null, approvalStatus: null, computerStates: new Map(), computerStatusGate: null, failures: [], actions: [], calls: [], streams: new Set(), events: [],
     bots: [
       {id: BOT_A, name: 'Ada', instructions: 'Research and turn findings into useful notes.', model: 'gpt-6.1-sol', runtime: 'pi', createdAt: date, updatedAt: date},
       {id: BOT_B, name: 'Linus', instructions: 'Help build and maintain software.', model: 'gpt-6.1-sol', runtime: 'pi', createdAt: date, updatedAt: date},
@@ -43,10 +49,11 @@ export async function createConsoleFixture({port = 0} = {}) {
       const url = new URL(request.url, 'http://fixture'), path = url.pathname;
       const json = (data, status = 200) => {response.writeHead(status, {'content-type': 'application/json', 'cache-control': 'no-store'}); response.end(JSON.stringify(data));};
       if (path.startsWith('/console/')) {
-        const filename = path === '/console/' ? 'index.html' : path.slice('/console/'.length);
-        if (!['index.html', 'console.js', 'console.css'].includes(filename)) {response.writeHead(404).end(); return;}
-        const data = await readFile(new URL(`../../apps/console/${filename}`, import.meta.url));
-        response.writeHead(200, {'content-type': filename.endsWith('.js') ? 'text/javascript' : filename.endsWith('.css') ? 'text/css' : 'text/html', 'content-security-policy': "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob: data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"}); response.end(data); return;
+        const filename = path === '/console/' ? 'index.html' : decodeURIComponent(path.slice('/console/'.length));
+        const asset = resolve(consoleRoot, filename), contentType = assetTypes.get(extname(asset));
+        if (!asset.startsWith(consoleRoot + (consoleRoot.endsWith(sep) ? '' : sep)) || !contentType) {response.writeHead(404).end(); return;}
+        let data; try {data = await readFile(asset);} catch (error) {if (error.code === 'ENOENT') {response.writeHead(404).end(); return;} throw error;}
+        response.writeHead(200, {'content-type': contentType, 'content-security-policy': "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob: data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"}); response.end(data); return;
       }
       if (state.rejectAuth || request.headers.authorization !== `Bearer ${TEST_TOKEN}`) return json({error: {code: 'unauthorized', message: 'Token rejected.'}}, 401);
       let body; if (!['GET', 'HEAD'].includes(request.method)) {let raw = ''; for await (const chunk of request) raw += chunk; body = raw ? JSON.parse(raw) : {};}
@@ -61,7 +68,17 @@ export async function createConsoleFixture({port = 0} = {}) {
       if (!tail) {if (request.method === 'PATCH') {if (state.patchGate) await state.patchGate; if (state.patchError) return json({error: state.patchError}, state.patchError.status || 503); Object.assign(bot, body);} return json({bot});}
       if (tail === '/messages') {
         if (request.method === 'GET') {const snapshot = structuredClone(state.messages.get(id)); if (state.readsGate) await state.readsGate; return json({messages: snapshot});}
-        const run = {id: randomUUID(), botId: id, operationId: body.operationId, status: 'queued', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()}; state.runs.get(id).unshift(run); state.messages.get(id).push({id: randomUUID(), botId: id, runId: run.id, role: 'user', text: body.text, createdAt: run.createdAt}); return json({run}, 202);
+        if (state.messageGates.has(id)) await state.messageGates.get(id);
+        if (typeof body.text !== 'string' || !body.text.trim() || typeof body.operationId !== 'string' || !body.operationId) return json({error: {code: 'invalid_request', message: 'text and operationId are required.'}}, 400);
+        const key = `${id}:${body.operationId}`, previous = state.messageOperations.get(key);
+        if (previous) {
+          if (previous.text !== body.text) return json({error: {code: 'operation_conflict', message: 'This operation ID belongs to another message.'}}, 409);
+          return json({run: previous.run}, 202);
+        }
+        const run = {id: randomUUID(), botId: id, operationId: body.operationId, status: 'queued', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()};
+        state.messageOperations.set(key, {run, text: body.text}); state.runs.get(id).unshift(run); state.messages.get(id).push({id: randomUUID(), botId: id, runId: run.id, role: 'user', text: body.text, createdAt: run.createdAt});
+        if (state.messageResponseGates.has(id)) await state.messageResponseGates.get(id);
+        return json({run}, 202);
       }
       if (tail === '/runs') {
         const all = state.runs.get(id), offset = Number(url.searchParams.get('before') || 0), limit = Number(url.searchParams.get('limit') || 30);
