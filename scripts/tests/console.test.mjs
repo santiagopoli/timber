@@ -659,6 +659,22 @@ test('timeline ties preserve user request, approval, then answer and retain a re
   });
 });
 
+test('saved mobile reply renders the screenshot Markdown as headings, emphasis and code', async () => {
+  await withPage(async ({page, login, state}) => {
+    const text = 'La prueba funcionó. **El código que apareció fue `360068`**, leído únicamente de la captura posterior al clic.\n\n### Resultados reales de Linux\n\n**`uname -a`:**\n```text\nLinux f4678a333d61e228db1d264bc67f4dc0f38109346cb726b155ad9eda9df7cc 6.18.54-cloudflare-microvm-2026.9.16 #1 SMP PREEMPT_DYNAMIC Mon Sep 27 00:00:00 UTC 2010 x86_64 GNU/Linux\n```';
+    state.messages.set(BOT_A, [{id:'screenshot-format',botId:BOT_A,role:'assistant',text,createdAt:'2026-10-06T19:17:28Z'}]);
+    await login();
+    const reply=page.locator('[data-message-id="screenshot-format"]');
+    assert.equal(await reply.locator('h3').innerText(),'Resultados reales de Linux');
+    assert.equal(await reply.locator('[data-streamdown="strong"]').first().innerText(),'El código que apareció fue 360068');
+    assert.equal(await reply.locator('[data-streamdown="strong"] code').first().innerText(),'360068');
+    assert.match(await reply.locator('pre code').innerText(),/^Linux f4678a/);
+    assert.doesNotMatch(await reply.innerText(),/\*\*|###|```/);
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+    if(process.env.CONSOLE_SCREENSHOT_DIR) {await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});await reply.scrollIntoViewIfNeeded();await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/saved-markdown-mobile.png`});}
+  },{viewport:{width:390,height:844},colorScheme:'dark'});
+});
+
 test('streamed Markdown preserves recovered prefixes, open fences, replay order and the final transcript', async () => {
   for (const width of [1440, 390]) await withPage(async ({page, login, state}) => {
     const run = {id: 'stream-run', botId: BOT_A, operationId: 'stream-operation', status: 'running', createdAt: '2026-10-06T12:00:00Z', updatedAt: '2026-10-06T12:00:00Z'};

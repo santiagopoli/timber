@@ -22,14 +22,21 @@ export default {
       // Static developer console contains no account data or credentials.
       if((url.pathname==="/" || url.pathname==="/console" || url.pathname.startsWith("/console/")) && request.method==="GET") {
         if(!env.ASSETS) throw new ApiError(404,"not_found","Console not installed.");
+        // Assets canonicalizes /index.html back to /. Redirect the public aliases
+        // before rewriting, otherwise / -> /index.html -> / loops indefinitely.
+        if(["/","/console","/console/index.html"].includes(url.pathname)) {
+          return new Response(null,{status:307,headers:{location:`/console/${url.search}`,"cache-control":"no-store"}});
+        }
         const assetUrl=new URL(request.url);
-        if(assetUrl.pathname==="/" || assetUrl.pathname==="/console") assetUrl.pathname="/index.html";
-        else assetUrl.pathname=assetUrl.pathname.slice("/console".length);
+        assetUrl.pathname=assetUrl.pathname.slice("/console".length);
         const response=await env.ASSETS.fetch(new Request(assetUrl,request));
         const headers=new Headers(response.headers);
         headers.set("content-security-policy","default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob: data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
         headers.set("referrer-policy","no-referrer");
         headers.set("x-content-type-options","nosniff");
+        // Always load the current shell; its fingerprinted JS/CSS retain their
+        // own asset cache policy. This never reloads an active conversation.
+        if(assetUrl.pathname==="/" || headers.get("content-type")?.includes("text/html")) headers.set("cache-control","no-store");
         return new Response(response.body,{status:response.status,headers});
       }
       const owner=await authenticate(request,env.BOTSPACE_API_TOKEN);
