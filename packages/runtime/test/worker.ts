@@ -1,5 +1,5 @@
 import { DurableObject } from 'cloudflare:workers';
-import { createPiRuntime, DEFAULT_MODEL } from '../src/index.js';
+import { createPiRuntime, DEFAULT_MODEL, type RuntimeApprovalContext } from '../src/index.js';
 import { responsesFixture } from './responses-fixture.js';
 
 const CF_MODEL = '@cf/moonshotai/kimi-k2.7-code';
@@ -36,21 +36,35 @@ export class HarnessProbe extends DurableObject {
         ];
         return new Response(chunks.map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
       } } as unknown as Ai,
-      getBot: async () => ({ name: 'Ada', instructions: 'Your private instruction is amber-lantern.', model: ctx.storage.sql.exec<{ value: string }>('SELECT value FROM config WHERE key=?', 'model').toArray()[0]?.value ?? CF_MODEL }),
+      getBot: async () => ({ name: 'Ada', instructions: 'Your private instruction is amber-lantern.', model: this.setting('model') ?? CF_MODEL, computerApprovalMode: this.setting('approvalMode') === 'automatic' ? 'automatic' : 'ask' }),
+      getApprovalContext: async () => {
+        if (this.setting('approvalContext') === 'unavailable') throw new Error('fixture host context unavailable');
+        return JSON.parse(this.setting('approvalContext') ?? '{"active":[],"recent":[]}') as RuntimeApprovalContext;
+      },
       tools: {
         execute: async ({ operationId, runOperationId, action }) => {
           // Enforce the real computer boundary, even though execution is a fixture.
           if (operationId.length > 160 || /[^A-Za-z0-9:_.-]/.test(operationId)) throw new Error('Invalid computer operation ID');
-          ctx.storage.sql.exec('INSERT INTO tool_calls(input) VALUES(?)', JSON.stringify({ operationId, runOperationId, action }));
-          return action.type === 'readFile' ? { operationId, status: 'completed', output: 'test file' } : action.type === 'screenshot' ? { operationId, status: 'completed', artifactId: 'test.png' } : { status: 'pending_approval', approvalId: 'approval-fixture' };
+          const call = ctx.storage.sql.exec<{ id: number }>('INSERT INTO tool_calls(input) VALUES(?) RETURNING id', JSON.stringify({ operationId, runOperationId, action })).one();
+          const nextContext = this.setting('afterToolApprovalContext');
+          if (nextContext) ctx.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)', 'approvalContext', nextContext);
+          return action.type === 'readFile' ? { operationId, status: 'completed', output: 'test file' } : action.type === 'screenshot' ? { operationId, status: 'completed', artifactId: 'test.png' } : this.setting('approvalMode') === 'automatic' ? { operationId, status: 'completed', output: 'fixture completed' } : { status: 'pending_approval', approvalId: `approval-fixture-${call.id}` };
         },
         readImage: async () => ({ data: 'aW1hZ2U=', mimeType: 'image/png' }),
       },
       onEvent: event => { ctx.storage.sql.exec('INSERT INTO projected(event) VALUES(?)', JSON.stringify(event)); },
     });
   }
+  private setting(key: string) { return this.ctx.storage.sql.exec<{ value: string }>('SELECT value FROM config WHERE key=?', key).toArray()[0]?.value; }
   async onRequest(request: Request) {
     const path = new URL(request.url).pathname;
+    if (path === '/host-context') {
+      const input = await request.json<{ approvals?: RuntimeApprovalContext | 'unavailable'; afterToolApprovals?: RuntimeApprovalContext; mode?: 'ask' | 'automatic' }>();
+      if (input.approvals) this.ctx.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)', 'approvalContext', input.approvals === 'unavailable' ? 'unavailable' : JSON.stringify(input.approvals));
+      if (input.afterToolApprovals) this.ctx.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)', 'afterToolApprovalContext', JSON.stringify(input.afterToolApprovals));
+      if (input.mode) this.ctx.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)', 'approvalMode', input.mode);
+      return Response.json({ ok: true });
+    }
     if (path === '/submit') {
       const input = await request.json<{ text: string; operationId: string; chatgpt?: boolean }>();
       if (input.chatgpt) this.ctx.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)', 'model', DEFAULT_MODEL);

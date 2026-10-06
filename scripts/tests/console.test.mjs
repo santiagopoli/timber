@@ -47,6 +47,42 @@ test('bot administration, isolated drafts, safe message rendering and session cl
   });
 });
 
+test('computer permission defaults to ask and persists explicit create/edit settings without approving stored actions', async () => {
+  await withPage(async ({page, login, state}) => {
+    const previousApprovals = ['pending', 'denied', 'interrupted'].map((status, i) => ({
+      id: `existing-approval-${i}`, botId: BOT_A, runId: 'existing-run', operationId: `existing-operation-${i}`,
+      status, action: {type: 'exec', command: 'printf existing-action'}, createdAt: '2026-10-05T10:00:00Z', expiresAt: '2026-10-07T10:00:00Z',
+      ...(status === 'interrupted' ? {result: {operationId: `existing-operation-${i}`, status, error: 'Inspect existing effects.'}} : {}),
+    }));
+    state.approvals.set(BOT_A, structuredClone(previousApprovals));
+    assert.equal(state.bots[0].computerApprovalMode, undefined, 'fixture includes a legacy bot');
+    await login(); await until(page, '#selected-computer-mode', 'Ask for each action');
+    await page.locator('#edit-bot').click(); assert.equal(await page.locator('#edit-computer-approval-mode').inputValue(), 'ask');
+    assert.match(await page.locator('#edit-computer-approval-help').innerText(), /commands, write files, and control the browser/);
+    assert.match(await page.locator('#edit-computer-approval-help').innerText(), /Existing requests stay unchanged/);
+    await page.locator('#edit-computer-approval-mode').selectOption('automatic'); await page.locator('#edit-form [type=submit]').click();
+    await until(page, '#selected-computer-mode', 'Use authorized');
+    assert.equal(state.bots.find(bot => bot.id === BOT_A).computerApprovalMode, 'automatic');
+    assert.equal(state.calls.find(call => call.method === 'PATCH').body.computerApprovalMode, 'automatic');
+    await page.locator('#disconnect').click(); await login(); await page.locator('#edit-bot').click();
+    assert.equal(await page.locator('#edit-computer-approval-mode').inputValue(), 'automatic', 'saved permission survives reconnect');
+    await page.locator('#edit-computer-approval-mode').selectOption('ask'); await page.locator('#edit-form [type=submit]').click();
+    await until(page, '#selected-computer-mode', 'Ask for each action'); assert.equal(state.bots.find(bot => bot.id === BOT_A).computerApprovalMode, 'ask');
+    await page.locator('#new-bot').click(); assert.equal(await page.locator('#bot-computer-approval-mode').inputValue(), 'ask');
+    await page.locator('#bot-name').fill('Authorized bot'); await page.locator('#bot-computer-approval-mode').selectOption('automatic');
+    await page.locator('#create-form [type=submit]').click(); await until(page, '#selected-name', 'Authorized bot'); await until(page, '#selected-computer-mode', 'Use authorized');
+    assert.equal(state.bots[0].computerApprovalMode, 'automatic');
+    await page.locator('#edit-bot').click(); assert.equal(await page.locator('#edit-computer-approval-mode').inputValue(), 'automatic'); await page.locator('#edit-dialog [data-close-dialog]').first().click();
+    await page.locator('#new-bot').click(); assert.equal(await page.locator('#bot-computer-approval-mode').inputValue(), 'ask', 'each new bot starts with per-action approval');
+    await page.locator('#bot-name').fill('Ask bot'); await page.locator('#create-form [type=submit]').click(); await until(page, '#selected-name', 'Ask bot');
+    assert.equal(state.bots[0].computerApprovalMode, 'ask');
+    assert.deepEqual(state.calls.filter(call => call.method === 'POST' && call.path === '/v1/bots').map(call => call.body.computerApprovalMode), ['automatic', 'ask']);
+    assert.deepEqual(state.approvals.get(BOT_A), previousApprovals, 'stored pending, denied and interrupted requests stay unchanged');
+    assert.equal(state.calls.some(call => call.method === 'POST' && /\/(?:approvals|computer)\//.test(call.path)), false, 'configuration never approves or executes stored actions');
+    assert.equal(state.actions.length, 0);
+  });
+});
+
 test('restores older active runs, ignores stale SSE and retains pagination through updates', async () => {
   await withPage(async ({page, login, state}) => {
     const now = new Date('2026-10-05T12:00:00Z');

@@ -1,5 +1,5 @@
 import type { DurableObject } from 'cloudflare:workers';
-import type { Bot, ComputerAction, ComputerResult } from '@botspace/contracts';
+import type { Approval, Bot, ComputerAction, ComputerResult } from '@botspace/contracts';
 import type { AISettings } from 'agents/models/pi-ai';
 
 export type PendingApproval = {
@@ -33,13 +33,25 @@ export interface RuntimeMessage {
   text: string;
   createdAt?: string;
 }
+/** Current host metadata only: never commands, arguments, results, or credentials. */
+export interface RuntimeApprovalSummary {
+  id: string;
+  status: Approval['status'] | 'expired';
+  actionType: ComputerAction['type'];
+  expiresAt: string;
+}
+export interface RuntimeApprovalContext {
+  active: RuntimeApprovalSummary[];
+  recent: RuntimeApprovalSummary[];
+}
 export interface PiRuntimeOptions<Env extends object> {
   owner: DurableObject<Env>;
   storage: DurableObjectStorage;
   ai: AISettings['binding'];
   /** Host-owned OAuth transport; the runtime never receives account credentials. */
   chatgpt?: { fetch(request: Request): Promise<Response> };
-  getBot(): Promise<Pick<Bot, 'name' | 'instructions' | 'model'>>;
+  getBot(): Promise<Pick<Bot, 'name' | 'instructions' | 'model' | 'computerApprovalMode'>>;
+  getApprovalContext?(): Promise<RuntimeApprovalContext>;
   tools: RuntimeTools;
   onEvent?(event: RuntimeEvent): void | Promise<void>;
   defaultModel?: string;

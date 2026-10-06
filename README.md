@@ -44,6 +44,13 @@ and an approval indicator available from every panel. Reconnecting restores acti
 runs even when newer runs have already finished. Older event replay cannot move a
 completed run back to running.
 
+Create or edit a bot to choose **Computer permission**. **Ask for each action**
+is the default; **Allow computer use** authorizes that bot's new commands, file
+writes and desktop/browser actions without separate approval. Existing pending
+requests, denials and interrupted results are unchanged when switching modes.
+The model receives current approval state on each generation, so a historical
+pending result does not block an explicit new request to retry after a denial.
+
 The computer panel shows elapsed time during pending actions, clickable workspace
 files, readable terminal output, and raw results on demand. Screenshot clicking is
 opt-in and maps the displayed image to desktop coordinates. Optional screenshot

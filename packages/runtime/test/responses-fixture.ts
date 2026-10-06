@@ -2,11 +2,12 @@ import { MAX_OUTPUT_CHARACTERS, TOOL_NAMESPACE } from '../src/chatgpt.js';
 
 /** Wire-format OpenAI fixture. No model behavior, credentials, or Pi internals mocked. */
 export function responsesFixture(payload: { input: Record<string, unknown>[] }): Response {
-  const user = payload.input.filter(item => item.role === 'user').at(-1);
+  const userIndex = payload.input.findLastIndex(item => item.role === 'user');
+  const user = payload.input[userIndex];
   const text = JSON.stringify(user);
-  const hasToolOutput = payload.input.some(item => item.type === 'function_call_output');
+  const hasToolOutput = payload.input.slice(userIndex + 1).some(item => item.type === 'function_call_output');
   const vision = text.includes('request-vision') && !hasToolOutput;
-  const exec = text.includes('request-exec');
+  const exec = text.includes('request-exec') && !hasToolOutput;
   const loop = text.includes('request-loop');
   const namespace = text.includes('bad-namespace') ? 'untrusted' : TOOL_NAMESPACE;
   const tool = vision || exec || loop || text.includes('bad-namespace');

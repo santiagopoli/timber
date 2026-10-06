@@ -30,9 +30,9 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
 - POST /v1/connections/chatgpt/verify performs one small real inference and only
   returns {ok:true,model} after response.completed.
 - GET /v1/bots -> {bots:Bot[]}
-- POST /v1/bots {name,instructions?,model?} -> 201 {bot:Bot}
+- POST /v1/bots {name,instructions?,model?,computerApprovalMode?} -> 201 {bot:Bot}
 - GET /v1/bots/:id -> {bot:Bot}
-- PATCH /v1/bots/:id {name?,instructions?} -> {bot:Bot}
+- PATCH /v1/bots/:id {name?,instructions?,computerApprovalMode?} -> {bot:Bot}
 - GET /v1/bots/:id/messages -> {messages:Message[]}
 - POST /v1/bots/:id/messages {text,operationId} -> 202 {run:Run}
 - GET /v1/bots/:id/runs?limit=30&before=<cursor>
@@ -88,9 +88,13 @@ a deterministic SHA-256 mapping in a separate namespace. Never strip characters
 or truncate IDs, which could merge distinct operations. Stored interrupted
 approvals are not rewritten or replayed by this mapping change.
 
-Computer actions from the model pass through host policy. Shell execution requires
-approval by default; read/list/screenshot can run without approval. Browser navigation,
-click/type/key/scroll also require explicit approval in initial secure MVP; the console
+Computer actions from the model pass through host policy. The bot configuration
+`computerApprovalMode` is `ask` (default, including older bots with no field) or
+`automatic`, selected explicitly through authenticated bot configuration. In `ask`,
+shell, file writes and browser/desktop input require approval; read/list/screenshot
+and checkpoints can run automatically. In `automatic`, new computer operations run
+under the bot's standing authorization. Changing this setting never executes,
+rewrites or overrides a stored approval, denial or interrupted result. The console
 can directly invoke actions as the human. User action approvals are persisted; do not
 keep an unbounded promise waiting for approval. The runtime returns a pending-approval
 result and resumes with the decision after user input. No automatically replayed exec.
@@ -99,6 +103,18 @@ approval result and continuation input are persisted atomically; stale finalizer
 cannot overwrite a terminal approval or rewind a later continuation. Provider
 exceptions retain only reviewed diagnostic codes/messages, still mark the outcome
 unconfirmed, and never authorize an automatic retry of the effect.
+
+Before each model generation, the host can supply an approval context: all active
+unexpired pending/executing approvals and the latest 20 other approvals, with only
+id, status, action type and expiration. Expired pending requests are summarized as
+expired. Historical pending tool results are not current authorization state.
+A fresh explicit user request to retry may create a new approval request after a
+denial or expiration; it does not approve or execute the old action. Pausing applies
+to the current run, not to every future message in the bot conversation.
+The runtime refreshes bot configuration from the registry before each generation
+and each new tool dispatch. A failed lookup authorizes no new action. Monotonic
+configuration timestamps prevent an older in-flight request from restoring an
+obsolete permission; already accepted effects are not cancelled by a policy edit.
 
 ## Storage / lifecycle
 Workspace path /workspace, one writer via ComputerDO. Root package/tool image version

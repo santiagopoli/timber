@@ -1,5 +1,6 @@
 export type RunStatus = "queued" | "running" | "waiting_approval" | "completed" | "failed" | "cancelled" | "interrupted";
-export interface Bot { id: string; name: string; instructions: string; runtime: "pi"; model: string; createdAt: string; updatedAt: string; }
+export type ComputerApprovalMode = "ask" | "automatic";
+export interface Bot { id: string; name: string; instructions: string; runtime: "pi"; model: string; computerApprovalMode?: ComputerApprovalMode; createdAt: string; updatedAt: string; }
 export interface Message { id: string; botId: string; runId?: string; role: "user" | "assistant" | "tool" | "system"; text: string; createdAt: string; }
 export interface Run { id: string; botId: string; operationId: string; status: RunStatus; createdAt: string; updatedAt: string; error?: string; }
 /** A newest-first history page plus all currently active runs, independent of pagination. */

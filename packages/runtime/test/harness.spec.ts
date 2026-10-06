@@ -137,3 +137,76 @@ it('retains the 12-generation limit with ChatGPT subscription inference', async 
   const state = await (await request('/inspect')).json<{ calls: unknown[] }>();
   expect(state.calls).toHaveLength(12);
 });
+
+function developerText(wire: string): string {
+  const payload = JSON.parse(wire) as { input: { role?: string; content?: unknown }[] };
+  return payload.input.filter(item => item.role === 'developer').map(item => typeof item.content === 'string' ? item.content : Array.isArray(item.content) ? item.content.map(part => part.text ?? '').join('') : '').join('\n');
+}
+
+it.each(['pending', 'denied', 'expired'] as const)('delivers current %s state and permits a fresh user retry to request a new approval', async status => {
+  await request('/submit', { text: 'request-exec', operationId: 'first-attempt', chatgpt: true });
+  await request('/wait?id=first-attempt');
+  const approval = { id: 'approval-fixture-1', status, actionType: 'exec', expiresAt: status === 'pending' ? '2099-01-01T00:00:00.000Z' : '2026-01-01T00:00:00.000Z', command: 'must-not-leak', result: 'private-result' };
+  await request('/host-context', { approvals: { active: status === 'pending' ? [approval] : [], recent: status === 'pending' ? [] : [approval] } });
+  await request('/submit', { text: 'Please retry the task now: request-exec', operationId: 'fresh-retry' });
+  await request('/wait?id=fresh-retry');
+  const state = await (await request('/inspect')).json<{ calls: { input: string }[]; toolCalls: { input: string }[]; messages: { role: string; text: string }[] }>();
+  expect(state.calls).toHaveLength(2);
+  const currentPrompt = developerText(state.calls[1]!.input);
+  expect(currentPrompt).toContain(`"status":"${status}"`);
+  if (status === 'pending') expect(currentPrompt).toContain('"active":[{"id":"approval-fixture-1","status":"pending"');
+  expect(currentPrompt).toContain('An old pending_approval message does not block a fresh user request');
+  expect(currentPrompt).toContain('Current computer approval mode: ask');
+  expect(currentPrompt).not.toContain('must-not-leak');
+  expect(currentPrompt).not.toContain('private-result');
+  expect(state.calls[1]!.input).toContain('pending_approval');
+  const calls = state.toolCalls.map(row => JSON.parse(row.input));
+  expect(calls).toHaveLength(2);
+  expect(calls[0].operationId).not.toBe(calls[1].operationId);
+  expect(calls[1].runOperationId).toBe('fresh-retry');
+  expect(state.messages.filter(message => message.role === 'tool' && message.text.includes('pending_approval'))).toHaveLength(2);
+  expect(state.messages.some(message => message.text.includes('approval-fixture-2'))).toBe(true);
+});
+
+it('refreshes approval metadata between tool rounds within the same native run', async () => {
+  const pending = { id: 'current-approval', status: 'pending', actionType: 'exec', expiresAt: '2099-01-01T00:00:00.000Z' };
+  await request('/host-context', { approvals: { active: [pending], recent: [] }, afterToolApprovals: { active: [], recent: [{ ...pending, status: 'denied' }] } });
+  await request('/submit', { text: 'request-vision', operationId: 'fresh-snapshot', chatgpt: true });
+  await request('/wait?id=fresh-snapshot');
+  const state = await (await request('/inspect')).json<{ calls: { input: string }[] }>();
+  expect(state.calls).toHaveLength(2);
+  expect(developerText(state.calls[0]!.input)).toContain('"status":"pending"');
+  expect(developerText(state.calls[1]!.input)).toContain('"status":"denied"');
+  expect(developerText(state.calls[1]!.input)).not.toContain('"status":"pending"');
+});
+
+it('publishes unavailable approval state instead of retaining a stale snapshot on host failure', async () => {
+  await request('/host-context', { approvals: { active: [{ id: 'stale-approval', status: 'pending', actionType: 'exec', expiresAt: '2099-01-01T00:00:00.000Z' }], recent: [] } });
+  await request('/submit', { text: 'hello', operationId: 'before-failure', chatgpt: true });
+  await request('/wait?id=before-failure');
+  await request('/host-context', { approvals: 'unavailable' });
+  await request('/submit', { text: 'hello again', operationId: 'after-failure' });
+  await request('/wait?id=after-failure');
+  const state = await (await request('/inspect')).json<{ calls: { input: string }[] }>();
+  const prompt = developerText(state.calls[1]!.input);
+  expect(prompt).toContain('Current host approval status is unavailable');
+  expect(prompt).not.toContain('stale-approval');
+});
+
+it('refreshes automatic policy for new requests while retaining historical pending tool results', async () => {
+  await request('/submit', { text: 'request-exec', operationId: 'asked-attempt', chatgpt: true });
+  await request('/wait?id=asked-attempt');
+  await request('/host-context', { mode: 'automatic', approvals: { active: [{ id: 'approval-fixture-1', status: 'pending', actionType: 'exec', expiresAt: '2099-01-01T00:00:00.000Z' }], recent: [] } });
+  await request('/submit', { text: 'Please retry now: request-exec', operationId: 'automatic-retry' });
+  expect(await (await request('/wait?id=automatic-retry')).json()).toMatchObject({ status: 'done' });
+  const state = await (await request('/inspect')).json<{ calls: { input: string }[]; toolCalls: { input: string }[] }>();
+  expect(state.calls).toHaveLength(3);
+  expect(developerText(state.calls[0]!.input)).toContain('Current computer approval mode: ask');
+  expect(developerText(state.calls[1]!.input)).toContain('Current computer approval mode: automatic');
+  expect(state.calls[1]!.input).toContain('pending_approval');
+  expect(state.calls[1]!.input).not.toContain('Human approval is required');
+  const calls = state.toolCalls.map(row => JSON.parse(row.input));
+  expect(calls).toHaveLength(2);
+  expect(calls[1].runOperationId).toBe('automatic-retry');
+  expect(calls[0].operationId).not.toBe(calls[1].operationId);
+});

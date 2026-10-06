@@ -1,4 +1,4 @@
-import type { ComputerAction } from "@botspace/contracts";
+import type { ComputerAction, ComputerApprovalMode } from "@botspace/contracts";
 import { ApiError } from "./errors";
 
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -43,9 +43,9 @@ export function parseMessage(value:unknown):{text:string;operationId:string} {
   if(!text.trim()) invalid("text cannot be blank.");
   return {text,operationId:operationId(data.operationId)};
 }
-export function parseBotInput(value:unknown,patch=false):{name?:string;instructions?:string;model?:string} {
+export function parseBotInput(value:unknown,patch=false):{name?:string;instructions?:string;model?:string;computerApprovalMode?:ComputerApprovalMode} {
   const data=object(value);
-  const output:{name?:string;instructions?:string;model?:string}={};
+  const output:{name?:string;instructions?:string;model?:string;computerApprovalMode?:ComputerApprovalMode}={};
   if(data.name!==undefined || !patch) {
     output.name=string(data.name,"name",80).trim();
     if(!output.name) invalid("name cannot be blank.");
@@ -56,7 +56,11 @@ export function parseBotInput(value:unknown,patch=false):{name?:string;instructi
     output.model=string(data.model,"model",180);
     if(output.model!=="gpt-6.1-sol" && !/^@cf\/[A-Za-z0-9._/-]+$/.test(output.model)) invalid("model must be gpt-6.1-sol or an explicit Workers AI @cf/ model identifier.");
   }
-  if(patch && !Object.keys(output).length) invalid("Provide name or instructions.");
+  if(data.computerApprovalMode!==undefined) {
+    if(data.computerApprovalMode!=="ask" && data.computerApprovalMode!=="automatic") invalid("computerApprovalMode must be ask or automatic.");
+    output.computerApprovalMode=data.computerApprovalMode;
+  }
+  if(patch && !Object.keys(output).length) invalid("Provide name, instructions or computerApprovalMode.");
   return output;
 }
 function finite(value:unknown,name:string,min:number,max:number):number {

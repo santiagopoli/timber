@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Approval, Bot, BotEvent, ComputerAction, ComputerResult, ComputerStatus, Message, Run, RunPage, RunStatus } from "@botspace/contracts";
 import { createCloudComputerProvider, touchCloudComputer, suspendCloudComputer, ComputerProviderError } from "@botspace/computer";
-import { createPiRuntime, type AgentRuntime } from "@botspace/runtime";
+import { createPiRuntime, type AgentRuntime, type RuntimeApprovalContext, type RuntimeApprovalSummary, type RuntimeToolResult } from "@botspace/runtime";
 import type { Env } from "./env";
 import { ApiError, errorResponse, json } from "./errors";
 import { body, fingerprint, operationId, parseAction, parseMessage, UUID } from "./validation";
@@ -35,6 +35,7 @@ export class BotDO extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS submissions (operation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, text TEXT NOT NULL, admitted INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, source_key TEXT UNIQUE, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, fingerprint TEXT NOT NULL, data TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS approvals_status_expiry_idx ON approvals (json_extract(data,'$.status'),json_extract(data,'$.expiresAt'));
       CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, source_key TEXT UNIQUE, data TEXT NOT NULL);
     `);
     this.computer=createCloudComputerProvider(env.COMPUTER);
@@ -48,7 +49,8 @@ export class BotDO extends DurableObject<Env> {
         const connection=env.CHATGPT!.get(env.CHATGPT!.idFromName("owner"));
         return connection.fetch(new Request("https://chatgpt/responses",{method:"POST",headers:{"content-type":"application/json"},body:request.body,signal:request.signal}));
       }}}:{}),
-      getBot:async()=>this.bot(),
+      getBot:async()=>this.currentBot(),
+      getApprovalContext:async()=>this.approvalContext(),
       tools:{
         execute:async(input)=>this.executeTool(input),
         readImage:async(artifactId)=>this.readImage(artifactId),
@@ -65,10 +67,31 @@ export class BotDO extends DurableObject<Env> {
   private configure(request:Request):void {
     const raw=request.headers.get("x-botspace-config");
     if(!raw) throw new ApiError(403,"internal_only","Missing internal configuration.");
-    const incoming=JSON.parse(decodeURIComponent(raw)) as Bot;
+    this.acceptConfig(JSON.parse(decodeURIComponent(raw)) as Bot);
+  }
+  private async currentBot():Promise<Bot> {
+    const id=this.bot().id;
+    try {
+      const registry=this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName("owner"));
+      const response=await registry.fetch(`https://workspace/${id}`);
+      if(!response.ok) throw new Error("Bot configuration unavailable");
+      const {bot}=await response.json<{bot:Bot}>();
+      this.acceptConfig(bot);
+      return this.bot();
+    } catch {
+      throw new ApiError(503,"bot_policy_unavailable","Current bot settings could not be checked. No new computer action was authorized.");
+    }
+  }
+  private acceptConfig(incoming:Bot):void {
     if(!UUID.test(incoming.id)) throw new ApiError(400,"invalid_bot","Invalid bot identity.");
     const current=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM config WHERE id=1").toArray()[0];
-    if(current && JSON.parse(current.data).id!==incoming.id) throw new ApiError(403,"bot_mismatch","Bot identity mismatch.");
+    if(current) {
+      const previous=JSON.parse(current.data) as Bot;
+      if(previous.id!==incoming.id) throw new ApiError(403,"bot_mismatch","Bot identity mismatch.");
+      // An older in-flight request must not undo a newer permission/config edit.
+      // WorkspaceDO assigns a strictly increasing updatedAt to each accepted patch.
+      if(incoming.updatedAt<previous.updatedAt) return;
+    }
     this.ctx.storage.sql.exec("INSERT INTO config (id,data) VALUES (1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",JSON.stringify(incoming));
   }
   private getRunRow(id:string):RunRow {
@@ -126,6 +149,22 @@ export class BotDO extends DurableObject<Env> {
     if(!error) delete updated.error;
     this.saveRun(updated);
     this.emit("run.updated",{run:updated},runId);
+  }
+  private approvalContext():RuntimeApprovalContext {
+    const now=timestamp();
+    // Project only host-owned metadata. Commands, text, results and credentials
+    // must never enter this generation context through the approval journal.
+    type SummaryRow={id:string;status:RuntimeApprovalSummary["status"];actionType:RuntimeApprovalSummary["actionType"];expiresAt:string};
+    const active=this.ctx.storage.sql.exec<SummaryRow>(
+      "SELECT id,json_extract(data,'$.status') AS status,json_extract(data,'$.action.type') AS actionType,json_extract(data,'$.expiresAt') AS expiresAt FROM approvals WHERE json_extract(data,'$.status')='executing' OR (json_extract(data,'$.status')='pending' AND json_extract(data,'$.expiresAt')>?) ORDER BY rowid DESC",
+      now,
+    ).toArray();
+    const recent=this.ctx.storage.sql.exec<SummaryRow>(
+      "SELECT id,json_extract(data,'$.status') AS status,json_extract(data,'$.action.type') AS actionType,json_extract(data,'$.expiresAt') AS expiresAt FROM approvals WHERE json_extract(data,'$.status')!='executing' AND (json_extract(data,'$.status')!='pending' OR json_extract(data,'$.expiresAt')<=?) ORDER BY rowid DESC LIMIT 20",
+      now,
+    ).toArray().map((approval):RuntimeApprovalSummary=>({...approval,status:approval.status==="pending"?"expired":approval.status}));
+    // Expiration is a view here; enforcement and execution remain in the host.
+    return {active,recent};
   }
   private hasPendingApproval(runId:string):boolean {
     return this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM approvals").toArray().some(row=>{
@@ -254,25 +293,36 @@ export class BotDO extends DurableObject<Env> {
     return this.recovering;
   }
 
-  private async executeTool(input:{operationId:string;runOperationId:string;action:ComputerAction;signal?:AbortSignal}):Promise<ComputerResult|{status:"pending_approval";approvalId:string;message:string}> {
+  private existingToolDecision(operationId:string,hash:string):RuntimeToolResult|undefined {
+    const existing=this.ctx.storage.sql.exec<{fingerprint:string;data:string}>("SELECT fingerprint,data FROM approvals WHERE operation_id=?",operationId).toArray()[0];
+    if(existing) {
+      if(existing.fingerprint!==hash) throw new ApiError(409,"idempotency_conflict","Tool operation arguments changed.");
+      const approval=JSON.parse(existing.data) as Approval;
+      if(approval.result) return approval.result;
+      if(approval.status==="denied") return {operationId:operationId,status:"failed",error:"User denied this action."};
+      return {status:"pending_approval",approvalId:approval.id,message:"Waiting for the user to approve the stored action. Stop and wait."};
+    }
+    return undefined;
+  }
+  private async executeTool(input:{operationId:string;runOperationId:string;action:ComputerAction;signal?:AbortSignal}):Promise<RuntimeToolResult> {
     const row=this.findRun(input.runOperationId);
     if(!row) throw new ApiError(409,"run_not_found","Tool has no active run.");
     const run=JSON.parse(row.data) as Run;
     if(terminal.has(run.status) || input.signal?.aborted) return {operationId:input.operationId,status:"interrupted",error:"Run is no longer active."};
     const action=parseAction(input.action);
-    if(automatic.has(action.type)) {
+    const hash=await fingerprint(action);
+    const existing=this.existingToolDecision(input.operationId,hash);
+    if(existing) return existing;
+    const bot=await this.currentBot();
+    if(terminal.has(this.getRun(run.id).status) || input.signal?.aborted) return {operationId:input.operationId,status:"interrupted",error:"Run is no longer active."};
+    // Another invocation may have persisted this exact decision while the
+    // registry read was pending. Recheck before dispatching under fresh policy.
+    const concurrentDecision=this.existingToolDecision(input.operationId,hash);
+    if(concurrentDecision) return concurrentDecision;
+    if(automatic.has(action.type) || bot.computerApprovalMode==="automatic") {
       const result=await this.computer.exec(run.botId,input.operationId,action);
       this.emit("tool.completed",{operationId:input.operationId,actionType:action.type,result},run.id,`tool:${input.operationId}`);
       return result;
-    }
-    const hash=await fingerprint(action);
-    const existing=this.ctx.storage.sql.exec<{fingerprint:string;data:string}>("SELECT fingerprint,data FROM approvals WHERE operation_id=?",input.operationId).toArray()[0];
-    if(existing) {
-      if(existing.fingerprint!==hash) throw new ApiError(409,"idempotency_conflict","Tool operation arguments changed.");
-      const approval=JSON.parse(existing.data) as Approval;
-      if(approval.result) return approval.result;
-      if(approval.status==="denied") return {operationId:input.operationId,status:"failed",error:"User denied this action."};
-      return {status:"pending_approval",approvalId:approval.id,message:"Waiting for the user to approve the stored action. Stop and wait."};
     }
     const now=Date.now();
     const approval:Approval={id:crypto.randomUUID(),botId:run.botId,runId:run.id,operationId:input.operationId,action,status:"pending",createdAt:new Date(now).toISOString(),expiresAt:new Date(now+(gui.has(action.type)?5*60*1000:24*60*60*1000)).toISOString()};
