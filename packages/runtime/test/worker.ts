@@ -10,6 +10,7 @@ export class HarnessProbe extends DurableObject {
   constructor(ctx: DurableObjectState, env: object) {
     super(ctx, env);
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS calls(id INTEGER PRIMARY KEY AUTOINCREMENT, input TEXT)');
+    ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS tool_calls(id INTEGER PRIMARY KEY AUTOINCREMENT, input TEXT)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS projected(id INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY,value TEXT)');
     this.runtime = createPiRuntime({
@@ -37,7 +38,12 @@ export class HarnessProbe extends DurableObject {
       } } as unknown as Ai,
       getBot: async () => ({ name: 'Ada', instructions: 'Your private instruction is amber-lantern.', model: ctx.storage.sql.exec<{ value: string }>('SELECT value FROM config WHERE key=?', 'model').toArray()[0]?.value ?? CF_MODEL }),
       tools: {
-        execute: async ({ operationId, action }) => action.type === 'readFile' ? { operationId, status: 'completed', output: 'test file' } : action.type === 'screenshot' ? { operationId, status: 'completed', artifactId: 'test.png' } : { status: 'pending_approval', approvalId: 'approval-fixture' },
+        execute: async ({ operationId, runOperationId, action }) => {
+          // Enforce the real computer boundary, even though execution is a fixture.
+          if (operationId.length > 160 || /[^A-Za-z0-9:_.-]/.test(operationId)) throw new Error('Invalid computer operation ID');
+          ctx.storage.sql.exec('INSERT INTO tool_calls(input) VALUES(?)', JSON.stringify({ operationId, runOperationId, action }));
+          return action.type === 'readFile' ? { operationId, status: 'completed', output: 'test file' } : action.type === 'screenshot' ? { operationId, status: 'completed', artifactId: 'test.png' } : { status: 'pending_approval', approvalId: 'approval-fixture' };
+        },
         readImage: async () => ({ data: 'aW1hZ2U=', mimeType: 'image/png' }),
       },
       onEvent: event => { ctx.storage.sql.exec('INSERT INTO projected(event) VALUES(?)', JSON.stringify(event)); },
@@ -54,6 +60,7 @@ export class HarnessProbe extends DurableObject {
     if (path === '/inspect') return Response.json({
       messages: await this.runtime.messages(),
       calls: ctxRows(this.ctx.storage, 'SELECT input FROM calls'),
+      toolCalls: ctxRows(this.ctx.storage, 'SELECT input FROM tool_calls'),
       events: ctxRows(this.ctx.storage, 'SELECT event FROM projected'),
     });
     return new Response('Not found', { status: 404 });

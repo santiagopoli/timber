@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { EntryRecord, ToolExecutionApi } from '@earendil-works/pi-durable';
 import { classifyFailure, normalizeEntries, textContent } from '../src/normalize.js';
-import { computerTools, executeComputerTool, type ToolBridge } from '../src/tools.js';
+import { computerToolOperationId, computerTools, executeComputerTool, type ToolBridge } from '../src/tools.js';
 import { chatgptModel, chatgptPayload, createChatGPTProvider } from '../src/chatgpt.js';
 import { createModels } from '@earendil-works/pi-ai/models';
 
@@ -14,6 +14,37 @@ function bridge(): ToolBridge {
     tools: { execute: vi.fn(async ({ operationId }) => ({ operationId, status: 'completed' as const })) },
   };
 }
+
+describe('computer tool operation identity', () => {
+  it('preserves already-valid legacy identities, including the 160-character boundary', async () => {
+    for (const callId of ['call-42', 'a:b.c_d-9', 'a'.repeat(160 - 'pi-tool:17:'.length)]) {
+      expect(await computerToolOperationId('17', callId)).toBe(`pi-tool:17:${callId}`);
+    }
+  });
+  it.each([
+    'call_SyntheticCompositeAb12|fc_0123456789abcdef0123456789abcdef0123456789abcdef01234567',
+    'call/with/slashes', 'call_漢字_ñ', 'a'.repeat(200), 'call-with-final-newline\n',
+  ])('maps an opaque call to a stable bounded identity: %s', async callId => {
+    const result = await computerToolOperationId('12', callId);
+    expect(result).toMatch(/^pi-tool-sha256:[a-f0-9]{64}$/);
+    expect(result).toMatch(/^[A-Za-z0-9:_.-]{1,160}$/);
+    expect(await computerToolOperationId('12', callId)).toBe(result);
+  });
+  it('keeps delimiter variants, tuple boundaries and oversized suffixes distinct', async () => {
+    const inputs = [
+      ['17', 'a/b'], ['17', 'a|b'], ['17', 'a_b'],
+      ['17:a', 'b/c'], ['17', 'a:b/c'],
+      ['17', 'a'.repeat(200) + 'b'], ['17', 'a'.repeat(200) + 'c'],
+      ['17', 'call_漢字'], ['18', 'call_漢字'],
+    ];
+    const results = await Promise.all(inputs.map(([taskId, callId]) => computerToolOperationId(taskId!, callId!)));
+    expect(new Set(results).size).toBe(inputs.length);
+    const hash = await computerToolOperationId('17', 'a/b');
+    const legacy = await computerToolOperationId('sha256', hash.split(':')[1]!);
+    expect(legacy).toBe(`pi-tool:sha256:${hash.split(':')[1]}`);
+    expect(legacy).not.toBe(hash);
+  });
+});
 
 describe('runtime computer bridge', () => {
   it('stops the native run on pending approval without executing a second operation', async () => {
@@ -31,6 +62,19 @@ describe('runtime computer bridge', () => {
     await executeComputerTool(host, { type: 'readFile', path: '/workspace/a' }, api, context);
     const calls = vi.mocked(host.tools.execute).mock.calls;
     expect(calls[0]?.[0].operationId).toBe(calls[1]?.[0].operationId);
+  });
+  it('uses the same bounded composite identity for the tool budget and replayed dispatch', async () => {
+    const host = bridge();
+    const compositeApi = { ...api, taskId: '12', callId: 'call_SyntheticCompositeAb12|fc_0123456789abcdef0123456789abcdef0123456789abcdef01234567' } as unknown as ToolExecutionApi;
+    const action = { type: 'readFile' as const, path: '/workspace/a' };
+    await executeComputerTool(host, action, compositeApi, context);
+    await executeComputerTool(host, action, compositeApi, context);
+    const operationId = await computerToolOperationId('12', compositeApi.callId);
+    expect(host.consume).toHaveBeenNthCalledWith(1, 'user-operation', 'tool', operationId);
+    expect(host.consume).toHaveBeenNthCalledWith(2, 'user-operation', 'tool', operationId);
+    for (const [input] of vi.mocked(host.tools.execute).mock.calls) {
+      expect(input).toEqual({ operationId, runOperationId: 'user-operation', action, signal: context.abortSignal });
+    }
   });
   it('refuses dispatch after the durable tool budget is exhausted', async () => {
     const host = bridge();

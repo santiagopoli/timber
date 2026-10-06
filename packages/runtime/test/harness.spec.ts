@@ -100,9 +100,14 @@ it('replays namespaced calls, full history and screenshot pixels through native 
 it('pauses a namespaced ChatGPT exec for approval and resumes with a new durable input', async () => {
   await request('/submit', { text: 'request-exec', operationId: 'approval-chatgpt', chatgpt: true });
   await request('/wait?id=approval-chatgpt');
-  const paused = await (await request('/inspect')).json<{ calls: unknown[]; messages: { text: string }[] }>();
+  const paused = await (await request('/inspect')).json<{ calls: unknown[]; messages: { text: string }[]; toolCalls: { input: string }[]; events: { event: string }[] }>();
   expect(paused.calls).toHaveLength(1);
   expect(paused.messages.some(message => message.text.includes('pending_approval'))).toBe(true);
+  expect(paused.toolCalls).toHaveLength(1);
+  const invocation = JSON.parse(paused.toolCalls[0]!.input);
+  expect(invocation).toMatchObject({ runOperationId: 'approval-chatgpt', action: { type: 'exec', command: 'echo fixture' } });
+  expect(invocation.operationId).toMatch(/^pi-tool-sha256:[a-f0-9]{64}$/);
+  expect(paused.events.map(row => JSON.parse(row.event))).toContainEqual(expect.objectContaining({ type: 'tool.started', data: { toolCallId: 'call_fixture_1|fc_fixture_1', toolName: 'exec' } }));
   await request('/submit', { text: 'The approved action completed: fixture', operationId: 'approval:decision-1' });
   expect(await (await request('/wait?id=approval:decision-1')).json()).toMatchObject({ status: 'done' });
   const resumed = await (await request('/inspect')).json<{ calls: unknown[] }>();

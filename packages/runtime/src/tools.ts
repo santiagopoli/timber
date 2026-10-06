@@ -13,6 +13,17 @@ export interface ToolBridge {
   pause?(runOperationId: string, approval: PendingApproval): void;
 }
 
+/** Keep admitted journal identities stable; opaque provider IDs need a bounded wire identity. */
+export async function computerToolOperationId(taskId: string, callId: string): Promise<string> {
+  const legacyId = `pi-tool:${taskId}:${callId}`;
+  if (legacyId.length <= 160 && !/[^A-Za-z0-9:_.-]/.test(legacyId)) return legacyId;
+  // JSON preserves tuple boundaries and Unicode code units without lossy sanitization.
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify([taskId, callId])));
+  const hex = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+  // Separate namespace: no already-valid pi-tool: identity can equal a hash identity.
+  return `pi-tool-sha256:${hex}`;
+}
+
 export async function executeComputerTool(
   bridge: ToolBridge,
   action: ComputerAction,
@@ -23,7 +34,7 @@ export async function executeComputerTool(
     return { content: [{ type: 'text', text: 'The configured model does not accept screenshot images. Select a vision-capable model to use visual computer tools.' }], isError: true };
   }
   const runOperationId = await bridge.operationForCall(api, context);
-  const operationId = `pi-tool:${String(api.taskId)}:${api.callId}`;
+  const operationId = await computerToolOperationId(String(api.taskId), api.callId);
   const paused = bridge.paused?.(runOperationId);
   if (paused) return { content: [{ type: 'text', text: JSON.stringify(paused) }], control: { terminate: true } };
   try {

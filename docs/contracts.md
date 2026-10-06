@@ -80,6 +80,14 @@ screenshot, click, type, key, scroll, navigate, checkpoint. Cloud provider and
 ComputerDO concrete implementation live under packages/computer. Container HTTP
 server and image live in infra/computer. Agree export names with API agent.
 
+Computer operation IDs accept 1–160 ASCII letters, digits, dots, colons, hyphens
+or underscores. Runtime adapters must map opaque model call IDs into this space
+before requesting approval or invoking a computer. Pi preserves existing valid
+`pi-tool:<taskId>:<callId>` IDs for journal compatibility; incompatible IDs use
+a deterministic SHA-256 mapping in a separate namespace. Never strip characters
+or truncate IDs, which could merge distinct operations. Stored interrupted
+approvals are not rewritten or replayed by this mapping change.
+
 Computer actions from the model pass through host policy. Shell execution requires
 approval by default; read/list/screenshot can run without approval. Browser navigation,
 click/type/key/scroll also require explicit approval in initial secure MVP; the console
