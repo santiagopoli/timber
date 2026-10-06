@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Approval, Bot, BotEvent, ComputerAction, ComputerResult, ComputerStatus, Message, Run, RunPage, RunStatus } from "@botspace/contracts";
-import { createCloudComputerProvider, touchCloudComputer, suspendCloudComputer, ComputerProviderError } from "@botspace/computer";
+import { createCloudComputerProvider, touchCloudComputer, suspendCloudComputer, deleteCloudComputer, ComputerProviderError } from "@botspace/computer";
 import { createPiRuntime, type AgentRuntime, type RuntimeApprovalContext, type RuntimeApprovalSummary, type RuntimeToolResult } from "@botspace/runtime";
 import type { Env } from "./env";
 import { ApiError, errorResponse, json } from "./errors";
@@ -21,7 +21,7 @@ const admissionExhausted="Message saved, but delivery to the agent could not be 
 const maxAdmissionAttempts=5;
 
 export class BotDO extends DurableObject<Env> {
-  private runtime:AgentRuntime;
+  private runtime!:AgentRuntime;
   private computer:ReturnType<typeof createCloudComputerProvider>;
   private admitting=new Map<string,Promise<void>>();
   private observing=new Set<string>();
@@ -30,9 +30,18 @@ export class BotDO extends DurableObject<Env> {
   private streams=0;
   private lastComputerTouch=0;
   private suspending?:Promise<ComputerStatus>;
+  private deleted=false;
+  private deleting?:Promise<void>;
+  private closeStreams=new Set<()=>void>();
 
   constructor(ctx:DurableObjectState,env:Env) {
     super(ctx,env);
+    ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS bot_deletion (id INTEGER PRIMARY KEY CHECK(id=1),bot_id TEXT NOT NULL)");
+    this.deleted=ctx.storage.sql.exec<{bot_id:string}>("SELECT bot_id FROM bot_deletion WHERE id=1").toArray().length>0;
+    this.computer=createCloudComputerProvider(env.COMPUTER);
+    // A deleted object's identity is never reused. Do not reopen Pi or recreate
+    // conversation state when a delayed request/alarm wakes its tombstone.
+    if(this.deleted) return;
     ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS config (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, fingerprint TEXT NOT NULL, native_operation_id TEXT NOT NULL, data TEXT NOT NULL);
@@ -44,7 +53,6 @@ export class BotDO extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS approvals_status_expiry_idx ON approvals (json_extract(data,'$.status'),json_extract(data,'$.expiresAt'));
       CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, source_key TEXT UNIQUE, data TEXT NOT NULL);
     `);
-    this.computer=createCloudComputerProvider(env.COMPUTER);
     this.runtime=createPiRuntime({
       owner:this,
       storage:ctx.storage,
@@ -66,7 +74,38 @@ export class BotDO extends DurableObject<Env> {
     });
   }
 
+  private active():void {if(this.deleted) throw new ApiError(404,"not_found","Bot not found.");}
+  private async deleteBot(id:string):Promise<void> {
+    if(this.deleting) return this.deleting;
+    const previous=this.ctx.storage.sql.exec<{bot_id:string}>("SELECT bot_id FROM bot_deletion WHERE id=1").toArray()[0];
+    if(previous && previous.bot_id!==id) throw new ApiError(403,"bot_mismatch","Bot identity mismatch.");
+    if(!this.ctx.id.equals(this.env.BOT.idFromName(`owner:${id}`))) throw new ApiError(403,"bot_mismatch","Bot identity mismatch.");
+    this.deleted=true;
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO bot_deletion(id,bot_id) VALUES(1,?)",id);
+    for(const close of this.closeStreams) close();
+    const work=(async()=>{
+      // Stop the computer alongside Pi: a native task may be awaiting its tool
+      // response. Neither side may acknowledge cleanup before it is quiescent.
+      await Promise.all([this.runtime?.destroy(),deleteCloudComputer(this.env.COMPUTER,id)]);
+      await Promise.allSettled([...this.admitting.values(),...this.finishingApprovals.values(),...(this.recovering?[this.recovering]:[]),...(this.suspending?[this.suspending]:[])]);
+      const tables=this.ctx.storage.sql.exec<{name:string}>("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name!='bot_deletion'").toArray();
+      this.ctx.storage.transactionSync(()=>{
+        this.ctx.storage.sql.exec("PRAGMA defer_foreign_keys=ON");
+        for(const table of tables) this.ctx.storage.sql.exec(`DELETE FROM "${table.name.replace(/"/g,'""')}"`);
+      });
+      while(true) {
+        const keys=[...(await this.ctx.storage.list({limit:128})).keys()];
+        if(!keys.length) break;
+        await this.ctx.storage.delete(keys);
+      }
+      await this.ctx.storage.deleteAlarm();
+    })().finally(()=>{this.deleting=undefined;});
+    this.deleting=work;
+    return work;
+  }
+
   private bot():Bot {
+    this.active();
     const row=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM config WHERE id=1").toArray()[0];
     if(!row) throw new ApiError(409,"bot_unconfigured","Bot configuration is not available.");
     return JSON.parse(row.data) as Bot;
@@ -90,6 +129,7 @@ export class BotDO extends DurableObject<Env> {
     }
   }
   private acceptConfig(incoming:Bot):void {
+    this.active();
     if(!UUID.test(incoming.id)) throw new ApiError(400,"invalid_bot","Invalid bot identity.");
     const current=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM config WHERE id=1").toArray()[0];
     if(current) {
@@ -138,18 +178,21 @@ export class BotDO extends DurableObject<Env> {
   private findRun(nativeOperationId:string):RunRow|undefined {
     return this.ctx.storage.sql.exec<RunRow>("SELECT runs.* FROM runs JOIN submissions ON submissions.run_id=runs.id WHERE submissions.operation_id=?",nativeOperationId).toArray()[0];
   }
-  private saveRun(run:Run):void {this.ctx.storage.sql.exec("UPDATE runs SET data=? WHERE id=?",JSON.stringify(run),run.id);}
+  private saveRun(run:Run):void {if(!this.deleted) this.ctx.storage.sql.exec("UPDATE runs SET data=? WHERE id=?",JSON.stringify(run),run.id);}
   private emit(type:string,data:Record<string,unknown>,runId?:string,sourceKey?:string):void {
+    if(this.deleted) return;
     const event:Omit<BotEvent,"id">={botId:this.bot().id,type,data,createdAt:timestamp(),...(runId?{runId}:{})};
     this.ctx.storage.sql.exec("INSERT OR IGNORE INTO events (source_key,data) VALUES (?,?)",sourceKey??null,JSON.stringify(event));
   }
   private addMessage(message:Message,sourceKey:string):void {
+    if(this.deleted) return;
     const existed=this.ctx.storage.sql.exec<{id:string}>("SELECT id FROM messages WHERE source_key=?",sourceKey).toArray()[0];
     if(existed) return;
     this.ctx.storage.sql.exec("INSERT INTO messages (id,source_key,data) VALUES (?,?,?)",message.id,sourceKey,JSON.stringify(message));
     this.emit("message.created",{message},message.runId,`message:${sourceKey}`);
   }
   private updateStatus(runId:string,status:RunStatus,error?:string):void {
+    if(this.deleted) return;
     const run=this.getRun(runId);
     if(run.status===status && run.error===error) return;
     const updated:Run={...run,status,updatedAt:timestamp(),...(error?{error}:{})};
@@ -181,7 +224,16 @@ export class BotDO extends DurableObject<Env> {
   }
 
   private async project(event:RuntimeProjection):Promise<void> {
+    if(this.deleted) return;
     const row=event.operationId?this.findRun(event.operationId):undefined;
+    // Native snapshots replay committed progress after a restart without a run
+    // attribution. Stable native IDs deduplicate both live and snapshot paths.
+    const progress=event.data;
+    if(event.type==="message" && (row || !event.operationId) && progress.role==="assistant" && progress.kind==="progress" && typeof progress.id==="string" && typeof progress.text==="string" && progress.text.trim()) {
+      const sourceRun=row?JSON.parse(row.data) as Run:undefined;
+      const config=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM config WHERE id=1").toArray()[0];
+      if(config) this.addMessage({id:crypto.randomUUID(),botId:(JSON.parse(config.data) as Bot).id,...(sourceRun?{runId:sourceRun.id}:{}),role:"assistant",kind:"progress",text:progress.text,createdAt:typeof progress.createdAt==="string"?progress.createdAt:timestamp()},`native:${progress.id}`);
+    }
     if(!row) return;
     const run=JSON.parse(row.data) as Run;
     // Do not expose raw provider error strings, which may contain request details.
@@ -198,7 +250,7 @@ export class BotDO extends DurableObject<Env> {
       this.ctx.waitUntil(touchCloudComputer(this.env.COMPUTER,run.botId).catch(()=>{}));
     }
     if(event.type==="run.started" && !this.hasPendingApproval(run.id)) this.updateStatus(run.id,"running");
-    if(event.type==="run.completed") await this.completeOperation(event.operationId!,"done",typeof event.data.text==="string"?event.data.text:undefined);
+    if(event.type==="run.completed") await this.completeOperation(event.operationId!,"done",typeof event.data.text==="string"?event.data.text:undefined,undefined,event.data.kind==="progress"?"progress":"final");
     if(event.type==="run.failed") {
       if(this.hasPendingApproval(run.id)) this.updateStatus(run.id,"waiting_approval");
       else {
@@ -214,11 +266,12 @@ export class BotDO extends DurableObject<Env> {
       error:publicMessage?.slice(0,800) ?? (reason==="model_error"?"The model could not complete this request.":failed?"The agent encountered an execution error.":"The agent run was interrupted before a final answer."),
     };
   }
-  private async completeOperation(nativeOperationId:string,status:string,text?:string,reason?:string):Promise<void> {
+  private async completeOperation(nativeOperationId:string,status:string,text?:string,reason?:string,kind?:Message["kind"]):Promise<void> {
+    if(this.deleted) return;
     const row=this.findRun(nativeOperationId);
     if(!row) return;
     const run=JSON.parse(row.data) as Run;
-    if(text) this.addMessage({id:crypto.randomUUID(),botId:run.botId,runId:run.id,role:"assistant",text,createdAt:timestamp()},`answer:${nativeOperationId}`);
+    if(text && kind!=="progress") this.addMessage({id:crypto.randomUUID(),botId:run.botId,runId:run.id,role:"assistant",kind:"final",text,createdAt:timestamp()},`answer:${nativeOperationId}`);
     if(row.native_operation_id!==nativeOperationId || terminal.has(run.status)) return;
     if(this.hasPendingApproval(run.id)) {this.updateStatus(run.id,"waiting_approval");return;}
     // The provider checkpoints file mutations before returning their results.
@@ -229,6 +282,7 @@ export class BotDO extends DurableObject<Env> {
 
   private async createRun(input:{text:string;operationId:string}):Promise<Run> {
     const hash=await fingerprint({text:input.text});
+    this.active();
     if(input.operationId.startsWith("approval:") || input.operationId.startsWith("delegate:")) throw new ApiError(400,"reserved_operation_id","This operationId prefix is reserved.");
     const existing=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs WHERE operation_id=?",input.operationId).toArray()[0];
     if(existing) {
@@ -270,6 +324,7 @@ export class BotDO extends DurableObject<Env> {
     return operation;
   }
   private async admitOnce(nativeOperationId:string):Promise<void> {
+    if(this.deleted) return;
     const submission=this.ctx.storage.sql.exec<Submission>("SELECT * FROM submissions WHERE operation_id=?",nativeOperationId).toArray()[0];
     if(!submission) return;
     const row=this.getRunRow(submission.run_id),run=JSON.parse(row.data) as Run;
@@ -279,6 +334,7 @@ export class BotDO extends DurableObject<Env> {
     try {
       if(!submission.admitted) {
         await this.runtime.submit(submission.text,{operationId:nativeOperationId});
+        if(this.deleted) return;
         this.ctx.storage.sql.exec("UPDATE submissions SET admitted=1 WHERE operation_id=?",nativeOperationId);
         this.ctx.storage.sql.exec("DELETE FROM admission_retries WHERE operation_id=?",nativeOperationId);
         const current=this.getRunRow(run.id),latest=JSON.parse(current.data) as Run;
@@ -297,7 +353,7 @@ export class BotDO extends DurableObject<Env> {
       if(known && known.status!=="missing") {
         this.ctx.storage.sql.exec("UPDATE submissions SET admitted=1 WHERE operation_id=?",nativeOperationId);
         this.ctx.storage.sql.exec("DELETE FROM admission_retries WHERE operation_id=?",nativeOperationId);
-        if(known.status==="done" || known.status==="unanswered") await this.completeOperation(nativeOperationId,known.status,known.text,known.reason);
+        if(known.status==="done" || known.status==="unanswered") await this.completeOperation(nativeOperationId,known.status,known.text,known.reason,known.kind);
         else {this.updateStatus(run.id,known.status==="running"?"running":"queued");this.observe(nativeOperationId);}
         return;
       }
@@ -308,21 +364,24 @@ export class BotDO extends DurableObject<Env> {
     }
   }
   private canAdmit(nativeOperationId:string,runId:string):boolean {
+    if(this.deleted) return false;
     const current=this.getRunRow(runId),run=JSON.parse(current.data) as Run;
     return current.native_operation_id===nativeOperationId && !terminal.has(run.status) && run.status!=="waiting_approval";
   }
   private observe(nativeOperationId:string):void {
+    if(this.deleted) return;
     if(this.observing.has(nativeOperationId)) return;
     this.observing.add(nativeOperationId);
     this.ctx.waitUntil((async()=>{
       try {
         const result=await this.runtime.wait(nativeOperationId);
-        await this.completeOperation(nativeOperationId,result.status,result.text,result.reason);
-      } catch {const row=this.findRun(nativeOperationId);if(row?.native_operation_id===nativeOperationId) {const run=JSON.parse(row.data) as Run;if(!terminal.has(run.status) && run.status!=="waiting_approval") this.updateStatus(run.id,"interrupted","The agent run was interrupted.");}}
+        await this.completeOperation(nativeOperationId,result.status,result.text,result.reason,result.kind);
+      } catch {if(!this.deleted) {const row=this.findRun(nativeOperationId);if(row?.native_operation_id===nativeOperationId) {const run=JSON.parse(row.data) as Run;if(!terminal.has(run.status) && run.status!=="waiting_approval") this.updateStatus(run.id,"interrupted","The agent run was interrupted.");}}}
       finally {this.observing.delete(nativeOperationId);}
     })());
   }
   private recover():Promise<void> {
+    if(this.deleted) return Promise.resolve();
     if(this.recovering) return this.recovering;
     this.recovering=(async()=>{
       const rows=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs").toArray();
@@ -348,16 +407,19 @@ export class BotDO extends DurableObject<Env> {
     }
     return undefined;
   }
-  private async executeTool(input:{operationId:string;runOperationId:string;action:ComputerAction;signal?:AbortSignal}):Promise<RuntimeToolResult> {
+  private async executeTool(input:{operationId:string;runOperationId:string;toolCallId?:string;action:ComputerAction;signal?:AbortSignal}):Promise<RuntimeToolResult> {
+    this.active();
     const row=this.findRun(input.runOperationId);
     if(!row) throw new ApiError(409,"run_not_found","Tool has no active run.");
     const run=JSON.parse(row.data) as Run;
     if(terminal.has(run.status) || input.signal?.aborted) return {operationId:input.operationId,status:"interrupted",error:"Run is no longer active."};
     const action=parseAction(input.action);
     const hash=await fingerprint(action);
+    this.active();
     const existing=this.existingToolDecision(input.operationId,hash);
     if(existing) return existing;
     const bot=await this.currentBot();
+    this.active();
     if(terminal.has(this.getRun(run.id).status) || input.signal?.aborted) return {operationId:input.operationId,status:"interrupted",error:"Run is no longer active."};
     // Another invocation may have persisted this exact decision while the
     // registry read was pending. Recheck before dispatching under fresh policy.
@@ -365,11 +427,11 @@ export class BotDO extends DurableObject<Env> {
     if(concurrentDecision) return concurrentDecision;
     if(automatic.has(action.type) || bot.computerApprovalMode==="automatic") {
       const result=await this.computer.exec(run.botId,input.operationId,action);
-      this.emit("tool.completed",{operationId:input.operationId,actionType:action.type,result},run.id,`tool:${input.operationId}`);
+      this.emit("tool.completed",{operationId:input.operationId,...(input.toolCallId?{toolCallId:input.toolCallId}:{}),actionType:action.type,result},run.id,`tool:${input.operationId}`);
       return result;
     }
     const now=Date.now();
-    const approval:Approval={id:crypto.randomUUID(),botId:run.botId,runId:run.id,operationId:input.operationId,action,status:"pending",createdAt:new Date(now).toISOString(),expiresAt:new Date(now+(gui.has(action.type)?5*60*1000:24*60*60*1000)).toISOString()};
+    const approval:Approval={id:crypto.randomUUID(),botId:run.botId,runId:run.id,operationId:input.operationId,...(input.toolCallId?{toolCallId:input.toolCallId}:{}),action,status:"pending",createdAt:new Date(now).toISOString(),expiresAt:new Date(now+(gui.has(action.type)?5*60*1000:24*60*60*1000)).toISOString()};
     this.ctx.storage.sql.exec("INSERT INTO approvals (id,operation_id,fingerprint,data) VALUES (?,?,?,?)",approval.id,input.operationId,hash,JSON.stringify(approval));
     this.updateStatus(run.id,"waiting_approval");
     this.emit("approval.created",{approval},run.id,`approval:${approval.id}`);
@@ -384,8 +446,9 @@ export class BotDO extends DurableObject<Env> {
     for(let start=0;start<bytes.length;start+=8192) binary+=String.fromCharCode(...bytes.subarray(start,start+8192));
     return {data:btoa(binary),mimeType:stored.httpMetadata!.contentType!};
   }
-  private saveApproval(approval:Approval):void {this.ctx.storage.sql.exec("UPDATE approvals SET data=? WHERE id=?",JSON.stringify(approval),approval.id);}
+  private saveApproval(approval:Approval):void {if(!this.deleted) this.ctx.storage.sql.exec("UPDATE approvals SET data=? WHERE id=?",JSON.stringify(approval),approval.id);}
   private async decideApproval(id:string,decision:unknown):Promise<Approval> {
+    this.active();
     if(this.suspending) throw new ApiError(409,"computer_busy","The computer is being suspended. Retry after it stops.");
     if(decision!=="approve" && decision!=="deny") throw new ApiError(400,"invalid_request","decision must be approve or deny.");
     const row=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM approvals WHERE id=?",id).toArray()[0];
@@ -437,6 +500,7 @@ export class BotDO extends DurableObject<Env> {
     return work;
   }
   private async finishApprovalOnce(id:string):Promise<void> {
+    if(this.deleted) return;
     const row=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM approvals WHERE id=?",id).toArray()[0];
     if(!row) return;
     const approval=JSON.parse(row.data) as Approval;
@@ -446,10 +510,12 @@ export class BotDO extends DurableObject<Env> {
     let providerDiagnostic:string|undefined;
     try {result=await this.computer.exec(approval.botId,approval.operationId,approval.action);}
     catch(error) {
+      if(this.deleted) return;
       console.error("approval.failure",{code:error instanceof ComputerProviderError?error.code:"computer_unavailable",actionType:approval.action.type});
       if(error instanceof ComputerProviderError) providerDiagnostic=`${error.code}: ${error.publicMessage} The action outcome is unconfirmed. Do not retry automatically.`;
       result={operationId:approval.operationId,status:"interrupted",error:providerDiagnostic??"Could not establish whether the action completed. Do not retry automatically."};
     }
+    if(this.deleted) return;
     let continuation:string|undefined;
     this.ctx.storage.transactionSync(()=>{
       const currentRow=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM approvals WHERE id=?",id).toArray()[0];
@@ -457,7 +523,7 @@ export class BotDO extends DurableObject<Env> {
       const completed:Approval={...approval,result,status:result.status==="completed"?"completed":result.status==="interrupted"?"interrupted":"failed"};
       this.saveApproval(completed);
       this.emit("approval.updated",{approval:completed},approval.runId,`approval-result:${approval.id}`);
-      this.emit("tool.completed",{operationId:approval.operationId,actionType:approval.action.type,result},approval.runId,`tool:${approval.operationId}`);
+      this.emit("tool.completed",{operationId:approval.operationId,...(approval.toolCallId?{toolCallId:approval.toolCallId}:{}),actionType:approval.action.type,result},approval.runId,`tool:${approval.operationId}`);
       if(result.status==="interrupted") {
         if(!terminal.has(this.getRun(approval.runId).status)) this.updateStatus(approval.runId,"interrupted",providerDiagnostic??"An approved action was interrupted. Check its effects before retrying.");
       } else continuation=this.queueApprovalContinuation(completed);
@@ -467,6 +533,7 @@ export class BotDO extends DurableObject<Env> {
   /** Called in the same transaction as the decision/result, so a restart cannot
    * leave a finished approval without its durable continuation input. */
   private queueApprovalContinuation(approval:Approval):string|undefined {
+    if(this.deleted) return;
     const row=this.getRunRow(approval.runId),run=JSON.parse(row.data) as Run;
     if(terminal.has(run.status)) return;
     const nativeOperationId=`approval:${approval.id}`;
@@ -520,12 +587,14 @@ export class BotDO extends DurableObject<Env> {
     const cleanup=()=>{
       if(closed) return;
       closed=true;this.streams--;
+      this.closeStreams.delete(finish);
       if(timer) clearInterval(timer);if(deadline) clearTimeout(deadline);
       request.signal.removeEventListener("abort",finish);
     };
     const finish=()=>{if(closed) return;cleanup();try{controller.close();}catch{}};
     const pump=()=>{
       if(closed) return;
+      if(this.deleted) {finish();return;}
       if(controller.desiredSize!==null && controller.desiredSize<=0) return;
       const rows=this.ctx.storage.sql.exec<{id:number;data:string}>("SELECT id,data FROM events WHERE id>? ORDER BY id LIMIT 100",cursor).toArray();
       let chunk="";
@@ -535,6 +604,7 @@ export class BotDO extends DurableObject<Env> {
     const stream=new ReadableStream<Uint8Array>({
       start:c=>{
         controller=c;
+        this.closeStreams.add(finish);
         controller.enqueue(encoder.encode("retry: 1000\n: connected\n\n"));
         timer=setInterval(pump,500);
         deadline=setTimeout(finish,25_000);
@@ -549,9 +619,16 @@ export class BotDO extends DurableObject<Env> {
 
   async fetch(request:Request):Promise<Response> {
     try {
+      const url=new URL(request.url),path=url.pathname;
+      if(path==="/delete" && request.method==="POST") {
+        const id=request.headers.get("x-botspace-bot-id")??"";
+        if(!UUID.test(id)) throw new ApiError(403,"internal_only","Missing internal bot identity.");
+        await this.deleteBot(id);
+        return json({botId:id,deleted:true});
+      }
+      this.active();
       this.configure(request);
       this.ctx.waitUntil(this.recover());
-      const url=new URL(request.url),path=url.pathname;
       if(path==="/messages" && request.method==="GET") {
         const messages=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM messages ORDER BY rowid DESC LIMIT 500").toArray().reverse().map(row=>JSON.parse(row.data));
         return json({messages});
@@ -569,6 +646,7 @@ export class BotDO extends DurableObject<Env> {
       if(path==="/computer/actions" && request.method==="POST") {
         if(this.suspending) throw new ApiError(409,"computer_busy","The computer is being suspended. Retry after it stops.");
         const input=await body(request),action=parseAction(input.action),op=operationId(input.operationId);
+        this.active();
         if(!["readFile","listFiles","screenshot"].includes(action.type)) this.invalidatePendingGui();
         const result=await this.computer.exec(this.bot().id,op,action);
         this.emit("computer.action",{operationId:op,actionType:action.type,result},undefined,`direct:${op}`);

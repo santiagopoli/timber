@@ -48,7 +48,7 @@ export async function executeComputerTool(
   }
   const signal = context.abortSignal ?? new AbortController().signal;
   signal.throwIfAborted();
-  const result = await bridge.tools.execute({ operationId, runOperationId, action, signal });
+  const result = await bridge.tools.execute({ operationId, runOperationId, toolCallId: api.callId, action, signal });
   if (result.status === 'pending_approval') {
     bridge.pause?.(runOperationId, result);
     return {

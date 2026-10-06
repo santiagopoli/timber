@@ -6,6 +6,129 @@ let probeId: string;
 beforeEach(() => { probeId = crypto.randomUUID(); });
 const request = (path: string, input?: unknown) => exports.default.fetch(`https://test${path}`, { headers: { 'content-type': 'application/json', 'x-probe-id': probeId }, ...(input ? { method: 'POST', body: JSON.stringify(input) } : {}) });
 afterEach(async () => { await reset(); });
+it('retries a transient shutdown failure without reopening admission', async () => {
+  const stub = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE.getByName(probeId);
+  await request('/submit', { text: 'hello', operationId: 'before-deletion' });
+  await request('/wait?id=before-deletion');
+  await runInDurableObject(stub, async (instance, state) => {
+    const deleteAlarm = state.storage.deleteAlarm.bind(state.storage);
+    let fail = true;
+    state.storage.deleteAlarm = async () => {
+      if (fail) { fail = false; throw new Error('fixture transient alarm failure'); }
+      return deleteAlarm();
+    };
+    try {
+      await expect(instance.runtime.destroy()).rejects.toThrow('fixture transient alarm failure');
+      await expect(instance.runtime.submit('late', { operationId: 'after-deletion' })).rejects.toThrow('destroyed');
+      await instance.runtime.destroy();
+      expect(await state.storage.getAlarm()).toBeNull();
+    } finally { state.storage.deleteAlarm = deleteAlarm; }
+  });
+});
+it('keeps tool-calling commentary classified as progress when approval pauses a native run', async () => {
+  await request('/submit', { text: 'request-multistep-recovery', operationId: 'approval-commentary', chatgpt: true });
+  expect(await (await request('/wait?id=approval-commentary')).json()).toMatchObject({ status: 'done', text: 'Working on fixture round 1.', kind: 'progress' });
+  const state = await (await request('/inspect')).json<{ events: { event: string }[] }>();
+  expect(state.events.map(row => JSON.parse(row.event))).toContainEqual(expect.objectContaining({
+    type: 'run.completed', operationId: 'approval-commentary', data: { text: 'Working on fixture round 1.', kind: 'progress' },
+  }));
+});
+it('reports a reasoning-only final response as a failure without repeating completed tools', async () => {
+  await request('/host-context', { mode: 'automatic' });
+  await request('/submit', { text: 'request-exec empty-final-after-exec', operationId: 'empty-final', chatgpt: true });
+  expect(await (await request('/wait?id=empty-final')).json()).toMatchObject({ status: 'unanswered', reason: 'model_error' });
+  const state = await (await request('/inspect')).json<{ calls: unknown[]; toolCalls: unknown[]; messages: unknown[]; events: { event: string }[] }>();
+  expect(state.calls).toHaveLength(2);
+  expect(state.toolCalls).toHaveLength(1);
+  const events = state.events.map(row => JSON.parse(row.event));
+  expect(events).toContainEqual(expect.objectContaining({ type: 'run.failed', data: expect.objectContaining({ errorCode: 'model_empty_response' }) }));
+  expect(events.some(event => event.type === 'run.completed')).toBe(false);
+  expect(JSON.stringify({ messages: state.messages, events })).not.toContain('Private fixture reasoning');
+});
+it('continues multiple delayed tool rounds after a hard restart without another user message', async () => {
+  const namespace = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE;
+  let stub = namespace.getByName(probeId);
+  await request('/host-context', { mode: 'automatic' });
+  await runInDurableObject(stub, instance => {
+    instance.toolDelayMs = 600;
+    instance.holdInferenceAfterToolCount = 2;
+    instance.heldInference = new Promise(() => {});
+  });
+  await request('/submit', { text: 'request-multistep-recovery', operationId: 'multistep-recovery', chatgpt: true });
+  await expect.poll(() => runInDurableObject(stub, (_instance, state) =>
+    state.storage.sql.exec('SELECT id FROM calls').toArray().length,
+  ), { timeout: 5_000 }).toBe(2);
+  await runInDurableObject(stub, (_instance, state) => {
+    expect(state.storage.sql.exec('SELECT id FROM tool_calls').toArray()).toHaveLength(2);
+    expect(state.storage.sql.exec('SELECT event FROM projected').toArray().some(row => JSON.parse(row.event as string).type === 'run.completed')).toBe(false);
+  });
+  // The first two effects have settled. Lose only the subsequent inference attempt.
+  await abortAllDurableObjects();
+  stub = namespace.getByName(probeId);
+  await runInDurableObject(stub, (_instance, state) => {
+    state.storage.sql.exec("UPDATE cf_agents_jobs SET time=0 WHERE capability='pi-harness'");
+  });
+  await runDurableObjectAlarm(stub);
+  const result = await runInDurableObject(stub, instance => instance.runtime.wait('multistep-recovery'));
+  const finalAnswer = 'Completed both commands, opened the page, and checked the screenshot.';
+  expect(result).toMatchObject({ status: 'done', text: finalAnswer });
+  await runInDurableObject(stub, async (instance, state) => {
+    const tools = state.storage.sql.exec<{ input: string }>('SELECT input FROM tool_calls').toArray().map(row => JSON.parse(row.input));
+    expect(tools.map(tool => tool.action.type)).toEqual(['exec', 'exec', 'navigate', 'screenshot']);
+    expect(new Set(tools.map(tool => tool.operationId)).size).toBe(4);
+    const messages = await instance.runtime.messages();
+    expect(messages.filter(message => message.role === 'user')).toHaveLength(1);
+    expect(messages).toContainEqual(expect.objectContaining({ role: 'assistant', text: finalAnswer }));
+    expect(messages.filter(message => message.kind === 'progress')).toHaveLength(3);
+    expect(messages).toContainEqual(expect.objectContaining({ role: 'assistant', text: finalAnswer, kind: 'final' }));
+    const events = state.storage.sql.exec<{ event: string }>('SELECT event FROM projected').toArray().map(row => JSON.parse(row.event));
+    expect(events).toContainEqual(expect.objectContaining({ type: 'run.completed', operationId: 'multistep-recovery', data: { text: finalAnswer, kind: 'final' } }));
+    for (const tool of tools) expect(events).toContainEqual(expect.objectContaining({
+      type: 'tool.completed', operationId: 'multistep-recovery',
+      data: expect.objectContaining({ operationId: tool.operationId, toolCallId: tool.toolCallId, status: 'completed' }),
+    }));
+    const lastRequest = JSON.parse(state.storage.sql.exec<{ input: string }>('SELECT input FROM calls ORDER BY id DESC LIMIT 1').one().input);
+    expect(lastRequest.input.filter((item: { type: string }) => item.type === 'function_call_output')).toHaveLength(4);
+    expect(JSON.stringify(lastRequest.input)).toContain('data:image/png;base64,aW1hZ2U=');
+  });
+});
+it('permanently fences admission and alarms while deletion waits boundedly for an in-flight tool', async () => {
+  const stub = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE.getByName(probeId);
+  await request('/host-context', { mode: 'automatic' });
+  await runInDurableObject(stub, instance => {
+    // Simulate a dispatched computer RPC that cannot be retracted by aborting Pi.
+    instance.heldTool = new Promise(resolve => { instance.releaseHeldTool = resolve; });
+  });
+  try {
+    await request('/submit', { text: 'request-exec', operationId: 'deleting-active', chatgpt: true });
+    await expect.poll(() => runInDurableObject(stub, (_instance, state) =>
+      state.storage.sql.exec('SELECT id FROM tool_calls').toArray().length,
+    )).toBe(1);
+    await request('/submit', { text: 'This queued message must never run', operationId: 'deleting-queued' });
+    await runInDurableObject(stub, instance => instance.runtime.scheduleAdmissionRetry('deleting-unadmitted', 60_000));
+    await expect(runInDurableObject(stub, instance => instance.runtime.destroy())).rejects.toThrow('shutdown is still pending');
+    const projectedBefore = await runInDurableObject(stub, async (instance, state) => {
+      expect(await state.storage.getAlarm()).toBeNull();
+      await expect(instance.runtime.submit('late input', { operationId: 'deleting-late' })).rejects.toThrow('destroyed');
+      await expect(instance.runtime.scheduleAdmissionRetry('deleting-late', 0)).rejects.toThrow('destroyed');
+      expect(state.storage.sql.exec('SELECT id FROM calls').toArray()).toHaveLength(1);
+      instance.releaseHeldTool?.();
+      return state.storage.sql.exec('SELECT id FROM projected').toArray().length;
+    });
+    // A retry joins the same shutdown; only actual quiescence permits the host's wipe.
+    await runInDurableObject(stub, instance => instance.runtime.destroy());
+    await runInDurableObject(stub, async (instance, state) => {
+      await instance.runtime.destroy();
+      expect(await state.storage.getAlarm()).toBeNull();
+      expect(state.storage.sql.exec('SELECT id FROM projected').toArray()).toHaveLength(projectedBefore);
+      expect(state.storage.sql.exec('SELECT id FROM calls').toArray()).toHaveLength(1);
+      expect(state.storage.sql.exec('SELECT id FROM tool_calls').toArray()).toHaveLength(1);
+      expect(state.storage.sql.exec('SELECT id FROM admission_wakes').toArray()).toHaveLength(0);
+    });
+  } finally {
+    await runInDurableObject(stub, instance => { instance.releaseHeldTool?.(); });
+  }
+});
 it('persists one admission wake across eviction and preserves a backoff scheduled by its callback', async () => {
   const namespace = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE;
   let stub = namespace.getByName(probeId);
@@ -150,7 +273,7 @@ it('pauses a namespaced ChatGPT exec for approval and resumes with a new durable
   expect(resumed.messages).toContainEqual(expect.objectContaining({ role: 'assistant', text: answer }));
   const events = resumed.events.map(row => JSON.parse(row.event));
   expect(events).toContainEqual(expect.objectContaining({ type: 'message', operationId: 'approval:decision-1', data: expect.objectContaining({ role: 'assistant', text: answer }) }));
-  expect(events).toContainEqual(expect.objectContaining({ type: 'run.completed', operationId: 'approval:decision-1', data: { text: answer } }));
+  expect(events).toContainEqual(expect.objectContaining({ type: 'run.completed', operationId: 'approval:decision-1', data: { text: answer, kind: 'final' } }));
   expect(events.filter(event => event.type === 'run.completed' && event.operationId === 'approval-chatgpt').every(event => event.data.text !== answer)).toBe(true);
 });
 
@@ -254,5 +377,5 @@ it('refreshes automatic policy for new requests while retaining historical pendi
   expect(state.messages).toContainEqual(expect.objectContaining({ role: 'assistant', text: answer }));
   const events = state.events.map(row => JSON.parse(row.event));
   expect(events).toContainEqual(expect.objectContaining({ type: 'message', operationId: 'automatic-retry', data: expect.objectContaining({ role: 'assistant', text: answer }) }));
-  expect(events).toContainEqual(expect.objectContaining({ type: 'run.completed', operationId: 'automatic-retry', data: { text: answer } }));
+  expect(events).toContainEqual(expect.objectContaining({ type: 'run.completed', operationId: 'automatic-retry', data: { text: answer, kind: 'final' } }));
 });

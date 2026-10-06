@@ -28,6 +28,291 @@ async function withPage(work, options = {}) {
 const until = async (page, id, text) => page.locator(id).filter({hasText: text}).waitFor();
 const sentMessages = (state, botId) => state.calls.filter(call => call.method === 'POST' && call.path === `/v1/bots/${botId}/messages`);
 const sendMessage = page => page.locator('#message-form').getByRole('button', {name: /^Send(?: message)?(?:\s|$)/}).click();
+const deletedBots = state => state.calls.filter(call => call.method === 'DELETE' && /^\/v1\/bots\//.test(call.path));
+const openDelete = async page => {await page.locator('#edit-bot').click(); await page.locator('#delete-bot').click(); await page.locator('#delete-dialog').waitFor({state: 'visible'});};
+
+test('Enter and Send enqueue follow-up messages without cancelling the active run', async () => {
+  await withPage(async ({page, login, state}) => {
+    const run = {id: 'active-send-run', botId: BOT_A, operationId: 'active-send-operation', status: 'running', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()};
+    state.runs.set(BOT_A, [run]);
+    state.messages.set(BOT_A, [{id: 'active-send-request', botId: BOT_A, runId: run.id, role: 'user', text: 'Continue the current task.', createdAt: run.createdAt}]);
+    await login(); await until(page, '#run-status', 'running');
+    await page.locator('#message').fill('Follow-up sent with Enter'); await page.locator('#message').press('Enter');
+    await page.locator('[data-message-id]').filter({hasText: 'Follow-up sent with Enter'}).waitFor();
+    await page.locator('#message').fill('A second follow-up sent with the button'); await sendMessage(page);
+    await page.locator('[data-message-id]').filter({hasText: 'A second follow-up sent with the button'}).waitFor();
+    assert.deepEqual(sentMessages(state, BOT_A).map(call => call.body.text), ['Follow-up sent with Enter', 'A second follow-up sent with the button']);
+    assert.equal(state.calls.filter(call => call.path.endsWith('/cancel')).length, 0);
+    assert.equal(run.status, 'running'); assert.equal(state.runs.get(BOT_A).length, 3);
+    assert.equal(await page.locator('#message-form').getByRole('button', {name: /stop/i}).count(), 0, 'sending has no adjacent implicit stop control');
+    assert.equal(await page.locator('#cancel-run').isVisible(), true, 'explicit named stop remains available');
+  });
+});
+
+test('explicitly stopping a run reports cancellation in the conversation without retrying', async () => {
+  await withPage(async ({page, login, state}) => {
+    const run = {id: 'explicit-stop-run', botId: BOT_A, operationId: 'explicit-stop-operation', status: 'running', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()};
+    state.runs.set(BOT_A, [run]);
+    state.messages.set(BOT_A, [{id: 'explicit-stop-request', botId: BOT_A, runId: run.id, role: 'user', text: 'Task to stop explicitly.', createdAt: run.createdAt}]);
+    state.emit(BOT_A, 'runtime.snapshot', {busy: true, partialText: 'Working on the request'}, run.id);
+    await login(); await until(page, '#streaming-text', 'Working on the request');
+    await page.locator('#cancel-run').click();
+    await until(page, '[data-message-id="explicit-stop-request"]', /cancelled/i);
+    await page.locator('#streaming-message').waitFor({state: 'hidden'});
+    assert.equal(run.status, 'cancelled');
+    assert.deepEqual(state.calls.filter(call => call.path.endsWith('/cancel')).map(call => ({path: call.path, method: call.method})), [{path: `/v1/bots/${BOT_A}/runs/${run.id}/cancel`, method: 'POST'}]);
+    state.emit(BOT_A, 'message.delta', {delta: 'Late text from a cancelled run'}, run.id);
+    await page.locator('#tab-activity').click();
+    await Promise.all([page.waitForResponse(response => response.url().endsWith('/messages')), page.locator('#refresh-history').click()]);
+    await page.locator('#tab-conversation').click();
+    assert.equal(await page.locator('#streaming-message').isVisible(), false);
+    assert.equal((await page.locator('#messages').innerText()).includes('Late text from a cancelled run'), false);
+    assert.equal(sentMessages(state, BOT_A).length, 0); assert.equal(state.actions.length, 0);
+    assert.equal(await page.getByRole('button', {name: 'Retry sending', exact: true}).count(), 0);
+  });
+});
+
+test('public progress and correlated tool callbacks form one activity entry while the final answer stays visible', async () => {
+  for (const width of [1440, 390]) await withPage(async ({page, login, state}) => {
+    const createdAt = new Date().toISOString();
+    const run = {id: 'activity-final-run', botId: BOT_A, operationId: 'activity-final-operation', status: 'running', createdAt, updatedAt: createdAt};
+    const user = {id: 'activity-request', botId: BOT_A, runId: run.id, role: 'user', text: 'Check the workspace and give me the result.', createdAt};
+    const legacy = {id: 'activity-unclassified', botId: BOT_A, runId: run.id, role: 'assistant', text: 'Unclassified assistant text remains a normal message.', createdAt};
+    const progress = {id: 'activity-progress', botId: BOT_A, runId: run.id, role: 'assistant', kind: 'progress', text: 'Checking the actual computer workspace.', createdAt: new Date(Date.parse(createdAt) - 1000).toISOString()};
+    state.runs.set(BOT_A, [run]); state.messages.set(BOT_A, [user, legacy, progress]);
+    const toolCallId = 'call-activity-exec', operationId = 'pi-tool:activity-task:call-activity-exec';
+    state.emit(BOT_A, 'tool.started', {toolCallId, toolName: 'exec'}, run.id);
+    await login();
+    const activity = page.locator(`[data-run-activity="${run.id}"]`);
+    await activity.locator(`[data-progress-message-id="${progress.id}"]`).waitFor();
+    assert.equal(await page.locator(`[data-message-id="${legacy.id}"]`).evaluate(node => node.closest('[data-run-activity]') === null), true);
+    await activity.locator(`[data-tool-operation-id="${toolCallId}"]`).waitFor();
+    assert.equal(await activity.locator('[data-tool-operation-id]').count(), 1);
+    assert.equal(await page.locator(`[data-message-id="${user.id}"]`).evaluate((node, runId) => Boolean(node.compareDocumentPosition(document.querySelector(`[data-run-activity="${runId}"]`)) & Node.DOCUMENT_POSITION_FOLLOWING), run.id), true, 'provider timestamp skew cannot move activity before its own request');
+    state.emit(BOT_A, 'tool.completed', {operationId, toolCallId, actionType: 'exec', result: {operationId, status: 'completed', output: '/workspace\n', exitCode: 0}}, run.id);
+    await activity.locator(`[data-tool-operation-id="${operationId}"][data-tool-status="completed"]`).waitFor();
+    // The native callback reports completion too, but represents the same effect.
+    state.emit(BOT_A, 'tool.completed', {toolCallId, toolName: 'exec', operationId, status: 'completed'}, run.id);
+    await activity.getByRole('button', {name: /^Activity/}).filter({hasText: '1 action'}).waitFor();
+    assert.equal(await activity.locator('[data-tool-operation-id]').count(), 1);
+    const tool = activity.locator(`[data-tool-operation-id="${operationId}"]`);
+    await tool.locator('summary').click();
+    assert.equal(await tool.locator('pre').first().textContent(), '/workspace\n');
+    assert.match(await tool.innerText(), /Completed.*exit 0/);
+    assert.match(await page.locator('#run-status').innerText(), /running/, 'a completed command does not claim the whole task finished');
+    const final = {id: 'activity-final-answer', botId: BOT_A, runId: run.id, role: 'assistant', kind: 'final', text: '**Workspace verified.** The command succeeded in `/workspace`.', createdAt: new Date(Date.now() + 1000).toISOString()};
+    state.messages.set(BOT_A, [user, legacy, progress, final]); run.status = 'completed'; run.updatedAt = final.createdAt;
+    state.emit(BOT_A, 'message.created', {message: final}, run.id); state.emit(BOT_A, 'run.updated', {run}, run.id);
+    const answer = page.locator(`[data-message-id="${final.id}"]`);
+    await answer.filter({hasText: 'Workspace verified.'}).waitFor();
+    assert.equal(await answer.evaluate(node => node.closest('[data-run-activity]') === null), true, 'final text remains outside activity');
+    assert.equal(await answer.getByRole('button', {name: 'Copy message', exact: true}).isVisible(), true);
+    const disclosure = activity.getByRole('button', {name: /^Activity/});
+    if (await disclosure.getAttribute('aria-expanded') === 'false') await disclosure.click();
+    assert.equal(await activity.locator('[data-tool-operation-id]').count(), 1);
+    assert.equal(await tool.locator('pre').first().textContent(), '/workspace\n', 'the native completion callback preserves the host result');
+    assert.equal(await activity.locator(`[data-progress-message-id="${progress.id}"]`).count(), 1);
+    assert.equal(await activity.locator(`[data-message-id="${final.id}"]`).count(), 0);
+    if (process.env.CONSOLE_SCREENSHOT_DIR) {await mkdir(process.env.CONSOLE_SCREENSHOT_DIR, {recursive: true}); await answer.scrollIntoViewIfNeeded(); await page.screenshot({path: `${process.env.CONSOLE_SCREENSHOT_DIR}/activity-final-${width}.png`, animations: 'disabled'});}
+    assert.equal(state.calls.some(call => call.method !== 'GET'), false); assert.equal(state.actions.length, 0);
+  }, {viewport: {width, height: 1000}});
+});
+
+test('a successful command followed by an empty model answer exposes the failure without replaying the command', async () => {
+  await withPage(async ({page, login, state}) => {
+    const createdAt = new Date().toISOString();
+    const run = {id: 'empty-answer-run', botId: BOT_A, operationId: 'empty-answer-operation', status: 'running', createdAt, updatedAt: createdAt};
+    const user = {id: 'empty-answer-request', botId: BOT_A, runId: run.id, role: 'user', text: 'Run the command and explain its result.', createdAt};
+    state.runs.set(BOT_A, [run]); state.messages.set(BOT_A, [user]);
+    const operationId = 'pi-tool:empty-answer:exec';
+    state.emit(BOT_A, 'tool.completed', {operationId, toolCallId: 'empty-answer-exec', actionType: 'exec', result: {operationId, status: 'completed', output: 'done\n', exitCode: 0}}, run.id);
+    await login();
+    run.status = 'failed'; run.error = 'The model ended its turn without a visible answer. The completed tools were not repeated.'; run.updatedAt = new Date(Date.now() + 1000).toISOString();
+    state.emit(BOT_A, 'run.updated', {run}, run.id);
+    await until(page, '[data-message-id="empty-answer-request"]', 'without a visible answer');
+    assert.match(await page.locator('[data-message-id="empty-answer-request"]').innerText(), /Failed/);
+    const activity = page.locator(`[data-run-activity="${run.id}"]`), disclosure = activity.getByRole('button', {name: /^Activity/});
+    if (await disclosure.getAttribute('aria-expanded') === 'false') await disclosure.click();
+    assert.equal(await activity.locator(`[data-tool-operation-id="${operationId}"][data-tool-status="completed"]`).count(), 1);
+    assert.equal(await page.locator('#streaming-message').isVisible(), false); assert.equal(state.messages.get(BOT_A).length, 1, 'no fabricated final response is introduced');
+    assert.equal(sentMessages(state, BOT_A).length, 0); assert.equal(state.actions.length, 0);
+    assert.equal(await page.getByRole('button', {name: 'Retry sending', exact: true}).count(), 0);
+  });
+});
+
+test('a historical approval-request tool callback never claims the action completed or is still awaiting a decision', async () => {
+  await withPage(async ({page, login, state}) => {
+    const createdAt = new Date().toISOString();
+    const run = {id: 'historical-request-run', botId: BOT_A, operationId: 'historical-request-operation', status: 'completed', createdAt, updatedAt: createdAt};
+    state.runs.set(BOT_A, [run]);
+    state.messages.set(BOT_A, [
+      {id: 'historical-request-user', botId: BOT_A, runId: run.id, role: 'user', text: 'Consider running the command.', createdAt},
+      {id: 'historical-request-final', botId: BOT_A, runId: run.id, role: 'assistant', kind: 'final', text: 'That command was not executed. The task is closed.', createdAt},
+    ]);
+    state.emit(BOT_A, 'tool.completed', {toolCallId: 'historical-request-call', toolName: 'exec', status: 'pending_approval'}, run.id);
+    await login();
+    const activity = page.locator(`[data-run-activity="${run.id}"]`);
+    await activity.getByRole('button', {name: /^Activity/}).click();
+    const step = activity.locator('[data-tool-operation-id="historical-request-call"]');
+    await step.waitFor(); assert.equal(await step.getAttribute('data-tool-status'), 'pending_approval');
+    assert.match(await step.innerText(), /Approval requested/); assert.doesNotMatch(await step.innerText(), /Completed|Awaiting approval/);
+    assert.equal(await page.locator('#approval-shortcut').isVisible(), false);
+    assert.equal(await page.locator('[data-approval-decision]').count(), 0);
+    assert.equal(state.calls.some(call => call.method !== 'GET'), false);
+  });
+});
+
+test('copying either message role preserves the exact source Markdown', async () => {
+  await withPage(async ({page, context, login, state, url}) => {
+    const user = '  Please keep **this formatting**.\n\n```sh\nprintf "¡Hola!"\n```\n';
+    const assistant = '## Result\n\n- **Résumé**\n- A [source](https://example.com/a?q=1)\n\n```text\nline one\nline two\n```\n';
+    state.messages.get(BOT_A)[0].text = user; state.messages.get(BOT_A)[1].text = assistant;
+    await context.grantPermissions(['clipboard-read', 'clipboard-write'], {origin: new URL(url).origin});
+    await login();
+    for (const [id, text] of [['message-one', user], ['message-two', assistant]]) {
+      const message = page.locator(`[data-message-id="${id}"]`);
+      await message.getByRole('button', {name: 'Copy message', exact: true}).click();
+      await message.getByRole('status').filter({hasText: /Copied/i}).waitFor();
+      assert.equal(await page.evaluate(() => navigator.clipboard.readText()), text, 'clipboard receives original Markdown, including whitespace');
+    }
+    assert.equal(state.calls.some(call => call.method !== 'GET'), false, 'copy is entirely local');
+  });
+});
+
+test('clipboard rejection is visible and a later explicit copy can succeed', async () => {
+  await withPage(async ({page, login, state}) => {
+    await page.addInitScript(() => {
+      globalThis.__copyTest = {reject: true, writes: []};
+      Object.defineProperty(navigator, 'clipboard', {configurable: true, value: {writeText: async text => {
+        if (globalThis.__copyTest.reject) throw new DOMException('Clipboard unavailable', 'NotAllowedError');
+        globalThis.__copyTest.writes.push(text);
+      }}});
+    });
+    await login(); const message = page.locator('[data-message-id="message-two"]');
+    await message.getByRole('button', {name: 'Copy message', exact: true}).click();
+    await message.getByRole('status').filter({hasText: /could not|couldn.t|unable|failed/i}).waitFor();
+    assert.deepEqual(await page.evaluate(() => globalThis.__copyTest.writes), []);
+    assert.equal(await message.getByRole('status').filter({hasText: /^Copied/i}).count(), 0);
+    await page.evaluate(() => {globalThis.__copyTest.reject = false;});
+    await message.getByRole('button', {name: 'Copy message', exact: true}).click();
+    await message.getByRole('status').filter({hasText: /Copied/i}).waitFor();
+    assert.deepEqual(await page.evaluate(() => globalThis.__copyTest.writes), [state.messages.get(BOT_A)[1].text]);
+  });
+});
+
+test('pending and streaming message copy uses the text visible at that moment', async () => {
+  await withPage(async ({page, context, login, state, url}) => {
+    await context.grantPermissions(['clipboard-read', 'clipboard-write'], {origin: new URL(url).origin});
+    const run = {id: 'copy-stream-run', botId: BOT_A, operationId: 'copy-stream-operation', status: 'running', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()};
+    state.runs.set(BOT_A, [run]); state.emit(BOT_A, 'runtime.snapshot', {busy: true, partialText: 'A **partial** answer'}, run.id);
+    await login();
+    await page.getByRole('button', {name: 'Copy response so far', exact: true}).click();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), 'A **partial** answer');
+    state.emit(BOT_A, 'message.delta', {delta: '\n\n```sh\npwd\n```'}, run.id);
+    await until(page, '#streaming-text', 'pwd');
+    await page.getByRole('button', {name: 'Copy response so far', exact: true}).click();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), 'A **partial** answer\n\n```sh\npwd\n```');
+    let release; state.messageGates.set(BOT_A, new Promise(resolve => {release = resolve;}));
+    const text = 'A pending **request**\nwith another line';
+    await page.locator('#message').fill(text); await sendMessage(page);
+    await page.getByRole('button', {name: 'Copy pending message', exact: true}).click();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), text);
+    release();
+  });
+});
+
+test('bot deletion requires confirmation and retains the captured target during a selection change', async () => {
+  await withPage(async ({page, login, state}) => {
+    await login(); await page.locator(`[data-bot-id="${BOT_B}"]`).click(); await until(page, '#selected-name', 'Linus');
+    await page.locator('#message').fill('Keep Linus draft'); await page.locator(`[data-bot-id="${BOT_A}"]`).click();
+    await openDelete(page); assert.match(await page.locator('#delete-title').innerText(), /Ada/);
+    await page.locator('#cancel-delete-bot').click(); await page.locator('#delete-dialog').waitFor({state: 'hidden'});
+    assert.equal(deletedBots(state).length, 0); assert.equal(state.bots.length, 2);
+    if (await page.locator('#edit-dialog').isVisible()) await page.locator('#delete-bot').click(); else await openDelete(page);
+    let release; state.deleteGates.set(BOT_A, new Promise(resolve => {release = resolve;}));
+    const requested = page.waitForRequest(request => request.method() === 'DELETE');
+    await page.locator('#confirm-delete-bot').click(); await requested;
+    assert.equal(await page.locator('#confirm-delete-bot').isDisabled(), true); assert.equal(await page.locator('#cancel-delete-bot').isDisabled(), true);
+    await page.locator('#delete-form').dispatchEvent('submit');
+    await page.evaluate(id => {location.hash = `bot=${id}`;}, BOT_B); await until(page, '#selected-name', 'Linus');
+    const completed = page.waitForResponse(response => response.request().method() === 'DELETE'); release(); await completed;
+    await page.locator('#delete-dialog').waitFor({state: 'hidden'});
+    assert.deepEqual(deletedBots(state).map(call => call.path), [`/v1/bots/${BOT_A}`]);
+    assert.deepEqual(state.bots.map(bot => bot.id), [BOT_B]); assert.equal(await page.locator(`[data-bot-id="${BOT_A}"]`).count(), 0);
+    assert.equal(await page.locator('#message').inputValue(), 'Keep Linus draft'); assert.equal(await page.locator('#selected-name').innerText(), 'Linus');
+  });
+});
+
+test('an unconfirmed deletion leaves the bot and draft intact until an explicit successful retry', async () => {
+  for (const failure of ['http', 'network']) await withPage(async ({page, login, state}) => {
+    await login(); await page.locator('#message').fill('Keep this draft if deletion fails');
+    await page.route(`**/v1/bots/${BOT_A}`, route => {
+      if (route.request().method() !== 'DELETE') return route.continue();
+      return failure === 'network' ? route.abort('failed') : route.fulfill({status: 503, contentType: 'application/json', body: JSON.stringify({error: {code: 'service_unavailable', message: 'Deletion service unavailable.'}})});
+    });
+    await openDelete(page); await page.locator('#confirm-delete-bot').click();
+    await until(page, '#delete-error', failure === 'http' ? 'Deletion service unavailable.' : /lost|not confirmed|unconfirmed/i);
+    assert.equal(state.bots.length, 2); assert.equal(await page.locator(`[data-bot-id="${BOT_A}"]`).count(), 1);
+    assert.equal(await page.locator('#message').inputValue(), 'Keep this draft if deletion fails');
+    assert.equal(deletedBots(state).length, 0, 'no automatic retry follows the failed attempt');
+    await page.unroute(`**/v1/bots/${BOT_A}`);
+    await page.locator('#confirm-delete-bot').click(); await page.locator('#delete-dialog').waitFor({state: 'hidden'});
+    await until(page, '#selected-name', 'Linus'); assert.deepEqual(state.bots.map(bot => bot.id), [BOT_B]);
+  });
+});
+
+test('partially completed deletion fences the bot and preserves a cleanup retry for that exact ID', async () => {
+  await withPage(async ({page, login, state}) => {
+    state.deleteError = {code: 'bot_deletion_pending', message: 'Bot access is disabled. Data cleanup is still pending; retry deletion.', status: 503};
+    await login(); await openDelete(page); await page.locator('#confirm-delete-bot').click();
+    await until(page, '#delete-error', /cleanup.*pending/i);
+    assert.match(await page.locator('#delete-title').innerText(), /Ada/);
+    await until(page, '#selected-name', 'Linus'); assert.equal(await page.locator(`[data-bot-id="${BOT_A}"]`).count(), 0);
+    assert.equal(state.deletedBots.has(BOT_A), false, 'fixture cleanup has not completed');
+    assert.equal(state.deletingBots.has(BOT_A), true); assert.equal(deletedBots(state).length, 1);
+    await page.locator('#cancel-delete-bot').click(); await page.locator('#delete-dialog').waitFor({state: 'hidden'});
+    await page.locator(`[data-pending-deletion="${BOT_A}"]`).click(); await page.locator('#delete-dialog').waitFor({state: 'visible'});
+    assert.match(await page.locator('#delete-title').innerText(), /Ada/);
+    state.deleteError = null;
+    await page.getByRole('button', {name: 'Retry cleanup', exact: true}).click(); await page.locator('#delete-dialog').waitFor({state: 'hidden'});
+    assert.deepEqual(deletedBots(state).map(call => call.path), [`/v1/bots/${BOT_A}`, `/v1/bots/${BOT_A}`]);
+    assert.equal(state.deletedBots.has(BOT_A), true); assert.deepEqual(state.bots.map(bot => bot.id), [BOT_B]);
+  });
+});
+
+test('deleting the final bot clears its conversation, computer view and selection before creating another', async () => {
+  await withPage(async ({page, login, state}) => {
+    state.bots = state.bots.filter(bot => bot.id === BOT_A);
+    await login(); await page.locator('#message').fill('Draft belonging only to the deleted bot');
+    await page.locator('#tab-computer').click(); await page.locator('#take-screenshot').click(); await page.locator('#screenshot').waitFor({state: 'visible'});
+    await page.locator('#tab-conversation').click(); await openDelete(page); await page.locator('#confirm-delete-bot').click();
+    await page.locator('#delete-dialog').waitFor({state: 'hidden'}); await page.locator('#empty').waitFor({state: 'visible'});
+    assert.equal(await page.locator('#bot-workspace').isVisible(), false); assert.equal(await page.locator('.bot-item').count(), 0);
+    assert.equal(await page.locator('[data-message-id], [data-operation-id], [data-approval-id]').count(), 0);
+    assert.equal(await page.locator('#screenshot').getAttribute('src'), null); assert.equal(page.url().includes(BOT_A), false);
+    assert.equal(state.messages.has(BOT_A), false); assert.equal(state.runs.has(BOT_A), false); assert.equal(state.approvals.has(BOT_A), false);
+    await page.locator('#new-bot').click(); await page.locator('#bot-name').fill('Fresh bot'); await page.locator('#create-form [type=submit]').click();
+    await until(page, '#selected-name', 'Fresh bot'); assert.equal(await page.locator('#message').inputValue(), '');
+    assert.equal((await page.locator('#messages').innerText()).includes('Three themes'), false);
+    assert.equal(state.calls.some(call => call.method === 'DELETE' && call.path.includes('connections')), false, 'shared ChatGPT credentials are not disconnected');
+  });
+});
+
+test('a late deletion response from an ended session cannot reset the new session view', async () => {
+  await withPage(async ({page, login, state}) => {
+    await login(); let release; state.deleteGates.set(BOT_A, new Promise(resolve => {release = resolve;}));
+    await openDelete(page); const requested = page.waitForRequest(request => request.method() === 'DELETE');
+    await page.locator('#confirm-delete-bot').click(); await requested;
+    // Session shutdown may occur independently of an open modal (for example token expiry).
+    await page.locator('#disconnect').evaluate(node => node.click()); await page.locator('#login').waitFor({state: 'visible'});
+    await login(); await until(page, '#selected-name', 'Linus'); await page.locator('#message').fill('Draft in the new session');
+    release();
+    await page.locator('#reload-bots').click(); await until(page, '#selected-name', 'Linus');
+    assert.equal(await page.locator('#message').inputValue(), 'Draft in the new session'); assert.equal(await page.locator('#delete-dialog').isVisible(), false);
+    assert.equal(state.deletedBots.has(BOT_A), true, 'cleanup completed after the old client session ended');
+    assert.deepEqual(deletedBots(state).map(call => call.path), [`/v1/bots/${BOT_A}`]);
+  });
+});
 
 test('message acceptance is visible immediately and slow history refresh cannot lose a newer draft', async () => {
   await withPage(async ({page, login, state}) => {

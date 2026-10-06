@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { EntryRecord, ToolExecutionApi } from '@earendil-works/pi-durable';
-import { classifyFailure, normalizeEntries, textContent } from '../src/normalize.js';
+import { classifyFailure, normalizeEntries, textContent, toolCompletion } from '../src/normalize.js';
 import { computerToolOperationId, computerTools, executeComputerTool, type ToolBridge } from '../src/tools.js';
 import { chatgptModel, chatgptPayload, createChatGPTProvider } from '../src/chatgpt.js';
 import { createModels } from '@earendil-works/pi-ai/models';
@@ -54,7 +54,7 @@ describe('runtime computer bridge', () => {
     const result = await executeComputerTool(host, action, api, context);
     expect(result.control).toEqual({ terminate: true });
     expect(host.tools.execute).toHaveBeenCalledTimes(1);
-    expect(host.tools.execute).toHaveBeenCalledWith({ operationId: 'pi-tool:task-17:call-42', runOperationId: 'user-operation', action, signal: context.abortSignal });
+    expect(host.tools.execute).toHaveBeenCalledWith({ operationId: 'pi-tool:task-17:call-42', runOperationId: 'user-operation', toolCallId: api.callId, action, signal: context.abortSignal });
   });
   it('preserves the operation id across replay of a safe tool', async () => {
     const host = bridge();
@@ -73,7 +73,7 @@ describe('runtime computer bridge', () => {
     expect(host.consume).toHaveBeenNthCalledWith(1, 'user-operation', 'tool', operationId);
     expect(host.consume).toHaveBeenNthCalledWith(2, 'user-operation', 'tool', operationId);
     for (const [input] of vi.mocked(host.tools.execute).mock.calls) {
-      expect(input).toEqual({ operationId, runOperationId: 'user-operation', action, signal: context.abortSignal });
+      expect(input).toEqual({ operationId, runOperationId: 'user-operation', toolCallId: compositeApi.callId, action, signal: context.abortSignal });
     }
   });
   it('refuses dispatch after the durable tool budget is exhausted', async () => {
@@ -108,6 +108,20 @@ describe('runtime computer bridge', () => {
 });
 
 describe('public transcript projection', () => {
+  it('classifies public tool-call commentary and final answers from native metadata only', () => {
+    const entries = [{ id: '12', conversationId: '1', kind: 'assistant', model: [
+      { role: 'assistant', content: [{ type: 'text', text: 'Same words' }, { type: 'toolCall', id: 'call-1', name: 'exec', arguments: { command: 'private command' } }], stopReason: 'toolUse' },
+      { role: 'assistant', content: [{ type: 'text', text: 'Same words' }], stopReason: 'stop' },
+      { role: 'assistant', content: [{ type: 'text', text: 'Same words' }], stopReason: 'error' },
+    ] }] as unknown as EntryRecord[];
+    expect(normalizeEntries(entries).map(message => message.kind)).toEqual(['progress', 'final', undefined]);
+    expect(JSON.stringify(normalizeEntries(entries))).not.toContain('private command');
+  });
+  it('projects honest tool status and correlation without tool output or arguments', () => {
+    const entry = { model: [{ role: 'toolResult', toolCallId: 'call1', toolName: 'exec', content: [{ type: 'text', text: JSON.stringify({ operationId: 'pi-tool:12:call1', status: 'pending_approval', output: 'private output' }) }] }] } as unknown as EntryRecord;
+    expect(toolCompletion(entry)).toEqual({ operationId: 'pi-tool:12:call1', status: 'pending_approval' });
+    expect(toolCompletion({ model: [{ role: 'toolResult', isError: true, content: [{ type: 'text', text: 'Validation detail' }] }] } as unknown as EntryRecord)).toEqual({ status: 'failed' });
+  });
   it('does not serialize private reasoning, tool arguments, or image payloads as text', () => {
     expect(textContent([{ type: 'thinking', thinking: 'internal' }, { type: 'text', text: 'Answer' }, { type: 'image', data: 'secret-pixels' }])).toBe('Answer');
   });

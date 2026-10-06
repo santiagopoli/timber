@@ -6,13 +6,14 @@ import { mountChat } from './src/chat.tsx';
   const $ = (id) => document.getElementById(id);
   const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
   const guiActions = new Set(['navigate', 'click', 'type', 'key', 'scroll']);
+  const removedBots = new Set(), deletionPending = new Map();
   const drafts = new Map(), pendingMessages = new Map(), pendingActions = new Map(), computerPending = new Map(), stopping = new Set(), approvalWork = new Map(), approvalFeedback = new Map();
   let token = '', bots = [], selected = null, currentRun = null, generation = 0, authSession = 0;
   let sessionController = new AbortController(), streamController, refreshTimer, progressTimer, computerStatusTimer;
   let computerStatusRequest = 0;
   let messages = [], approvals = [], runs = new Map(), activeRunIds = new Set(), nextCursor = null, olderPagesLoaded = false, loadingOlderRuns = false, runFilter = null, runRevision = 0, runsRequest = 0, messagesRequest = 0, approvalsRequest = 0;
   let cursor = 0, boundary = '', events = [], streamDrafts = new Map(), chatLoading = false, focusApproval = 0, screenUrl = null, artifact = null, directoryPath = '.';
-  let chatGPTConnected = false, chatGPTBusy = false, chatGPTAccount = null, editBotId = null, sendBusy = new Set();
+  let chatGPTConnected = false, chatGPTBusy = false, chatGPTAccount = null, editBotId = null, deleteTarget = null, deleteBusy = false, sendBusy = new Set();
   const el = (tag, cls, text) => { const node = document.createElement(tag); if (cls) node.className = cls; if (text !== undefined) node.textContent = text; return node; };
   const botPath = (id = selected?.id) => `/v1/bots/${encodeURIComponent(id)}`;
   const errorText = (error) => error instanceof Error ? error.message : 'Request failed.';
@@ -40,6 +41,8 @@ import { mountChat } from './src/chat.tsx';
   async function guarded(fn) { $('app-error').textContent = ''; try { return await fn(); } catch (error) { if (error.name !== 'AbortError') showError(error); } }
   async function request(path, { method = 'GET', body, signal, raw = false } = {}) {
     if (!token) throw new Error('Reconnect with your Timber API token.');
+    const targetId = /^\/v1\/bots\/([^/?]+)/.exec(path)?.[1];
+    if (targetId && removedBots.has(targetId) && !(method === 'DELETE' && path === botPath(targetId))) throw new DOMException('This bot is no longer available.', 'AbortError');
     const session = authSession, headers = { Authorization: `Bearer ${token}` };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     let response;
@@ -48,7 +51,7 @@ import { mountChat } from './src/chat.tsx';
     if (!response.ok) {
       const detail = await response.json().catch(() => ({}));
       if (response.status === 401 && !String(detail.error?.code || '').startsWith('chatgpt_') && session === authSession) disconnect('Your API token was rejected or expired. Enter the current token to reconnect.');
-      const error = new Error(detail.error?.message || `Request failed (${response.status}).`); error.status = response.status; throw error;
+      const error = new Error(detail.error?.message || `Request failed (${response.status}).`); error.status = response.status; error.code = detail.error?.code; throw error;
     }
     if (session !== authSession) throw new DOMException('The session ended.', 'AbortError');
     if (raw) return response;
@@ -66,12 +69,12 @@ import { mountChat } from './src/chat.tsx';
   function disconnect(message = '') {
     stopComputerStatus(); generation++; authSession++; token = ''; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
     selected = null; currentRun = null; bots = []; messages = []; approvals = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
-    drafts.clear(); pendingMessages.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); closeDialogs(); clearScreen();
+    removedBots.clear(); deletionPending.clear(); deleteTarget = null; deleteBusy = false; editBotId = null; drafts.clear(); pendingMessages.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); closeDialogs(); clearScreen();
     chatGPTConnected = false; chatGPTAccount = null; chatGPTBusy = false;
     chat.clear();
     for (const id of ['activity-list', 'bot-list', 'run-list', 'file-list']) $(id).replaceChildren();
     for (const id of ['token', 'type-text', 'exec-command', 'navigate-url', 'key-name', 'file-content', 'bot-search']) $(id).value = '';
-    $('create-form').reset(); $('edit-form').reset(); $('file-path').value = '.'; $('computer-result').textContent = 'No actions yet.';
+    $('create-form').reset(); $('edit-form').reset(); $('delete-error').textContent = ''; $('delete-form').reset(); renderDeleteControls(); $('file-path').value = '.'; $('computer-result').textContent = 'No actions yet.';
     $('result-raw').textContent = ''; $('result-details').hidden = true; $('computer-warning').hidden = true; $('computer-progress').hidden = true;
     $('chatgpt-status').textContent = 'Connection not checked.'; $('chatgpt-account').textContent = ''; $('chatgpt-account').hidden = true;
     $('chatgpt-verification').textContent = 'Model access has not been verified.'; $('chatgpt-error').textContent = ''; $('disconnect-chatgpt').hidden = true; $('verify-chatgpt').disabled = true;
@@ -82,19 +85,23 @@ import { mountChat } from './src/chat.tsx';
   function renderBots() {
     const query = $('bot-search').value.trim().toLowerCase(), matching = bots.filter((bot) => `${bot.name} ${bot.instructions}`.toLowerCase().includes(query));
     $('bot-count').textContent = String(bots.length); $('bot-list').replaceChildren();
-    if (!matching.length) { $('bot-list').append(emptyState(bots.length ? 'No matching bots' : 'Your team starts here', bots.length ? 'Try another name or keyword.' : 'Use New bot to create one.')); return; }
+    if (!matching.length) $('bot-list').append(emptyState(bots.length ? 'No matching bots' : 'Your team starts here', bots.length ? 'Try another name or keyword.' : 'Use New bot to create one.'));
     for (const bot of matching) {
       const button = el('button', `bot-item${bot.id === selected?.id ? ' selected' : ''}`); button.type = 'button'; button.dataset.botId = bot.id;
       button.setAttribute('aria-pressed', String(bot.id === selected?.id)); button.append(el('span', 'avatar', bot.name.slice(0, 1).toUpperCase()));
       const info = el('span', 'bot-info'); info.append(el('span', 'bot-name', bot.name), el('small', '', bot.instructions?.trim().split('\n')[0] || 'A persistent cloud bot'));
       button.append(info); button.addEventListener('click', () => guarded(() => selectBot(bot))); $('bot-list').append(button);
     }
+    for (const pending of deletionPending.values()) {
+      const button = el('button', 'bot-deletion-pending', `Finish deleting ${pending.name}`); button.type = 'button'; button.dataset.pendingDeletion = pending.id;
+      button.addEventListener('click', () => openDelete(pending)); $('bot-list').append(button);
+    }
   }
-  async function loadBots() { const session = authSession, result = await request('/v1/bots'); if (session !== authSession) return; bots = result.bots; renderBots(); }
+  async function loadBots() { const session = authSession, result = await request('/v1/bots'); if (session !== authSession) return; bots = result.bots.filter(bot => !removedBots.has(bot.id)); renderBots(); }
   function updateBotHeader() { $('selected-name').textContent = selected.name; $('selected-avatar').textContent = selected.name.slice(0, 1).toUpperCase(); $('selected-model').textContent = `${selected.runtime} · ${selected.model}`; $('selected-computer-mode').textContent = selected.computerApprovalMode === 'automatic' ? 'Computer · Use authorized' : 'Computer · Ask for each action'; }
   function chosenHash() { const value = new URLSearchParams(location.hash.slice(1)).get('bot'); return /^[a-f\d-]{36}$/i.test(value || '') ? value : null; }
   async function selectBot(bot) {
-    if (selected?.id === bot.id) return;
+    if (selected?.id === bot.id || removedBots.has(bot.id)) return;
     stopComputerStatus(); generation++; const version = generation; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
     selected = bot; chatLoading = true; currentRun = null; cursor = 0; boundary = ''; events = []; messages = []; approvals = []; runs = new Map(); activeRunIds = new Set(); streamDrafts = new Map(); nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; runFilter = null; runRevision = 0;
     history.replaceState(null, '', `${location.pathname}${location.search}#bot=${encodeURIComponent(bot.id)}`);
@@ -396,6 +403,59 @@ import { mountChat } from './src/chat.tsx';
     finally { if (session === authSession) { chatGPTBusy = false; $('refresh-chatgpt').disabled = false; $('disconnect-chatgpt').disabled = false; $('verify-chatgpt').disabled = !chatGPTConnected; } }
   }
   async function loadChatGPT(session = authSession) { const status = await request('/v1/connections/chatgpt'); if (session === authSession) renderChatGPT(status); }
+  function renderDeleteControls() {
+    $('confirm-delete-bot').disabled = deleteBusy;
+    $('confirm-delete-bot').textContent = deleteBusy ? 'Deleting…' : deleteTarget?.pending ? 'Retry cleanup' : 'Delete permanently';
+    $('cancel-delete-bot').disabled = deleteBusy;
+    $('cancel-delete-bot').textContent = deleteTarget?.pending ? 'Close' : 'Cancel';
+  }
+  function openDelete(bot) {
+    if (!token || deleteBusy) return;
+    deleteTarget = {id: bot.id, name: bot.name, pending: deletionPending.has(bot.id)};
+    $('delete-title').textContent = `Delete “${bot.name}”?`; $('delete-bot-name').textContent = bot.name;
+    $('delete-error').textContent = deleteTarget.pending ? 'Bot access is disabled. Data cleanup is still pending. Retry cleanup to finish deleting this bot.' : '';
+    $('edit-dialog').close(); renderDeleteControls(); $('delete-dialog').showModal(); $('cancel-delete-bot').focus();
+  }
+  function forgetBot(id) {
+    removedBots.add(id); bots = bots.filter(bot => bot.id !== id); drafts.delete(id); sendBusy.delete(id); approvalFeedback.delete(id); computerPending.delete(id);
+    for (const [key, message] of pendingMessages) if (message.botId === id) pendingMessages.delete(key);
+    for (const map of [pendingActions, approvalWork]) for (const key of map.keys()) if (key.startsWith(`${id}:`)) map.delete(key);
+    if (editBotId === id) {editBotId = null; $('edit-form').reset(); $('edit-dialog').close();}
+    const wasSelected = selected?.id === id;
+    if (wasSelected) {
+      stopComputerStatus(); generation++; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
+      for (const runId of runs.keys()) stopping.delete(runId);
+      selected = null; currentRun = null; messages = []; approvals = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
+      cursor = 0; boundary = ''; runFilter = null; nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; chatLoading = false; chat.clear();
+      for (const element of ['activity-list', 'run-list', 'file-list']) $(element).replaceChildren();
+      for (const element of ['file-content', 'type-text', 'exec-command', 'navigate-url', 'key-name']) $(element).value = '';
+      for (const element of ['selected-name', 'selected-model', 'selected-computer-mode', 'app-error', 'run-error', 'result-raw']) $(element).textContent = '';
+      $('file-path').value = '.'; directoryPath = '.'; $('computer-result').textContent = 'No actions yet.'; $('computer-status').textContent = 'Load status to inspect the environment.';
+      for (const element of ['result-details', 'computer-warning', 'run-error', 'approval-shortcut', 'active-run-count', 'cancel-run', 'reconnect-stream']) $(element).hidden = true;
+      $('event-count').textContent = '0'; $('approval-count').textContent = '0'; $('stream-state').textContent = ''; $('bot-workspace').hidden = true; $('empty').hidden = false;
+      history.replaceState(null, '', `${location.pathname}${location.search}`); showPanel('conversation');
+    }
+    renderBots(); renderProgress();
+    if (wasSelected && bots[0]) void guarded(() => selectBot(bots[0]));
+  }
+  async function deleteBot() {
+    const target = deleteTarget, session = authSession;
+    if (!target || !token || deleteBusy) return;
+    deleteBusy = true; $('delete-error').textContent = ''; renderDeleteControls();
+    try {
+      const result = await request(botPath(target.id), {method: 'DELETE'});
+      if (session !== authSession) return;
+      if (result.deleted !== true || result.botId !== target.id) throw new Error('The server did not confirm deletion of this bot.');
+      deletionPending.delete(target.id); forgetBot(target.id);
+      if (deleteTarget === target) {deleteTarget = null; $('delete-dialog').close();}
+    } catch (error) {
+      if (session !== authSession || error.name === 'AbortError') return;
+      if (error.code === 'bot_deletion_pending') {
+        target.pending = true; deletionPending.set(target.id, {...target}); forgetBot(target.id);
+        $('delete-error').textContent = 'Bot access is disabled. Data cleanup is still pending. Retry cleanup to finish deleting this bot. Other bots are unaffected.';
+      } else $('delete-error').textContent = `${errorText(error)} Deletion was not confirmed. Nothing was retried automatically.`;
+    } finally {if (session === authSession) {deleteBusy = false; renderDeleteControls();}}
+  }
   function showPanel(name, focus = false) {
     for (const button of document.querySelectorAll('[data-panel]')) { const active = button.dataset.panel === name; button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active)); button.tabIndex = active ? 0 : -1; $(`panel-${button.dataset.panel}`).hidden = !active; if (active && focus) button.focus(); }
     if (name !== 'computer') stopComputerStatus();
@@ -424,6 +484,10 @@ import { mountChat } from './src/chat.tsx';
     try { const { bot } = await request(botPath(id), { method: 'PATCH', body: { name: $('edit-name').value.trim(), instructions: $('edit-instructions').value.trim(), computerApprovalMode: $('edit-computer-approval-mode').value } }); bots = bots.map((item) => item.id === bot.id ? bot : item); if (selected?.id === bot.id) { selected = bot; updateBotHeader(); renderMessages(); renderApprovals(); } renderBots(); $('edit-dialog').close(); }
     catch (error) { if (token) $('edit-error').textContent = errorText(error); } finally { button.disabled = false; }
   });
+  $('delete-bot').addEventListener('click', () => {const bot = bots.find(item => item.id === editBotId); if (bot) openDelete(bot);});
+  $('delete-form').addEventListener('submit', event => {event.preventDefault(); void deleteBot();});
+  $('cancel-delete-bot').addEventListener('click', () => {if (!deleteBusy) {$('delete-dialog').close(); deleteTarget = null;}});
+  $('delete-dialog').addEventListener('cancel', event => {if (deleteBusy) event.preventDefault(); else deleteTarget = null;});
   $('cancel-run').addEventListener('click', () => { if (currentRun) void guarded(() => cancelRun(currentRun.id)); });
   $('refresh-runs').addEventListener('click', () => guarded(() => loadRuns())); $('load-more-runs').addEventListener('click', () => guarded(() => loadRuns(generation, true)));
   $('approval-shortcut').addEventListener('click', () => { runFilter = null; focusApproval++; showPanel('conversation'); renderMessages(); });

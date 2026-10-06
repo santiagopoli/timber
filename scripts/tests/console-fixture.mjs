@@ -29,7 +29,7 @@ export async function createConsoleFixture({port = 0} = {}) {
   await readFile(resolve(consoleRoot, 'index.html'));
   const date = '2026-10-05T10:00:00.000Z';
   const state = {
-    rejectAuth: false, actionGate: null, readsGate: null, messageGates: new Map(), messageResponseGates: new Map(), messageOperations: new Map(), patchGate: null, patchError: null, approvalGate: null, approvalError: null, approvalStatus: null, computerStates: new Map(), computerStatusGate: null, failures: [], actions: [], calls: [], streams: new Set(), events: [],
+    rejectAuth: false, actionGate: null, readsGate: null, messageGates: new Map(), messageResponseGates: new Map(), messageOperations: new Map(), patchGate: null, patchError: null, deleteGates: new Map(), deleteError: null, deletingBots: new Set(), deletedBots: new Set(), approvalGate: null, approvalError: null, approvalStatus: null, computerStates: new Map(), computerStatusGate: null, failures: [], actions: [], calls: [], streams: new Set(), events: [],
     bots: [
       {id: BOT_A, name: 'Ada', instructions: 'Research and turn findings into useful notes.', model: 'gpt-6.1-sol', runtime: 'pi', createdAt: date, updatedAt: date},
       {id: BOT_B, name: 'Linus', instructions: 'Help build and maintain software.', model: 'gpt-6.1-sol', runtime: 'pi', createdAt: date, updatedAt: date},
@@ -38,11 +38,11 @@ export async function createConsoleFixture({port = 0} = {}) {
       {id: 'message-one', botId: BOT_A, role: 'user', text: 'Organize the research notes and prepare a summary.', createdAt: date},
       {id: 'message-two', botId: BOT_A, role: 'assistant', text: 'The notes are ready. **Three themes** stood out:\n\n- Persistent conversations\n- Reusable computers\n- Portable workspaces\n\n```sh\ncat notes/summary.md\n```', createdAt: date},
     ]], [BOT_B, []]]),
-    runs: new Map([[BOT_A, []], [BOT_B, []]]), approvals: new Map([[BOT_A, []], [BOT_B, []]]),
+    runs: new Map([[BOT_A, []], [BOT_B, []]]), approvals: new Map([[BOT_A, []], [BOT_B, []]]), nextEventId: 0,
   };
   state.deliver = event => {for (const stream of state.streams) if (stream.botId === event.botId) stream.response.write(`id: ${event.id}\ndata: ${JSON.stringify(event)}\n\n`);};
   state.emit = (botId, type, data, runId) => {
-    const event = {id: state.events.length + 1, botId, type, data, runId, createdAt: new Date().toISOString()}; state.events.push(event); state.deliver(event); return event;
+    const event = {id: ++state.nextEventId, botId, type, data, runId, createdAt: new Date().toISOString()}; state.events.push(event); state.deliver(event); return event;
   };
   const server = createServer(async (request, response) => {
     try {
@@ -60,11 +60,25 @@ export async function createConsoleFixture({port = 0} = {}) {
       state.calls.push({path: request.url, method: request.method, body});
       if (path === '/v1/connections/chatgpt') return json({connected: true, status: 'verified', model: 'gpt-6.1-sol', verifiedAt: date});
       if (path === '/v1/bots') {
-        if (request.method === 'GET') return json({bots: state.bots});
+        if (request.method === 'GET') return json({bots: state.bots.filter(bot => !state.deletingBots.has(bot.id))});
         const bot = {id: randomUUID(), ...body, runtime: 'pi', createdAt: date, updatedAt: date}; state.bots.unshift(bot); state.messages.set(bot.id, []); state.runs.set(bot.id, []); state.approvals.set(bot.id, []); return json({bot}, 201);
       }
       const match = /^\/v1\/bots\/([^/]+)(.*)$/.exec(path); if (!match) return json({}, 404);
-      const [, id, tail] = match, bot = state.bots.find(bot => bot.id === id); if (!bot) return json({}, 404);
+      const [, id, tail] = match, bot = state.bots.find(bot => bot.id === id);
+      if (!tail && request.method === 'DELETE') {
+        if (state.deletedBots.has(id)) return json({botId: id, deleted: true});
+        if (!bot) return json({error: {code: 'not_found', message: 'Bot not found.'}}, 404);
+        state.deletingBots.add(id);
+        if (state.deleteGates.has(id)) await state.deleteGates.get(id);
+        if (state.deleteError) return json({error: state.deleteError}, state.deleteError.status || 503);
+        state.bots = state.bots.filter(item => item.id !== id); state.messages.delete(id); state.runs.delete(id); state.approvals.delete(id); state.computerStates.delete(id);
+        for (const key of state.messageOperations.keys()) if (key.startsWith(`${id}:`)) state.messageOperations.delete(key);
+        for (const stream of state.streams) if (stream.botId === id) stream.response.end();
+        state.events = state.events.filter(event => event.botId !== id);
+        state.deletingBots.delete(id); state.deletedBots.add(id);
+        return json({botId: id, deleted: true});
+      }
+      if (!bot || state.deletingBots.has(id)) return json({}, 404);
       if (!tail) {if (request.method === 'PATCH') {if (state.patchGate) await state.patchGate; if (state.patchError) return json({error: state.patchError}, state.patchError.status || 503); Object.assign(bot, body);} return json({bot});}
       if (tail === '/messages') {
         if (request.method === 'GET') {const snapshot = structuredClone(state.messages.get(id)); if (state.readsGate) await state.readsGate; return json({messages: snapshot});}

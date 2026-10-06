@@ -33,7 +33,18 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
 - POST /v1/bots {name,instructions?,model?,computerApprovalMode?} -> 201 {bot:Bot}
 - GET /v1/bots/:id -> {bot:Bot}
 - PATCH /v1/bots/:id {name?,instructions?,computerApprovalMode?} -> {bot:Bot}
+- DELETE /v1/bots/:id -> 200 {botId,deleted:true}. Repeated deletion of the same
+  known bot is idempotent; an unknown ID returns 404. Registry access is removed
+  before cleanup. The agent and computer are stopped before their data and R2
+  prefix are erased. If cleanup is pending, returns 503 `bot_deletion_pending`;
+  access remains disabled, the deletion alarm retries, and another DELETE resumes
+  cleanup. Minimal ID/status tombstones prevent resurrection. Shared ChatGPT
+  credentials are not deleted.
 - GET /v1/bots/:id/messages -> {messages:Message[]}
+  Assistant messages may carry `kind: "progress" | "final"`. Progress is public
+  assistant commentary accompanying native tool calls; it is durably deduplicated
+  by its native message identity. Final answers retain operation-based deduplication.
+  Messages without kind remain ordinary messages for backward compatibility.
 - POST /v1/bots/:id/messages {text,operationId} -> 202 {run:Run}
   The receipt confirms durable storage of the user input. A busy bot processes
   subsequent inputs in order. Transient engine admission failures stay queued
@@ -59,6 +70,11 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
 - POST /v1/bots/:id/runs/:runId/cancel -> {run:Run}
 - GET /v1/bots/:id/events?after=cursor -> SSE id, event=event, JSON BotEvent.
   Reconnect fetches durable events >cursor; no credentials in URL.
+  Tool completion events can include both `operationId` (stable computer effect
+  identity) and `toolCallId` (native call identity). Clients merge these explicit
+  aliases for display; neither identical command text nor event names prove
+  execution success. A successful inference with no tool call or public answer
+  fails explicitly as `model_empty_response`; completed effects are not replayed.
 - GET /v1/bots/:id/computer -> {computer:ComputerStatus}. `starting` means an
   initialization is currently in flight. A failed control-server probe or saved
   startup failure is `unavailable`, with optional fixed `error:{code,message}`.
@@ -141,6 +157,9 @@ Bootstrap desktop provisioning is bounded by a native process-group timeout
 continue after the failure. No user action is journaled or dispatched before
 initialization succeeds. Startup diagnostics survive object eviction until a
 newly requested initialization succeeds; status polling does not retry startup.
+The production configuration uses a digest-pinned prebuilt desktop image, avoiding
+bootstrap package installation. Image preparation occurs at deployment; existing
+running computers retain their image until the next natural start.
 
 ## Delegation
 Not implemented in this milestone. Future send_to_bot should use bounded

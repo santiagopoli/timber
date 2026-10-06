@@ -13,6 +13,8 @@ export interface RuntimeToolRequest {
   operationId: string;
   /** The original user submission, used to attach approvals to the right run. */
   runOperationId: string;
+  /** Opaque display correlation only; never use this as the computer journal identity. */
+  toolCallId?: string;
   action: ComputerAction;
   signal: AbortSignal;
 }
@@ -31,6 +33,7 @@ export interface RuntimeMessage {
   id: string;
   role: 'user' | 'assistant' | 'tool' | 'system';
   text: string;
+  kind?: 'progress' | 'final';
   createdAt?: string;
 }
 /** Current host metadata only: never commands, arguments, results, or credentials. */
@@ -63,8 +66,8 @@ export interface PiRuntimeOptions<Env extends object> {
 
 /** Host-facing protocol. No Pi session IDs, native transcript or lifecycle types. */
 export interface RuntimeReceipt { operationId: string; accepted: boolean; }
-export interface RuntimeOperationResult { operationId: string; status: 'done' | 'unanswered'; text?: string; reason?: string; }
-export interface RuntimeOperation { operationId: string; status: 'queued' | 'running' | 'done' | 'unanswered' | 'missing'; text?: string; reason?: string; }
+export interface RuntimeOperationResult { operationId: string; status: 'done' | 'unanswered'; text?: string; kind?: RuntimeMessage['kind']; reason?: string; }
+export interface RuntimeOperation { operationId: string; status: 'queued' | 'running' | 'done' | 'unanswered' | 'missing'; text?: string; kind?: RuntimeMessage['kind']; reason?: string; }
 export interface RuntimePendingOperation { operationId: string; status: 'queued' | 'running'; }
 export interface AgentRuntime {
   submit(text: string, input: { operationId: string }): Promise<RuntimeReceipt>;
@@ -76,4 +79,7 @@ export interface AgentRuntime {
   operation(operationId: string): Promise<RuntimeOperation>;
   messages(): Promise<RuntimeMessage[]>;
   dispose(): Promise<void>;
+  /** Permanently fence new work and await quiescence before host storage deletion.
+   * Rejects if shutdown exceeds its bounded wait; retain the tombstone and retry. */
+  destroy(): Promise<void>;
 }

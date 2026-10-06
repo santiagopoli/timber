@@ -110,6 +110,11 @@
       "file": "src/components/ui/textarea.tsx",
       "source": "https://ui.shadcn.com/r/styles/new-york-v4/textarea.json",
       "upstreamSha256": "5cafcfeeee29534f449387a16b585f5923d2faab1a0cdc50a874416b175f59ce"
+    },
+    {
+      "file": "src/components/ai-elements/chain-of-thought.tsx",
+      "source": "https://elements.ai-sdk.dev/api/registry/chain-of-thought.json",
+      "upstreamSha256": "5ccfddc925c98161c2508f63632380bb9976bfe95ffede4b9332451dcb6f0b70"
     }
   ]
 }

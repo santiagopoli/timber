@@ -48,6 +48,7 @@ const COMPUTER_ERRORS = {
   computer_invalid_request: {status:400, message:"The computer request is invalid."},
   computer_method_not_allowed: {status:405, message:"The computer request method is not allowed."},
   computer_owner_mismatch: {status:403, message:"This computer belongs to another bot."},
+  computer_deleted: {status:410, message:"This bot's computer has been permanently deleted."},
 } as const;
 
 export type ComputerErrorCode = keyof typeof COMPUTER_ERRORS;
@@ -87,10 +88,14 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   private flights = new Map<string, Promise<ComputerResult>>();
   private token = "";
   private desktop = false;
+  private deleted=false;
+  private deleting?:Promise<void>;
+  private shutdown=new AbortController();
 
   constructor(ctx: DurableObjectState, env: ComputerEnv) {
     super(ctx, env);
     void ctx.blockConcurrencyWhile(async () => {
+      if(await ctx.storage.get<string>("deleted")) {this.deleted=true;this.shutdown.abort();return;}
       this.token = await ctx.storage.get<string>("internalToken") ?? crypto.randomUUID() + crypto.randomUUID();
       await ctx.storage.put("internalToken", this.token);
       // If the DO was evicted during an effect, its outcome is unknown. A retry
@@ -115,6 +120,30 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     this.tail = result.catch(() => undefined);
     return result;
   }
+  private active():void {if(this.deleted) throw new ComputerProviderError("computer_deleted");}
+  private remove(botId:string):Promise<void> {
+    if(this.deleting) return this.deleting;
+    this.deleted=true;
+    this.shutdown.abort();
+    this.deleting=(async()=>{
+      await this.ctx.storage.put("deleted",botId);
+      await this.ctx.storage.deleteAlarm();
+      if(this.container && (this.container.running || this.starting)) await this.container.destroy("Bot permanently deleted");
+      // Stop first, then drain queued/in-flight operations before acknowledging
+      // deletion. Workspace can now remove R2 without a late uploader racing it.
+      await this.tail;
+      if(this.starting) await this.starting.catch(()=>{});
+      while(true) {
+        const values=await this.ctx.storage.list({limit:128});
+        const keys=[...values.keys()].filter(key=>key!=="deleted");
+        if(!keys.length) break;
+        await this.ctx.storage.delete(keys);
+      }
+      await this.ctx.storage.deleteAlarm();
+      this.token="";this.desktop=false;
+    })().finally(()=>{this.deleting=undefined;});
+    return this.deleting;
+  }
 
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
@@ -122,13 +151,17 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       if (request.method !== "POST") throw new ComputerProviderError("computer_method_not_allowed");
       const body = await request.json<{botId:string; operationId?:string; action?:ComputerAction}>();
       if (!/^[A-Za-z0-9_-]{1,100}$/.test(body.botId)) throw new ComputerProviderError("computer_invalid_request");
-      const savedBotId = await this.ctx.storage.get<string>("botId");
+      const savedBotId = await this.ctx.storage.get<string>("deleted") ?? await this.ctx.storage.get<string>("botId");
       if (savedBotId && savedBotId !== body.botId) throw new ComputerProviderError("computer_owner_mismatch");
+      if(path==="/delete") {await this.remove(body.botId);return Response.json({botId:body.botId,deleted:true});}
+      this.active();
       if (!savedBotId) await this.ctx.storage.put("botId", body.botId);
+      this.active();
       if (path === "/status") return Response.json(await this.status(body.botId));
       if (path === "/touch") { await this.touch(); return Response.json({ok:true}); }
       if (path === "/suspend") {
         return Response.json(await this.serialize(async () => {
+          this.active();
           if (this.container?.running) {
             await this.ensureReady(body.botId);
             await this.saveCheckpoint(body.botId, true);
@@ -182,21 +215,27 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   }
 
   private execute(botId: string, operationId: string, action: ComputerAction): Promise<ComputerResult> {
+    this.active();
     // Include argument digest even when another call with this id is in flight.
     const flightKey = `${operationId}:${stableAction(action)}`;
     const existing = this.flights.get(flightKey);
     if (existing) return existing;
     const work = this.serialize(async () => {
+      this.active();
       const digest = await sha256(stableAction(action));
+      this.active();
       const key = `operation:${operationId}`;
       const existingRecord = await this.ctx.storage.get<OperationRecord>(key);
+      this.active();
       if (existingRecord) {
         if (existingRecord.digest !== digest) return {operationId, status:"failed" as const, error:"operationId was already used with different arguments"};
         return existingRecord.result ?? {operationId, status:"interrupted" as const, error:"Operation outcome is unknown; it will not be replayed"};
       }
       await this.ensureReady(botId);
       await this.touch();
+      this.active();
       await this.ctx.storage.put<OperationRecord>(key, {digest});
+      this.active();
       let result: ComputerResult;
       let operationStage: "checkpoint" | "action" | "artifact_read" | "artifact_store" = "action";
       try {
@@ -219,6 +258,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
             if (!artifact.ok || !artifact.body) throw new Error("Screenshot could not be read");
             const artifactId = crypto.randomUUID();
             operationStage = "artifact_store";
+            this.active();
             await this.env.FILES.put(`bots/${botId}/artifacts/${artifactId}`, artifact.body, {httpMetadata:{contentType:"image/png"}});
             result.artifactId = artifactId;
             result.mimeType = "image/png";
@@ -235,6 +275,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         console.error("computer.failure", {stage:operationStage,code:safeError(error).code});
         result = {operationId,status:"interrupted",error:"Computer connection or persistence failed; the action may have completed. Inspect effects before submitting a new operation."};
       }
+      this.active();
       await this.ctx.storage.put<OperationRecord>(key, {digest,result});
       // The effect's outcome is now durable. Failure to renew its idle lifetime
       // must not replace that known result with an uncertain transport failure.
@@ -249,13 +290,18 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   }
 
   private async touch(): Promise<void> {
+    this.active();
     await this.ctx.storage.put("lastActivity", Date.now());
+    this.active();
     await this.ctx.storage.setAlarm(Date.now() + IDLE_MS);
+    this.active();
     if (this.container?.running) await stage("computer_lifecycle_failed", () => this.container!.setInactivityTimeout(SAFETY_TIMEOUT_MS));
   }
 
   async alarm(): Promise<void> {
+    if(this.deleted) {await this.ctx.storage.deleteAlarm();return;}
     await this.serialize(async () => {
+      if(this.deleted) return;
       const lastActivity = await this.ctx.storage.get<number>("lastActivity") ?? 0;
       if (Date.now() - lastActivity < IDLE_MS) {
         await this.ctx.storage.setAlarm(lastActivity + IDLE_MS);
@@ -272,16 +318,17 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       } catch {
         // Do not intentionally discard an uncheckpointed filesystem. A later
         // infrastructure failure can still lose it; this is not a live volume.
-        await this.ctx.storage.setAlarm(Date.now() + 60_000);
+        if(!this.deleted) await this.ctx.storage.setAlarm(Date.now() + 60_000);
       }
     });
   }
 
   private call(path: string, init: RequestInit = {}): Promise<Response> {
+    this.active();
     if (!this.container) throw new ComputerProviderError("computer_not_configured");
     const headers = new Headers(init.headers);
     headers.set("Authorization", `Bearer ${this.token}`);
-    return this.container.getTcpPort(PORT).fetch(`http://computer${path}`, {...init,headers});
+    return this.container.getTcpPort(PORT).fetch(`http://computer${path}`, {...init,headers,signal:init.signal?AbortSignal.any([init.signal,this.shutdown.signal]):this.shutdown.signal});
   }
 
   private async health(): Promise<Health> {
@@ -293,19 +340,22 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   }
 
   private ensureReady(botId: string): Promise<Health> {
+    this.active();
     this.starting ??= this.startAndRestore(botId).then(async health => {
+      this.active();
       await this.ctx.storage.delete("startupFailure");
       return health;
     }, async error => {
       const failure = safeError(error);
       this.desktop = false;
-      await this.ctx.storage.put("startupFailure",failure.code);
+      if(!this.deleted) await this.ctx.storage.put("startupFailure",failure.code);
       throw failure;
     }).finally(() => { this.starting = undefined; });
     return this.starting;
   }
 
   private async startAndRestore(botId: string): Promise<Health> {
+    this.active();
     const container = this.container;
     if (!container) throw new ComputerProviderError("computer_not_configured");
     const bootstrap = this.env.COMPUTER_BOOTSTRAP === "true";
@@ -330,12 +380,15 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     }
     let health: Health | undefined;
     for (let attempt = 0; attempt < 120; attempt++) {
+      this.active();
       try { health = await this.health(); break; }
       catch { await new Promise(resolve => setTimeout(resolve,250)); }
     }
     if (!health) throw new ComputerProviderError("computer_not_ready");
+    this.active();
     this.desktop = health.desktop;
     const storedBoot = await this.ctx.storage.get<string>("restoredBoot");
+    this.active();
     if (storedBoot !== health.bootId) {
       const checkpoint = await this.ctx.storage.get<Checkpoint>("lastCheckpoint");
       if (checkpoint) {
@@ -351,6 +404,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         ]));
         if (!response.ok) throw new ComputerProviderError("computer_restore_failed");
       }
+      this.active();
       await this.ctx.storage.put("restoredBoot",health.bootId);
     }
     if (started) await this.touch();
@@ -358,6 +412,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   }
 
   private async bootstrap(): Promise<void> {
+    this.active();
     const container = this.container!;
     await stage("computer_provisioning_failed", async () => {
       // GNU timeout stops the complete apt process group. Timing out only the
@@ -368,6 +423,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       if (exitCode !== 0) throw new ComputerProviderError("computer_provisioning_failed");
     });
     for (const [path, source] of [["/opt/botspace/server.py",serverSource],["/opt/botspace/start.sh",startSource]] as const) {
+      this.active();
       await stage("computer_server_install_failed", async () => {
         const process = await container.exec(["timeout","--kill-after=5","30","python3","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())",path], {
           stdin:new ReadableStream<Uint8Array>({start(controller) {controller.enqueue(encoder.encode(source));controller.close();}}),
@@ -375,6 +431,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         if ((await process.output()).exitCode !== 0) throw new ComputerProviderError("computer_server_install_failed");
       });
     }
+    this.active();
     await stage("computer_server_start_failed", async () => {
       const process = await container.exec(["timeout","--kill-after=5","30","sh","-c","nohup sh /opt/botspace/start.sh > /state/server.log 2>&1 < /dev/null &"],{
         env:{BOTSPACE_COMPUTER_TOKEN:this.token,DISPLAY:":99",BOTSPACE_WORKSPACE:"/workspace",BOTSPACE_STATE:"/state"},
@@ -384,6 +441,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   }
 
   private async saveCheckpoint(botId: string, quiesce = false): Promise<Checkpoint> {
+    this.active();
     const response = await stage("computer_checkpoint_failed", () => this.call("/checkpoint", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({quiesce})}));
     if (!response.ok || !response.body) throw new ComputerProviderError("computer_checkpoint_failed");
     const size = Number(response.headers.get("Content-Length"));
@@ -392,7 +450,9 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     const key = `bots/${botId}/checkpoints/${id}.tar.gz`;
     const checksum = response.headers.get("X-Content-SHA256") ?? "";
     if (!/^[a-f0-9]{64}$/.test(checksum)) throw new ComputerProviderError("computer_checkpoint_integrity_failed");
+    this.active();
     const object = await stage("computer_checkpoint_persist_failed", () => this.env.FILES.put(key,response.body,{httpMetadata:{contentType:"application/gzip"},sha256:checksum}));
+    this.active();
     if (!object || object.size !== size) throw new ComputerProviderError("computer_checkpoint_integrity_failed");
     const checkpoint: Checkpoint = {id,key,size,sha256:checksum,createdAt:new Date().toISOString()};
     // R2 atomically publishes an object. Only then does this durable pointer move.
@@ -450,3 +510,4 @@ export function createCloudComputerProvider(binding: DurableObjectNamespace): Co
 }
 export const touchCloudComputer = (binding: DurableObjectNamespace, botId: string) => rpc<{ok:true}>(binding,botId,"/touch");
 export const suspendCloudComputer = (binding: DurableObjectNamespace, botId: string) => rpc<ComputerStatus>(binding,botId,"/suspend");
+export const deleteCloudComputer = (binding: DurableObjectNamespace, botId: string) => rpc<{botId:string;deleted:true}>(binding,botId,"/delete");

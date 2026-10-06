@@ -5,7 +5,19 @@ export function responsesFixture(payload: { input: Record<string, unknown>[] }):
   const userIndex = payload.input.map(item => item.role === 'user').lastIndexOf(true);
   const user = payload.input[userIndex];
   const text = JSON.stringify(user);
+  if (text.includes('request-multistep-recovery')) return multistepResponse(payload.input.slice(userIndex + 1));
   const hasToolOutput = payload.input.slice(userIndex + 1).some(item => item.type === 'function_call_output');
+  if (hasToolOutput && text.includes('empty-final-after-exec')) {
+    const item = { type: 'reasoning', id: 'rs_empty_final', summary: [{ type: 'summary_text', text: 'Private fixture reasoning must remain hidden.' }], encrypted_content: 'synthetic-fixture-ciphertext' };
+    const response = { id: 'resp_empty_final', object: 'response', status: 'completed', output: [item], usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 } };
+    const events = [
+      { type: 'response.created', response: { ...response, output: [], status: 'in_progress' } },
+      { type: 'response.output_item.added', output_index: 0, item: { ...item, summary: [] } },
+      { type: 'response.output_item.done', output_index: 0, item },
+      { type: 'response.completed', response },
+    ];
+    return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
+  }
   const vision = text.includes('request-vision') && !hasToolOutput;
   const exec = text.includes('request-exec') && !hasToolOutput;
   const loop = text.includes('request-loop');
@@ -28,4 +40,35 @@ export function responsesFixture(payload: { input: Record<string, unknown>[] }):
   else if (text.includes('incomplete-response')) events.push({ type: 'response.incomplete', response: { ...response, status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } } });
   else if (!text.includes('truncated-stream')) events.push({ type: 'response.completed', response });
   return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
+}
+
+/** Several tool rounds with commentary/reasoning and distinct composite call IDs. */
+function multistepResponse(history: Record<string, unknown>[]): Response {
+  const completed = history.filter(item => item.type === 'function_call_output').length;
+  const round = completed === 0 ? 0 : completed === 2 ? 1 : completed === 3 ? 2 : 3;
+  const calls = round === 0
+    ? [{ name: 'exec', args: { command: 'printf fixture-one' } }, { name: 'exec', args: { command: 'printf fixture-two' } }]
+    : round === 1 ? [{ name: 'browser_navigate', args: { url: 'https://example.test/fixture' } }]
+    : round === 2 ? [{ name: 'desktop_screenshot', args: {} }] : [];
+  const items: Record<string, unknown>[] = [
+    { type: 'reasoning', id: `rs_multistep_${round}`, summary: [], encrypted_content: 'synthetic-fixture-ciphertext' },
+    { type: 'message', id: `msg_multistep_${round}`, role: 'assistant', status: 'completed', phase: calls.length ? 'commentary' : 'final_answer', content: [{ type: 'output_text', text: calls.length ? `Working on fixture round ${round + 1}.` : 'Completed both commands, opened the page, and checked the screenshot.', annotations: [] }] },
+    ...calls.map((call, index) => ({ type: 'function_call', id: `fc_multistep_${round}_${index}`, call_id: `call_multistep_${round}_${index}`, name: call.name, namespace: TOOL_NAMESPACE, arguments: JSON.stringify(call.args), status: 'completed' })),
+  ];
+  const response = { id: `resp_multistep_${round}`, object: 'response', status: 'completed', output: items, usage: { input_tokens: 20, output_tokens: 15, total_tokens: 35, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 4 } } };
+  const events: Record<string, unknown>[] = [{ type: 'response.created', response: { ...response, output: [], status: 'in_progress' } }];
+  items.forEach((item, output_index) => {
+    events.push({ type: 'response.output_item.added', output_index, item: { ...item, ...(item.type === 'function_call' ? { arguments: '' } : item.type === 'message' ? { content: [] } : {}), status: 'in_progress' } });
+    if (item.type === 'function_call') {
+      const argumentsText = item.arguments as string;
+      const split = Math.floor(argumentsText.length / 2);
+      for (const delta of [argumentsText.slice(0, split), argumentsText.slice(split)]) events.push({ type: 'response.function_call_arguments.delta', output_index, item_id: item.id, delta });
+      events.push({ type: 'response.function_call_arguments.done', output_index, item_id: item.id, arguments: argumentsText });
+    } else if (item.type === 'message') {
+      events.push({ type: 'response.output_text.delta', output_index, item_id: item.id, content_index: 0, delta: (item.content as { text: string }[])[0]!.text });
+    }
+    events.push({ type: 'response.output_item.done', output_index, item });
+  });
+  events.push({ type: 'response.completed', response });
+  return new Response(events.map((event, sequence_number) => `event: ${event.type}\ndata: ${JSON.stringify({ ...event, sequence_number })}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
 }

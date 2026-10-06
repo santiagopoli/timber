@@ -14,8 +14,11 @@ export async function emitFixtureRuntimeEvent(operationId: string, type: string,
 
 export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<Env>) {
   const pending = new Map<string, Promise<Result>>();
+  let destroyed = false;
+  const assertActive = () => { if (destroyed) throw new Error("Runtime has been destroyed"); };
   const key = (id: string) => `fixture-runtime:${id}`;
   const emit = async (operationId: string, type: string, data: Record<string, unknown>) => {
+    if (destroyed) return;
     await options.onEvent?.({operationId, type, data, eventKey: `${operationId}:${type}`});
   };
   async function execute(operationId: string): Promise<Result> {
@@ -26,6 +29,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
     await options.storage.put(key(operationId), operation);
     await emit(operationId, "run.started", {});
     await new Promise(resolve => setTimeout(resolve, 15));
+    if (destroyed) return {operationId, session: "1", status: "unanswered", reason: "aborted"};
     if (["fixture:model-error", "fixture:model-error-late"].includes(operation.text)) {
       const result: Result = {operationId, session: "1", status: "unanswered", reason: "model_error"};
       await options.storage.put(key(operationId), {...operation, status: "unanswered", result});
@@ -42,6 +46,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
           ? {type: "click", x: 20, y: 30}
           : {type: "exec", command: "printf original-approved-command"}, signal: new AbortController().signal,
       });
+      if (destroyed) return {operationId, session: "1", status: "unanswered", reason: "aborted"};
       if (result.status === "pending_approval") {
         const paused: Result = {operationId, session: "1", status: "unanswered", reason: "terminated"};
         await options.storage.put(key(operationId), {...operation, status: "unanswered", result: paused});
@@ -59,10 +64,12 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
   }
   return {
     async scheduleAdmissionRetry(operationId: string, delayMs: number) {
+      assertActive();
       // Tests explicitly dispatch this durable intent; no wall-clock timer.
       await options.storage.put(`fixture-admission-retry:${operationId}`, {operationId, delayMs, dueAt: Date.now() + delayMs});
     },
     async submit(text: string, input: {operationId: string}) {
+      assertActive();
       fixtureEvents.set(input.operationId, (type, data) => emit(input.operationId, type, data));
       const existing = await options.storage.get(key(input.operationId));
       if (!existing) await options.storage.put(key(input.operationId), {text, status: "queued"});
@@ -91,5 +98,13 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
       return true;
     },
     async dispose() {},
+    async destroy() {
+      destroyed = true;
+      await Promise.allSettled(pending.values());
+      for (const id of pending.keys()) fixtureEvents.delete(id);
+      const wakes = await options.storage.list({prefix: "fixture-admission-retry:"});
+      if (wakes.size) await options.storage.delete([...wakes.keys()]);
+      await options.storage.deleteAlarm();
+    },
   };
 }

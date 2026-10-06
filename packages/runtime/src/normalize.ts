@@ -16,19 +16,40 @@ export function normalizeEntries(entries: readonly EntryRecord[]): RuntimeMessag
     const text = textContent(message.content);
     if (!text) return [];
     const timestamp = 'timestamp' in message ? message.timestamp : undefined;
+    const kind = message.role === 'assistant'
+      ? message.content.some(part => part.type === 'toolCall') ? 'progress'
+      : ['stop', 'length'].includes(message.stopReason) ? 'final' : undefined
+      : undefined;
     return [{
       id: `pi:${String(entry.id)}:${index}`,
       role: role as RuntimeMessage['role'],
       text,
+      ...(kind ? { kind: kind as RuntimeMessage['kind'] } : {}),
       ...(typeof timestamp === 'number' && Number.isFinite(timestamp)
         ? { createdAt: new Date(timestamp).toISOString() } : {}),
     }];
   }));
 }
 
+/** Correlate a native completion with the host journal without exposing tool output. */
+export function toolCompletion(entry: EntryRecord | undefined): { operationId?: string; status?: string } {
+  const message = entry?.model?.find(message => message.role === 'toolResult');
+  if (!message || message.role !== 'toolResult') return {};
+  try {
+    const result = JSON.parse(textContent(message.content)) as { operationId?: unknown; status?: unknown };
+    return {
+      ...(typeof result.operationId === 'string' && /^[A-Za-z0-9:_.-]{1,160}$/.test(result.operationId) ? { operationId: result.operationId } : {}),
+      ...(typeof result.status === 'string' && ['completed', 'failed', 'interrupted', 'pending_approval'].includes(result.status) ? { status: result.status } : message.isError ? { status: 'failed' } : {}),
+    };
+  } catch { return message.isError ? { status: 'failed' } : {}; }
+}
+
 /** Publish an actionable failure category without copying provider bodies or prompts. */
 export function classifyFailure(reason: string, detail: unknown): { errorCode: string; publicMessage: string } {
   const text = typeof detail === 'string' ? detail : '';
+  if (/model_empty_response/.test(text)) {
+    return { errorCode: 'model_empty_response', publicMessage: 'The model ended its turn without a visible answer. The completed tools were not repeated.' };
+  }
   if (/chatgpt_not_connected|chatgpt_reauthorization_required|chatgpt_reauthentication_required|chatgpt_connection_expired|subscription_sharing_invalid_user/.test(text)) {
     return { errorCode: 'chatgpt_not_connected', publicMessage: 'Connect ChatGPT before running this bot.' };
   }

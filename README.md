@@ -24,7 +24,7 @@ other engines can implement these boundaries without changing bot identity.
 
 ## Implemented
 
-- Create and rename bots; edit instructions; persistent conversation per bot.
+- Create, rename and delete bots; edit instructions; persistent conversation per bot.
 - Durable asynchronous runs with streamed events, reconnect cursors and cancellation.
 - Paginated run history with active runs returned independently of the history page.
 - Replaceable agent engine, initially the durable Pi harness with `gpt-6.1-sol`
@@ -45,6 +45,18 @@ runs even when newer runs have already finished. Older event replay cannot move 
 completed run back to running.
 Streaming replies use the same safe Markdown formatting as saved messages;
 recovery snapshots replace the partial reply before later deltas are appended.
+Each user or assistant message has a copy action that preserves its original
+Markdown. Public progress updates and computer operations share an expandable
+**Activity** block, separate from the final answer. Native and host events for the
+same tool call produce one row. This displays public progress, not private model
+reasoning. Cancellation, interrupted work and empty model responses have explicit
+inline states rather than silently appearing complete.
+
+**Edit bot → Delete bot** asks for confirmation naming the bot. Deletion disables
+access, stops the agent and computer, and erases the conversation, approvals,
+artifacts and checkpoints. If cleanup cannot finish immediately, the console
+offers **Finish deleting** while the backend also retries. The shared ChatGPT
+connection is retained.
 
 Create or edit a bot to choose **Computer permission**. **Ask for each action**
 is the default; **Allow computer use** authorizes that bot's new commands, file
@@ -102,7 +114,7 @@ npm run test:console
 
 The conversation uses the official AI Elements source components, React and
 Streamdown inside the existing admin console. Vite builds the static files with
-`npm run build:console`; both deploy commands build these assets automatically.
+`npm run build:console`; the deploy commands build these assets automatically.
 For `npm run dev`, build the console first. The API Worker serves
 `apps/console/dist` at `/console/`; no additional UI server or model gateway is
 required. Component provenance and licenses are in
@@ -144,11 +156,24 @@ Store that key in your secret manager if you need to recover or migrate this
 deployment. Do not replace an existing key: stored credentials would become
 unreadable. The current Timber deployment already has this secret configured.
 
-Skip bucket creation if it already exists. `npm run deploy` builds the desktop
-image and therefore requires a working Docker daemon. For an initial deployment
-without local Docker, use `npm run deploy:bootstrap` instead. The bootstrap image
-installs desktop dependencies when a fresh computer starts; it is slower and is
-not the proposed fast cold-start production configuration.
+Skip bucket creation if it already exists. `npm run deploy` uses
+`apps/api/wrangler.production.jsonc`, with the desktop image pinned by digest in
+this deployment's Cloudflare Registry. Chromium, Xvfb and desktop dependencies
+are already installed; fresh computers do not run package installation. The first
+image preparation happens during deployment. Updating the image map does not
+restart running computers; the new image is used on their next natural start.
+
+For another Cloudflare account, use `npm run deploy:build` with a working Docker
+daemon to build and upload the desktop image for that account. For this deployment,
+the **Desktop image release** GitHub workflow builds and tests the image, then
+publishes a pristine Docker archive and SHA-256 checksum. To release a newer
+image without local Docker, verify the archive checksum, decompress it, push it
+to the account's Cloudflare Registry with `crane push` and temporary registry
+credentials, and update the digest in `wrangler.production.jsonc`. No Cloudflare
+credentials are stored in the repository or image release.
+
+`npm run deploy:bootstrap` remains an explicit fallback. It installs desktop
+dependencies when a fresh computer starts and is substantially slower.
 
 After deployment, configure the client token using the exact URL Wrangler returns:
 
@@ -268,12 +293,18 @@ input, PNG screenshot, shell deduplication, checkpoint checksum and file restore
 With Containers enabled, a separate authenticated Cloudflare smoke on 2026-10-05
 passed real file write/read, terminal execution, operation deduplication, PNG
 capture stored in R2, checkpoint, suspend, and file recovery in a fresh container.
-It uses the same ComputerDO and bootstrap server as production. This caught and
+It used the same ComputerDO and bootstrap server as production at that time. This caught and
 fixed Python's startup failure on Cloudflare's 64-character container hostname.
 Fresh provisioning plus workspace restore took 132 seconds in that single run;
-bootstrap remains a temporary deployment mode, not a fast cold-start target.
-The fix is deployed to `timber-api`; rerun `SMOKE_TIMEOUT_MS=600000 npm run smoke
--- --computer` with the owner's local credentials to verify the full production
-API and model flow. The isolated computer test does not validate ChatGPT OAuth.
+the production configuration now replaces bootstrap with a prebuilt desktop image.
+The release image passed actual Chromium/X11, shell, screenshot and checkpoint
+smoke tests in GitHub Actions. An isolated Cloudflare computer using the prebuilt
+image on 2026-10-06 returned its first Linux command in 24.1 seconds, including
+network and VM startup; a subsequent command reused the computer and returned in
+9.4 seconds. These are single observations, not a latency guarantee. Package
+installation is removed, but VM startup and checkpoint restoration still cost time.
+Run `npm run smoke -- --computer`
+with the owner's local credentials to verify the full production API and model
+flow. The isolated computer test does not validate ChatGPT OAuth.
 
 No credentials belong in this repository.

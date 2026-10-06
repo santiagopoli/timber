@@ -7,6 +7,11 @@ const CF_MODEL = '@cf/moonshotai/kimi-k2.7-code';
 /** Fake ONLY the external inference transport; Pi, lifecycle and SQLite are real. */
 export class HarnessProbe extends DurableObject {
   runtime: ReturnType<typeof createPiRuntime>;
+  heldTool?: Promise<void>;
+  releaseHeldTool?: () => void;
+  heldInference?: Promise<void>;
+  holdInferenceAfterToolCount?: number;
+  toolDelayMs?: number;
   constructor(ctx: DurableObjectState, env: object) {
     super(ctx, env);
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS calls(id INTEGER PRIMARY KEY AUTOINCREMENT, input TEXT)');
@@ -19,6 +24,7 @@ export class HarnessProbe extends DurableObject {
       chatgpt: { fetch: async request => {
         const input = await request.json<{ input: Record<string, unknown>[] }>();
         ctx.storage.sql.exec('INSERT INTO calls(input) VALUES(?)', JSON.stringify({ ...input, fixtureUrl: request.url, fixtureHeaders: Object.fromEntries(request.headers) }));
+        if (input.input.filter(item => item.type === 'function_call_output').length === this.holdInferenceAfterToolCount) await this.heldInference;
         return responsesFixture(input);
       } },
       ai: { run: async (_model: string, input: { messages: { role: string; content: unknown }[] }) => {
@@ -43,10 +49,12 @@ export class HarnessProbe extends DurableObject {
         return JSON.parse(this.setting('approvalContext') ?? '{"active":[],"recent":[]}') as RuntimeApprovalContext;
       },
       tools: {
-        execute: async ({ operationId, runOperationId, action }) => {
+        execute: async ({ operationId, runOperationId, toolCallId, action }) => {
           // Enforce the real computer boundary, even though execution is a fixture.
           if (operationId.length > 160 || /[^A-Za-z0-9:_.-]/.test(operationId)) throw new Error('Invalid computer operation ID');
-          const call = ctx.storage.sql.exec<{ id: number }>('INSERT INTO tool_calls(input) VALUES(?) RETURNING id', JSON.stringify({ operationId, runOperationId, action })).one();
+          const call = ctx.storage.sql.exec<{ id: number }>('INSERT INTO tool_calls(input) VALUES(?) RETURNING id', JSON.stringify({ operationId, runOperationId, toolCallId, action })).one();
+          await this.heldTool;
+          if (this.toolDelayMs) await new Promise(resolve => setTimeout(resolve, this.toolDelayMs));
           const nextContext = this.setting('afterToolApprovalContext');
           if (nextContext) ctx.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)', 'approvalContext', nextContext);
           return action.type === 'readFile' ? { operationId, status: 'completed', output: 'test file' } : action.type === 'screenshot' ? { operationId, status: 'completed', artifactId: 'test.png' } : this.setting('approvalMode') === 'automatic' ? { operationId, status: 'completed', output: 'fixture completed' } : { status: 'pending_approval', approvalId: `approval-fixture-${call.id}` };

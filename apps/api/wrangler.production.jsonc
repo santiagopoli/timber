@@ -1,0 +1,89 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "timber-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-05",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "workers_dev": true,
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.1
+  },
+  "assets": {
+    "directory": "../console/dist",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "ai": {
+    "binding": "AI"
+  },
+  "vars": {
+    "BOTSPACE_DEFAULT_MODEL": "gpt-6.1-sol"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "WORKSPACE",
+        "class_name": "WorkspaceDO"
+      },
+      {
+        "name": "BOT",
+        "class_name": "BotDO"
+      },
+      {
+        "name": "COMPUTER",
+        "class_name": "ComputerDO"
+      },
+      {
+        "name": "CHATGPT",
+        "class_name": "ChatGPTAuthDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "WorkspaceDO",
+        "BotDO",
+        "ComputerDO"
+      ]
+    },
+    {
+      "tag": "v2-chatgpt",
+      "new_sqlite_classes": [
+        "ChatGPTAuthDO"
+      ]
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "FILES",
+      "bucket_name": "timber-files"
+    }
+  ],
+  "containers": [
+    {
+      "class_name": "ComputerDO",
+      "scheduling_policy": "durable_object",
+      "images": {
+        "base": {
+          "image": "registry.cloudflare.com/3acfff91febe1ba644c6358ae5612736/timber-computer@sha256:7fe12aa97f04f977499156805faf0d386e2799186c0287bb9c195a61508630bf"
+        }
+      }
+    }
+  ],
+  "rules": [
+    {
+      "type": "Text",
+      "globs": [
+        "**/*.py",
+        "**/*.sh"
+      ],
+      "fallthrough": true
+    }
+  ],
+  "preview_urls": false
+}

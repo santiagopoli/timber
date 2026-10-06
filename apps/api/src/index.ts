@@ -50,7 +50,7 @@ export default {
       if(!match || !UUID.test(match[1])) throw new ApiError(404,"not_found","Bot not found.");
       const botId=match[1];
       const tail=match[2]??"";
-      if(tail==="" && request.method==="PATCH") return registry.fetch(internalRequest(request,`https://workspace/${botId}`));
+      if(tail==="" && ["PATCH","DELETE"].includes(request.method)) return registry.fetch(internalRequest(request,`https://workspace/${botId}`));
       const record=await registry.fetch(`https://workspace/${botId}`);
       if(!record.ok) return record;
       const {bot}=await record.json<{bot:Bot}>();

@@ -7,8 +7,8 @@ import {
 import { PiHarness, type PiHarnessContext } from 'agents/harness/pi';
 import { Lifecycle, LifecycleCapability, type LifecycleJobContext } from 'agents/lifecycle';
 import { createAI } from 'agents/models/pi-ai';
-import { classifyFailure, normalizeEntries, textContent } from './normalize.js';
-import { computerTools } from './tools.js';
+import { classifyFailure, normalizeEntries, textContent, toolCompletion } from './normalize.js';
+import { computerToolOperationId, computerTools } from './tools.js';
 import { CHATGPT_MODEL, chatgptModel, createChatGPTProvider } from './chatgpt.js';
 import type { AgentRuntime, PendingApproval, PiRuntimeOptions, RuntimeApprovalSummary, RuntimeEvent, RuntimeMessage, RuntimeOperation, RuntimeOperationResult, RuntimeReceipt } from './types.js';
 
@@ -61,8 +61,12 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
   let background: PiHarnessContext['context'];
   let eventStream: AgentEventStream | undefined;
   let activeOperationId: string | undefined;
+  let destroyed = false;
+  let shutdown: Promise<void> | undefined;
+  let nativeAborted = false;
+  const assertActive = () => { if (destroyed) throw new Error('Runtime has been destroyed'); };
 
-  const emit = async (event: RuntimeEvent) => { await options.onEvent?.(event); };
+  const emit = async (event: RuntimeEvent) => { if (!destroyed) await options.onEvent?.(event); };
   const resolveInputs = async (inputs: readonly SubmissionId[]) => {
     for (const id of inputs) {
       const record = await storage.submission(id, background);
@@ -94,17 +98,25 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
           void (async () => {
             let policyBlocked = true;
             try {
+              assertActive();
               const live = await native.snapshot(LiveDoc, ROOT_CONVERSATION_ID, background);
               const operationId = live?.run ? await resolveInputs(live.run.inputs) : undefined;
               if (!operationId || !live?.run) throw new Error('Model request has no durable originating operation');
               if (paused(operationId)) throw new Error('Run is paused awaiting human approval');
               consume(operationId, 'generation', String(live.run.taskId));
+              assertActive();
               policyBlocked = false;
               const upstream = provider.streamSimple(model, context, {
                 ...streamOptions, maxTokens: Math.min(streamOptions?.maxTokens ?? 4096, 4096),
               });
-              for await (const event of upstream) output.push(event);
-              output.end(await upstream.result());
+              let emptyAnswer: AssistantMessage | undefined;
+              for await (const event of upstream) {
+                if (event.type === 'done' && ['stop', 'length', 'toolUse'].includes(event.message.stopReason) && !event.message.content.some(part => part.type === 'toolCall') && !textContent(event.message.content).trim()) {
+                  emptyAnswer = { ...event.message, stopReason: 'error', errorMessage: 'model_empty_response' };
+                  output.push({ type: 'error', reason: 'error', error: emptyAnswer });
+                } else output.push(event);
+              }
+              output.end(emptyAnswer ?? await upstream.result());
             } catch (error) {
               const message: AssistantMessage = {
                 role: 'assistant', api: model.api, provider: model.provider, model: model.id,
@@ -157,7 +169,10 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
           ].filter(Boolean).join('\n');
         } }],
         tools: computerTools({
-          tools: options.tools, operationForCall, consume, paused, pause,
+          tools: {
+            execute: request => { assertActive(); return options.tools.execute(request); },
+            ...(options.tools.readImage ? { readImage: (artifactId: string) => { assertActive(); return options.tools.readImage!(artifactId); } } : {}),
+          }, operationForCall, consume, paused, pause,
           imageInputSupported: async () => resolveModel((await options.getBot()).model).input.includes('image'),
         }),
       });
@@ -182,7 +197,14 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
       await emit({ type: 'message', data: { ...message }, operationId, eventKey: message.id });
     }
   };
+  const completedKind = async (operationId: string): Promise<RuntimeMessage['kind']> => {
+    const record = await storage.submissionByRequest(ROOT_CONVERSATION_ID, operationId, background);
+    if (record?.type !== 'input' || record.status !== 'done') return undefined;
+    const answer = await storage.entry(record.answer, background);
+    return answer ? normalizeEntries([answer.entry]).find(message => message.role === 'assistant')?.kind : undefined;
+  };
   const processEvent = async (event: AgentEvent): Promise<void> => {
+    if (destroyed) return;
     switch (event.type) {
       case 'snapshot': {
         activeOperationId = event.run ? await resolveInputs(event.run.inputs) : undefined;
@@ -208,6 +230,15 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
         break;
       case 'message_end':
         await publishEntry([event.entry], activeOperationId);
+        for (const message of event.entry.model ?? []) {
+          if (message.role !== 'toolResult') continue;
+          const completed = toolCompletion(event.entry);
+          if (!completed.operationId && event.entry.byTaskId !== undefined) completed.operationId = await computerToolOperationId(String(event.entry.byTaskId), message.toolCallId);
+          await emit({ type: 'tool.completed', operationId: activeOperationId,
+            eventKey: `tool_execution_end:${message.toolCallId}`,
+            data: { toolCallId: message.toolCallId, toolName: message.toolName, ...completed },
+          });
+        }
         break;
       case 'submission': {
         const record = event.record;
@@ -220,14 +251,15 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
         }
         if (record.status === 'done') {
           const answer = await storage.entry(record.answer, background);
-          data.text = answer ? normalizeEntries([answer.entry]).filter(message => message.role === 'assistant').map(message => message.text).join('\n') : '';
+          const messages = answer ? normalizeEntries([answer.entry]).filter(message => message.role === 'assistant') : [];
+          data.text = messages.map(message => message.text).join('\n');
+          if (messages[0]?.kind) data.kind = messages[0].kind;
         }
         await emit({ type, operationId: record.requestId, eventKey: `submission:${String(record.id)}:${record.status}`, data });
         break;
       }
       case 'tool_execution_start':
-      case 'tool_execution_end':
-        await emit({ type: event.type === 'tool_execution_start' ? 'tool.started' : 'tool.completed', operationId: activeOperationId,
+        await emit({ type: 'tool.started', operationId: activeOperationId,
           eventKey: `${event.type}:${event.toolCallId}`, data: { toolCallId: event.toolCallId, toolName: event.toolName } });
         break;
       case 'task_failed':
@@ -240,6 +272,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
   class Projection extends LifecycleCapability {
     constructor() { super('botspace-pi-projection'); }
     override async onStart(): Promise<void> {
+      if (destroyed) return;
       eventStream = await harness.session().events();
       await processEvent(eventStream.snapshot);
       eventStream.start(async events => {
@@ -250,6 +283,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
   class AdmissionRetries extends LifecycleCapability {
     constructor() { super('botspace-admission'); }
     async schedule(operationId: string, delayMs: number): Promise<void> {
+      assertActive();
       if (!options.onAdmissionRetry) throw new Error('Admission retry handler is not configured');
       if (!operationId || !Number.isFinite(delayMs) || delayMs < 0) throw new Error('Invalid admission retry');
       await this.lifecycle.jobs.push({
@@ -259,7 +293,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
     }
     async onJob({ job }: LifecycleJobContext): Promise<void> {
       const payload = job.payload as { operationId?: unknown } | null;
-      if (job.fn !== 'retry' || typeof payload?.operationId !== 'string' || !options.onAdmissionRetry) return;
+      if (destroyed || job.fn !== 'retry' || typeof payload?.operationId !== 'string' || !options.onAdmissionRetry) return;
       const operationId = payload.operationId;
       // The host reconciles its durable outbox and chooses the next bounded retry.
       // Re-pushing this same job from the callback preserves the newer wake.
@@ -267,30 +301,66 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
     }
   }
   const admissionRetries = new AdmissionRetries();
-  Lifecycle.install(options.owner).use(harness).use(new Projection()).use(admissionRetries);
+  const lifecycle = Lifecycle.install(options.owner).use(harness).use(new Projection()).use(admissionRetries);
+
+  const destroy = (): Promise<void> => {
+    if (!shutdown) {
+      // The host must also persist its deletion tombstone before calling this.
+      // Fences take effect synchronously; successful close confirms no native writes remain.
+      destroyed = true;
+      const attempt = (async () => {
+        await lifecycle.disableAlarms();
+        await eventStream?.stop();
+        if (native && !nativeAborted) {
+          const conversation = await native.conversation(ROOT_CONVERSATION_ID, background);
+          await conversation?.abort(background, { background: true });
+          nativeAborted = true;
+        }
+        await harness.dispose();
+      })().catch(error => {
+        // A transient teardown failure can be retried while admission remains fenced.
+        if (shutdown === attempt) shutdown = undefined;
+        throw error;
+      });
+      shutdown = attempt;
+    }
+    let timer: ReturnType<typeof setTimeout>;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Runtime shutdown is still pending; retain deletion tombstone and retry')), 5_000);
+    });
+    return Promise.race([shutdown, deadline]).finally(() => clearTimeout(timer));
+  };
 
   return {
     scheduleAdmissionRetry: (operationId, delayMs) => admissionRetries.schedule(operationId, delayMs),
     async submit(text: string, input: { operationId: string }): Promise<RuntimeReceipt> {
+      assertActive();
       const bot = await options.getBot();
+      assertActive();
       await harness.session().setModel(resolveModel(bot.model));
+      assertActive();
       const result = await harness.submit(text, { operationId: input.operationId });
       return { operationId: result.operationId, accepted: result.accepted };
     },
     async wait(operationId: string): Promise<RuntimeOperationResult> {
+      assertActive();
       const { status, text, reason } = await harness.wait(operationId);
-      return { operationId, status, ...(text === undefined ? {} : { text }), ...(reason === undefined ? {} : { reason }) };
+      const kind = status === 'done' ? await completedKind(operationId) : undefined;
+      return { operationId, status, ...(text === undefined ? {} : { text }), ...(kind ? { kind } : {}), ...(reason === undefined ? {} : { reason }) };
     },
-    async pending() { return (await harness.pending({ session: '1' })).map(({ operationId, status }) => ({ operationId, status })); },
-    cancel: (operationId?: string) => harness.abort({ operationId }),
+    async pending() { assertActive(); return (await harness.pending({ session: '1' })).map(({ operationId, status }) => ({ operationId, status })); },
+    async cancel(operationId?: string) { assertActive(); return harness.abort({ operationId }); },
     async operation(operationId: string): Promise<RuntimeOperation> {
+      assertActive();
       const pending = (await harness.pending({ session: '1' })).find(item => item.operationId === operationId);
       if (pending) return { operationId, status: pending.status };
       // For a known finished or unknown operation, Pi wait resolves immediately from its durable record.
       const result = await harness.wait(operationId);
-      return { operationId, status: result.reason === 'not_found' ? 'missing' : result.status, ...(result.text === undefined ? {} : { text: result.text }), ...(result.reason === undefined ? {} : { reason: result.reason }) };
+      const kind = result.status === 'done' ? await completedKind(operationId) : undefined;
+      return { operationId, status: result.reason === 'not_found' ? 'missing' : result.status, ...(result.text === undefined ? {} : { text: result.text }), ...(kind ? { kind } : {}), ...(result.reason === undefined ? {} : { reason: result.reason }) };
     },
-    async messages(): Promise<RuntimeMessage[]> { return normalizeEntries(await harness.messages()); },
-    async dispose() { await eventStream?.stop(); await harness.dispose(); },
+    async messages(): Promise<RuntimeMessage[]> { assertActive(); return normalizeEntries(await harness.messages()); },
+    async dispose() { if (shutdown) return shutdown; await eventStream?.stop(); await harness.dispose(); },
+    destroy,
   };
 }
