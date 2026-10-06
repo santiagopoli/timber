@@ -1,0 +1,45 @@
+name: Publish desktop image archive
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infra/computer/**'
+      - 'scripts/smoke-computer.mjs'
+      - '.github/workflows/desktop-release.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: desktop-release-${{ github.sha }}
+  cancel-in-progress: false
+jobs:
+  desktop-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Build immutable desktop image
+        run: docker build --platform linux/amd64 --file infra/computer/Dockerfile --tag timber-computer:release infra/computer
+      - name: Exercise the built desktop
+        shell: bash
+        run: |
+          export COMPUTER_TEST_TOKEN="$(openssl rand -hex 32)"
+          trap 'docker rm -f timber-image-smoke >/dev/null 2>&1 || true' EXIT
+          docker run -d --name timber-image-smoke --shm-size=512m -p 127.0.0.1:8080:8080 -e BOTSPACE_COMPUTER_TOKEN="$COMPUTER_TEST_TOKEN" timber-computer:release
+          node scripts/smoke-computer.mjs
+      - name: Export pristine image and checksum
+        run: |
+          docker save timber-computer:release | gzip -1 > timber-desktop-linux-amd64.tar.gz
+          sha256sum timber-desktop-linux-amd64.tar.gz > SHA256SUMS
+      - name: Publish commit-addressed archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "desktop-${GITHUB_SHA}" \
+            --target "$GITHUB_SHA" --prerelease --latest=false \
+            --title "Desktop image ${GITHUB_SHA:0:12}" \
+            --notes "Tested linux/amd64 desktop image built from this commit. Contains application code and dependencies only. Import into Cloudflare Registry and pin its image digest before deployment." \
+            timber-desktop-linux-amd64.tar.gz SHA256SUMS
