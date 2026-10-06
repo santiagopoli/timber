@@ -106,8 +106,8 @@ test('approval navigation works across panels and hides secure typing text', asy
   await withPage(async ({page, login, state}) => {
     const approval = {id: '30000000-0000-4000-8000-000000000001', botId: BOT_A, runId: 'pending', status: 'pending', action: {type: 'type', text: 'test-only-sensitive-input'}, expiresAt: new Date(Date.now() + 3600000).toISOString()};
     state.approvals.set(BOT_A, [approval]); await login(); await page.locator('#tab-computer').click(); await page.locator('#approval-shortcut').click();
-    assert.equal(await page.locator('#panel-conversation').isVisible(), true); assert.equal((await page.locator('#approvals').innerText()).includes(approval.action.text), false);
-    await page.locator('#approvals').getByRole('button', {name: 'Deny', exact: true}).click(); await page.locator('#approval-shortcut').waitFor({state: 'hidden'}); assert.equal(approval.status, 'denied');
+    assert.equal(await page.locator('#panel-conversation').isVisible(), true); assert.equal((await page.locator('#messages').innerText()).includes(approval.action.text), false);
+    await page.locator('#messages').getByRole('button', {name: 'Deny', exact: true}).click(); await page.locator('#approval-shortcut').waitFor({state: 'hidden'}); assert.equal(approval.status, 'denied');
   });
 });
 
@@ -120,11 +120,11 @@ test('interrupted approval history is collapsed and exposes safe diagnostics wit
       result: {operationId: `interrupted-operation-${i}`, status: 'interrupted', error: `Stored interruption ${i}: inspect existing effects. <img src=x onerror=alert(1)>`},
     }));
     state.approvals.set(BOT_A, interrupted); await login();
-    const cards = page.locator('#approvals [data-approval-status="interrupted"]');
+    const cards = page.locator('#messages [data-approval-status="interrupted"]');
     assert.equal(await cards.count(), 8, 'all returned interrupted approvals remain accessible');
-    assert.equal(await page.locator('#approval-history').evaluate(node => node.open), false);
-    await page.locator('#approval-history summary').click();
-    assert.equal(await cards.first().getAttribute('data-approval-id'), interrupted[7].id);
+    assert.equal(await page.locator('[data-approval-history-id][open]').count(), 0);
+    for (const summary of await page.locator('[data-approval-history-id] summary').all()) await summary.click();
+    assert.equal(await cards.first().getAttribute('data-approval-id'), interrupted[0].id);
     assert.equal(await page.locator(`[data-approval-id="${interrupted[2].id}"]`).count(), 1);
     for (const approval of interrupted) {
       const card = page.locator(`[data-approval-id="${approval.id}"]`), text = await card.innerText();
@@ -146,25 +146,90 @@ test('interrupted approval history is collapsed and exposes safe diagnostics wit
 
 const pendingApproval = (id = 'current-request', minute = 20) => ({id, botId: BOT_A, runId: 'pending-run', operationId: `operation-${id}`, status: 'pending', action: {type: 'exec', command: `printf ${id}`}, createdAt: new Date(Date.UTC(2026, 9, 6, 10, minute)).toISOString(), expiresAt: new Date(Date.now() + 3600000).toISOString()});
 
-test('newest approval stays beside the composer with long history on desktop and mobile', async () => {
+test('approvals appear chronologically inline with messages on desktop and mobile', async () => {
   for (const width of [1440, 390]) await withPage(async ({page, login, state}) => {
     state.messages.set(BOT_A, Array.from({length: 80}, (_, i) => ({id: `long-${i}`, botId: BOT_A, role: i % 2 ? 'assistant' : 'user', text: `Message ${i}: ${'Long conversation text. '.repeat(15)}`, createdAt: '2026-10-06T10:00:00Z'})));
     state.approvals.set(BOT_A, Array.from({length: 12}, (_, i) => pendingApproval(`older-${i}`, i)));
+    state.messages.get(BOT_A).push({id: 'latest-request', botId: BOT_A, runId: 'pending-run', role: 'user', text: 'Run the current command and show me its output.', createdAt: pendingApproval().createdAt}, {id: 'ready-for-review', botId: BOT_A, runId: 'pending-run', role: 'assistant', text: 'The command is ready for your review.', createdAt: pendingApproval().createdAt});
     await login();
     state.approvals.get(BOT_A).push(pendingApproval()); state.emit(BOT_A, 'approval.created', {approval: pendingApproval()}, 'pending-run');
     await page.locator('#current-approval[data-approval-id="current-request"]').waitFor();
     await page.evaluate(() => {const history = document.querySelector('#messages'); history.scrollTop = history.scrollHeight; document.querySelector('#message-form').scrollIntoView({block: 'end'});});
-    assert.equal(await page.locator('#approval-history').evaluate(node => node.open), false);
-    assert.equal(await page.locator('#approval-history [data-approval-id]').count(), 12);
+    assert.equal(await page.locator('[data-approval-history-id][open]').count(), 0);
+    assert.equal(await page.locator('#messages [data-approval-history-id]').count(), 12);
     const button = page.locator('#current-approval [data-approval-decision="approve"]'), bounds = await button.boundingBox();
-    assert.ok(bounds.y >= 0 && bounds.y + bounds.height <= 1000, `current approve button stays visible at the composer on ${width}px`);
+    assert.ok(bounds.y >= 0 && bounds.y + bounds.height <= 1000, `current approve button stays visible at the timeline bottom on ${width}px`);
     assert.match(await page.locator('#current-approval pre').innerText(), /printf current-request/);
     const layout = await page.evaluate(() => ({history: document.querySelector('#messages').getBoundingClientRect().bottom, approval: document.querySelector('#current-approval').getBoundingClientRect().top, composer: document.querySelector('#message-form').getBoundingClientRect().top}));
-    assert.ok(layout.approval >= layout.history && layout.composer > layout.approval);
+    assert.ok(layout.approval < layout.history && layout.composer > layout.approval);
+    assert.equal(await page.locator('#messages > #current-approval').count(), 1, 'current approval is a timeline entry, not a separate stack');
+    assert.equal(await page.locator('#approvals').count(), 0);
     if (process.env.CONSOLE_SCREENSHOT_DIR) {await mkdir(process.env.CONSOLE_SCREENSHOT_DIR, {recursive: true}); await page.screenshot({path: `${process.env.CONSOLE_SCREENSHOT_DIR}/approval-${width}.png`});}
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
     assert.equal(state.calls.some(call => call.method !== 'GET'), false);
   }, {viewport: {width, height: 1000}});
+});
+
+test('timeline ties preserve user request, approval, then answer and retain a reviewed scroll position', async () => {
+  await withPage(async ({page, login, state}) => {
+    const approval = pendingApproval(), timestamp = approval.createdAt;
+    state.approvals.set(BOT_A, [approval]);
+    state.messages.set(BOT_A, [
+      {id: 'tie-user', botId: BOT_A, runId: approval.runId, role: 'user', text: 'Run the command.', createdAt: timestamp},
+      {id: 'tie-answer', botId: BOT_A, runId: approval.runId, role: 'assistant', text: 'The requested command is ready for review.', createdAt: timestamp},
+      {id: 'tie-user-second', botId: BOT_A, runId: 'second-run', role: 'user', text: 'A second request.', createdAt: timestamp},
+      {id: 'tie-answer-second', botId: BOT_A, runId: 'second-run', role: 'assistant', text: 'A second answer.', createdAt: timestamp},
+      ...Array.from({length: 30}, (_, i) => ({id: `later-${i}`, botId: BOT_A, role: 'assistant', text: `Later message ${i}. ${'History text. '.repeat(15)}`, createdAt: '2026-10-06T12:00:00Z'})),
+    ]);
+    await login();
+    const order = await page.locator('#messages').evaluate(node => [...node.children].map(item => item.dataset.messageId || item.dataset.timelineApproval));
+    assert.deepEqual(order.slice(0, 5), ['tie-user', approval.id, 'tie-answer', 'tie-user-second', 'tie-answer-second'], 'tied approval follows its request while canonical message order is preserved');
+    await page.locator('#messages').evaluate(node => {node.scrollTop = 160;});
+    const before = await page.locator('#messages').evaluate(node => node.scrollTop);
+    state.emit(BOT_A, 'approval.updated', {approval}, approval.runId);
+    await page.waitForResponse(response => response.url().endsWith('/approvals'));
+    await page.waitForFunction(expected => document.querySelector('#messages').scrollTop === expected, before);
+    await page.locator('#tab-computer').click(); await page.locator('#approval-shortcut').click();
+    assert.equal(await page.locator('#current-approval button').first().evaluate(node => node === document.activeElement), true);
+  });
+});
+
+test('streamed Markdown preserves recovered prefixes, open fences, replay order and the final transcript', async () => {
+  for (const width of [1440, 390]) await withPage(async ({page, login, state}) => {
+    const run = {id: 'stream-run', botId: BOT_A, operationId: 'stream-operation', status: 'running', createdAt: '2026-10-06T12:00:00Z', updatedAt: '2026-10-06T12:00:00Z'};
+    const user = {id: 'stream-user', botId: BOT_A, runId: run.id, role: 'user', text: 'Ejecutá `uname -a && pwd` y verificá el archivo antes de preparar la página.', createdAt: run.createdAt};
+    state.runs.set(BOT_A, [run]); state.messages.set(BOT_A, [user]);
+    const prefix = state.emit(BOT_A, 'runtime.snapshot', {busy: true, partialText: 'La sal'}, run.id);
+    const firstDelta = state.emit(BOT_A, 'message.delta', {delta: 'ida de `uname -a && pwd` es:\n\n```te'}, run.id);
+    await login(); await until(page, '#streaming-text', 'La salida');
+    state.emit(BOT_A, 'message.delta', {delta: 'xt\nLinux fixture-kernel\n/workspace\n<img src=x onerror=alert(1)>'}, run.id);
+    await until(page, '#streaming-text pre', '/workspace');
+    const partial = 'La salida de `uname -a && pwd` es:\n\n```text\nLinux fixture-kernel\n/workspace\n<img src=x onerror=alert(1)>';
+    assert.equal(await page.locator('#streaming-text p code').innerText(), 'uname -a && pwd');
+    assert.equal(await page.locator('#streaming-text pre code').textContent(), 'Linux fixture-kernel\n/workspace\n<img src=x onerror=alert(1)>', 'an unfinished fence is already a multiline code block');
+    assert.equal(await page.locator('#streaming-text img').count(), 0);
+    state.emit(BOT_A, 'runtime.snapshot', {busy: true, partialText: partial}, run.id);
+    state.deliver(firstDelta); state.deliver(prefix);
+    const suffix = '\n```\n\nTerminó con código de salida `0`.\nAhora preparo la página.\n\n- Archivo verificado\n- Servidor pendiente';
+    state.emit(BOT_A, 'message.delta', {delta: suffix}, run.id);
+    await until(page, '#streaming-text', 'Servidor pendiente');
+    assert.equal((await page.locator('#streaming-text').innerText()).split('La salida').length - 1, 1, 'snapshot replaces instead of duplicating the prefix');
+    assert.equal(await page.locator('#streaming-text p').count(), 2); assert.equal(await page.locator('#streaming-text li').count(), 2);
+    assert.match(await page.locator('#streaming-text p').last().textContent(), /`?0`?\.\nAhora preparo/);
+    assert.equal(await page.locator('#streaming-text pre code').textContent(), 'Linux fixture-kernel\n/workspace\n<img src=x onerror=alert(1)>');
+    const recovered = page.waitForResponse(response => response.url().includes('/events?after=')); await page.locator('#reconnect-stream').evaluate(node => node.click()); await recovered;
+    assert.equal(await page.locator('#streaming-text p').first().innerText(), 'La salida de uname -a && pwd es:');
+    await page.locator('#streaming-message').scrollIntoViewIfNeeded();
+    if (process.env.CONSOLE_SCREENSHOT_DIR) {await mkdir(process.env.CONSOLE_SCREENSHOT_DIR, {recursive: true}); await page.screenshot({path: `${process.env.CONSOLE_SCREENSHOT_DIR}/streaming-${width}.png`});}
+    const final = {id: 'stream-final', botId: BOT_A, runId: run.id, role: 'assistant', text: partial + suffix, createdAt: '2026-10-06T12:01:00Z'};
+    state.messages.set(BOT_A, [user, final]); state.emit(BOT_A, 'message.created', {message: final}, run.id);
+    run.status = 'completed'; run.updatedAt = final.createdAt; state.emit(BOT_A, 'run.updated', {run}, run.id);
+    await page.locator('#streaming-message').waitFor({state: 'hidden'}); await until(page, '[data-message-id="stream-final"]', 'Servidor pendiente');
+    assert.equal(await page.locator('[data-message-id="stream-final"]').count(), 1); assert.equal(await page.locator('#messages pre code').textContent(), 'Linux fixture-kernel\n/workspace\n<img src=x onerror=alert(1)>');
+    state.emit(BOT_A, 'runtime.snapshot', {busy: true, partialText: 'stale ghost'}, run.id); state.emit(BOT_A, 'message.delta', {delta: 'must not return'}, run.id);
+    assert.equal(await page.locator('#streaming-message').isVisible(), false); assert.equal(await page.locator('#messages img').count(), 0);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+  }, {viewport: {width, height: 1000}, colorScheme: 'dark'});
 });
 
 test('combined approval patches then approves once despite refreshes and bot switches', async () => {
@@ -226,7 +291,7 @@ test('expired requests stay read-only and fresh terminal state replaces a cached
     state.bots[0].computerApprovalMode = 'automatic'; state.approvals.set(BOT_A, [expired, pending]); state.approvalStatus = 'executing';
     await login(); assert.equal(await page.locator('#current-approval').getAttribute('data-approval-id'), pending.id);
     assert.equal(await page.locator('[data-approval-decision="approve-and-allow"]').count(), 0);
-    await page.locator('#approval-history summary').click();
+    await page.locator('[data-approval-history-id="expired-request"] summary').click();
     assert.equal(await page.locator('[data-approval-status="expired"] button').count(), 0);
     assert.match(await page.locator('[data-approval-status="expired"]').innerText(), /can no longer be approved/);
     await page.locator('#current-approval [data-approval-decision="approve"]').click(); await until(page, '#current-approval', 'Approved action is executing');

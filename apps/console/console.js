@@ -8,7 +8,7 @@
   let sessionController = new AbortController(), streamController, refreshTimer, progressTimer, computerStatusTimer;
   let computerStatusRequest = 0;
   let messages = [], approvals = [], runs = new Map(), activeRunIds = new Set(), nextCursor = null, olderPagesLoaded = false, loadingOlderRuns = false, runFilter = null, runRevision = 0, runsRequest = 0, messagesRequest = 0, approvalsRequest = 0;
-  let cursor = 0, boundary = '', events = [], streamDrafts = new Map(), screenUrl = null, artifact = null, directoryPath = '.';
+  let cursor = 0, boundary = '', events = [], streamDrafts = new Map(), renderedStreamId = null, renderedStreamText = '', screenUrl = null, artifact = null, directoryPath = '.';
   let chatGPTConnected = false, chatGPTBusy = false, chatGPTAccount = null, editBotId = null, sendBusy = new Set();
   const el = (tag, cls, text) => { const node = document.createElement(tag); if (cls) node.className = cls; if (text !== undefined) node.textContent = text; return node; };
   const botPath = (id = selected?.id) => `/v1/bots/${encodeURIComponent(id)}`;
@@ -50,7 +50,7 @@
     selected = null; currentRun = null; bots = []; messages = []; approvals = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
     drafts.clear(); pendingMessages.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); closeDialogs(); clearScreen();
     chatGPTConnected = false; chatGPTAccount = null; chatGPTBusy = false;
-    for (const id of ['messages', 'approvals', 'activity-list', 'bot-list', 'run-list', 'file-list']) $(id).replaceChildren();
+    for (const id of ['messages', 'activity-list', 'bot-list', 'run-list', 'file-list']) $(id).replaceChildren();
     for (const id of ['token', 'message', 'type-text', 'exec-command', 'navigate-url', 'key-name', 'file-content', 'bot-search']) $(id).value = '';
     $('create-form').reset(); $('edit-form').reset(); $('file-path').value = '.'; $('computer-result').textContent = 'No actions yet.';
     $('result-raw').textContent = ''; $('result-details').hidden = true; $('computer-warning').hidden = true; $('computer-progress').hidden = true;
@@ -81,7 +81,7 @@
     selected = bot; currentRun = null; cursor = 0; boundary = ''; events = []; messages = []; approvals = []; runs = new Map(); activeRunIds = new Set(); streamDrafts = new Map(); nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; runFilter = null; runRevision = 0;
     history.replaceState(null, '', `${location.pathname}${location.search}#bot=${encodeURIComponent(bot.id)}`);
     $('empty').hidden = true; $('bot-workspace').hidden = false; updateBotHeader(); renderBots();
-    for (const id of ['messages', 'approvals', 'activity-list', 'run-list']) $(id).replaceChildren();
+    for (const id of ['messages', 'activity-list', 'run-list']) $(id).replaceChildren();
     $('messages').append(emptyState('Loading conversation…', 'Restoring this bot’s messages and active runs.'));
     $('event-count').textContent = '0'; $('message').value = drafts.get(bot.id) || ''; $('message-form').querySelector('button').disabled = sendBusy.has(bot.id);
     $('computer-result').textContent = 'No actions yet.'; $('result-details').hidden = true; $('computer-warning').hidden = true;
@@ -115,16 +115,23 @@
     return output;
   }
   function renderMessages() {
-    const list = $('messages'), atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 100; list.replaceChildren();
+    if (!selected) return;
+    const list = $('messages'), atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 100, scrollTop = list.scrollTop, timeline = approvalTimeline(); list.replaceChildren();
     const visible = runFilter ? messages.filter((message) => message.runId === runFilter) : messages;
     $('run-filter').hidden = !runFilter; if (runFilter) $('run-filter-label').textContent = `Messages for run ${runFilter.slice(0, 8)}`;
-    if (!visible.length) list.append(emptyState(runFilter ? 'No messages in this view' : `What should ${selected.name} work on?`, runFilter ? 'Older messages may be outside the current history window. Show the full conversation to continue.' : 'Give this bot its first task. Its conversation will stay here.'));
-    for (const message of visible) {
+    if (!visible.length && !timeline.length) list.append(emptyState(runFilter ? 'No messages in this view' : `What should ${selected.name} work on?`, runFilter ? 'Older messages may be outside the current history window. Show the full conversation to continue.' : 'Give this bot its first task. Its conversation will stay here.'));
+    for (const entry of timeline) {
+      const requestIndex = visible.findIndex(message => message.role === 'user' && message.runId && message.runId === entry.node.dataset.runId && message.createdAt === entry.createdAt);
+      entry.order = requestIndex < 0 ? visible.length * 2 : requestIndex * 2 + 1;
+    }
+    for (const [index, message] of visible.entries()) {
       const block = el('article', `message ${['user', 'assistant', 'tool', 'system'].includes(message.role) ? message.role : ''}`); block.dataset.messageId = message.id;
       const meta = el('div', 'message-meta'); meta.append(el('span', '', message.role === 'assistant' ? selected.name : message.role === 'user' ? 'You' : message.role), el('time', '', date(message.createdAt)));
-      block.append(meta, markdown(message.text)); list.append(block);
+      block.append(meta, markdown(message.text)); timeline.push({ createdAt: message.createdAt, order: index * 2, node: block });
     }
-    if (atBottom) list.scrollTop = list.scrollHeight;
+    timeline.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || (a.order ?? 1) - (b.order ?? 1));
+    for (const entry of timeline) list.append(entry.node);
+    list.scrollTop = atBottom ? list.scrollHeight : scrollTop;
   }
   async function loadMessages(version = generation) { const id = selected?.id, sequence = ++messagesRequest; if (!id) return; const result = await request(`${botPath(id)}/messages`); if (!validView(version) || sequence !== messagesRequest) return; messages = result.messages; renderMessages(); }
   function mergeRun(run, source = 'snapshot') {
@@ -200,11 +207,11 @@
       if (session !== authSession) return;
       work.approval = result.approval;
       const failed = ['failed', 'interrupted'].includes(result.approval.status);
-      approvalFeedback.set(botId, { error: failed, text: `${permissionSaved ? 'Computer use is allowed for future actions. ' : ''}${failed ? `This action ${result.approval.status}: ${result.approval.result?.error || 'Inspect its effects before retrying.'}` : decision === 'deny' ? 'Request denied.' : 'This request was approved.'}` });
+      approvalFeedback.set(botId, { createdAt: new Date().toISOString(), runId: approval.runId, error: failed, text: `${permissionSaved ? 'Computer use is allowed for future actions. ' : ''}${failed ? `This action ${result.approval.status}: ${result.approval.result?.error || 'Inspect its effects before retrying.'}` : decision === 'deny' ? 'Request denied.' : 'This request was approved.'}` });
     } catch (error) {
       if (session !== authSession || error.name === 'AbortError') return;
       const explanation = permissionSaved ? 'Computer use is allowed for future actions, but approval of this request was not confirmed.' : allowComputer ? 'Computer permission could not be confirmed. This request was not approved; check bot settings before retrying.' : 'The decision could not be confirmed. Inspect the request state before retrying.';
-      approvalFeedback.set(botId, { error: true, text: `${explanation} ${errorText(error)} Nothing was retried automatically.` });
+      approvalFeedback.set(botId, { createdAt: new Date().toISOString(), runId: approval.runId, error: true, text: `${explanation} ${errorText(error)} Nothing was retried automatically.` });
     } finally {
       if (session === authSession && approvalWork.get(key) === work) {
         work.busy = false;
@@ -212,20 +219,20 @@
       }
     }
   }
-  function renderApprovals() {
-    if (!selected) return;
-    const botId = selected.id, historyOpen = $('approval-history')?.open || false;
+  function renderApprovals() { renderMessages(); }
+  function approvalTimeline() {
+    if (!selected) return [];
+    const botId = selected.id, entries = [], openHistory = new Set([...document.querySelectorAll('[data-approval-history-id][open]')].map(node => node.dataset.approvalHistoryId));
     const visible = approvals.map((approval) => {
       const cached = approvalWork.get(`${botId}:${approval.id}`)?.approval;
       // A fresh terminal result must replace a cached executing result.
       const value = cached && (approval.status === 'pending' || (approval.status === 'executing' && cached.status !== 'pending')) ? cached : approval;
       return value.status === 'pending' && Date.parse(value.expiresAt) <= Date.now() ? { ...value, status: 'expired' } : value;
-    }).filter((approval) => ['pending', 'executing', 'interrupted', 'expired'].includes(approval.status)).sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
-    const pending = visible.filter((approval) => approval.status === 'pending'), current = pending[0] || visible.find((approval) => approval.status === 'executing');
+    }).sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+    const pending = visible.filter((approval) => approval.status === 'pending'), scoped = visible.filter((approval) => !runFilter || approval.runId === runFilter), current = scoped.find((approval) => approval.status === 'pending') || scoped.find((approval) => approval.status === 'executing');
     $('approval-count').textContent = String(pending.length); $('approval-shortcut').hidden = !pending.length;
-    $('approvals').replaceChildren();
     const feedback = approvalFeedback.get(botId);
-    if (feedback) { const notice = el('p', feedback.error ? 'error notice' : 'hint notice', feedback.text); notice.id = 'approval-feedback'; notice.setAttribute('role', 'status'); $('approvals').append(notice); }
+    if (feedback && (!runFilter || feedback.runId === runFilter)) { const notice = el('p', feedback.error ? 'error notice' : 'hint notice', feedback.text); notice.id = 'approval-feedback'; notice.setAttribute('role', 'status'); entries.push({ createdAt: feedback.createdAt, node: notice }); }
     const makeCard = (approval) => {
       const card = el('article', 'approval'); card.dataset.approvalId = approval.id; card.dataset.approvalStatus = approval.status;
       if (approval === current) card.id = 'current-approval';
@@ -233,7 +240,8 @@
         card.append(el('h3', '', `Expired request · ${approval.action.type}`), el('pre', '', actionSummary(approval.action)), el('p', 'hint', `Expired ${date(approval.expiresAt)}. This request can no longer be approved. Send a new request if you still want this action.`));
       } else if (approval.status === 'interrupted') {
         card.append(el('h3', '', `Interrupted action · ${approval.action.type}`), el('pre', '', actionSummary(approval.action)), el('p', 'hint', `Operation ID: ${approval.operationId}`), el('p', 'error', approval.result?.error || 'The action ended without a confirmed result.'), el('p', 'hint', 'This action may have partially completed. Inspect its effects before retrying. It will not be retried automatically.'));
-      } else card.append(el('h3', '', approval.status === 'executing' ? 'Approved action is executing' : 'This action needs your approval'), el('pre', '', actionSummary(approval.action)), el('p', 'hint', `Expires ${date(approval.expiresAt)}`));
+      } else if (['pending', 'executing'].includes(approval.status)) card.append(el('h3', '', approval.status === 'executing' ? 'Approved action is executing' : 'This action needs your approval'), el('pre', '', actionSummary(approval.action)), el('p', 'hint', `Expires ${date(approval.expiresAt)}`));
+      else { card.append(el('h3', '', `Action ${statusLabel(approval.status)} · ${approval.action.type}`), el('pre', '', actionSummary(approval.action))); if (approval.result?.output) card.append(el('pre', '', approval.result.output)); if (approval.result?.error) card.append(el('p', 'error', approval.result.error)); }
       if (approval.status === 'pending') {
         const controls = el('div', 'row approval-controls'), busy = approvalWork.get(`${botId}:${approval.id}`)?.busy === true;
         const options = [{ label: 'Deny', decision: 'deny', cls: 'quiet' }, { label: 'Approve action', decision: 'approve', cls: selected.computerApprovalMode === 'automatic' ? '' : 'quiet' }];
@@ -245,9 +253,17 @@
       }
       return card;
     };
-    if (current) $('approvals').append(makeCard(current));
-    const older = visible.filter((approval) => approval !== current);
-    if (older.length) { const details = el('details', 'approval-history'); details.id = 'approval-history'; details.open = historyOpen; details.append(el('summary', '', `${current ? 'Other requests and past actions' : 'Past requests and interrupted actions'} (${older.length})`)); const list = el('div', 'approval-history-list'); for (const approval of older) list.append(makeCard(approval)); details.append(list); $('approvals').append(details); }
+    for (const approval of scoped) {
+      const card = makeCard(approval); let node = card;
+      if (approval !== current) {
+        const details = el('details', 'approval-history'); details.dataset.approvalHistoryId = approval.id; details.open = openHistory.has(approval.id);
+        const label = approval.status === 'pending' ? 'Pending approval' : approval.status === 'executing' ? 'Approved action executing' : `Action ${statusLabel(approval.status)}`;
+        details.append(el('summary', '', `${label} · ${approval.action.type} · ${date(approval.createdAt || selected.createdAt)}`), card); node = details;
+      }
+      node.dataset.timelineApproval = approval.id; node.dataset.runId = approval.runId || '';
+      entries.push({ createdAt: approval.createdAt || runs.get(approval.runId)?.createdAt || selected.createdAt, node });
+    }
+    return entries;
   }
   async function loadApprovals(version = generation) {
     const id = selected?.id, sequence = ++approvalsRequest; if (!id) return; const result = await request(`${botPath(id)}/approvals`); if (!validView(version) || sequence !== approvalsRequest) return;
@@ -261,7 +277,13 @@
   }
   function renderStreamDraft() {
     const entry = [...streamDrafts.entries()].find(([id, text]) => text && activeRunIds.has(id) && !terminal.has(runs.get(id)?.status) && (!runFilter || runFilter === id));
-    $('streaming-message').hidden = !entry; $('streaming-text').textContent = entry?.[1] || '';
+    $('streaming-message').hidden = !entry;
+    const id = entry?.[0] || null, text = entry?.[1] || '';
+    if (id === renderedStreamId && text === renderedStreamText) return;
+    renderedStreamId = id; renderedStreamText = text;
+    const target = $('streaming-text'), scroll = [...target.querySelectorAll('pre')].map(node => ({ left: node.scrollLeft, top: node.scrollTop }));
+    target.replaceChildren(...markdown(text).childNodes);
+    target.querySelectorAll('pre').forEach((node, index) => { if (scroll[index]) { node.scrollLeft = scroll[index].left; node.scrollTop = scroll[index].top; } });
   }
   function recordEvent(event, version) {
     if (!validView(version) || !Number.isSafeInteger(event.id) || event.id <= cursor) return;
@@ -272,6 +294,11 @@
     if (event.type === 'run.updated' && event.data.run) {
       const run = event.data.run;
       if ((runs.has(run.id) || !boundary || run.createdAt >= boundary) && mergeRun(run, 'event')) { runRevision++; if (!terminal.has(run.status)) activeRunIds.add(run.id); renderRuns(); }
+    }
+    if (event.type === 'runtime.snapshot' && typeof event.data.partialText === 'string' && activeRunIds.has(event.runId) && !terminal.has(runs.get(event.runId)?.status)) {
+      // Recovery snapshots replace the whole partial; only later deltas append.
+      if (event.data.busy === false) streamDrafts.delete(event.runId); else streamDrafts.set(event.runId, event.data.partialText);
+      renderStreamDraft();
     }
     if (event.type === 'message.delta' && typeof event.data.delta === 'string') {
       if (activeRunIds.has(event.runId) && !terminal.has(runs.get(event.runId)?.status)) { streamDrafts.set(event.runId, (streamDrafts.get(event.runId) || '') + event.data.delta); renderStreamDraft(); }
@@ -427,7 +454,7 @@
   $('cancel-run').addEventListener('click', () => { if (currentRun) void guarded(() => cancelRun(currentRun.id)); });
   $('refresh-runs').addEventListener('click', () => guarded(() => loadRuns())); $('load-more-runs').addEventListener('click', () => guarded(() => loadRuns(generation, true)));
   $('clear-run-filter').addEventListener('click', () => { runFilter = null; renderMessages(); renderStreamDraft(); });
-  $('approval-shortcut').addEventListener('click', () => { showPanel('conversation'); $('approvals').scrollIntoView({ block: 'start', behavior: 'smooth' }); $('approvals').querySelector('button')?.focus(); });
+  $('approval-shortcut').addEventListener('click', () => { runFilter = null; showPanel('conversation'); renderMessages(); renderStreamDraft(); $('current-approval')?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); $('current-approval')?.querySelector('button')?.focus(); });
   const tabs = [...document.querySelectorAll('[data-panel]')];
   tabs.forEach((button, index) => { button.addEventListener('click', () => showPanel(button.dataset.panel)); button.addEventListener('keydown', (event) => { let next; if (event.key === 'ArrowRight') next = (index + 1) % tabs.length; if (event.key === 'ArrowLeft') next = (index + tabs.length - 1) % tabs.length; if (event.key === 'Home') next = 0; if (event.key === 'End') next = tabs.length - 1; if (next !== undefined) { event.preventDefault(); showPanel(tabs[next].dataset.panel, true); } }); });
   $('refresh-history').addEventListener('click', () => guarded(() => Promise.all([loadMessages(), loadRuns(), loadApprovals()]))); $('reconnect-stream').addEventListener('click', startStream);

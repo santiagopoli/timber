@@ -34,9 +34,9 @@ export async function createConsoleFixture({port = 0} = {}) {
     ]], [BOT_B, []]]),
     runs: new Map([[BOT_A, []], [BOT_B, []]]), approvals: new Map([[BOT_A, []], [BOT_B, []]]),
   };
+  state.deliver = event => {for (const stream of state.streams) if (stream.botId === event.botId) stream.response.write(`id: ${event.id}\ndata: ${JSON.stringify(event)}\n\n`);};
   state.emit = (botId, type, data, runId) => {
-    const event = {id: state.events.length + 1, botId, type, data, runId, createdAt: new Date().toISOString()}; state.events.push(event);
-    for (const stream of state.streams) if (stream.botId === botId) stream.response.write(`id: ${event.id}\ndata: ${JSON.stringify(event)}\n\n`);
+    const event = {id: state.events.length + 1, botId, type, data, runId, createdAt: new Date().toISOString()}; state.events.push(event); state.deliver(event); return event;
   };
   const server = createServer(async (request, response) => {
     try {

@@ -43,14 +43,16 @@ conversation with code blocks and per-bot drafts, a Runs panel with cancellation
 and an approval indicator available from every panel. Reconnecting restores active
 runs even when newer runs have already finished. Older event replay cannot move a
 completed run back to running.
+Streaming replies use the same safe Markdown formatting as saved messages;
+recovery snapshots replace the partial reply before later deltas are appended.
 
 Create or edit a bot to choose **Computer permission**. **Ask for each action**
 is the default; **Allow computer use** authorizes that bot's new commands, file
 writes and desktop/browser actions without separate approval. Existing pending
 requests, denials and interrupted results are unchanged when switching modes.
-The newest approval appears directly above the conversation composer; older
-requests and interruptions are collapsed below it. **Approve and allow computer
-use** saves the bot's permission and then approves that exact stored request.
+Approvals appear inline in the conversation beside their requests, with older
+records collapsed in place. **Approve and allow computer use** saves the bot's
+permission and then approves that exact stored request.
 If either step fails, the console reports what was confirmed without replaying
 the action.
 The model receives current approval state on each generation, so a historical
@@ -194,8 +196,8 @@ shell deduplication, screenshot artifact, checkpoint, suspend and restored file.
 For the slower bootstrap mode, set `SMOKE_TIMEOUT_MS=600000`.
 
 If an approved action is interrupted, the conversation retains a read-only card
-with its stored action, operation ID and diagnostic in the collapsed approval
-history. Do not repeat the original task until its effects are checked:
+with its stored action, operation ID and diagnostic in a collapsible conversation
+entry. Do not repeat the original task until its effects are checked:
 inspect the relevant workspace file or take a fresh screenshot. An interruption
 means the outcome was not confirmed, not that the action had no effect. Polling
 the console coalesces recovery of an executing approval; it does not launch a

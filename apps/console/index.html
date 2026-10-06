@@ -40,7 +40,6 @@
         <div id="run-filter" class="filter-banner" hidden><span id="run-filter-label"></span><button id="clear-run-filter" class="text-button">Show full conversation</button></div>
         <div id="messages" class="messages" aria-live="polite"></div>
         <article id="streaming-message" class="message assistant" hidden><div class="message-meta"><span class="pulse-dot" aria-hidden="true"></span><span>Responding…</span></div><div id="streaming-text" class="message-text"></div></article>
-        <div id="approvals" aria-live="polite"></div>
         <form id="message-form" class="composer"><label class="sr-only" for="message">Message this bot</label><textarea id="message" rows="3" placeholder="Give this bot a task…" required></textarea><div class="row"><span class="hint">⌘ / Ctrl + Enter to send · drafts stay with each bot</span><span class="spacer"></span><button type="submit">Send <span aria-hidden="true">↑</span></button></div></form>
       </section>
       <section id="panel-runs" class="panel" role="tabpanel" aria-labelledby="tab-runs" hidden><div class="section-title"><div><h2>Run history</h2><p class="hint">Tasks inside this bot’s persistent conversation.</p></div><button id="refresh-runs" class="quiet">Refresh</button></div><div id="run-list" class="run-list"></div><button id="load-more-runs" class="quiet load-more" hidden>Load older runs</button></section>
