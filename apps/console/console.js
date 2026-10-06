@@ -3,9 +3,10 @@
   const $ = (id) => document.getElementById(id);
   const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
   const guiActions = new Set(['navigate', 'click', 'type', 'key', 'scroll']);
-  const drafts = new Map(), pendingMessages = new Map(), pendingActions = new Map(), computerPending = new Map(), stopping = new Set();
+  const drafts = new Map(), pendingMessages = new Map(), pendingActions = new Map(), computerPending = new Map(), stopping = new Set(), approvalWork = new Map(), approvalFeedback = new Map();
   let token = '', bots = [], selected = null, currentRun = null, generation = 0, authSession = 0;
-  let sessionController = new AbortController(), streamController, refreshTimer, progressTimer;
+  let sessionController = new AbortController(), streamController, refreshTimer, progressTimer, computerStatusTimer;
+  let computerStatusRequest = 0;
   let messages = [], approvals = [], runs = new Map(), activeRunIds = new Set(), nextCursor = null, olderPagesLoaded = false, loadingOlderRuns = false, runFilter = null, runRevision = 0, runsRequest = 0, messagesRequest = 0, approvalsRequest = 0;
   let cursor = 0, boundary = '', events = [], streamDrafts = new Map(), screenUrl = null, artifact = null, directoryPath = '.';
   let chatGPTConnected = false, chatGPTBusy = false, chatGPTAccount = null, editBotId = null, sendBusy = new Set();
@@ -45,9 +46,9 @@
     $('click-mode').checked = false; $('auto-screenshot').checked = false; document.querySelector('.screen').classList.remove('click-enabled');
   }
   function disconnect(message = '') {
-    generation++; authSession++; token = ''; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
+    stopComputerStatus(); generation++; authSession++; token = ''; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
     selected = null; currentRun = null; bots = []; messages = []; approvals = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
-    drafts.clear(); pendingMessages.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); closeDialogs(); clearScreen();
+    drafts.clear(); pendingMessages.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); closeDialogs(); clearScreen();
     chatGPTConnected = false; chatGPTAccount = null; chatGPTBusy = false;
     for (const id of ['messages', 'approvals', 'activity-list', 'bot-list', 'run-list', 'file-list']) $(id).replaceChildren();
     for (const id of ['token', 'message', 'type-text', 'exec-command', 'navigate-url', 'key-name', 'file-content', 'bot-search']) $(id).value = '';
@@ -76,7 +77,7 @@
   async function selectBot(bot) {
     if (selected?.id === bot.id) return;
     if (selected) drafts.set(selected.id, $('message').value);
-    generation++; const version = generation; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
+    stopComputerStatus(); generation++; const version = generation; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
     selected = bot; currentRun = null; cursor = 0; boundary = ''; events = []; messages = []; approvals = []; runs = new Map(); activeRunIds = new Set(); streamDrafts = new Map(); nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; runFilter = null; runRevision = 0;
     history.replaceState(null, '', `${location.pathname}${location.search}#bot=${encodeURIComponent(bot.id)}`);
     $('empty').hidden = true; $('bot-workspace').hidden = false; updateBotHeader(); renderBots();
@@ -88,7 +89,7 @@
     $('file-content').value = ''; $('type-text').value = ''; $('file-list').replaceChildren(el('p', 'hint', 'Browse to load files. This may wake the computer.'));
     $('app-error').textContent = ''; $('approval-shortcut').hidden = true; renderCurrentRun(); renderStreamDraft(); renderProgress();
     try { await Promise.all([loadMessages(version), loadRuns(version), loadApprovals(version)]); }
-    finally { if (validView(version)) startStream(); }
+    finally { if (validView(version)) { startStream(); if (!$('panel-computer').hidden) void guarded(computerStatus); } }
   }
   function inlineText(container, text) {
     const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*)/g; let index = 0;
@@ -181,24 +182,76 @@
     finally { if (session === authSession) stopping.delete(id); if (validView(version)) renderRuns(); }
   }
   function actionSummary(action) { return JSON.stringify(action.type === 'type' ? { type: 'type', text: `[${String(action.text || '').length} characters hidden]` } : action, null, 2); }
+  async function decideApproval(botId, approval, decision, allowComputer = false) {
+    const key = `${botId}:${approval.id}`, session = authSession;
+    if (!token || approvalWork.get(key)?.busy || approvalWork.get(key)?.approval) return;
+    const work = { busy: true }; approvalWork.set(key, work); approvalFeedback.delete(botId);
+    if (selected?.id === botId) renderApprovals();
+    let permissionSaved = false;
+    try {
+      if (allowComputer) {
+        const { bot } = await request(botPath(botId), { method: 'PATCH', body: { computerApprovalMode: 'automatic' } });
+        if (session !== authSession) return;
+        permissionSaved = true; bots = bots.map((item) => item.id === botId ? bot : item);
+        if (selected?.id === botId) { selected = bot; updateBotHeader(); renderApprovals(); } renderBots();
+      }
+      if (session !== authSession || !token) return;
+      const result = await request(`${botPath(botId)}/approvals/${encodeURIComponent(approval.id)}`, { method: 'POST', body: { decision } });
+      if (session !== authSession) return;
+      work.approval = result.approval;
+      const failed = ['failed', 'interrupted'].includes(result.approval.status);
+      approvalFeedback.set(botId, { error: failed, text: `${permissionSaved ? 'Computer use is allowed for future actions. ' : ''}${failed ? `This action ${result.approval.status}: ${result.approval.result?.error || 'Inspect its effects before retrying.'}` : decision === 'deny' ? 'Request denied.' : 'This request was approved.'}` });
+    } catch (error) {
+      if (session !== authSession || error.name === 'AbortError') return;
+      const explanation = permissionSaved ? 'Computer use is allowed for future actions, but approval of this request was not confirmed.' : allowComputer ? 'Computer permission could not be confirmed. This request was not approved; check bot settings before retrying.' : 'The decision could not be confirmed. Inspect the request state before retrying.';
+      approvalFeedback.set(botId, { error: true, text: `${explanation} ${errorText(error)} Nothing was retried automatically.` });
+    } finally {
+      if (session === authSession && approvalWork.get(key) === work) {
+        work.busy = false;
+        if (selected?.id === botId) { renderApprovals(); queueComputerStatus(); void guarded(() => Promise.all([loadApprovals(), loadRuns()])); }
+      }
+    }
+  }
+  function renderApprovals() {
+    if (!selected) return;
+    const botId = selected.id, historyOpen = $('approval-history')?.open || false;
+    const visible = approvals.map((approval) => {
+      const cached = approvalWork.get(`${botId}:${approval.id}`)?.approval;
+      // A fresh terminal result must replace a cached executing result.
+      const value = cached && (approval.status === 'pending' || (approval.status === 'executing' && cached.status !== 'pending')) ? cached : approval;
+      return value.status === 'pending' && Date.parse(value.expiresAt) <= Date.now() ? { ...value, status: 'expired' } : value;
+    }).filter((approval) => ['pending', 'executing', 'interrupted', 'expired'].includes(approval.status)).sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+    const pending = visible.filter((approval) => approval.status === 'pending'), current = pending[0] || visible.find((approval) => approval.status === 'executing');
+    $('approval-count').textContent = String(pending.length); $('approval-shortcut').hidden = !pending.length;
+    $('approvals').replaceChildren();
+    const feedback = approvalFeedback.get(botId);
+    if (feedback) { const notice = el('p', feedback.error ? 'error notice' : 'hint notice', feedback.text); notice.id = 'approval-feedback'; notice.setAttribute('role', 'status'); $('approvals').append(notice); }
+    const makeCard = (approval) => {
+      const card = el('article', 'approval'); card.dataset.approvalId = approval.id; card.dataset.approvalStatus = approval.status;
+      if (approval === current) card.id = 'current-approval';
+      if (approval.status === 'expired') {
+        card.append(el('h3', '', `Expired request · ${approval.action.type}`), el('pre', '', actionSummary(approval.action)), el('p', 'hint', `Expired ${date(approval.expiresAt)}. This request can no longer be approved. Send a new request if you still want this action.`));
+      } else if (approval.status === 'interrupted') {
+        card.append(el('h3', '', `Interrupted action · ${approval.action.type}`), el('pre', '', actionSummary(approval.action)), el('p', 'hint', `Operation ID: ${approval.operationId}`), el('p', 'error', approval.result?.error || 'The action ended without a confirmed result.'), el('p', 'hint', 'This action may have partially completed. Inspect its effects before retrying. It will not be retried automatically.'));
+      } else card.append(el('h3', '', approval.status === 'executing' ? 'Approved action is executing' : 'This action needs your approval'), el('pre', '', actionSummary(approval.action)), el('p', 'hint', `Expires ${date(approval.expiresAt)}`));
+      if (approval.status === 'pending') {
+        const controls = el('div', 'row approval-controls'), busy = approvalWork.get(`${botId}:${approval.id}`)?.busy === true;
+        const options = [{ label: 'Deny', decision: 'deny', cls: 'quiet' }, { label: 'Approve action', decision: 'approve', cls: selected.computerApprovalMode === 'automatic' ? '' : 'quiet' }];
+        if (selected.computerApprovalMode !== 'automatic') options.push({ label: 'Approve and allow computer use', decision: 'approve', allow: true, cls: 'approve-allow' });
+        for (const option of options) { const button = el('button', option.cls, option.label); button.type = 'button'; button.disabled = busy; button.dataset.approvalDecision = option.allow ? 'approve-and-allow' : option.decision; button.addEventListener('click', () => { void decideApproval(botId, approval, option.decision, option.allow); }); controls.append(button); }
+        card.append(controls);
+        if (selected.computerApprovalMode !== 'automatic') card.append(el('p', 'hint', 'Approve and allow computer use approves this request and authorizes future commands, file changes, and browser/desktop actions for this bot.'));
+        if (busy) card.append(el('p', 'hint', 'Saving your decision…'));
+      }
+      return card;
+    };
+    if (current) $('approvals').append(makeCard(current));
+    const older = visible.filter((approval) => approval !== current);
+    if (older.length) { const details = el('details', 'approval-history'); details.id = 'approval-history'; details.open = historyOpen; details.append(el('summary', '', `${current ? 'Other requests and past actions' : 'Past requests and interrupted actions'} (${older.length})`)); const list = el('div', 'approval-history-list'); for (const approval of older) list.append(makeCard(approval)); details.append(list); $('approvals').append(details); }
+  }
   async function loadApprovals(version = generation) {
     const id = selected?.id, sequence = ++approvalsRequest; if (!id) return; const result = await request(`${botPath(id)}/approvals`); if (!validView(version) || sequence !== approvalsRequest) return;
-    const interrupted = result.approvals.filter((approval) => approval.status === 'interrupted').sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 5);
-    approvals = [...result.approvals.filter((approval) => ['pending', 'executing'].includes(approval.status)), ...interrupted]; $('approvals').replaceChildren();
-    const pending = approvals.filter((approval) => approval.status === 'pending').length;
-    $('approval-count').textContent = String(pending); $('approval-shortcut').hidden = !pending;
-    for (const approval of approvals) {
-      const card = el('article', 'approval'); card.dataset.approvalId = approval.id; card.dataset.approvalStatus = approval.status;
-      if (approval.status === 'interrupted') {
-        card.append(el('h3', '', `Interrupted action · ${approval.action.type}`), el('pre', '', actionSummary(approval.action)), el('p', 'hint', `Operation ID: ${approval.operationId}`), el('p', 'error', approval.result?.error || 'The action ended without a confirmed result.'), el('p', 'hint', 'This action may have partially completed. Inspect its effects before retrying. It will not be retried automatically.'));
-      } else card.append(el('h3', '', approval.status === 'executing' ? 'Approved action is executing' : 'Review this action'), el('pre', '', actionSummary(approval.action)), el('p', 'hint', `Expires ${date(approval.expiresAt)}`));
-      if (approval.status === 'pending') {
-        const controls = el('div', 'row');
-        for (const decision of ['deny', 'approve']) { const button = el('button', decision === 'deny' ? 'quiet' : '', decision === 'approve' ? 'Approve action' : 'Deny'); button.type = 'button'; button.addEventListener('click', () => guarded(async () => { for (const item of controls.querySelectorAll('button')) item.disabled = true; try { await request(`${botPath(id)}/approvals/${encodeURIComponent(approval.id)}`, { method: 'POST', body: { decision } }); } finally { if (validView(version)) await Promise.all([loadApprovals(version), loadRuns(version)]); } })); controls.append(button); }
-        card.append(controls);
-      }
-      $('approvals').append(card);
-    }
+    approvals = result.approvals; renderApprovals();
   }
   function scheduleRefresh(version) { clearTimeout(refreshTimer); refreshTimer = setTimeout(() => { if (validView(version)) void guarded(() => Promise.all([loadMessages(version), loadRuns(version), loadApprovals(version)])); }, 300); }
   function redact(value, key = '') {
@@ -212,6 +265,7 @@
   }
   function recordEvent(event, version) {
     if (!validView(version) || !Number.isSafeInteger(event.id) || event.id <= cursor) return;
+    if (['computer.action', 'computer.suspended', 'tool.started', 'tool.completed', 'approval.updated'].includes(event.type)) queueComputerStatus();
     cursor = event.id; events.push(event); if (events.length > 200) events.shift(); $('event-count').textContent = String(events.length);
     const row = el('article', 'event'), title = el('div', 'event-title'); title.append(el('span', '', event.type.replaceAll('.', ' · ')), el('span', 'muted', `#${event.id} · ${time(event.createdAt)}`));
     const detail = el('details'); detail.append(el('summary', '', 'Event details')); const serialized = JSON.stringify(redact(event.data), null, 2); detail.append(el('pre', '', serialized.length > 8000 ? `${serialized.slice(0, 8000)}\n…` : serialized)); row.append(title, detail); $('activity-list').prepend(row); while ($('activity-list').children.length > 200) $('activity-list').lastElementChild.remove();
@@ -253,7 +307,19 @@
   function beginComputer(id, label) { if (computerPending.has(id)) return null; const pending = { started: Date.now(), label }; computerPending.set(id, pending); if (!progressTimer) progressTimer = setInterval(renderProgress, 500); renderProgress(); $('computer-warning').hidden = true; return pending; }
   function finishComputer(id, pending) { if (computerPending.get(id) === pending) computerPending.delete(id); renderProgress(); }
   function warning(message) { $('computer-warning').textContent = message; $('computer-warning').hidden = false; }
-  async function computerStatus() { const version = generation, id = selected?.id; if (!id) return; const { computer } = await request(`${botPath(id)}/computer`); if (!validView(version)) return; $('computer-status').textContent = `${statusLabel(computer.state)} · ${computer.provider}${computer.lastCheckpointId ? ' · checkpoint available' : ''}${computer.state === 'unavailable' ? ' · This deployment has no available computer.' : ''}`; }
+  function stopComputerStatus() { clearTimeout(computerStatusTimer); computerStatusTimer = null; computerStatusRequest++; }
+  function queueComputerStatus() { if (!selected || !token || $('panel-computer').hidden) return; clearTimeout(computerStatusTimer); computerStatusTimer = setTimeout(() => { computerStatusTimer = null; void guarded(computerStatus); }, 250); }
+  async function computerStatus() {
+    const version = generation, id = selected?.id; if (!id || !token || $('panel-computer').hidden) return;
+    clearTimeout(computerStatusTimer); computerStatusTimer = null; const sequence = ++computerStatusRequest;
+    try {
+      const { computer } = await request(`${botPath(id)}/computer`);
+      if (!validView(version) || sequence !== computerStatusRequest || $('panel-computer').hidden) return;
+      const diagnostic = computer.error?.message ? `${computer.error.message}${computer.error.code ? ` (${computer.error.code})` : ''}` : computer.state === 'unavailable' ? 'Computer health could not be confirmed. Refresh status to check again.' : '';
+      $('computer-status').textContent = `${statusLabel(computer.state)} · ${computer.provider}${computer.lastCheckpointId ? ' · checkpoint available' : ''}${diagnostic ? ` · ${diagnostic}` : ''}`;
+      if (computer.state === 'starting') computerStatusTimer = setTimeout(() => { computerStatusTimer = null; void guarded(computerStatus); }, 1500);
+    } catch (error) { if (!validView(version) || sequence !== computerStatusRequest || $('panel-computer').hidden) return; $('computer-status').textContent = 'Status could not be refreshed. Check your connection and refresh status.'; throw error; }
+  }
   function renderResult(result, action) {
     $('result-details').hidden = false; $('result-raw').textContent = JSON.stringify(redact(result), null, 2);
     const parts = [];
@@ -325,6 +391,7 @@
   async function loadChatGPT(session = authSession) { const status = await request('/v1/connections/chatgpt'); if (session === authSession) renderChatGPT(status); }
   function showPanel(name, focus = false) {
     for (const button of document.querySelectorAll('[data-panel]')) { const active = button.dataset.panel === name; button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active)); button.tabIndex = active ? 0 : -1; $(`panel-${button.dataset.panel}`).hidden = !active; if (active && focus) button.focus(); }
+    if (name !== 'computer') stopComputerStatus();
     if (name === 'computer' && selected) void guarded(computerStatus); if (name === 'runs' && selected) void guarded(() => loadRuns());
   }
   function bindForm(id, fn) { $(id).addEventListener('submit', (event) => { event.preventDefault(); void guarded(fn); }); }
@@ -347,7 +414,7 @@
   $('edit-bot').addEventListener('click', () => { if (!selected) return; editBotId = selected.id; $('edit-name').value = selected.name; $('edit-instructions').value = selected.instructions; $('edit-computer-approval-mode').value = selected.computerApprovalMode === 'automatic' ? 'automatic' : 'ask'; $('edit-error').textContent = ''; $('edit-dialog').showModal(); $('edit-name').focus(); });
   $('edit-form').addEventListener('submit', async (event) => {
     event.preventDefault(); const button = event.submitter || event.currentTarget.querySelector('[type=submit]'), id = editBotId; if (!id) return; button.disabled = true; $('edit-error').textContent = '';
-    try { const { bot } = await request(botPath(id), { method: 'PATCH', body: { name: $('edit-name').value.trim(), instructions: $('edit-instructions').value.trim(), computerApprovalMode: $('edit-computer-approval-mode').value } }); bots = bots.map((item) => item.id === bot.id ? bot : item); if (selected?.id === bot.id) { selected = bot; updateBotHeader(); renderMessages(); } renderBots(); $('edit-dialog').close(); }
+    try { const { bot } = await request(botPath(id), { method: 'PATCH', body: { name: $('edit-name').value.trim(), instructions: $('edit-instructions').value.trim(), computerApprovalMode: $('edit-computer-approval-mode').value } }); bots = bots.map((item) => item.id === bot.id ? bot : item); if (selected?.id === bot.id) { selected = bot; updateBotHeader(); renderMessages(); renderApprovals(); } renderBots(); $('edit-dialog').close(); }
     catch (error) { if (token) $('edit-error').textContent = errorText(error); } finally { button.disabled = false; }
   });
   $('message').addEventListener('input', () => { if (selected) drafts.set(selected.id, $('message').value); });

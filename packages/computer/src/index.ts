@@ -36,6 +36,7 @@ const COMPUTER_ERRORS = {
   computer_start_failed: {status:503, message:"Cloudflare could not start the computer. Check Containers access, provisioning, and instance capacity."},
   computer_lifecycle_failed: {status:503, message:"Cloudflare could not configure the computer lifetime."},
   computer_provisioning_failed: {status:503, message:"The cloud computer could not install its desktop packages."},
+  computer_start_timeout: {status:503, message:"The cloud computer exceeded its startup time limit. No requested action was executed."},
   computer_server_install_failed: {status:503, message:"The cloud computer could not install its control server."},
   computer_server_start_failed: {status:503, message:"The cloud computer control server could not start."},
   computer_not_ready: {status:503, message:"The cloud computer started but its control server did not become ready."},
@@ -85,7 +86,6 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   private starting?: Promise<Health>;
   private flights = new Map<string, Promise<ComputerResult>>();
   private token = "";
-  private readyBoot?: string;
   private desktop = false;
 
   constructor(ctx: DurableObjectState, env: ComputerEnv) {
@@ -133,7 +133,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
             await this.ensureReady(body.botId);
             await this.saveCheckpoint(body.botId, true);
             await this.container.destroy("User suspended computer after durable checkpoint");
-            this.readyBoot = undefined;
+            this.desktop = false;
           }
           return this.status(body.botId);
         }));
@@ -150,19 +150,34 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   }
 
   private async status(botId: string): Promise<ComputerStatus> {
-    const checkpoint = await this.ctx.storage.get<Checkpoint>("lastCheckpoint");
+    const [checkpoint, startupFailure] = await Promise.all([
+      this.ctx.storage.get<Checkpoint>("lastCheckpoint"),
+      this.ctx.storage.get<ComputerErrorCode>("startupFailure"),
+    ]);
     const container = this.container;
     let state: ComputerStatus["state"] = !container ? "unavailable" : this.starting ? "starting" : container.running ? "running" : "stopped";
-    if (state === "running" && !this.readyBoot) {
+    let error: ComputerProviderError | undefined;
+    if (!container) error = new ComputerProviderError("computer_not_configured");
+    else if (!this.starting && startupFailure) {
+      state = "unavailable";
+      error = new ComputerProviderError(startupFailure);
+    } else if (state === "running") {
       try {
         const health = await this.health();
         this.desktop = health.desktop;
-      } catch { state = "starting"; }
+      } catch {
+        // A failed probe is not an active startup. Status never boots, repairs,
+        // touches idle activity, or replays an action just to update the UI.
+        state = "unavailable";
+        error = new ComputerProviderError("computer_not_ready");
+      }
     }
+    if (state !== "running") this.desktop = false;
     return {
       id:botId, provider:"cloudflare", state,
       capabilities: container ? [...BASE_CAPABILITIES, ...(this.desktop ? DESKTOP_CAPABILITIES : [])] : [],
       ...(checkpoint ? {lastCheckpointId:checkpoint.id} : {}),
+      ...(error ? {error:{code:error.code,message:error.publicMessage}} : {}),
     };
   }
 
@@ -253,7 +268,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         await this.ensureReady(botId);
         await this.saveCheckpoint(botId, true);
         await this.container.destroy("Idle computer checkpointed");
-        this.readyBoot = undefined;
+        this.desktop = false;
       } catch {
         // Do not intentionally discard an uncheckpointed filesystem. A later
         // infrastructure failure can still lose it; this is not a live volume.
@@ -272,11 +287,21 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   private async health(): Promise<Health> {
     const response = await this.call("/health", {signal:AbortSignal.timeout(2000)});
     if (!response.ok) throw new Error("Computer is not ready");
-    return response.json<Health>();
+    const health = await response.json<Health>();
+    if (health.ok !== true || typeof health.bootId !== "string" || !health.bootId || typeof health.desktop !== "boolean") throw new Error("Invalid computer health");
+    return health;
   }
 
   private ensureReady(botId: string): Promise<Health> {
-    this.starting ??= this.startAndRestore(botId).finally(() => { this.starting = undefined; });
+    this.starting ??= this.startAndRestore(botId).then(async health => {
+      await this.ctx.storage.delete("startupFailure");
+      return health;
+    }, async error => {
+      const failure = safeError(error);
+      this.desktop = false;
+      await this.ctx.storage.put("startupFailure",failure.code);
+      throw failure;
+    }).finally(() => { this.starting = undefined; });
     return this.starting;
   }
 
@@ -328,7 +353,6 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       }
       await this.ctx.storage.put("restoredBoot",health.bootId);
     }
-    this.readyBoot = health.bootId;
     if (started) await this.touch();
     return health;
   }
@@ -336,19 +360,23 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   private async bootstrap(): Promise<void> {
     const container = this.container!;
     await stage("computer_provisioning_failed", async () => {
-      const install = await container.exec(["sh","-c", "mkdir -p /workspace /state /opt/botspace; if ! test -f /opt/botspace/desktop-ready; then export DEBIAN_FRONTEND=noninteractive; apt-get update > /state/bootstrap.log 2>&1 && apt-get install -y --no-install-recommends python3 chromium xvfb xdotool xclip scrot openbox fonts-liberation ca-certificates curl git procps >> /state/bootstrap.log 2>&1 && touch /opt/botspace/desktop-ready; fi"]);
-      if ((await install.output()).exitCode !== 0) throw new ComputerProviderError("computer_provisioning_failed");
+      // GNU timeout stops the complete apt process group. Timing out only the
+      // JavaScript wait or its parent shell would leave package installs running.
+      const install = await container.exec(["timeout","--kill-after=5","240","sh","-c", "mkdir -p /workspace /state /opt/botspace; if ! test -f /opt/botspace/desktop-ready; then export DEBIAN_FRONTEND=noninteractive; apt-get update > /state/bootstrap.log 2>&1 && apt-get install -y --no-install-recommends python3 chromium xvfb xdotool xclip scrot openbox fonts-liberation ca-certificates curl git procps >> /state/bootstrap.log 2>&1 && touch /opt/botspace/desktop-ready; fi"]);
+      const {exitCode} = await install.output();
+      if (exitCode === 124) throw new ComputerProviderError("computer_start_timeout");
+      if (exitCode !== 0) throw new ComputerProviderError("computer_provisioning_failed");
     });
     for (const [path, source] of [["/opt/botspace/server.py",serverSource],["/opt/botspace/start.sh",startSource]] as const) {
       await stage("computer_server_install_failed", async () => {
-        const process = await container.exec(["python3","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())",path], {
+        const process = await container.exec(["timeout","--kill-after=5","30","python3","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())",path], {
           stdin:new ReadableStream<Uint8Array>({start(controller) {controller.enqueue(encoder.encode(source));controller.close();}}),
         });
         if ((await process.output()).exitCode !== 0) throw new ComputerProviderError("computer_server_install_failed");
       });
     }
     await stage("computer_server_start_failed", async () => {
-      const process = await container.exec(["sh","-c","nohup sh /opt/botspace/start.sh > /state/server.log 2>&1 < /dev/null &"],{
+      const process = await container.exec(["timeout","--kill-after=5","30","sh","-c","nohup sh /opt/botspace/start.sh > /state/server.log 2>&1 < /dev/null &"],{
         env:{BOTSPACE_COMPUTER_TOKEN:this.token,DISPLAY:":99",BOTSPACE_WORKSPACE:"/workspace",BOTSPACE_STATE:"/state"},
       });
       if ((await process.output()).exitCode !== 0) throw new ComputerProviderError("computer_server_start_failed");

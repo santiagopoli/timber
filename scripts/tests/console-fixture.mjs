@@ -23,7 +23,7 @@ const image = png();
 export async function createConsoleFixture({port = 0} = {}) {
   const date = '2026-10-05T10:00:00.000Z';
   const state = {
-    rejectAuth: false, actionGate: null, readsGate: null, failures: [], actions: [], calls: [], streams: new Set(), events: [],
+    rejectAuth: false, actionGate: null, readsGate: null, patchGate: null, patchError: null, approvalGate: null, approvalError: null, approvalStatus: null, computerStates: new Map(), computerStatusGate: null, failures: [], actions: [], calls: [], streams: new Set(), events: [],
     bots: [
       {id: BOT_A, name: 'Ada', instructions: 'Research and turn findings into useful notes.', model: 'gpt-6.1-sol', runtime: 'pi', createdAt: date, updatedAt: date},
       {id: BOT_B, name: 'Linus', instructions: 'Help build and maintain software.', model: 'gpt-6.1-sol', runtime: 'pi', createdAt: date, updatedAt: date},
@@ -58,7 +58,7 @@ export async function createConsoleFixture({port = 0} = {}) {
       }
       const match = /^\/v1\/bots\/([^/]+)(.*)$/.exec(path); if (!match) return json({}, 404);
       const [, id, tail] = match, bot = state.bots.find(bot => bot.id === id); if (!bot) return json({}, 404);
-      if (!tail) {if (request.method === 'PATCH') Object.assign(bot, body); return json({bot});}
+      if (!tail) {if (request.method === 'PATCH') {if (state.patchGate) await state.patchGate; if (state.patchError) return json({error: state.patchError}, state.patchError.status || 503); Object.assign(bot, body);} return json({bot});}
       if (tail === '/messages') {
         if (request.method === 'GET') {const snapshot = structuredClone(state.messages.get(id)); if (state.readsGate) await state.readsGate; return json({messages: snapshot});}
         const run = {id: randomUUID(), botId: id, operationId: body.operationId, status: 'queued', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()}; state.runs.get(id).unshift(run); state.messages.get(id).push({id: randomUUID(), botId: id, runId: run.id, role: 'user', text: body.text, createdAt: run.createdAt}); return json({run}, 202);
@@ -69,13 +69,13 @@ export async function createConsoleFixture({port = 0} = {}) {
       }
       if (tail.startsWith('/runs/')) {const run = state.runs.get(id).find(run => run.id === tail.split('/')[2]); if (!run) return json({}, 404); if (tail.endsWith('/cancel')) {run.status = 'cancelled'; run.updatedAt = new Date().toISOString();} return json({run});}
       if (tail === '/approvals') return json({approvals: state.approvals.get(id)});
-      if (tail.startsWith('/approvals/')) {const approval = state.approvals.get(id).find(item => item.id === tail.split('/')[2]); approval.status = body.decision === 'deny' ? 'denied' : 'completed'; return json({approval});}
+      if (tail.startsWith('/approvals/')) {if (state.approvalGate) await state.approvalGate; if (state.approvalError) return json({error: state.approvalError}, state.approvalError.status || 409); const approval = state.approvals.get(id).find(item => item.id === tail.split('/')[2]); approval.status = body.decision === 'deny' ? 'denied' : state.approvalStatus || 'completed'; return json({approval});}
       if (tail === '/events') {
         response.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache'}); response.write(': connected\n\n');
         for (const event of state.events) if (event.botId === id && event.id > Number(url.searchParams.get('after') || 0)) response.write(`id: ${event.id}\ndata: ${JSON.stringify(event)}\n\n`);
         const stream = {botId: id, response}; state.streams.add(stream); response.on('close', () => state.streams.delete(stream)); return;
       }
-      if (tail === '/computer') return json({computer: {id, provider: 'cloudflare', state: 'running', capabilities: ['exec', 'readFile', 'writeFile', 'listFiles', 'screenshot', 'click']}});
+      if (tail === '/computer') {const computer = {id, provider: 'cloudflare', state: 'running', capabilities: ['exec', 'readFile', 'writeFile', 'listFiles', 'screenshot', 'click'], ...state.computerStates.get(id)}; if (state.computerStatusGate) await state.computerStatusGate; return json({computer});}
       if (tail === '/computer/actions') {
         state.actions.push({botId: id, ...body}); if (state.actionGate) await state.actionGate;
         const {action, operationId} = body;

@@ -264,7 +264,12 @@ export class BotDO extends DurableObject<Env> {
       }
       this.observe(nativeOperationId);
     } catch {
-      this.updateStatus(run.id,"failed","The agent runtime could not accept this run.");
+      const current=this.getRunRow(run.id),latest=JSON.parse(current.data) as Run;
+      // Admission may settle after an approval replaced this native input or the
+      // user cancelled it. A stale failure cannot terminate the newer input.
+      if(current.native_operation_id===nativeOperationId && !terminal.has(latest.status) && latest.status!=="waiting_approval") {
+        this.updateStatus(run.id,"failed","The agent runtime could not accept this run.");
+      }
     }
   }
   private observe(nativeOperationId:string):void {
@@ -274,7 +279,7 @@ export class BotDO extends DurableObject<Env> {
       try {
         const result=await this.runtime.wait(nativeOperationId);
         await this.completeOperation(nativeOperationId,result.status,result.text,result.reason);
-      } catch {const row=this.findRun(nativeOperationId);if(row) {const run=JSON.parse(row.data) as Run;if(!terminal.has(run.status) && run.status!=="waiting_approval") this.updateStatus(run.id,"interrupted","The agent run was interrupted.");}}
+      } catch {const row=this.findRun(nativeOperationId);if(row?.native_operation_id===nativeOperationId) {const run=JSON.parse(row.data) as Run;if(!terminal.has(run.status) && run.status!=="waiting_approval") this.updateStatus(run.id,"interrupted","The agent run was interrupted.");}}
       finally {this.observing.delete(nativeOperationId);}
     })());
   }

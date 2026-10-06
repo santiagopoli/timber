@@ -19,7 +19,7 @@ export type ComputerAction =
  | {type:"navigate";url:string}
  | {type:"checkpoint"};
 export interface ComputerResult { operationId:string;status:"completed"|"failed"|"interrupted";output?:string;exitCode?:number;artifactId?:string;mimeType?:string;checkpointId?:string;error?:string; }
-export interface ComputerStatus { id:string;provider:"cloudflare";state:"stopped"|"starting"|"running"|"unavailable";capabilities:string[];lastCheckpointId?:string; }
+export interface ComputerStatus { id:string;provider:"cloudflare";state:"stopped"|"starting"|"running"|"unavailable";capabilities:string[];lastCheckpointId?:string;error?:{code:string;message:string}; }
 export interface Approval {id:string;botId:string;runId:string;operationId:string;action:ComputerAction;status:"pending"|"approved"|"denied"|"executing"|"completed"|"failed"|"interrupted";createdAt:string;expiresAt:string;result?:ComputerResult;}
 export interface ComputerProvider {exec(botId:string,operationId:string,action:ComputerAction):Promise<ComputerResult>;status(botId:string):Promise<ComputerStatus>;checkpoint(botId:string):Promise<ComputerResult>;}
 export interface ApiError {error:{code:string;message:string};}

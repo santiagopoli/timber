@@ -50,7 +50,10 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
 - POST /v1/bots/:id/runs/:runId/cancel -> {run:Run}
 - GET /v1/bots/:id/events?after=cursor -> SSE id, event=event, JSON BotEvent.
   Reconnect fetches durable events >cursor; no credentials in URL.
-- GET /v1/bots/:id/computer -> {computer:ComputerStatus}
+- GET /v1/bots/:id/computer -> {computer:ComputerStatus}. `starting` means an
+  initialization is currently in flight. A failed control-server probe or saved
+  startup failure is `unavailable`, with optional fixed `error:{code,message}`.
+  Status reads never start a computer, dispatch actions or renew its idle timeout.
 - POST /v1/bots/:id/computer/actions {operationId,action:ComputerAction}
   -> {result:ComputerResult}; authenticated user intentionally invokes tools.
 - POST /v1/bots/:id/computer/suspend -> {computer:ComputerStatus}; checkpoint
@@ -103,6 +106,8 @@ approval result and continuation input are persisted atomically; stale finalizer
 cannot overwrite a terminal approval or rewind a later continuation. Provider
 exceptions retain only reviewed diagnostic codes/messages, still mark the outcome
 unconfirmed, and never authorize an automatic retry of the effect.
+Late admission or observation failures from an older native input cannot change
+the status of its replacement continuation or undo cancellation.
 
 Before each model generation, the host can supply an approval context: all active
 unexpired pending/executing approvals and the latest 20 other approvals, with only
@@ -122,6 +127,11 @@ pinned. Backend stores artifacts and directory archive in R2, metadata in DO. Un
 in-progress operations after restart are interrupted; completed results deduplicated.
 No container per tool call. Stop only after true inactivity. Mark checkpoints durable
 only after successful upload; don't claim full live-volume persistence.
+Bootstrap desktop provisioning is bounded by a native process-group timeout
+(240 seconds plus a 5-second kill grace), so timed-out package installers cannot
+continue after the failure. No user action is journaled or dispatched before
+initialization succeeds. Startup diagnostics survive object eviction until a
+newly requested initialization succeeds; status polling does not retry startup.
 
 ## Delegation
 Not implemented in this milestone. Future send_to_bot should use bounded

@@ -246,3 +246,5 @@ dialog{padding:22px}
 .setup-details .row{flex-wrap:wrap}
 .login-command{flex-basis:100%}
 }
+
+#approvals:not(:empty){margin-top:16px}#approvals .approval pre{max-height:140px;overflow:auto}#approvals .approval-controls{flex-wrap:wrap}#approvals .approve-allow{white-space:normal}.approval-history{margin:10px 0;font-size:12px;color:var(--muted)}.approval-history summary{cursor:pointer;padding:7px 0}.approval-history-list{max-height:340px;overflow:auto;padding-top:8px}.approval-history .approval{color:var(--ink)}#current-approval{margin-bottom:8px}#approvals+.composer{margin-top:12px}@media(max-width:600px){#approvals .approval{padding:13px}#approvals .approval pre{max-height:110px}#approvals .approve-allow{flex-basis:100%}#approvals .approval-controls button{font-size:12px}.approval-history-list{max-height:260px}}

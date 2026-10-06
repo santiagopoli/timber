@@ -109,9 +109,15 @@ it('pauses a namespaced ChatGPT exec for approval and resumes with a new durable
   expect(invocation.operationId).toMatch(/^pi-tool-sha256:[a-f0-9]{64}$/);
   expect(paused.events.map(row => JSON.parse(row.event))).toContainEqual(expect.objectContaining({ type: 'tool.started', data: { toolCallId: 'call_fixture_1|fc_fixture_1', toolName: 'exec' } }));
   await request('/submit', { text: 'The approved action completed: fixture', operationId: 'approval:decision-1' });
-  expect(await (await request('/wait?id=approval:decision-1')).json()).toMatchObject({ status: 'done' });
-  const resumed = await (await request('/inspect')).json<{ calls: unknown[] }>();
+  const answer = 'Hello from ChatGPT via the real Pi harness.';
+  expect(await (await request('/wait?id=approval:decision-1')).json()).toMatchObject({ status: 'done', text: answer });
+  const resumed = await (await request('/inspect')).json<{ calls: unknown[]; messages: { role: string; text: string }[]; events: { event: string }[] }>();
   expect(resumed.calls).toHaveLength(2);
+  expect(resumed.messages).toContainEqual(expect.objectContaining({ role: 'assistant', text: answer }));
+  const events = resumed.events.map(row => JSON.parse(row.event));
+  expect(events).toContainEqual(expect.objectContaining({ type: 'message', operationId: 'approval:decision-1', data: expect.objectContaining({ role: 'assistant', text: answer }) }));
+  expect(events).toContainEqual(expect.objectContaining({ type: 'run.completed', operationId: 'approval:decision-1', data: { text: answer } }));
+  expect(events.filter(event => event.type === 'run.completed' && event.operationId === 'approval-chatgpt').every(event => event.data.text !== answer)).toBe(true);
 });
 
 it('projects an allowance failure after streaming without claiming completed inference', async () => {
@@ -198,8 +204,9 @@ it('refreshes automatic policy for new requests while retaining historical pendi
   await request('/wait?id=asked-attempt');
   await request('/host-context', { mode: 'automatic', approvals: { active: [{ id: 'approval-fixture-1', status: 'pending', actionType: 'exec', expiresAt: '2099-01-01T00:00:00.000Z' }], recent: [] } });
   await request('/submit', { text: 'Please retry now: request-exec', operationId: 'automatic-retry' });
-  expect(await (await request('/wait?id=automatic-retry')).json()).toMatchObject({ status: 'done' });
-  const state = await (await request('/inspect')).json<{ calls: { input: string }[]; toolCalls: { input: string }[] }>();
+  const answer = 'Hello from ChatGPT via the real Pi harness.';
+  expect(await (await request('/wait?id=automatic-retry')).json()).toMatchObject({ status: 'done', text: answer });
+  const state = await (await request('/inspect')).json<{ calls: { input: string }[]; toolCalls: { input: string }[]; messages: { role: string; text: string }[]; events: { event: string }[] }>();
   expect(state.calls).toHaveLength(3);
   expect(developerText(state.calls[0]!.input)).toContain('Current computer approval mode: ask');
   expect(developerText(state.calls[1]!.input)).toContain('Current computer approval mode: automatic');
@@ -209,4 +216,9 @@ it('refreshes automatic policy for new requests while retaining historical pendi
   expect(calls).toHaveLength(2);
   expect(calls[1].runOperationId).toBe('automatic-retry');
   expect(calls[0].operationId).not.toBe(calls[1].operationId);
+  expect(state.calls[2]!.input).toContain('fixture completed');
+  expect(state.messages).toContainEqual(expect.objectContaining({ role: 'assistant', text: answer }));
+  const events = state.events.map(row => JSON.parse(row.event));
+  expect(events).toContainEqual(expect.objectContaining({ type: 'message', operationId: 'automatic-retry', data: expect.objectContaining({ role: 'assistant', text: answer }) }));
+  expect(events).toContainEqual(expect.objectContaining({ type: 'run.completed', operationId: 'automatic-retry', data: { text: answer } }));
 });

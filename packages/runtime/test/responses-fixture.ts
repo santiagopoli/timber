@@ -2,7 +2,7 @@ import { MAX_OUTPUT_CHARACTERS, TOOL_NAMESPACE } from '../src/chatgpt.js';
 
 /** Wire-format OpenAI fixture. No model behavior, credentials, or Pi internals mocked. */
 export function responsesFixture(payload: { input: Record<string, unknown>[] }): Response {
-  const userIndex = payload.input.findLastIndex(item => item.role === 'user');
+  const userIndex = payload.input.map(item => item.role === 'user').lastIndexOf(true);
   const user = payload.input[userIndex];
   const text = JSON.stringify(user);
   const hasToolOutput = payload.input.slice(userIndex + 1).some(item => item.type === 'function_call_output');
