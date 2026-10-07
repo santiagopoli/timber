@@ -142,9 +142,9 @@ const tokensCache = new Map<string, TokenizedCode>();
 const subscribers = new Map<string, Set<(result: TokenizedCode) => void>>();
 
 const getTokensCacheKey = (code: string, language: BundledLanguage) => {
-  const start = code.slice(0, 100);
-  const end = code.length > 100 ? code.slice(-100) : "";
-  return `${language}:${code.length}:${start}:${end}`;
+  // Different files may share their length, prefix and suffix. The complete
+  // source prevents a cache hit from rendering another file’s middle lines.
+  return `${language}:${code}`;
 };
 
 const getHighlighter = (

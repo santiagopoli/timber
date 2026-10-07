@@ -33,7 +33,7 @@ function unavailable():Response {
 export function parseWorkspaceApp(value:unknown):{name:string;port:number;operationId:string} {
   const data=object(value), name=string(data.name,"name",80).trim();
   if(!name) throw new ApiError(400,"invalid_request","App name cannot be blank.");
-  if(typeof data.port!=="number" || !Number.isInteger(data.port) || data.port<1024 || data.port>65535 || data.port===8080) {
+  if(typeof data.port!=="number" || !Number.isInteger(data.port) || data.port<1024 || data.port>65535 || [8080,5900,5901,6080,6081].includes(data.port)) {
     throw new ApiError(400,"invalid_request","Choose an app port from 1024 to 65535 other than the reserved control port.");
   }
   // Native tool operation IDs preserve already-admitted identities up to 160

@@ -8,6 +8,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
+    "@novnc/novnc": "1.7.0",
     "@radix-ui/react-use-controllable-state": "1.2.6",
     "ai": "7.0.128",
     "class-variance-authority": "0.7.1",

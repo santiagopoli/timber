@@ -31,6 +31,7 @@ export class BotDO extends DurableObject<Env> {
   private finishingApprovals=new Map<string,Promise<void>>();
   private streams=0;
   private lastComputerTouch=0;
+  private takingControl=false;
   private suspending?:Promise<ComputerStatus>;
   private deleted=false;
   private deleting?:Promise<void>;
@@ -288,7 +289,9 @@ export class BotDO extends DurableObject<Env> {
   }
 
   private async createRun(input:{text:string;operationId:string}):Promise<Run> {
+    if(this.takingControl) throw new ApiError(409,"computer_busy","Desktop control is being acquired. Retry after the connection is established.");
     const hash=await fingerprint({text:input.text});
+    if(this.takingControl) throw new ApiError(409,"computer_busy","Desktop control is being acquired. Retry after the connection is established.");
     this.active();
     if(input.operationId.startsWith("approval:") || input.operationId.startsWith("delegate:") || input.operationId.startsWith("connection:")) throw new ApiError(400,"reserved_operation_id","This operationId prefix is reserved.");
     const existing=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs WHERE operation_id=?",input.operationId).toArray()[0];
@@ -573,6 +576,7 @@ export class BotDO extends DurableObject<Env> {
   }
   private saveApproval(approval:Approval):void {if(!this.deleted) this.ctx.storage.sql.exec("UPDATE approvals SET data=? WHERE id=?",JSON.stringify(approval),approval.id);}
   private async decideApproval(id:string,decision:unknown):Promise<Approval> {
+    if(this.takingControl) throw new ApiError(409,"computer_busy","Desktop control is being acquired. Retry after the connection is established.");
     this.active();
     if(this.suspending) throw new ApiError(409,"computer_busy","The computer is being suspended. Retry after it stops.");
     if(decision!=="approve" && decision!=="deny") throw new ApiError(400,"invalid_request","decision must be approve or deny.");
@@ -690,6 +694,11 @@ export class BotDO extends DurableObject<Env> {
     return this.getRun(id);
   }
 
+  private computerView(request:Request,path:string):Promise<Response> {
+    const botId=this.bot().id;
+    return this.env.COMPUTER.get(this.env.COMPUTER.idFromName(botId)).fetch(new Request(`https://computer.internal${path}`,{method:request.method,headers:{"x-timber-bot-id":botId,"content-type":"application/json"},body:["GET","HEAD"].includes(request.method)?undefined:request.body}));
+  }
+
   private async suspendComputer():Promise<ComputerStatus> {
     if(this.suspending) return this.suspending;
     const activeRun=this.ctx.storage.sql.exec<{id:string}>("SELECT id FROM runs WHERE json_extract(data,'$.status') IN ('queued','running') LIMIT 1").toArray()[0];
@@ -789,6 +798,25 @@ export class BotDO extends DurableObject<Env> {
         if(request.method==="POST" && runRoute[2]) return json({run:await this.cancelRun(runRoute[1])});
       }
       if(path==="/events" && request.method==="GET") return this.events(request,url);
+      if(/^\/workspace\/(tree|file|download|projects|changes|diff)$/.test(path) && request.method==="GET") return this.computerView(request,path+url.search);
+      if(path==="/computer/live-session" && request.method==="POST") {
+        const input=await body(request);
+        if(input.mode!=="view" && input.mode!=="control") throw new ApiError(400,"invalid_mode","Choose view or control.");
+        if(this.suspending || this.takingControl) throw new ApiError(409,"computer_busy","The computer is changing state. Try again shortly.");
+        if(input.mode==="control") {
+          const run=this.ctx.storage.sql.exec("SELECT id FROM runs WHERE json_extract(data,'$.status') IN ('queued','running') LIMIT 1").toArray()[0];
+          const approval=this.ctx.storage.sql.exec("SELECT id FROM approvals WHERE json_extract(data,'$.status')='executing' LIMIT 1").toArray()[0];
+          if(run || approval) throw new ApiError(409,"computer_busy","Stop the active run or wait for its action to finish before taking control. You can watch while the agent works.");
+          this.takingControl=true;
+        }
+        try {
+          const response=await this.computerView(new Request(request.url,{method:"POST",body:JSON.stringify({mode:input.mode})}),"/desktop");
+          if(response.ok && input.mode==="control") this.invalidatePendingGui();
+          return response;
+        } finally {this.takingControl=false;}
+      }
+      const desktopSession=/^\/computer\/live-session\/([a-f0-9-]{36})(\/renew)?$/.exec(path);
+      if(desktopSession && ((request.method==="POST" && desktopSession[2]) || (request.method==="DELETE" && !desktopSession[2]))) return this.computerView(request,`/desktop/${desktopSession[1]}${desktopSession[2]??""}`);
       if(path==="/computer" && request.method==="GET") return json({computer:await this.computer.status(this.bot().id)});
       if(path==="/computer/suspend" && request.method==="POST") return json({computer:await this.suspendComputer()});
       if(path==="/computer/actions" && request.method==="POST") {

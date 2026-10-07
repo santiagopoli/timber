@@ -3,6 +3,9 @@ import { DurableObject } from "cloudflare:workers";
 import type { ComputerAction, ComputerProvider, ComputerResult, ComputerStatus } from "@botspace/contracts";
 import serverSource from "../../../infra/computer/server.py";
 import startSource from "../../../infra/computer/start.sh";
+import workspaceSource from "../../../infra/computer/workspace.py";
+import desktopSource from "../../../infra/computer/desktop_bridge.py";
+import { DesktopSessions, DesktopError } from "./live";
 
 export interface ComputerEnv {
   FILES: R2Bucket;
@@ -88,6 +91,7 @@ async function stage<T>(code: ComputerErrorCode, work: () => Promise<T>): Promis
 
 /** There is one instance per bot. Never expose this DO directly without API auth. */
 export class ComputerDO extends DurableObject<ComputerEnv> {
+  private live:DesktopSessions;
   private tail: Promise<unknown> = Promise.resolve();
   private starting?: Promise<Health>;
   private flights = new Map<string, Promise<ComputerResult>>();
@@ -100,6 +104,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
 
   constructor(ctx: DurableObjectState, env: ComputerEnv) {
     super(ctx, env);
+    this.live=new DesktopSessions(ctx.storage,promise=>ctx.waitUntil(promise));
     void ctx.blockConcurrencyWhile(async () => {
       if(await ctx.storage.get<string>("deleted")) {this.deleted=true;this.shutdown.abort();return;}
       this.token = await ctx.storage.get<string>("internalToken") ?? crypto.randomUUID() + crypto.randomUUID();
@@ -132,6 +137,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     this.deleted=true;
     this.shutdown.abort();
     this.deleting=(async()=>{
+      await this.live.closeAll();
       await this.ctx.storage.put("deleted",botId);
       await this.ctx.storage.deleteAlarm();
       if(this.container && (this.container.running || this.starting)) await this.container.destroy("Bot permanently deleted");
@@ -154,6 +160,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
     try {
+      if(path.startsWith("/workspace/") || path.startsWith("/desktop")) return await this.inspect(request);
       if(path.startsWith("/preview/")) return await this.preview(request);
       if (request.method !== "POST") throw new ComputerProviderError("computer_method_not_allowed");
       const body = await request.json<{botId:string; operationId?:string; action?:ComputerAction}>();
@@ -169,6 +176,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       if (path === "/suspend") {
         return Response.json(await this.serialize(async () => {
           this.active();
+          await this.live.closeAll();
           if (this.container?.running) {
             await this.ensureReady(body.botId);
             await this.saveCheckpoint(body.botId, true);
@@ -183,10 +191,48 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       }
       return Response.json(await this.execute(body.botId, body.operationId, body.action));
     } catch (error) {
+      if(error instanceof DesktopError) return Response.json({error:{code:error.code,message:error.message}},{status:error.status});
       const safe = safeError(error);
       console.error("computer.failure", {stage:"request",code:safe.code});
       return Response.json({error:{code:safe.code,message:safe.publicMessage}}, {status:safe.status});
     }
+  }
+
+  private async inspect(request:Request):Promise<Response> {
+    this.active();
+    const url=new URL(request.url),botId=request.headers.get("x-timber-bot-id")??"";
+    if(!/^[A-Za-z0-9_-]{1,100}$/.test(botId)) throw new ComputerProviderError("computer_invalid_request");
+    const owner=await this.ctx.storage.get<string>("botId");
+    if(owner && owner!==botId) throw new ComputerProviderError("computer_owner_mismatch");
+    if(!owner) await this.ctx.storage.put("botId",botId);
+    if(url.pathname==="/desktop-ws") return this.live.connect(botId,request,port=>{
+      if(!this.container?.running) throw new ComputerProviderError("computer_app_not_running");
+      return this.container.getTcpPort(port).fetch(new Request(`http://127.0.0.1:${port}/`,{headers:{Upgrade:"websocket",Authorization:`Bearer ${this.token}`,"Sec-WebSocket-Protocol":"binary"}}));
+    },()=>this.touch());
+    if(url.pathname==="/desktop" && request.method==="POST") {
+      const input=await request.json<{mode?:unknown}>();
+      if(input.mode!=="view" && input.mode!=="control") throw new ComputerProviderError("computer_invalid_request");
+      const mode=input.mode;
+      return this.serialize(async()=>{
+        const health=await this.ensureReady(botId);
+        if(!health.capabilities?.includes("liveDesktop")) throw new ComputerProviderError("computer_upgrade_required");
+        await this.touch();return Response.json(await this.live.create(botId,mode));
+      });
+    }
+    const session=/^\/desktop\/([a-f0-9-]{36})(\/renew)?$/.exec(url.pathname);
+    if(session && request.method==="POST" && session[2]) return this.serialize(async()=>{const value=await this.live.renew(botId,session[1]);await this.touch();return Response.json(value);});
+    if(session && request.method==="DELETE" && !session[2]) {await this.live.release(session[1]);return Response.json({released:true});}
+    if(request.method!=="GET" || !/^\/workspace\/(tree|file|download|projects|changes|diff)$/.test(url.pathname)) throw new ComputerProviderError("computer_invalid_request");
+    return this.serialize(async()=>{
+      const health=await this.ensureReady(botId);
+      if(!health.capabilities?.includes("workspace")) throw new ComputerProviderError("computer_upgrade_required");
+      await this.touch();
+      const response=await this.call(url.pathname+url.search);
+      const headers=new Headers(response.headers);
+      headers.set("cache-control","private, no-store");headers.set("x-content-type-options","nosniff");headers.set("content-security-policy","sandbox; default-src 'none'");
+      if(url.pathname==="/workspace/download") headers.set("content-disposition",`attachment; filename="workspace-file"`);
+      return new Response(response.body,{status:response.status,headers});
+    });
   }
 
   private async status(botId: string): Promise<ComputerStatus> {
@@ -239,6 +285,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         if (existingRecord.digest !== digest) return {operationId, status:"failed" as const, error:"operationId was already used with different arguments"};
         return existingRecord.result ?? {operationId, status:"interrupted" as const, error:"Operation outcome is unknown; it will not be replayed"};
       }
+      if(!["screenshot","readFile","listFiles"].includes(action.type) && await this.live.controlled()) return {operationId,status:"failed" as const,error:"A person has control of the desktop. No action was executed. Release desktop control before issuing a new action."};
       const health=await this.ensureReady(botId);
       if((action.type==="gitClone" || action.type==="gitPush") && !health.capabilities?.includes(action.type)) throw new ComputerProviderError("computer_upgrade_required");
       await this.touch();
@@ -339,7 +386,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     const url=new URL(request.url);
     const match=/^\/preview\/([0-9]{1,5})(\/.*)$/.exec(url.pathname);
     const port=match?Number(match[1]):0;
-    if(!match || port<1024 || port>65535 || port===PORT) throw new ComputerProviderError("computer_invalid_request");
+    if(!match || port<1024 || port>65535 || [PORT,5900,5901,6080,6081].includes(port)) throw new ComputerProviderError("computer_invalid_request");
     const botId=request.headers.get("x-timber-bot-id");
     if(!botId || !/^[A-Za-z0-9_-]{1,100}$/.test(botId)) throw new ComputerProviderError("computer_invalid_request");
     const owner=await this.ctx.storage.get<string>("botId");
@@ -482,12 +529,12 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     await stage("computer_provisioning_failed", async () => {
       // GNU timeout stops the complete apt process group. Timing out only the
       // JavaScript wait or its parent shell would leave package installs running.
-      const install = await container.exec(["timeout","--kill-after=5","240","sh","-c", "mkdir -p /workspace /state /opt/botspace; if ! test -f /opt/botspace/desktop-ready; then export DEBIAN_FRONTEND=noninteractive; apt-get update > /state/bootstrap.log 2>&1 && apt-get install -y --no-install-recommends python3 chromium xvfb xdotool xclip scrot openbox fonts-liberation ca-certificates curl git procps >> /state/bootstrap.log 2>&1 && touch /opt/botspace/desktop-ready; fi"]);
+      const install = await container.exec(["timeout","--kill-after=5","240","sh","-c", "mkdir -p /workspace /state /opt/botspace; if ! test -f /opt/botspace/desktop-ready; then export DEBIAN_FRONTEND=noninteractive; apt-get update > /state/bootstrap.log 2>&1 && apt-get install -y --no-install-recommends python3 chromium xvfb xdotool xclip scrot openbox fonts-liberation ca-certificates curl git procps x11vnc python3-websockify >> /state/bootstrap.log 2>&1 && touch /opt/botspace/desktop-ready; fi"]);
       const {exitCode} = await install.output();
       if (exitCode === 124) throw new ComputerProviderError("computer_start_timeout");
       if (exitCode !== 0) throw new ComputerProviderError("computer_provisioning_failed");
     });
-    for (const [path, source] of [["/opt/botspace/server.py",serverSource],["/opt/botspace/start.sh",startSource]] as const) {
+    for (const [path, source] of [["/opt/botspace/server.py",serverSource],["/opt/botspace/start.sh",startSource],["/opt/botspace/workspace.py",workspaceSource],["/opt/botspace/desktop_bridge.py",desktopSource]] as const) {
       this.active();
       await stage("computer_server_install_failed", async () => {
         const process = await container.exec(["timeout","--kill-after=5","30","python3","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())",path], {

@@ -51,3 +51,4 @@ jobs:
           trap 'docker rm -f timber-image-smoke >/dev/null 2>&1 || true' EXIT
           docker run -d --name timber-image-smoke --shm-size=512m -p 127.0.0.1:8080:8080 -e BOTSPACE_COMPUTER_TOKEN="$COMPUTER_TEST_TOKEN" timber-computer:ci
           node scripts/smoke-computer.mjs
+          docker exec -i timber-image-smoke python3 - < infra/computer/smoke_desktop.py

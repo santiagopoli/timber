@@ -1,5 +1,7 @@
 import './src/styles.css';
 import { mountChat } from './src/chat.tsx';
+import { createDesktopViewer } from './src/desktop.ts';
+import { mountWorkspaceExplorer } from './src/workspace.tsx';
 
 (() => {
   'use strict';
@@ -38,6 +40,38 @@ import { mountChat } from './src/chat.tsx';
     onStop: (botId, runId) => { if (selected?.id === botId) void guarded(() => cancelRun(runId)); },
     onConnect: (botId, requestId) => { if (selected?.id === botId) void connectGitHub(botId, requestId); },
   });
+  const desktopSessions = new Map();
+  const desktop = createDesktopViewer({
+    element: $('desktop-root'),
+    async connect(mode) {
+      const id = selected?.id, version = generation;
+      if (!id || !token) throw new Error('Select a bot first.');
+      const session = await request(`${botPath(id)}/computer/live-session`, {method: 'POST', body: {mode}});
+      desktopSessions.set(session.sessionId, id);
+      if (!validView(version) || selected?.id !== id) {
+        await releaseDesktop(session.sessionId);
+        throw new DOMException('Bot selection changed.', 'AbortError');
+      }
+      const url = new URL(`${botPath(id)}/computer/live`, location.origin);
+      url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      return {...session, url: url.href};
+    },
+    async renew(sessionId) {
+      const id = desktopSessions.get(sessionId);
+      if (!id) throw new Error('Desktop session ended.');
+      return request(`${botPath(id)}/computer/live-session/${sessionId}/renew`, {method: 'POST'});
+    },
+    release: releaseDesktop,
+  });
+  async function releaseDesktop(sessionId) {
+    const id = desktopSessions.get(sessionId);
+    desktopSessions.delete(sessionId);
+    if (id && token) await request(`${botPath(id)}/computer/live-session/${sessionId}`, {method: 'DELETE'});
+  }
+  const workspace = mountWorkspaceExplorer($('workspace-root'), {
+    request: (id, path) => request(`${botPath(id)}${path}`),
+    download: (id, path) => request(`${botPath(id)}${path}`, {raw: true}),
+  });
   function showError(error) { if (token) $('app-error').textContent = errorText(error); }
   async function guarded(fn) { $('app-error').textContent = ''; try { return await fn(); } catch (error) { if (error.name !== 'AbortError') showError(error); } }
   async function request(path, { method = 'GET', body, signal, raw = false } = {}) {
@@ -68,6 +102,7 @@ import { mountChat } from './src/chat.tsx';
     $('click-mode').checked = false; $('auto-screenshot').checked = false; document.querySelector('.screen').classList.remove('click-enabled');
   }
   function disconnect(message = '') {
+    desktop.disconnect(); workspace.clear();
     stopComputerStatus(); generation++; authSession++; token = ''; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
     selected = null; currentRun = null; bots = []; messages = []; approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
     removedBots.clear(); deletionPending.clear(); deleteTarget = null; deleteBusy = false; editBotId = null; drafts.clear(); pendingMessages.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); connectionWork.clear(); appWork.clear(); closeDialogs(); clearScreen();
@@ -104,6 +139,8 @@ import { mountChat } from './src/chat.tsx';
   function chosenHash() { const value = new URLSearchParams(location.hash.slice(1)).get('bot'); return /^[a-f\d-]{36}$/i.test(value || '') ? value : null; }
   async function selectBot(bot) {
     if (selected?.id === bot.id || removedBots.has(bot.id)) return;
+    desktop.disconnect(); workspace.clear();
+    if (!$('panel-files').hidden) workspace.setBot(bot.id);
     stopComputerStatus(); generation++; const version = generation; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
     selected = bot; chatLoading = true; currentRun = null; cursor = 0; boundary = ''; events = []; messages = []; approvals = []; connections = []; workspaceApps = []; runs = new Map(); activeRunIds = new Set(); streamDrafts = new Map(); nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; runFilter = null; runRevision = 0;
     $('refresh-apps').disabled = false; $('refresh-apps').textContent = 'Refresh apps';
@@ -544,6 +581,7 @@ import { mountChat } from './src/chat.tsx';
     $('edit-dialog').close(); renderDeleteControls(); $('delete-dialog').showModal(); $('cancel-delete-bot').focus();
   }
   function forgetBot(id) {
+    if (selected?.id === id) { desktop.disconnect(); workspace.clear(); }
     removedBots.add(id); bots = bots.filter(bot => bot.id !== id); drafts.delete(id); sendBusy.delete(id); approvalFeedback.delete(id); computerPending.delete(id);
     for (const [key, message] of pendingMessages) if (message.botId === id) pendingMessages.delete(key);
     for (const map of [pendingActions, approvalWork, connectionWork, appWork]) for (const key of map.keys()) if (key.startsWith(`${id}:`)) map.delete(key);
@@ -585,6 +623,9 @@ import { mountChat } from './src/chat.tsx';
   }
   function showPanel(name, focus = false) {
     for (const button of document.querySelectorAll('[data-panel]')) { const active = button.dataset.panel === name; button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active)); button.tabIndex = active ? 0 : -1; $(`panel-${button.dataset.panel}`).hidden = !active; if (active && focus) button.focus(); }
+    desktop.setActive(name === 'computer');
+    if (name === 'files' && selected) workspace.setBot(selected.id);
+    else workspace.clear();
     if (name !== 'computer') stopComputerStatus();
     if (name === 'computer' && selected) void guarded(computerStatus); if (name === 'runs' && selected) void guarded(() => loadRuns()); if (name === 'apps' && selected) void guarded(() => loadApps());
   }
@@ -645,5 +686,6 @@ import { mountChat } from './src/chat.tsx';
   $('refresh-github').addEventListener('click', () => {void loadGitHubStatus();});
   $('disconnect-github').addEventListener('click', () => {void disconnectGitHub();});
   window.addEventListener('focus', () => {if (token && selected && connections.some(item => item.status === 'pending')) void guarded(() => Promise.all([loadConnections(), loadRuns()]));});
+  document.addEventListener('visibilitychange', () => { desktop.setActive(!document.hidden && !$('panel-computer').hidden); });
   window.addEventListener('pagehide', () => disconnect());
 })();

@@ -100,7 +100,7 @@ p{line-height:1.65}
 #screen-placeholder small{font-size:11px;color:#90a897}
 .screen-toolbar{margin:14px 0}
 .check-label{display:inline-flex;align-items:center;gap:6px;font-size:10px;color:var(--muted);margin:0;font-weight:500;cursor:pointer}
-.check-label input{width:14px;height:14px;accent-color:var(--accent)}
+.check-label input{flex:0 0 14px;width:14px;height:14px;accent-color:var(--accent)}
 .tool-block{border:1px solid var(--line);border-radius:11px;padding:15px;background:var(--surface);margin-top:18px}
 .tool-block summary{font-weight:650;font-size:12px;cursor:pointer}
 .tool-block form{margin-top:12px}

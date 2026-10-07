@@ -34,7 +34,7 @@ export default {
         const response=await env.ASSETS.fetch(new Request(assetUrl,request));
         const headers=new Headers(response.headers);
         const previewOrigin=env.PREVIEW_ORIGIN && /^https:\/\/[a-z0-9.-]+$/.test(env.PREVIEW_ORIGIN)?env.PREVIEW_ORIGIN:"";
-        headers.set("content-security-policy",`default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob: data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' ${previewOrigin}`);
+        headers.set("content-security-policy",`default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ${url.origin.replace(/^http/, 'ws')}; img-src 'self' blob: data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' ${previewOrigin}`);
         headers.set("referrer-policy","no-referrer");
         headers.set("x-content-type-options","nosniff");
         // Always load the current shell; its fingerprinted JS/CSS retain their
@@ -47,6 +47,19 @@ export default {
       if((/^\/github\/setup\/(start|manifest|install|oauth)$/.test(url.pathname) && request.method==="GET") || url.pathname.startsWith("/github/git/")) {
         if(!env.GITHUB) throw new ApiError(503,"github_not_configured","GitHub is not configured.");
         return env.GITHUB.get(env.GITHUB.idFromName("owner")).fetch(request);
+      }
+      // Browser WebSockets cannot send Authorization. Only this exact route uses
+      // a one-use, bot-bound ticket in a protocol header, never in its URL.
+      const desktop=/^\/v1\/bots\/([^/]+)\/computer\/live$/.exec(url.pathname);
+      if(desktop) {
+        if(!env.BOTSPACE_API_TOKEN || env.BOTSPACE_API_TOKEN.length<24) throw new ApiError(503,"auth_unconfigured","API authentication is not configured.");
+        if(request.method!=="GET" || request.headers.get("upgrade")?.toLowerCase()!=="websocket" || request.headers.get("origin")!==url.origin || url.search || !UUID.test(desktop[1])) throw new ApiError(403,"desktop_access_denied","Desktop access denied.");
+        const protocols=request.headers.get("sec-websocket-protocol")??"";
+        if(protocols.length>256) throw new ApiError(403,"desktop_access_denied","Desktop access denied.");
+        const registry=env.WORKSPACE.get(env.WORKSPACE.idFromName("owner"));
+        const record=await registry.fetch(`https://workspace/${desktop[1]}`);
+        if(!record.ok) return record;
+        return env.COMPUTER.get(env.COMPUTER.idFromName(desktop[1])).fetch(new Request("https://computer.internal/desktop-ws",{headers:{"x-timber-bot-id":desktop[1],Upgrade:"websocket","sec-websocket-protocol":protocols}}));
       }
       const owner=await authenticate(request,env.BOTSPACE_API_TOKEN);
       if(!url.pathname.startsWith("/v1/")) throw new ApiError(404,"not_found","Endpoint not found.");

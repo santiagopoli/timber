@@ -51,3 +51,12 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+
+## noVNC
+
+The live desktop viewer bundles @novnc/novnc 1.7.0, licensed under Mozilla Public License 2.0.
+Upstream source and license: https://github.com/novnc/noVNC/tree/v1.7.0
+Timber imports the unmodified npm package; its source remains available upstream.
+
+The noVNC package also retains its upstream third-party notices in its published
+source distribution (including vendor codecs). See its LICENSE.txt and AUTHORS.

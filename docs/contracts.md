@@ -13,7 +13,8 @@ that conversation. v1 is cloud-only; no iOS implementation in this milestone.
   Workers AI. No automatic fallback to separately billed inference.
 - ComputerDO owns one reusable Linux desktop container, lazily started.
 - Private single-owner MVP. BOTSPACE_API_TOKEN is a Worker secret; every /v1
-  API request requires Authorization: Bearer token. Health is public and
+  API request requires Authorization: Bearer token, except the scoped live desktop
+  WebSocket upgrade described below. Health is public and
   contains no account information. Never put token in URL or localStorage.
 - /console is a static unprivileged test UI; it prompts for token in memory only.
 - Cross-tenant design: deterministic owner identity "owner" after auth. Bot ids are
@@ -228,6 +229,41 @@ WorkspacePreviewGateway. App code never runs on the admin origin. The ticket bec
 an HttpOnly, app-path-scoped browser session. App URLs contain no credentials;
 opening a copied URL on another browser requires access through Timber. HTML, assets,
 HTTP APIs and WebSockets share the app's prefix. The server must support that base
-path (e.g. Vite --base); no fragile HTML rewriting. Control port 8080 is blocked.
+path (e.g. Vite --base); no fragile HTML rewriting. Control and desktop transport ports 8080, 5900, 5901, 6080 and 6081 are blocked.
 Service workers are disabled on the preview origin. This is a private single-owner
 MVP: apps share a preview origin and are not separate browser security principals.
+
+## Live desktop and workspace inspection
+Computer screenshots capture the complete X11 desktop. The console now separates
+live observation/control from model screenshots and from the Files explorer.
+
+- POST `/v1/bots/:id/computer/live-session` `{mode:"view"|"control"}` creates an
+  owner-authorized desktop grant and explicitly starts/restores the computer.
+- GET `/v1/bots/:id/computer/live` upgrades a same-origin WebSocket using the
+  returned one-use ticket in `Sec-WebSocket-Protocol`, never a URL credential.
+- POST `/v1/bots/:id/computer/live-session/:sessionId/renew` renews a 60-second
+  lease; DELETE releases it. Maximum connection lifetime is one hour, maximum
+  four viewers and one controller per bot. Disconnect/tab exit releases access.
+- Observation is enforced by a separate view-only x11vnc server, not just the UI.
+  Remote cursor pixels are part of the desktop stream. A controller must wait for
+  active runs/actions to finish or stop them explicitly. New computer mutations
+  fail before journaling while a human control lease exists; nothing is replayed.
+- The gateway proxies only authenticated live-desktop ports. 8080, 5900, 5901,
+  6080 and 6081 cannot be exposed as workspace apps. Browser tickets are scoped
+  to one bot and mode, consumed atomically, and never enter agent history.
+- GET `/v1/bots/:id/workspace/{tree,file,download,projects,changes,diff}` is a
+  read-only owner-authenticated view. Query parameters: `path`, `project`, and
+  diff `mode=staged|unstaged`. Explicit Files navigation may wake the computer;
+  ordinary bot/status/tab discovery does not.
+- Text previews are capped at 256 KiB and downloads at 32 MiB. Text, HTML and SVG
+  are rendered as code; raster images may be previewed from authenticated blobs.
+  Downloads are attachments with sandbox/no-store/nosniff headers. Binary files
+  have metadata and download rather than a misleading text preview.
+- Repository discovery is bounded and excludes dependency/build directories.
+  Projects show branch/detached HEAD and staged/working/untracked counts. Diffs
+  use readonly Git without external diffs, textconv, hooks, fsmonitor or pager.
+  Paths and symlinks cannot escape the workspace.
+
+The live connection uses standard noVNC/RFB. The agent runtime remains separately
+replaceable: Pi, another harness and a future local computer can use the same
+product-level concepts without adopting CUA as the cloud compute provider.

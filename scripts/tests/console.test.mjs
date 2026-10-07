@@ -284,7 +284,7 @@ test('deleting the final bot clears its conversation, computer view and selectio
   await withPage(async ({page, login, state}) => {
     state.bots = state.bots.filter(bot => bot.id === BOT_A);
     await login(); await page.locator('#message').fill('Draft belonging only to the deleted bot');
-    await page.locator('#tab-computer').click(); await page.locator('#take-screenshot').click(); await page.locator('#screenshot').waitFor({state: 'visible'});
+    await page.locator('#tab-computer').click(); await page.locator('#computer-tools > summary').click(); await page.locator('#take-screenshot').click(); await page.locator('#screenshot').waitFor({state: 'visible'});
     await page.locator('#tab-conversation').click(); await openDelete(page); await page.locator('#confirm-delete-bot').click();
     await page.locator('#delete-dialog').waitFor({state: 'hidden'}); await page.locator('#empty').waitFor({state: 'visible'});
     assert.equal(await page.locator('#bot-workspace').isVisible(), false); assert.equal(await page.locator('.bot-item').count(), 0);
@@ -809,7 +809,7 @@ test('computer status polls only while starting and visible, refreshes on events
 
 test('computer actions require explicit screen input and preserve responsive progress and file paths', async () => {
   await withPage(async ({page, login, state}) => {
-    await login(); await page.locator('#tab-computer').click();
+    await login(); await page.locator('#tab-computer').click(); await page.locator('#computer-tools > summary').click();
     let release; state.actionGate = new Promise(resolve => {release = resolve;});
     await page.locator('#take-screenshot').click(); await page.locator('#computer-progress').waitFor({state: 'visible'}); assert.equal(await page.locator('#take-screenshot').isDisabled(), true);
     release(); state.actionGate = null; await page.locator('#screenshot').waitFor({state: 'visible'}); await page.locator('#computer-progress').waitFor({state: 'hidden'});

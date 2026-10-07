@@ -104,12 +104,21 @@ def main():
     view = Desktop(6080, token)
     assert (view.width, view.height) == (1280, 800)
     command("xdotool", "mousemove", "200", "200")
-    time.sleep(.2)
+    time.sleep(1)
     first = view.image()
     command("xdotool", "mousemove", "400", "400")
-    time.sleep(.2)
-    second = view.image()
-    assert first != second, "Observers must see the agent's real cursor movement"
+    def patch(pixels, x, y):
+        return b"".join(pixels[((y + row) * view.width + x) * 4:((y + row) * view.width + x + 40) * 4] for row in range(40))
+    # X11 polling and the VNC update request are asynchronous. Require changed
+    # pixels at BOTH old and new cursor positions, not unrelated desktop motion.
+    moved = False
+    for _ in range(25):
+        time.sleep(.2)
+        second = view.image()
+        if patch(first, 195, 195) != patch(second, 195, 195) and patch(first, 395, 395) != patch(second, 395, 395):
+            moved = True
+            break
+    assert moved, "Observers must see the agent's real cursor at its updated position"
     view.pointer(320, 240)
     time.sleep(.2)
     assert pointer() == (400, 400), "Observation must reject even directly injected pointer events"
