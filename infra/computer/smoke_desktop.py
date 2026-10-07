@@ -20,7 +20,9 @@ class Desktop:
         self.sock.sendall((f"GET / HTTP/1.1\r\nHost: localhost:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: binary\r\nAuthorization: Bearer {token}\r\n\r\n").encode())
         response = bytearray()
         while not response.endswith(b"\r\n\r\n"):
-            response.extend(self.sock.recv(1))
+            chunk = self.sock.recv(1)
+            if not chunk: raise EOFError("Desktop rejected the websocket handshake")
+            response.extend(chunk)
             assert len(response) < 16384
         assert b" 101 " in response, "Desktop websocket handshake failed"
         self.buffer = bytearray()
@@ -97,7 +99,7 @@ def main():
     token = os.environ["BOTSPACE_COMPUTER_TOKEN"]
     for port in (6080, 6081):
         try: Desktop(port, "incorrect-token")
-        except AssertionError: pass
+        except (AssertionError, ConnectionResetError, EOFError): pass
         else: raise AssertionError("Desktop accepted invalid authentication")
     view = Desktop(6080, token)
     assert (view.width, view.height) == (1280, 800)

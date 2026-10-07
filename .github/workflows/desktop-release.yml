@@ -30,7 +30,10 @@ jobs:
           trap 'docker rm -f timber-image-smoke >/dev/null 2>&1 || true' EXIT
           docker run -d --name timber-image-smoke --shm-size=512m -p 127.0.0.1:8080:8080 -e BOTSPACE_COMPUTER_TOKEN="$COMPUTER_TEST_TOKEN" timber-computer:release
           node scripts/smoke-computer.mjs
-          docker exec -i timber-image-smoke python3 - < infra/computer/smoke_desktop.py
+          if ! docker exec -i timber-image-smoke python3 - < infra/computer/smoke_desktop.py; then
+            docker exec timber-image-smoke sh -c 'tail -80 /state/desktop-view-bridge.log /state/desktop-control-bridge.log /state/desktop-view.log /state/desktop-control.log'
+            exit 1
+          fi
       - name: Export pristine image and checksum
         run: |
           docker save timber-computer:release | gzip -1 > timber-desktop-linux-amd64.tar.gz
