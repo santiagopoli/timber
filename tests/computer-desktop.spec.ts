@@ -56,6 +56,18 @@ describe("live desktop and workspace boundary",()=>{
       await instance.fetch(internal(botId,`/desktop/${next.sessionId}`,"DELETE"));
     });
   });
+  it("waits for a new image's desktop bridge without reporting an obsolete image",async()=>{
+    const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
+    await runInDurableObject(stub,async(instance)=>{
+      let probes=0;
+      Object.defineProperty(instance,"ensureReady",{value:async()=>({ok:true,desktop:true,capabilities:["workspace"]})});
+      Object.defineProperty(instance,"health",{value:async()=>{probes++;return {ok:true,desktop:true,capabilities:["workspace","liveDesktop"]};}});
+      const response=await instance.fetch(internal(botId,"/desktop","POST",{mode:"view"}));
+      expect(response.status).toBe(200);expect(probes).toBe(1);
+      const session=await response.json<{sessionId:string}>();
+      await instance.fetch(internal(botId,`/desktop/${session.sessionId}`,"DELETE"));
+    });
+  });
   it("caps viewers and checks old-image capability before exposing files",async()=>{
     const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
     await runInDurableObject(stub,async(instance,state)=>{

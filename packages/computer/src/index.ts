@@ -214,8 +214,15 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       if(input.mode!=="view" && input.mode!=="control") throw new ComputerProviderError("computer_invalid_request");
       const mode=input.mode;
       return this.serialize(async()=>{
-        const health=await this.ensureReady(botId);
-        if(!health.capabilities?.includes("liveDesktop")) throw new ComputerProviderError("computer_upgrade_required");
+        let health=await this.ensureReady(botId);
+        if(!health.capabilities?.includes("liveDesktop") && !health.capabilities?.includes("workspace")) throw new ComputerProviderError("computer_upgrade_required");
+        // The HTTP process can become ready a moment before the desktop bridge.
+        // Re-probe readiness, never replay an action or mislabel this as an old image.
+        for(let attempt=0;!health.capabilities?.includes("liveDesktop") && attempt<10;attempt++) {
+          await new Promise(resolve=>setTimeout(resolve,200));this.active();
+          health=await this.health();
+        }
+        if(!health.capabilities?.includes("liveDesktop")) throw new DesktopError("desktop_unavailable",503,"The live desktop is still starting. Connect again shortly.");
         await this.touch();return Response.json(await this.live.create(botId,mode));
       });
     }
