@@ -1,4 +1,5 @@
 """Exercise Git against a real authenticated HTTPS smart-HTTP server."""
+import sys
 import importlib.util
 import io
 import json
@@ -13,6 +14,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).parents[1]))
 spec = importlib.util.spec_from_file_location("git_computer_server", Path(__file__).parents[1] / "server.py")
 server = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(server)

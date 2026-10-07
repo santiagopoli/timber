@@ -24,7 +24,9 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import TCPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
+from workspace import WorkspaceInspector
+import socket
 
 MAX_JSON = 2 * 1024 * 1024
 MAX_OUTPUT = 128 * 1024
@@ -492,7 +494,18 @@ def safe_extract(archive_path: Path, destination: Path):
                 raise ValueError("Archive contains a symlink cycle") from exc
 
 
+def desktop_ready():
+    try:
+        for port in (6080, 6081):
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                pass
+        return True
+    except OSError:
+        return False
+
+
 def create_handler(computer: Computer, token: str):
+    inspector = WorkspaceInspector(computer.workspace)
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
             pass  # Never log request bodies, auth headers or screen contents.
@@ -528,7 +541,27 @@ def create_handler(computer: Computer, token: str):
                 desktop = all(shutil.which(tool) for tool in ["scrot", "xdotool", "chromium", "xclip"])
                 if desktop:
                     desktop = subprocess.run(["xdotool", "getdisplaygeometry"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2).returncode == 0
-                return self.respond(200, {"ok": True, "bootId": computer.boot_id, "desktop": desktop, "capabilities": ["gitClone", "gitPush"]})
+                return self.respond(200, {"ok": True, "bootId": computer.boot_id, "desktop": desktop, "capabilities": ["gitClone", "gitPush", "workspace"] + (["liveDesktop"] if desktop and desktop_ready() else [])})
+            parsed = urlparse(self.path)
+            if parsed.path.startswith("/workspace/"):
+                try:
+                    params = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=8)
+                    arg = lambda name, default=".": params.get(name, [default])[0]
+                    kind = parsed.path.removeprefix("/workspace/")
+                    if kind == "download":
+                        target, mime = inspector.download(arg("path"))
+                        return self.stream(target, mime)
+                    if kind == "tree": value = inspector.tree(arg("path"))
+                    elif kind == "file": value = inspector.file(arg("path"))
+                    elif kind == "projects": value = inspector.projects()
+                    elif kind == "changes": value = inspector.changes(arg("project"))
+                    elif kind == "diff": value = inspector.diff(arg("project"), arg("path"), arg("mode", "unstaged"))
+                    else: return self.respond(404, {"error": {"code": "not_found", "message": "Workspace view not found."}})
+                    return self.respond(200, value)
+                except FileNotFoundError:
+                    return self.respond(404, {"error": {"code": "file_not_found", "message": "This file no longer exists. Refresh the workspace."}})
+                except (ValueError, OSError, RuntimeError, subprocess.SubprocessError):
+                    return self.respond(400, {"error": {"code": "workspace_read_failed", "message": "This path cannot be inspected safely, or the workspace changed. Refresh and try again."}})
             if self.path.startswith("/artifacts/"):
                 name = self.path.removeprefix("/artifacts/")
                 if re.fullmatch(r"[a-f0-9-]{36}\.png", name) and (computer.state / name).is_file():

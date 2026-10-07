@@ -1,3 +1,4 @@
+import sys
 import hashlib
 import importlib.util
 import io
@@ -12,6 +13,7 @@ import urllib.error
 import urllib.request
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).parents[1]))
 spec = importlib.util.spec_from_file_location("computer_server", Path(__file__).parents[1] / "server.py")
 server = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(server)
