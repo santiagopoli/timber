@@ -199,7 +199,9 @@ export class WorkspaceApps {
 
 function appResponse(response:Response,app:WorkspaceApp):Response {
   const headers=new Headers(response.headers);
-  headers.set("cache-control","private, no-store");headers.set("referrer-policy","no-referrer");headers.set("x-robots-tag","noindex, nofollow");
+  // Keep same-origin HTML forms usable while suppressing cross-origin referrers.
+  // no-referrer also turns their Origin header into null and fails our CSRF gate.
+  headers.set("cache-control","private, no-store");headers.set("referrer-policy","same-origin");headers.set("x-robots-tag","noindex, nofollow");
   headers.delete("access-control-allow-origin");headers.delete("access-control-allow-credentials");headers.delete("service-worker-allowed");
   const cookies=response.headers.getSetCookie();headers.delete("set-cookie");
   for(const cookie of cookies) {

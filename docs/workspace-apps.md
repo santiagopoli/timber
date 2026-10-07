@@ -2,7 +2,10 @@
 
 A workspace can contain several named apps: Frontend, Admin, API, or another name
 the bot chooses from the user's task. The user opens an app from its card in the
-bot's Apps section. Ports remain an implementation detail for the agent.
+bot's Apps section or its registered root link in the conversation. Both actions
+request the same one-use grant. Other bots' links and unregistered URLs retain
+ordinary browser navigation and cannot mint a grant for the selected bot. Ports
+remain an implementation detail for the agent.
 
 `publish_app({name,port})` registers an existing HTTP app and probes readiness. It
 does not start a shell process, install dependencies, or change the app's code.
@@ -64,6 +67,12 @@ Deploy the API with the exported `WorkspacePreviewGateway` entrypoint, then run
 `npx wrangler deploy --config apps/preview/wrangler.jsonc`. Set `PREVIEW_ORIGIN` to
 the exact separate HTTPS preview origin and `GITHUB_PUBLIC_ORIGIN` to the console
 origin. The console's form-action CSP must permit the preview origin.
+The console uses `Referrer-Policy: strict-origin` in both its HTTP header and HTML
+metadata so browser form submissions carry its exact Origin without disclosing a
+path or query. `no-referrer` turns that Origin into `null` and breaks the ticket
+exchange. Preview responses use `same-origin` to retain their own form provenance
+while suppressing external referrers. Missing, null and foreign opening origins
+remain rejected.
 
 The preview origin is separate from the admin/API origin. On workers.dev,
 multiple apps use separate paths on one preview origin and therefore share the

@@ -21,7 +21,11 @@
 .timber-markdown ul,.timber-markdown ol{margin:12px 0;padding-left:22px}
 .timber-markdown li{margin:5px 0}
 .timber-markdown table{font-size:13px}
-.timber-markdown a{color:var(--ink);text-decoration:underline;text-underline-offset:3px;text-decoration-color:var(--muted)}
+.timber-markdown a[href]{color:#8ab4f8;text-decoration:underline;text-underline-offset:3px;text-decoration-thickness:1px;text-decoration-color:currentColor;border-radius:2px}
+.timber-markdown a[href]:hover{text-decoration-thickness:2px}
+.timber-markdown a[href]:focus-visible{outline:2px solid currentColor;outline-offset:3px}
+.timber-markdown a:not([href]){color:inherit;text-decoration:none;font-weight:inherit}
+@media(prefers-color-scheme:light){.timber-markdown a[href]{color:#155bb8}}
 .timber-markdown h1,.timber-markdown h2,.timber-markdown h3{line-height:1.35;letter-spacing:-.35px;margin:23px 0 10px;font-weight:600}
 .timber-markdown h1{font-size:24px}.timber-markdown h2{font-size:21px}.timber-markdown h3{font-size:17px}
 .timber-markdown blockquote{border-left:2px solid var(--line);padding-left:14px;margin:16px 0;color:var(--muted)}

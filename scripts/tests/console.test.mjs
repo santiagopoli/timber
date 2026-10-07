@@ -931,9 +931,14 @@ test('workspace apps have independent protected links and open without sending t
     const app = await opened; await app.getByRole('heading', {name: 'Workspace app is available'}).waitFor();
     assert.equal(app.url(), state.apps.get(BOT_A)[0].url); assert.equal(await app.evaluate(() => window.opener), null);
     assert.equal(state.previewCalls[0].method, 'POST'); assert.equal(state.previewCalls[0].url, '/access');
+    assert.equal(state.previewCalls[0].origin, new URL(url).origin, 'browser sends the real console origin for the ticket exchange');
+    assert.ok([undefined, `${new URL(url).origin}/`].includes(state.previewCalls[0].referer), 'referrers cannot expose console paths or queries');
     assert.equal(new URLSearchParams(state.previewCalls[0].body).get('ticket'), 'fixture-ticket-frontend');
     assert.equal(state.previewCalls.every(call => !call.authorization && !JSON.stringify(call).includes(TEST_TOKEN)), true, 'owner token never reaches the preview origin');
     assert.equal(state.previewCalls.every(call => !call.url.includes('ticket')), true, 'ticket stays out of URLs');
+    await app.getByRole('button', {name: 'Save draft', exact: true}).click();
+    await app.getByText('Draft saved', {exact: true}).waitFor();
+    assert.equal(state.previewCalls.at(-1).origin, state.previewOrigin, 'forms inside the app retain their same-origin provenance');
     await page.getByRole('button', {name: 'Copy Storefront link', exact: true}).click();
     assert.equal(await page.evaluate(() => navigator.clipboard.readText()), state.apps.get(BOT_A)[0].url);
     const admin = page.locator('[data-app-id="admin"]'); await admin.locator('summary').click(); await admin.getByRole('button', {name: 'Remove access', exact: true}).click();
@@ -1107,6 +1112,9 @@ test('mobile composer remains visible with a short keyboard-sized viewport and l
     for (const height of [844, 430]) {
       await page.setViewportSize({width: 390, height});
       await page.locator('#message').fill('A short follow-up'); await page.locator('#message').focus();
+      // Browser resize events update the keyboard viewport asynchronously.
+      // Wait for that event-driven sizing before asserting the visible layout.
+      await page.waitForFunction(() => Math.abs(parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--app-height')) - (window.visualViewport?.height || innerHeight)) <= 1);
       const geometry = await page.evaluate(() => {
         const input = document.querySelector('#message'), composer = document.querySelector('#message-form'), send = composer.querySelector('[type=submit]');
         const rect = node => {const {top, bottom, left, right, height} = node.getBoundingClientRect(); return {top, bottom, left, right, height};};

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createHighlighter, type BundledLanguage, type Highlighter, type ThemedToken } from 'shiki';
 import { createJavaScriptRegexEngine } from 'shiki/engine/javascript';
-import { ChevronRightIcon, DownloadIcon, FileIcon, FolderIcon, GitBranchIcon, RefreshCwIcon, LoaderCircleIcon, XIcon } from 'lucide-react';
+import { ArrowLeftIcon, ChevronRightIcon, DownloadIcon, FileIcon, FolderIcon, GitBranchIcon, RefreshCwIcon, LoaderCircleIcon, XIcon } from 'lucide-react';
 import './workspace.css';
 
 type Entry = {name:string;path:string;kind:'file'|'directory'|'symlink';size:number;accessible:boolean};
@@ -50,10 +50,13 @@ function Workspace({ botId, callbacks }: {botId:string;callbacks:WorkspaceCallba
   const [treeState,setTreeState] = useState<LoadState>('loading'), [projectsState,setProjectsState] = useState<LoadState>('loading'), [changesState,setChangesState] = useState<LoadState>('ready');
   const [treeError,setTreeError] = useState(''), [projectsError,setProjectsError] = useState(''), [changesError,setChangesError] = useState('');
   const [reading,setReading] = useState(false), [mode,setMode] = useState<'files'|'changes'>('files');
+  const [previewPath,setPreviewPath] = useState<string|null>(null);
   const busy = treeState==='loading' || projectsState==='loading' || changesState==='loading';
   const [limited,setLimited] = useState(false), [tab,setTab] = useState<'file'|'unstaged'|'staged'>('file');
   const alive = useRef(true), navigation = useRef(0), selection = useRef(0), objectURL = useRef<string | null>(null), projectGeneration = useRef(0), scanGeneration = useRef(0), controller = useRef<AbortController|null>(null);
+  const previewBack = useRef<HTMLButtonElement>(null), selectionTrigger = useRef<HTMLElement|null>(null);
   const releaseImage = () => {if (objectURL.current) URL.revokeObjectURL(objectURL.current); objectURL.current=null; setImage(null);};
+  const closeFile = () => {selection.current++;releaseImage();setFile(null);setDiff(null);setPreviewPath(null);setReading(false);setError('');requestAnimationFrame(()=>selectionTrigger.current?.focus({preventScroll:true}));};
   const message = (err:unknown) => err instanceof Error ? err.message : 'Workspace could not be loaded. Refresh to try again.';
   const report = (err:unknown) => {if (alive.current) setError(message(err));};
   const request = <T,>(route:string) => callbacks.request(botId,route,controller.current?.signal) as Promise<T>;
@@ -75,6 +78,7 @@ function Workspace({ botId, callbacks }: {botId:string;callbacks:WorkspaceCallba
     } catch(err){if(alive.current && generation===scanGeneration.current){setProjectsError(message(err));setProjectsState('error');}}
   };
   const chooseProject = async (value:Project) => {
+    closeFile();
     setProject(value);setMode('changes');setChanges([]);setChangesError('');setChangesState('loading');
     const generation=++projectGeneration.current;
     try {
@@ -84,7 +88,8 @@ function Workspace({ botId, callbacks }: {botId:string;callbacks:WorkspaceCallba
     } catch(err){if(alive.current && generation===projectGeneration.current){setChangesError(message(err));setChangesState('error');}}
   };
   const openFile = async (path:string,view:'file'|'unstaged'|'staged'='file',source=project) => {
-    const generation=++selection.current; releaseImage();setFile(null);setDiff(null);setTab(view);setReading(true);setError('');
+    if(document.activeElement instanceof HTMLElement && document.activeElement.closest('.workspace-sidebar'))selectionTrigger.current=document.activeElement;
+    const generation=++selection.current; releaseImage();setFile(null);setDiff(null);setPreviewPath(view!=='file' && source?join(source.path,path):path);setTab(view);setReading(true);setError('');
     try {
       if(view!=='file' && source){
         const data=await request<Diff>(query('diff',{project:source.path,path,mode:view}));
@@ -110,20 +115,21 @@ function Workspace({ botId, callbacks }: {botId:string;callbacks:WorkspaceCallba
     catch(err){report(err);}
   };
   useEffect(()=>{alive.current=true;controller.current=new AbortController();void loadTree();void loadProjects();return()=>{alive.current=false;controller.current?.abort();navigation.current++;selection.current++;projectGeneration.current++;scanGeneration.current++;if(objectURL.current)URL.revokeObjectURL(objectURL.current);};},[botId]);
-  const selectedPath = diff ? join(diff.project,diff.path) : file?.path;
+  useEffect(()=>{if(previewPath && window.matchMedia('(max-width: 760px)').matches)previewBack.current?.focus({preventScroll:true});},[previewPath]);
+  const selectedPath = previewPath;
   const selectedChange = project && selectedPath ? changes.find(c=>join(project.path,c.path)===selectedPath) : undefined;
   const breadcrumbs = tree?.path === '.' ? [] : tree?.path.split('/') ?? [];
-  return <div className="timber-workspace" data-workspace-explorer>
-    <header className="workspace-heading"><h2>Files</h2><button type="button" className="secondary" aria-label="Refresh workspace" onClick={()=>{void loadTree(tree?.path);void loadProjects();if(project)void chooseProject(project);}} disabled={busy}><RefreshCwIcon className={busy?'workspace-loading-icon':undefined}/> Refresh</button></header>
-    {error && <div className="workspace-error" role="alert">{error}</div>}
-    <div className="workspace-projects" aria-label="Git projects" aria-busy={projectsState==='loading'}>{projects.map(p=><button type="button" key={p.path} className={`workspace-project ${project?.path===p.path?'selected':''}`} onClick={()=>void chooseProject(p)}><span className="workspace-project-name"><GitBranchIcon/>{p.name}</span><span className="workspace-project-path">{p.path}</span><span>{p.error || (p.detached ? `Detached · ${p.head?.slice(0,7) || 'unknown'}` : p.branch || 'New repository')}</span>{!p.error && <small>{p.dirty ? `${p.staged} staged · ${p.unstaged} modified · ${p.untracked} untracked` : 'Clean working tree'}</small>}</button>)}{projectsState==='loading' && <span className="workspace-loading workspace-muted" role="status"><LoaderCircleIcon/>Loading projects…</span>}{projectsState==='error' && <span className="workspace-error" role="alert">{projectsError}</span>}{projectsState==='ready' && !projects.length && <span className="workspace-muted">No Git projects in /workspace.</span>}</div>
+  return <div className="timber-workspace" data-workspace-explorer data-preview-open={previewPath!==null}>
+    <header className="workspace-heading"><h2>Workspace</h2><button type="button" className="workspace-refresh" aria-label="Refresh workspace" title="Refresh workspace" onClick={()=>{void loadTree(tree?.path);void loadProjects();if(project)void chooseProject(project);}} disabled={busy}><RefreshCwIcon className={busy?'workspace-loading-icon':undefined}/><span>Refresh</span></button></header>
+    <div className="workspace-projects" aria-label="Git projects" aria-busy={projectsState==='loading'}>{projects.map(p=><button type="button" key={p.path} title={p.path} aria-pressed={project?.path===p.path} className={`workspace-project ${project?.path===p.path?'selected':''}`} onClick={()=>void chooseProject(p)}><span className="workspace-project-name"><span>{p.name}</span>{!p.error && <small title={`${p.staged} staged · ${p.unstaged} modified · ${p.untracked} untracked`}>{p.dirty?'Changed':'Clean'}</small>}</span><span className="workspace-project-branch"><GitBranchIcon/><span>{p.error || (p.detached ? `Detached · ${p.head?.slice(0,7) || 'unknown'}` : p.branch || 'New repository')}</span></span></button>)}{projectsState==='loading' && <span className="workspace-loading workspace-muted" role="status"><LoaderCircleIcon/>Loading projects…</span>}{projectsState==='error' && <span className="workspace-error" role="alert">{projectsError}</span>}{projectsState==='ready' && !projects.length && <span className="workspace-muted">No Git projects in /workspace.</span>}</div>
     {limited && <p className="workspace-notice">The workspace scan reached its limit. Open a project folder to inspect files directly.</p>}
     <div className="workspace-layout"><aside className="workspace-sidebar"><div className="workspace-modes"><button type="button" aria-pressed={mode==='files'} onClick={()=>setMode('files')}>Files</button><button type="button" aria-pressed={mode==='changes'} disabled={!project} onClick={()=>setMode('changes')}>Changes {project ? `(${changes.length})` : ''}</button></div>
       {mode==='files' ? <><nav className="workspace-breadcrumbs" aria-label="Workspace folders"><button type="button" onClick={()=>void loadTree('.')}>workspace</button>{breadcrumbs.map((part,index)=><span key={index}><ChevronRightIcon/><button type="button" onClick={()=>void loadTree(breadcrumbs.slice(0,index+1).join('/'))}>{part}</button></span>)}</nav><div className="workspace-file-list" aria-busy={treeState==='loading'}>{treeState==='loading' && <p className="workspace-loading workspace-muted" role="status"><LoaderCircleIcon/>Loading files…</p>}{treeState==='error' && <p className="workspace-error" role="alert">{treeError}</p>}{tree?.path!=='.' && tree && <button type="button" className="workspace-entry" onClick={()=>void loadTree(parent(tree.path))}><FolderIcon/>..</button>}{tree?.entries.map(entry=><button type="button" className={`workspace-entry ${selectedPath===entry.path?'selected':''}`} key={entry.path} title={entry.accessible ? entry.path : 'Symbolic links and special files cannot be opened'} disabled={!entry.accessible} onClick={()=>entry.kind==='directory'?void loadTree(entry.path):void openFile(entry.path)}>{entry.kind==='directory'?<FolderIcon/>:<FileIcon/>}<span>{entry.name}{entry.kind==='symlink'?' ↗':''}</span>{entry.kind==='file' && <small>{size(entry.size)}</small>}</button>)}{treeState==='ready' && tree && !tree.entries.length && <p className="workspace-muted">This folder is empty.</p>}{tree?.truncated && <p className="workspace-notice">Showing the first 2,000 entries.</p>}</div></> : <div className="workspace-changes" aria-busy={changesState==='loading'}><p className="workspace-project-label">{project?.path}</p>{changesState==='loading' && <p className="workspace-loading workspace-muted" role="status"><LoaderCircleIcon/>Loading changes…</p>}{changesState==='error' && <p className="workspace-error" role="alert">{changesError}</p>}{changes.map(change=><button type="button" className={`workspace-entry ${selectedPath===join(project!.path,change.path)?'selected':''}`} key={change.path} title={change.previousPath?`${change.previousPath} → ${change.path}`:change.path} onClick={()=>void openFile(change.path,change.unstaged||change.untracked?'unstaged':'staged')}><span className="workspace-git-status">{change.untracked?'U':`${change.indexStatus}${change.worktreeStatus}`.trim()}</span><span>{change.path}</span></button>)}{changesState==='ready' && !changes.length && <p className="workspace-muted">No changes in this project.</p>}</div>}
-    </aside><section className="workspace-viewer" aria-label="File preview" aria-busy={reading}>{selectedPath && <div className="workspace-file-toolbar"><strong title={selectedPath}>{selectedPath}</strong>{file && <span>{size(file.size)}</span>}{file?.downloadable && <button type="button" aria-label="Download file" onClick={()=>void download()}><DownloadIcon/></button>}<button type="button" aria-label="Close file" onClick={()=>{selection.current++;releaseImage();setFile(null);setDiff(null);setReading(false);}}><XIcon/></button></div>}
+    </aside><section className="workspace-viewer" aria-label="File preview" aria-busy={reading}>{previewPath && <div className="workspace-file-toolbar"><button ref={previewBack} type="button" className="workspace-back" aria-label={`Back to ${mode}`} onClick={closeFile}><ArrowLeftIcon/></button><strong title={previewPath}>{previewPath}</strong>{file && <span>{size(file.size)}</span>}{file?.downloadable && <button type="button" aria-label="Download file" onClick={()=>void download()}><DownloadIcon/></button>}<button type="button" className="workspace-close" aria-label="Close file" onClick={closeFile}><XIcon/></button></div>}
       {selectedChange && <div className="workspace-file-tabs"><button type="button" aria-pressed={tab==='file'} onClick={()=>void openFile(selectedPath!)}>File</button><button type="button" disabled={!selectedChange.unstaged && !selectedChange.untracked} aria-pressed={tab==='unstaged'} onClick={()=>void openFile(selectedChange.path,'unstaged')}>Working changes</button><button type="button" disabled={!selectedChange.staged} aria-pressed={tab==='staged'} onClick={()=>void openFile(selectedChange.path,'staged')}>Staged changes</button></div>}
       {reading && <div className="workspace-empty" role="status">Loading preview…</div>}
-      {!reading && !file && !diff && <div className="workspace-empty"><FileIcon/><h3>Select a file</h3></div>}
+      {error && <div className="workspace-error" role="alert">{error}</div>}
+      {!reading && !previewPath && <div className="workspace-empty"><FileIcon/><h3>Select a file</h3></div>}
       {file?.truncated && file.kind==='text' && <p className="workspace-notice">Preview limited to 256 KiB. Download the original for the complete file.</p>}
       {file?.kind==='text' && <div className="workspace-code"><SourceCode code={file.content || ''} language={file.language}/></div>}
       {file?.kind==='image' && (image ? <div className="workspace-image"><img src={image} alt={file.name}/></div> : !reading && <p className="workspace-empty">This image is too large to preview.</p>)}

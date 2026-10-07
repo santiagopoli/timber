@@ -75,3 +75,30 @@ test('Switching bots during a file read cannot replace the new bot workspace wit
   } finally {firstBot.resolve();}
  });
 });
+
+test('mobile file detail keeps Back available while loading and after a read failure',async()=>{
+ const read=deferred();let failed=true;
+ await withWorkspace(async route=>{
+  const endpoint=new URL(route.request().url()).pathname.split('/').at(-1);
+  if(endpoint==='tree')return route.fulfill({json:{path:'.',entries:[{name:'app.ts',path:'app.ts',kind:'file',size:20,accessible:true}],truncated:false}});
+  if(endpoint==='projects')return route.fulfill({json:{projects:[],truncated:false}});
+  if(endpoint==='file'){
+   await read.promise;
+   return failed?route.fulfill({status:503,json:{error:{message:'File is temporarily unavailable.'}}}):route.fulfill({json:{path:'app.ts',name:'app.ts',size:20,mimeType:'text/plain',kind:'text',content:'const ready = true;',language:'typescript',truncated:false,downloadable:true}});
+  }
+  return route.fulfill({status:404,json:{error:{message:'Unknown test endpoint'}}});
+ },async page=>{
+  try {
+   await page.locator('.workspace-entry').filter({hasText:'app.ts'}).click();
+   await page.getByText('Loading preview…',{exact:true}).waitFor();
+   assert.equal(await page.getByRole('button',{name:'Back to files',exact:true}).isVisible(),true);
+   assert.equal(await page.locator('.workspace-sidebar').isVisible(),false);
+   read.resolve();await page.getByRole('alert').filter({hasText:'File is temporarily unavailable.'}).waitFor();
+   await page.getByRole('button',{name:'Back to files',exact:true}).click();
+   assert.equal(await page.locator('.workspace-sidebar').isVisible(),true);
+   failed=false;await page.locator('.workspace-entry').filter({hasText:'app.ts'}).click();
+   await page.locator('.workspace-source').filter({hasText:'const ready = true;'}).waitFor();
+   assert.equal(await page.locator('[data-workspace-explorer] [role="alert"]').count(),0);
+  } finally {read.resolve();}
+ });
+});

@@ -349,6 +349,21 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
     if ((url.protocol !== 'https:' && !(localTest && url.protocol === 'http:')) || url.username || url.password || url.search || url.hash) throw new Error('This app does not have a valid access address.');
     return url;
   }
+  $('chat-root').addEventListener('click', event => {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || !authenticated || !selected) return;
+    const link = event.target instanceof Element ? event.target.closest('.timber-markdown a[href]') : null;
+    if (!link) return;
+    let address; try {address = appAddress(link.href);} catch {return;}
+    // Only this bot's registered app root can mint an app-specific ticket.
+    // Other links keep native browser behavior, including modified clicks.
+    const app = workspaceApps.find(item => {
+      if (item.botId !== selected.id) return false;
+      try {const registered = appAddress(item.url); return registered.origin === address.origin && registered.pathname.replace(/\/$/, '') === address.pathname.replace(/\/$/, '');} catch {return false;}
+    });
+    if (!app) return;
+    event.preventDefault(); $('app-error').textContent = '';
+    void openWorkspaceApp(app);
+  });
   function renderApps() {
     const list = $('workspace-app-list'); list.replaceChildren(); $('app-count').textContent = String(workspaceApps.length);
     $('workspace-app-empty').hidden = workspaceApps.length > 0;
@@ -406,7 +421,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
       const form = popup.document.createElement('form'); form.method = 'POST'; form.action = action.href;
       const input = popup.document.createElement('input'); input.type = 'hidden'; input.name = 'ticket'; input.value = result.ticket; form.append(input); popup.document.body.append(form); form.submit();
       work.message = 'Opened in a new tab.';
-    } catch (error) {popup?.close(); if (session === authSession && error.name !== 'AbortError') {work.message = errorText(error); work.error = true;}}
+    } catch (error) {popup?.close(); if (session === authSession && error.name !== 'AbortError') {work.message = errorText(error); work.error = true; if (selected?.id === botId && currentPanel !== 'apps') showError(error);}}
     finally {if (session === authSession) {work.busy = false; if (selected?.id === botId) renderApps();}}
   }
   async function copyAppLink(app) {

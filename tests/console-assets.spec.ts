@@ -26,6 +26,7 @@ describe("console entry points", () => {
       expect(requests).toEqual(["/"]);
       expect(next.headers.get("cache-control")).toBe("no-store");
       expect(next.headers.get("content-security-policy")).toContain("script-src 'self'");
+      expect(next.headers.get("referrer-policy")).toBe("strict-origin");
     }
   });
 

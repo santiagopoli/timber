@@ -47,15 +47,17 @@ export async function createConsoleFixture({port = 0} = {}) {
   };
   const preview = createServer(async (request, response) => {
     let raw = ''; for await (const chunk of request) raw += chunk;
-    state.previewCalls.push({method: request.method, url: request.url, authorization: request.headers.authorization, cookie: request.headers.cookie, body: raw});
+    state.previewCalls.push({method: request.method, url: request.url, origin: request.headers.origin, referer: request.headers.referer, authorization: request.headers.authorization, cookie: request.headers.cookie, body: raw});
     const url = new URL(request.url, state.previewOrigin);
     if (url.pathname === '/access' && request.method === 'POST') {
+      if (request.headers.origin !== state.consoleOrigin) {response.writeHead(403).end('invalid_origin: Open this app from Timber'); return;}
       const ticket = new URLSearchParams(raw).get('ticket'), app = [...state.apps.values()].flat().find(item => `fixture-ticket-${item.id}` === ticket);
       if (!app) {response.writeHead(403).end('Access denied'); return;}
       response.writeHead(303, {'location': app.url, 'set-cookie': 'fixture_app_access=granted; HttpOnly; SameSite=Lax; Path=/'}).end(); return;
     }
     if (!request.headers.cookie?.includes('fixture_app_access=granted')) {response.writeHead(401).end('Open this app from Timber'); return;}
-    response.writeHead(200, {'content-type': 'text/html'}).end('<!doctype html><title>Workspace app</title><h1>Workspace app is available</h1>');
+    if (request.headers.origin && request.headers.origin !== state.previewOrigin || !request.headers.origin && !['GET', 'HEAD', 'OPTIONS'].includes(request.method)) {response.writeHead(403).end('Origin not allowed'); return;}
+    response.writeHead(200, {'content-type': 'text/html', 'referrer-policy': 'same-origin'}).end(`<!doctype html><title>Workspace app</title><h1>Workspace app is available</h1>${request.method === 'POST' ? '<p>Draft saved</p>' : '<form method="post"><input name="draft" value="example"><button>Save draft</button></form>'}`);
   });
   await new Promise(resolve => preview.listen(0, '127.0.0.1', resolve));
   state.previewOrigin = `http://127.0.0.1:${preview.address().port}`;
@@ -69,7 +71,7 @@ export async function createConsoleFixture({port = 0} = {}) {
         const asset = resolve(consoleRoot, filename), contentType = assetTypes.get(extname(asset));
         if (!asset.startsWith(consoleRoot + (consoleRoot.endsWith(sep) ? '' : sep)) || !contentType) {response.writeHead(404).end(); return;}
         let data; try {data = await readFile(asset);} catch (error) {if (error.code === 'ENOENT') {response.writeHead(404).end(); return;} throw error;}
-        response.writeHead(200, {'content-type': contentType, 'content-security-policy': `default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob: data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' ${state.previewOrigin}`}); response.end(data); return;
+        response.writeHead(200, {'content-type': contentType, 'referrer-policy': 'strict-origin', 'content-security-policy': `default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob: data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' ${state.previewOrigin}`}); response.end(data); return;
       }
       if (path === '/github-connect') {response.writeHead(200, {'content-type': 'text/html'}).end('<!doctype html><title>GitHub connection</title><p>GitHub consent fixture</p>'); return;}
       const sessionId = /(?:^|;\s*)timber_fixture_session=([^;]+)/.exec(request.headers.cookie || '')?.[1];
@@ -165,5 +167,6 @@ export async function createConsoleFixture({port = 0} = {}) {
     } catch (error) {state.failures.push(String(error)); response.writeHead(500).end('{}');}
   });
   await new Promise(resolve => server.listen(port, '127.0.0.1', resolve));
+  state.consoleOrigin = `http://127.0.0.1:${server.address().port}`;
   return {state, url: `http://127.0.0.1:${server.address().port}/console/`, close: async () => {for (const {response} of state.streams) response.end(); server.closeAllConnections(); preview.closeAllConnections(); await Promise.all([new Promise(resolve => server.close(resolve)), new Promise(resolve => preview.close(resolve))]);}};
 }

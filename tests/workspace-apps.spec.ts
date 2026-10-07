@@ -114,6 +114,7 @@ describe("workspace apps",()=>{
     expect(response.headers.get("location")).toBe(app.url+"login");
     expect(response.headers.get("set-cookie")).toContain(`Path=${app.basePath}`);expect(response.headers.get("set-cookie")).not.toContain("Domain=");
     expect(response.headers.get("access-control-allow-origin")).toBeNull();expect(response.headers.get("cache-control")).toBe("private, no-store");
+    expect(response.headers.get("referrer-policy")).toBe("same-origin");
   }));
 
   it("rejects cross-site changes, path escape, and malformed opening requests before reaching the app",async()=>isolated(async(store,botId)=>{
@@ -124,7 +125,9 @@ describe("workspace apps",()=>{
     expect((await apps.preview(new Request(app.url,{method:"POST",headers:{cookie},body:"x"}),app.id,app.basePath)).status).toBe(403);
     expect((await apps.preview(new Request(app.url+"sw.js",{headers:{cookie,"service-worker":"script"}}),app.id,app.basePath+"sw.js")).status).toBe(403);
     await expect(apps.preview(new Request(app.url,{headers:{cookie}}),app.id,app.basePath+"../escape")).rejects.toMatchObject({code:"app_not_found"});
-    await expect(apps.preview(new Request(app.url+"__timber_open",{method:"POST",headers:{origin:"https://attacker.test"}}),app.id,app.basePath+"__timber_open")).rejects.toMatchObject({code:"invalid_origin"});
+    for (const origin of ["https://attacker.test", "null", ""]) {
+      await expect(apps.preview(new Request(app.url+"__timber_open",{method:"POST",headers:origin?{origin}:{}}),app.id,app.basePath+"__timber_open")).rejects.toMatchObject({code:"invalid_origin"});
+    }
     expect(calls).toBe(before);
   }));
 
