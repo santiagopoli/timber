@@ -10,8 +10,18 @@ computer if necessary, then displays a continuous desktop stream and the remote
 mouse pointer. Watch does not send keyboard or mouse input. To interact, wait for
 the bot to finish (or explicitly stop its run), then choose **Take control**.
 Click the desktop to focus it and use your keyboard/mouse. Switch back to Watch
-or Disconnect to release control. Closing the page or changing bots/tabs releases
-the session; a lost connection has a one-minute lease.
+or Disconnect to release control. Watch survives brief panel/browser-tab switches;
+after 30 seconds away it pauses and automatically resumes when you return.
+Network interruption or an expired desktop grant reconnects with fresh view-only
+access without signing you out. Closing the Computer pane, Disconnect, changing
+bots, logout or Suspend stops watching. Manual control releases immediately when
+the page/pane is hidden and must always be taken again explicitly.
+
+The bot can click at desktop coordinates using the left, right or middle button,
+and scroll at the current pointer. Watching never blocks those tools. A human
+control lease temporarily blocks bot mutations to avoid competing input; releasing
+control restores bot access. Native hover/move-only and drag tools are not yet
+exposed by the agent tool set.
 
 Full screen is available where the browser supports it. Screenshots, terminal and
 manual controls remain under **Snapshots, terminal & manual tools**. These are
@@ -55,6 +65,12 @@ path containment, safe Git inspection, actual noVNC/RFB negotiation in Chromium,
 rendered framebuffer pixels, keyboard/mouse, navigation cleanup, code highlighting,
 diffs and responsive layouts. The image workflow tests a real X11 desktop,
 including cursor movement and a native xterm window, after checkpoint restoration.
+
+Recovery regressions exercise real noVNC sockets through tab/panel changes,
+mobile background return, socket loss, network return, transient heartbeat errors,
+desktop versus account expiry, explicit Suspend and control-to-Watch recovery.
+Backend checks prove mouse actions work with viewers attached, remain fenced by
+human control, and lease renewal proceeds during a blocked workspace inspection.
 
 CI for `de80c8758fac8d6742f2a7d25fa15838aba6da00` passed backend/typechecks,
 48 console browser cases, both real desktop image checks, and Worker bundling.

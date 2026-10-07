@@ -83,6 +83,16 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   aliases for display; neither identical command text nor event names prove
   execution success. A successful inference with no tool call or public answer
   fails explicitly as `model_empty_response`; completed effects are not replayed.
+  Host-dispatched actions persist `tool.started` before execution and include an
+  allowlisted `input` display summary (command, path, coordinates or other public
+  parameters). Completion repeats that summary with the result, using the same
+  operation identity. File bodies and typed text are omitted; common command
+  credential forms and URL credentials/query values are masked. This summary is
+  presentation data and is never used to execute or retry an action.
+  The console renders started/completed events directly in both the conversation
+  and Activity, independent of transcript refresh. Command/parameters, status
+  and a bounded output/error preview remain visible with details closed. Streaming
+  text does not evict tool records from the separate bounded activity history.
 - GET /v1/bots/:id/computer -> {computer:ComputerStatus}. `starting` means an
   initialization is currently in flight. A failed control-server probe or saved
   startup failure is `unavailable`, with optional fixed `error:{code,message}`.
@@ -296,7 +306,15 @@ live observation/control from model screenshots and from the Files explorer.
   returned one-use ticket in `Sec-WebSocket-Protocol`, never a URL credential.
 - POST `/v1/bots/:id/computer/live-session/:sessionId/renew` renews a 60-second
   lease; DELETE releases it. Maximum connection lifetime is one hour, maximum
-  four viewers and one controller per bot. Disconnect/tab exit releases access.
+  four viewers and one controller per bot. Renewal updates lease metadata without
+  waiting behind workspace reads/checkpoints or starting a stopped computer.
+  `desktop_session_expired` expires the viewer grant, not the owner's login.
+- Watch retains its intent across panel and browser-tab switches. Brief absences
+  keep the socket for up to 30 seconds; longer absences pause it and returning
+  resumes with a fresh grant. Lost connections recover with bounded backoff.
+  Disconnect, closing the Computer pane, changing bots, logout and Suspend cancel
+  that intent. Human control releases immediately when hidden and is never
+  reacquired automatically: recovery always uses view-only access.
 - Observation is enforced by a separate view-only x11vnc server, not just the UI.
   Remote cursor pixels are part of the desktop stream. A controller must wait for
   active runs/actions to finish or stop them explicitly. New computer mutations

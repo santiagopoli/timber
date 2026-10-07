@@ -4,6 +4,7 @@ import { createCloudComputerProvider, touchCloudComputer, suspendCloudComputer, 
 import { createPiRuntime, type AgentRuntime, type RuntimeApprovalContext, type RuntimeApprovalSummary, type RuntimeToolResult, type RuntimeHostToolRequest } from "@botspace/runtime";
 import { hostTools, validateHostArguments, githubDevelopmentSkill, workspaceAppsSkill } from "./host-tools";
 import { WorkspaceApps } from "./workspace-apps";
+import { computerActivityInput, hostActivityInput } from "./tool-activity";
 import type { Env } from "./env";
 import { ApiError, errorResponse, json } from "./errors";
 import { body, fingerprint, operationId, parseAction, parseMessage, UUID } from "./validation";
@@ -191,6 +192,12 @@ export class BotDO extends DurableObject<Env> {
     if(this.deleted) return;
     const event:Omit<BotEvent,"id">={botId:this.bot().id,type,data,createdAt:timestamp(),...(runId?{runId}:{})};
     this.ctx.storage.sql.exec("INSERT OR IGNORE INTO events (source_key,data) VALUES (?,?)",sourceKey??null,JSON.stringify(event));
+  }
+  private startTool(operationId:string,data:Record<string,unknown>,runId:string):void {
+    // Re-observing a completed operation must not create a fresh running row.
+    // The provider's operation journal remains the authority for effects.
+    if(this.ctx.storage.sql.exec("SELECT id FROM events WHERE source_key=?",`tool:${operationId}`).toArray().length) return;
+    this.emit("tool.started",{operationId,...data},runId,`tool-start:${operationId}`);
   }
   private addMessage(message:Message,sourceKey:string):void {
     if(this.deleted) return;
@@ -439,8 +446,10 @@ export class BotDO extends DurableObject<Env> {
     const concurrentDecision=this.existingToolDecision(input.operationId,hash);
     if(concurrentDecision) return concurrentDecision;
     if(automatic.has(action.type) || bot.computerApprovalMode==="automatic") {
+      const activity={...(input.toolCallId?{toolCallId:input.toolCallId}:{}),actionType:action.type,input:computerActivityInput(action)};
+      this.startTool(input.operationId,activity,run.id);
       const result=await this.computer.exec(run.botId,input.operationId,action);
-      this.emit("tool.completed",{operationId:input.operationId,...(input.toolCallId?{toolCallId:input.toolCallId}:{}),actionType:action.type,result},run.id,`tool:${input.operationId}`);
+      this.emit("tool.completed",{operationId:input.operationId,...activity,result},run.id,`tool:${input.operationId}`);
       return result;
     }
     const now=Date.now();
@@ -555,6 +564,12 @@ export class BotDO extends DurableObject<Env> {
     this.active();
     if(this.getRunRow(run.id).native_operation_id!==input.runOperationId || terminal.has(this.getRun(run.id).status) || input.signal.aborted) return {operationId:input.operationId,status:'interrupted',error:'Run is no longer active.'};
     const args=input.arguments;
+    if(typeof args.repository==='string') {
+      const repository=args.repository.toLowerCase();
+      if(!/^[a-z0-9][a-z0-9-]{0,38}\/[a-z0-9._-]{1,100}$/.test(repository) || repository.endsWith('/.') || repository.endsWith('/..')) throw new ApiError(400,'invalid_repository','Use a GitHub repository in owner/name format.');
+    }
+    const activity={...(input.toolCallId?{toolCallId:input.toolCallId}:{}),toolName:input.name,input:hostActivityInput(input.name,args)};
+    this.startTool(input.operationId,activity,run.id);
     const completed=(value:unknown):ComputerResult=>({operationId:input.operationId,status:'completed',output:typeof value==='string'?value:JSON.stringify(value)});
     let result:ComputerResult;
     if(input.name==='load_skill') result=completed(args.name==='github-development'?githubDevelopmentSkill:workspaceAppsSkill);
@@ -571,7 +586,6 @@ export class BotDO extends DurableObject<Env> {
         :completed(await this.github('/repositories','POST',{botId:run.botId,...(args.page===undefined?{}:{page:args.page})}));
     } else {
       const repository=String(args.repository).toLowerCase();
-      if(!/^[a-z0-9][a-z0-9-]{0,38}\/[a-z0-9._-]{1,100}$/.test(repository) || repository.endsWith('/.') || repository.endsWith('/..')) throw new ApiError(400,'invalid_repository','Use a GitHub repository in owner/name format.');
       const permission=input.name==='github_connect'?(args.permission??'read') as 'read'|'write':['github_clone','github_list_pull_requests'].includes(input.name)?'read':'write';
       const pending=await this.requireConnection(input,run,repository,permission);
       if(pending) return pending;
@@ -585,7 +599,7 @@ export class BotDO extends DurableObject<Env> {
         result=response.status==='completed'?completed(response.data):{operationId:input.operationId,status:response.status==='interrupted'?'interrupted':'failed',error:(response.error as {message?:string}|undefined)?.message??'GitHub could not confirm the operation. Inspect its state before retrying.'};
       }
     }
-    this.emit('tool.completed',{operationId:input.operationId,...(input.toolCallId?{toolCallId:input.toolCallId}:{}),toolName:input.name,result},run.id,`tool:${input.operationId}`);
+    this.emit('tool.completed',{operationId:input.operationId,...activity,result},run.id,`tool:${input.operationId}`);
     return result;
   }
 
@@ -659,6 +673,8 @@ export class BotDO extends DurableObject<Env> {
     const approval=JSON.parse(row.data) as Approval;
     // Recovery can hold an older snapshot. A terminal decision is immutable.
     if(approval.status!=="executing") return;
+    const activity={...(approval.toolCallId?{toolCallId:approval.toolCallId}:{}),actionType:approval.action.type,input:computerActivityInput(approval.action)};
+    this.startTool(approval.operationId,activity,approval.runId);
     let result:ComputerResult;
     let providerDiagnostic:string|undefined;
     try {result=await this.computer.exec(approval.botId,approval.operationId,approval.action);}
@@ -676,7 +692,7 @@ export class BotDO extends DurableObject<Env> {
       const completed:Approval={...approval,result,status:result.status==="completed"?"completed":result.status==="interrupted"?"interrupted":"failed"};
       this.saveApproval(completed);
       this.emit("approval.updated",{approval:completed},approval.runId,`approval-result:${approval.id}`);
-      this.emit("tool.completed",{operationId:approval.operationId,...(approval.toolCallId?{toolCallId:approval.toolCallId}:{}),actionType:approval.action.type,result},approval.runId,`tool:${approval.operationId}`);
+      this.emit("tool.completed",{operationId:approval.operationId,...activity,result},approval.runId,`tool:${approval.operationId}`);
       if(result.status==="interrupted") {
         if(!terminal.has(this.getRun(approval.runId).status)) this.updateStatus(approval.runId,"interrupted",providerDiagnostic??"An approved action was interrupted. Check its effects before retrying.");
       } else continuation=this.queueApprovalContinuation(completed);
@@ -854,7 +870,7 @@ export class BotDO extends DurableObject<Env> {
         this.active();
         if(!["readFile","listFiles","screenshot"].includes(action.type)) this.invalidatePendingGui();
         const result=await this.computer.exec(this.bot().id,op,action);
-        this.emit("computer.action",{operationId:op,actionType:action.type,result},undefined,`direct:${op}`);
+        this.emit("computer.action",{operationId:op,actionType:action.type,input:computerActivityInput(action),result},undefined,`direct:${op}`);
         return json({result});
       }
       if(path==="/approvals" && request.method==="GET") {

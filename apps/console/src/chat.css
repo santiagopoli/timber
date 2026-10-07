@@ -101,32 +101,44 @@
 .timber-copy-feedback{font-size:11px;line-height:1.5}.timber-copy-feedback:empty{display:none}
 .timber-copy-error{color:var(--danger);max-width:230px}
 
-/* Activity is a quiet disclosure, not another message card. */
-.timber-activity-group{border:0;border-radius:0;background:transparent;min-width:0}
-.timber-activity-header{width:auto;max-width:100%;min-height:36px;padding:5px 0;gap:8px;background:transparent;color:var(--muted);border:0;border-radius:6px;font-size:12px;font-weight:400}
-.timber-activity-header:hover{color:var(--ink)}
-.timber-activity-header>svg:first-child{display:none}
-.timber-activity-header>svg:last-child{width:13px;height:13px;flex-shrink:0}
-.timber-activity-header>span{min-width:0}
-.timber-activity-title{display:flex;align-items:center;gap:8px;min-width:0;line-height:1.5}
-.timber-activity-title>svg{width:14px;height:14px;flex:none;color:var(--muted)}
-.timber-activity-name{font-weight:500}
+/* Each action is readable before expanding. One disclosure owns its diagnostics. */
+.timber-activity-group{min-width:0;color:var(--ink)}
+.timber-activity-header{display:flex;align-items:center;gap:7px;min-height:32px;margin-bottom:4px;color:var(--muted);font-size:11px;font-weight:400;line-height:1.5}
+.timber-activity-header>svg{width:13px;height:13px;flex:none}
 .timber-activity-count{font-size:11px;white-space:nowrap}
-.timber-activity-count::before{content:'·';margin-right:8px}
-.timber-activity-title .timber-activity-status{font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)}
-.timber-activity-status::before{content:'·';margin-right:8px}
-.timber-activity-title .timber-activity-status[data-status="failed"],.timber-activity-title .timber-activity-status[data-status="cancelled"],.timber-activity-title .timber-activity-status[data-status="interrupted"]{color:var(--danger)}
-.timber-activity-content{padding:8px 0 4px 13px;margin:0 0 0 6px;border-left:1px solid var(--line);display:flex;flex-direction:column;gap:20px}
-.timber-activity-group>div{margin-block:0}
-.timber-activity-content>*{margin:0}
-.timber-activity-label{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12px;font-weight:500;color:var(--ink)}
-.timber-activity-label time,.timber-tool-status{font-size:11px;font-weight:400;color:var(--muted)}
-.timber-activity-label time{margin-left:auto}
-.timber-tool-step{color:var(--muted)}.timber-tool-error .timber-tool-status{color:var(--danger)}
-.timber-tool-details{font-size:11px;color:var(--muted)}
-.timber-tool-details summary{cursor:pointer;font-size:11px;padding:3px 0}
-.timber-tool-details .timber-action{margin:9px 0 0;font-size:11px}
-.timber-activity-content,.timber-tool-step{animation:none}
+.timber-activity-count::before{content:'·';margin-right:7px}
+.timber-activity-status{display:flex;align-items:center;gap:5px;margin-left:auto;font-size:11px;color:var(--muted)}
+.timber-activity-status svg{width:12px;height:12px}
+.timber-activity-content{display:flex;flex-direction:column;min-width:0;gap:0;padding:0;margin:0;border:0}
+.timber-tool-row{min-width:0;border:0;border-bottom:1px solid var(--line);margin:0;color:var(--ink);background:transparent}
+.timber-tool-row:first-child{border-top:1px solid var(--line)}
+.timber-tool-summary{display:grid;grid-template-columns:16px minmax(0,1fr) 14px;align-items:start;column-gap:9px;padding:13px 0;cursor:pointer;list-style:none;min-width:0;text-align:left;border-radius:4px}
+.timber-tool-summary::-webkit-details-marker{display:none}
+.timber-tool-summary::marker{content:''}
+.timber-tool-summary:hover .timber-tool-command{color:var(--ink)}
+.timber-tool-summary:focus-visible{outline:2px solid var(--ink);outline-offset:4px}
+.timber-tool-icon{width:15px;height:15px;margin-top:3px;flex:none;color:var(--muted)}
+.timber-tool-overview{min-width:0;display:flex;flex-direction:column;gap:4px}
+.timber-tool-heading{display:flex;align-items:baseline;gap:5px 12px;flex-wrap:wrap;min-width:0}
+.timber-tool-command{min-width:0;font-size:12px;line-height:1.6;font-weight:500;overflow-wrap:anywhere;white-space:pre-wrap;color:var(--ink)}
+.timber-tool-command.is-command{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-weight:400}
+.timber-tool-status{font-size:10px;font-weight:400;line-height:1.6;color:var(--muted);white-space:nowrap}
+.timber-tool-parameters{font-size:10px;color:var(--muted);line-height:1.55;overflow-wrap:anywhere}
+.timber-tool-preview{margin:0;max-width:100%;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--muted);display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden}
+.timber-tool-preview.timber-inline-error{color:var(--danger);font-family:inherit}
+.timber-tool-preview.timber-save-warning{font-family:inherit}
+.timber-tool-error .timber-tool-status,.timber-tool-error .timber-tool-icon{color:var(--danger)}
+.timber-tool-chevron{width:13px;height:13px;margin-top:4px;color:var(--muted);transition:transform .15s}
+.timber-tool-row[open]>.timber-tool-summary .timber-tool-chevron{transform:rotate(180deg)}
+.timber-tool-expanded{min-width:0;padding:0 0 14px 25px}
+.timber-tool-expanded .timber-action{margin:5px 0 12px;max-height:320px;font-size:11px}
+.timber-tool-expanded .timber-action:last-child{margin-bottom:0}
+.timber-tool-detail-label{color:var(--muted);font-size:10px;line-height:1.5}
+.timber-tool-expanded>p{margin:0 0 10px}
+.timber-activity-panel{max-width:980px;min-width:0}
+.timber-activity-panel .timber-tool-command{font-size:13px}
+.timber-activity-panel .timber-tool-summary{padding-block:15px}
+.timber-activity-empty{font-size:13px;color:var(--muted);margin:0;padding:8px 0 16px}
 
 .timber-connection-entry{padding:16px;border:1px solid var(--line);border-radius:14px;background:var(--surface);display:flex;flex-direction:column;align-items:flex-start;gap:10px;min-width:0}
 .timber-connection-heading{display:flex;align-items:center;gap:8px;width:100%;font-size:13px;line-height:1.5}
@@ -166,8 +178,12 @@
   .timber-approval-heading time{display:none}
   .timber-approval-history>summary{min-height:42px}
   .timber-activity-header{min-height:40px}
-  .timber-activity-title{gap:7px}
-  .timber-activity-content{padding:8px 0 4px 10px}
+  .timber-tool-summary{padding-block:12px;column-gap:8px}
+  .timber-tool-command{font-size:13px}
+  .timber-tool-status,.timber-tool-parameters{font-size:11px}
+  .timber-tool-preview{font-size:12px}
+  .timber-tool-expanded{padding-left:0}
+  .timber-tool-expanded .timber-action{max-height:280px}
   .timber-connection-entry{padding:14px}
   .timber-connection-heading time{display:none}
   .timber-connection-entry [data-connect-github]{min-height:42px}

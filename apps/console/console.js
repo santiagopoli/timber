@@ -1,5 +1,5 @@
 import './src/styles.css';
-import { mountChat } from './src/chat.tsx';
+import { mountChat, mountToolActivity } from './src/chat.tsx';
 import { createDesktopViewer } from './src/desktop.ts';
 import { mountWorkspaceExplorer } from './src/workspace.tsx';
 
@@ -40,13 +40,14 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
     onStop: (botId, runId) => { if (selected?.id === botId) void guarded(() => cancelRun(runId)); },
     onConnect: (botId, requestId) => { if (selected?.id === botId) void connectGitHub(botId, requestId); },
   });
+  const activity = mountToolActivity($('activity-tools'));
   const desktopSessions = new Map();
   const desktop = createDesktopViewer({
     element: $('desktop-root'),
     async connect(mode) {
       const id = selected?.id, version = generation;
       if (!id || !authenticated) throw new Error('Select a bot first.');
-      const session = await request(`${botPath(id)}/computer/live-session`, {method: 'POST', body: {mode}});
+      const session = await request(`${botPath(id)}/computer/live-session`, {method: 'POST', body: {mode}, signal: AbortSignal.timeout(90_000)});
       desktopSessions.set(session.sessionId, id);
       if (!validView(version) || selected?.id !== id) {
         await releaseDesktop(session.sessionId);
@@ -59,14 +60,14 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
     async renew(sessionId) {
       const id = desktopSessions.get(sessionId);
       if (!id) throw new Error('Desktop session ended.');
-      return request(`${botPath(id)}/computer/live-session/${sessionId}/renew`, {method: 'POST'});
+      return request(`${botPath(id)}/computer/live-session/${sessionId}/renew`, {method: 'POST', signal: AbortSignal.timeout(8000)});
     },
     release: releaseDesktop,
   });
   async function releaseDesktop(sessionId) {
     const id = desktopSessions.get(sessionId);
     desktopSessions.delete(sessionId);
-    if (id && authenticated) await request(`${botPath(id)}/computer/live-session/${sessionId}`, {method: 'DELETE'});
+    if (id && authenticated) await request(`${botPath(id)}/computer/live-session/${sessionId}`, {method: 'DELETE', keepalive: true, signal: AbortSignal.timeout(5000)});
   }
   const workspace = mountWorkspaceExplorer($('workspace-root'), {
     request: (id, path, signal) => request(`${botPath(id)}${path}`, {signal}),
@@ -74,18 +75,18 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   });
   function showError(error) { if (authenticated) $('app-error').textContent = errorText(error); }
   async function guarded(fn) { $('app-error').textContent = ''; try { return await fn(); } catch (error) { if (error.name !== 'AbortError') showError(error); } }
-  async function request(path, { method = 'GET', body, signal, raw = false } = {}) {
+  async function request(path, { method = 'GET', body, signal, raw = false, keepalive = false } = {}) {
     if (!authenticated) throw new Error('Sign in to continue.');
     const targetId = /^\/v1\/bots\/([^/?]+)/.exec(path)?.[1];
     if (targetId && removedBots.has(targetId) && !(method === 'DELETE' && path === botPath(targetId))) throw new DOMException('This bot is no longer available.', 'AbortError');
     const session = authSession, headers = { 'X-Timber-Client': 'console' };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     let response;
-    try { response = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: signal ? AbortSignal.any([signal, sessionController.signal]) : sessionController.signal, cache: 'no-store', credentials: 'same-origin', redirect: 'error' }); }
+    try { response = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: signal ? AbortSignal.any([signal, sessionController.signal]) : sessionController.signal, cache: 'no-store', credentials: 'same-origin', redirect: 'error', keepalive }); }
     catch (error) { if (error.name === 'AbortError') throw error; throw new Error(method === 'GET' ? 'Connection lost. Check your network, then refresh or reconnect.' : 'The response was lost. The action may have been accepted. Inspect its state before retrying; nothing was retried automatically.'); }
     if (!response.ok) {
       const detail = await response.json().catch(() => ({}));
-      if (response.status === 401 && !/^(chatgpt_|github_)/.test(String(detail.error?.code || '')) && session === authSession) disconnect('Your session expired. Sign in again.');
+      if (response.status === 401 && !/^(chatgpt_|github_|desktop_session_expired$)/.test(String(detail.error?.code || '')) && session === authSession) disconnect('Your session expired. Sign in again.');
       const error = new Error(detail.error?.message || `Request failed (${response.status}).`); error.status = response.status; error.code = detail.error?.code; throw error;
     }
     if (session !== authSession) throw new DOMException('The session ended.', 'AbortError');
@@ -107,7 +108,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
     selected = null; currentRun = null; bots = []; messages = []; approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
     removedBots.clear(); deletionPending.clear(); deleteTarget = null; deleteBusy = false; editBotId = null; drafts.clear(); pendingMessages.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); connectionWork.clear(); appWork.clear(); closeDialogs(); clearScreen();
     chatGPTConnected = false; chatGPTAccount = null; chatGPTBusy = false;
-    chat.clear();
+    chat.clear(); activity.clear();
     for (const id of ['activity-list', 'bot-list', 'run-list', 'file-list', 'workspace-app-list']) $(id).replaceChildren();
     for (const id of ['token', 'type-text', 'exec-command', 'navigate-url', 'key-name', 'file-content', 'bot-search']) $(id).value = '';
     $('create-form').reset(); $('edit-form').reset(); $('delete-error').textContent = ''; $('delete-form').reset(); renderDeleteControls(); $('file-path').value = '.'; $('computer-result').textContent = 'No actions yet.';
@@ -186,9 +187,10 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
     const visibleApprovals = effectiveApprovals(), pending = visibleApprovals.filter(approval => approval.status === 'pending');
     $('approval-count').textContent = String(pending.length); $('approval-shortcut').hidden = !pending.length;
     const stream = [...streamDrafts.entries()].find(([id, text]) => text && activeRunIds.has(id) && !terminal.has(runs.get(id)?.status) && (!runFilter || id === runFilter));
-    chat.update({ bot: selected, messages, runs: [...runs.values()], approvals: visibleApprovals, connections: connections.map(item => ({...item, ...connectionWork.get(`${selected.id}:${item.id}`)})), events: events.filter(event => ['tool.started', 'tool.completed'].includes(event.type)).map(event => ({...event, data: redact(event.data)})),
+    const model = { bot: selected, messages, runs: [...runs.values()], approvals: visibleApprovals, connections: connections.map(item => ({...item, ...connectionWork.get(`${selected.id}:${item.id}`)})), events: events.filter(event => ['tool.started', 'tool.completed'].includes(event.type)).map(event => ({...event, data: redact(event.data)})),
       deliveries: [...pendingMessages.values()].filter(delivery => delivery.botId === selected.id).map(delivery => ({...delivery})), draft: drafts.get(selected.id) || '', sending: sendBusy.has(selected.id), loading: chatLoading,
-      currentRun, runFilter, focusApproval, stream: stream ? {runId: stream[0], text: stream[1]} : null, feedback: approvalFeedback.get(selected.id) });
+      currentRun, runFilter, focusApproval, stream: stream ? {runId: stream[0], text: stream[1]} : null, feedback: approvalFeedback.get(selected.id) };
+    chat.update(model); activity.update({...model, runFilter: null});
   }
   async function sendMessage(botId, rawText, retryOperationId) {
     const text = rawText.trim(); if (!authenticated || selected?.id !== botId || !text || sendBusy.has(botId)) return;
@@ -478,10 +480,15 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   function renderStreamDraft() { renderMessages(); }
   function recordEvent(event, version) {
     if (!validView(version) || !Number.isSafeInteger(event.id) || event.id <= cursor) return;
+    if (event.type === 'computer.suspended') desktop.disconnect();
     if (['computer.action', 'computer.suspended', 'tool.started', 'tool.completed', 'approval.updated'].includes(event.type)) queueComputerStatus();
-    cursor = event.id; events.push(event); if (events.length > 200) events.shift(); $('event-count').textContent = String(events.length);
+    cursor = event.id;
+    // Text deltas must not evict an in-flight tool from the activity model.
+    // Keep the bounded tool history separate from the diagnostic event log.
+    if (event.type === 'tool.started' || event.type === 'tool.completed') {events.push(event); if (events.length > 200) events.shift();}
     const row = el('article', 'event'), title = el('div', 'event-title'); title.append(el('span', '', event.type.replaceAll('.', ' · ')), el('span', 'muted', `#${event.id} · ${time(event.createdAt)}`));
     const detail = el('details'); detail.append(el('summary', '', 'Event details')); const serialized = JSON.stringify(redact(event.data), null, 2); detail.append(el('pre', '', serialized.length > 8000 ? `${serialized.slice(0, 8000)}\n…` : serialized)); row.append(title, detail); $('activity-list').prepend(row); while ($('activity-list').children.length > 200) $('activity-list').lastElementChild.remove();
+    $('event-count').textContent = String($('activity-list').children.length);
     if (event.type === 'run.updated' && event.data.run) {
       const run = event.data.run;
       if ((runs.has(run.id) || !boundary || run.createdAt >= boundary) && mergeRun(run, 'event')) { runRevision++; if (!terminal.has(run.status)) activeRunIds.add(run.id); renderRuns(); }
@@ -496,6 +503,9 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
       return;
     }
     if ((event.type === 'message.created' && event.data.message?.role === 'assistant') || (event.type === 'message' && event.data.role === 'assistant')) { streamDrafts.delete(event.runId); renderStreamDraft(); }
+    // Tool progress is already in the stream. Rendering it must not wait for
+    // transcript/runs REST refreshes (which may be delayed by ongoing work).
+    if (event.type === 'tool.started' || event.type === 'tool.completed') renderMessages();
     scheduleRefresh(version);
   }
   const pause = (ms, signal) => new Promise((resolve) => { if (signal.aborted) return resolve(); const done = () => { clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); }; const timer = setTimeout(done, ms); signal.addEventListener('abort', done, { once: true }); });
@@ -591,6 +601,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   }
   async function suspendComputer() {
     if (!selected) return; const id = selected.id, version = generation, pending = beginComputer(id, 'Saving workspace and suspending computer'); if (!pending) return;
+    await desktop.disconnect();
     try { const { computer } = await request(`${botPath(id)}/computer/suspend`, { method: 'POST', body: {} }); if (!validView(version)) return; clearScreen(); renderResult({ status: 'completed', ...(computer.lastCheckpointId ? { checkpointId: computer.lastCheckpointId } : {}), output: 'Computer suspended. The next action restores its workspace.' }, { type: 'suspend' }); if (!computer.lastCheckpointId) warning('No checkpoint reference was returned. Durable storage is not confirmed.'); await computerStatus(); }
     finally { finishComputer(id, pending); }
   }
@@ -631,7 +642,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
       stopComputerStatus(); generation++; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
       for (const runId of runs.keys()) stopping.delete(runId);
       selected = null; currentRun = null; messages = []; approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
-      cursor = 0; boundary = ''; runFilter = null; nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; chatLoading = false; chat.clear();
+      cursor = 0; boundary = ''; runFilter = null; nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; chatLoading = false; chat.clear(); activity.clear();
       for (const element of ['activity-list', 'run-list', 'file-list', 'workspace-app-list']) $(element).replaceChildren();
       for (const element of ['file-content', 'type-text', 'exec-command', 'navigate-url', 'key-name']) $(element).value = '';
       for (const element of ['selected-name', 'selected-model', 'selected-computer-mode', 'app-error', 'run-error', 'result-raw']) $(element).textContent = '';
@@ -737,7 +748,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   $('mobile-back')?.addEventListener('click', () => showBotList());
   $('mobile-account')?.addEventListener('click', () => $('settings-button').click());
   $('back-to-chat')?.addEventListener('click', () => showPanel('conversation'));
-  $('close-computer')?.addEventListener('click', () => {computerExpanded = false; showPanel('conversation');});
+  $('close-computer')?.addEventListener('click', () => {desktop.disconnect(); computerExpanded = false; showPanel('conversation');});
   $('expand-computer')?.addEventListener('click', () => {computerExpanded = !computerExpanded; showPanel('computer');});
   matchMedia('(min-width: 1024px)').addEventListener('change', () => {if (currentPanel === 'computer') showPanel('computer');});
   document.addEventListener('click', event => {const menu = $('panel-menu'); if (menu?.open && !menu.contains(event.target)) menu.open = false;});
@@ -788,8 +799,8 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   $('refresh-github').addEventListener('click', () => {void loadGitHubStatus();});
   $('disconnect-github').addEventListener('click', () => {void disconnectGitHub();});
   window.addEventListener('focus', () => {if (authenticated && $('settings-dialog').open) void loadGitHubStatus(); if (authenticated && selected && connections.some(item => item.status === 'pending')) void guarded(() => Promise.all([loadConnections(), loadRuns()]));});
-  document.addEventListener('visibilitychange', () => { desktop.setActive(!document.hidden && !$('panel-computer').hidden && (!matchMedia('(max-width: 760px)').matches || document.body.dataset.mobileView === 'bot')); });
-  window.addEventListener('pagehide', () => {desktop.disconnect(); stopComputerStatus(); streamController?.abort();});
+  document.addEventListener('visibilitychange', () => { desktop.setActive(!$('panel-computer').hidden && (!matchMedia('(max-width: 760px)').matches || document.body.dataset.mobileView === 'bot')); });
+  window.addEventListener('pagehide', () => {stopComputerStatus(); streamController?.abort();});
   window.addEventListener('pageshow', event => {if (event.persisted && authenticated) {startStream(); void guarded(loadBots);}});
   const updateViewport = () => {document.documentElement.style.setProperty('--app-height', `${Math.round(window.visualViewport?.height || innerHeight)}px`);};
   window.visualViewport?.addEventListener('resize', updateViewport); window.addEventListener('resize', updateViewport); updateViewport();

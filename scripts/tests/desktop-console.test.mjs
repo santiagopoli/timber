@@ -41,7 +41,7 @@ function rfbPeer(socket, record) {
 }
 async function withDesktop(work,{width=1440,height=1050}={}) {
  const fixture=await createConsoleFixture(),context=await browser.newContext({viewport:{width,height}}),page=await context.newPage();
- const state={calls:[],sockets:[],gates:[],gate:null},errors=[],violations=[];
+ const state={calls:[],sockets:[],gates:[],gate:null,renewReplies:[]},errors=[],violations=[];
  page.on('pageerror',e=>errors.push(e.message));page.setDefaultTimeout(6000);
  await page.exposeFunction('__desktopCsp',v=>violations.push(v));
  await page.addInitScript(()=>document.addEventListener('securitypolicyviolation',e=>globalThis.__desktopCsp({directive:e.effectiveDirective,resource:e.blockedURI})));
@@ -53,22 +53,30 @@ async function withDesktop(work,{width=1440,height=1050}={}) {
    if(state.gate){const gate=state.gate;state.gate=null;await gate;}
    return route.fulfill({json:{sessionId:id,protocols:['binary',`timber-fixture-ticket-${id}`],expiresAt:new Date(Date.now()+60000).toISOString()}});
   }
+  if(url.pathname.endsWith('/renew')) {
+   const reply=state.renewReplies.shift();
+   if(reply)return route.fulfill(reply);
+   return route.fulfill({json:{expiresAt:new Date(Date.now()+60000).toISOString()}});
+  }
   return route.fulfill({json:{ok:true}});
  });
  const proxy=createServer((req,res)=>{const upstream=forward(new URL(req.url,fixture.url),{method:req.method,headers:req.headers},reply=>{res.writeHead(reply.statusCode,reply.headers);reply.pipe(res);});upstream.on('error',()=>res.end());req.pipe(upstream);res.on('close',()=>upstream.destroy());});
  const websocket=new WebSocketServer({noServer:true,handleProtocols:protocols=>protocols.has('binary')?'binary':false});
  proxy.on('upgrade',(req,socket,head)=>{assert.match(req.url,/^\/v1\/bots\/[a-f0-9-]+\/computer\/live$/);assert.match(req.headers['sec-websocket-protocol'],/timber-fixture-ticket/);websocket.handleUpgrade(req,socket,head,client=>websocket.emit('connection',client,req));});
- websocket.on('connection',(client,req)=>{const record={url:req.url,inputs:[],unrecognized:[],connected:false,closed:false};state.sockets.push(record);rfbPeer({send:bytes=>client.send(bytes),onMessage:callback=>client.on('message',callback),onClose:callback=>client.on('close',callback)},record);});
+ websocket.on('connection',(client,req)=>{const record={url:req.url,inputs:[],unrecognized:[],connected:false,closed:false,drop:()=>client.terminate()};state.sockets.push(record);rfbPeer({send:bytes=>client.send(bytes),onMessage:callback=>client.on('message',callback),onClose:callback=>client.on('close',callback)},record);});
  await new Promise(resolve=>proxy.listen(0,'127.0.0.1',resolve));
  const consoleURL=`http://127.0.0.1:${proxy.address().port}/console/`;
  const login=async()=>{await page.goto(consoleURL);await page.locator('#login').waitFor({state:'visible'});await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('#app').waitFor({state:'visible'});if(width<=760)await page.locator('.bot-item').first().click();await page.locator('#bot-workspace').waitFor({state:'visible'});};
  const open=async mode=>{await openPanel(page,'computer');await page.locator(`[data-desktop="${mode==='control'?'control':'observe'}"]`).click();await page.locator('#desktop-root').filter({has:page.locator(`.desktop-status:text-is("${mode==='control'?'Live · you have control':'Live · watching'}")`)}).waitFor();};
- try{await work({page,login,open,state,context});assert.deepEqual(errors,[],'real noVNC has no uncaught browser errors');assert.deepEqual(violations,[],'live desktop conforms to production strict CSP');}
+ try{await work({page,login,open,state,context,fixture:fixture.state});assert.deepEqual(errors,[],'real noVNC has no uncaught browser errors');assert.deepEqual(violations,[],'live desktop conforms to production strict CSP');}
  catch(error){console.error('Desktop diagnostic',JSON.stringify({status:await page.locator('.desktop-status').textContent(),state,errors,violations}));throw error;}
  finally{for(const release of state.gates)release();await context.close();for(const client of websocket.clients)client.terminate();await new Promise(resolve=>websocket.close(resolve));proxy.closeAllConnections();await new Promise(resolve=>proxy.close(resolve));await fixture.close();}
 }
 const until=async(fn)=>{for(let i=0;i<100;i++){if(fn())return;await new Promise(r=>setTimeout(r,20));}assert.fail('Expected desktop fixture state was not reached');};
 const deletes=state=>state.calls.filter(call=>call.method==='DELETE');
+const creates=state=>state.calls.filter(call=>call.method==='POST'&&call.path.endsWith('/live-session'));
+const watching=page=>page.locator('.desktop-status').filter({hasText:'Live · watching'}).waitFor();
+const visibility=(page,hidden)=>page.evaluate(value=>{Object.defineProperty(document,'hidden',{configurable:true,get:()=>value});document.dispatchEvent(new Event('visibilitychange'));},hidden);
 
 test('live desktop negotiates a real framebuffer under strict CSP; Watch is read-only and Take control sends input',async()=>{
  await withDesktop(async({page,login,open,state})=>{
@@ -88,15 +96,18 @@ test('live desktop negotiates a real framebuffer under strict CSP; Watch is read
   assert.equal(state.sockets.length,2);
  });
 });
-test('leaving Computer and switching bots release only the originating session without reconnecting',async()=>{
+test('brief panel switches preserve Watch while changing bots releases its originating session',async()=>{
  await withDesktop(async({page,login,open,state})=>{
   await login();await open('view');await openPanel(page,'conversation');
+  await openPanel(page,'computer');await watching(page);
+  assert.equal(state.sockets.length,1,'a quick panel switch reuses the original socket');
+  assert.equal(deletes(state).length,0);
+  await page.locator('#settings-button').click();await page.keyboard.press('Escape');
+  assert.equal(state.sockets.length,1,'a dialog does not reset Watch');
+  await page.locator(`[data-bot-id="${BOT_B}"]`).click();await page.locator('#selected-name').filter({hasText:'Linus'}).waitFor();
   await until(()=>deletes(state).some(c=>c.path===`/v1/bots/${BOT_A}/computer/live-session/session-1`));
-  await openPanel(page,'computer');assert.equal(state.sockets.length,1,'returning does not silently restart');
-  await open('view');await page.locator(`[data-bot-id="${BOT_B}"]`).click();await page.locator('#selected-name').filter({hasText:'Linus'}).waitFor();
-  await until(()=>deletes(state).some(c=>c.path===`/v1/bots/${BOT_A}/computer/live-session/session-2`));
   assert.equal(deletes(state).some(c=>c.path.includes(BOT_B)),false,'a session created by Ada is never released against Linus');
-  assert.equal(state.sockets.length,2);
+  assert.equal(state.sockets.length,1);
  });
 });
 test('late session creation after navigation is released and never opens a hidden socket',async()=>{
@@ -107,7 +118,9 @@ test('late session creation after navigation is released and never opens a hidde
   await openPanel(page,'conversation');release();
   await until(()=>deletes(state).some(c=>c.path.endsWith('/session-1')));
   assert.equal(state.sockets.length,0);
-  await openPanel(page,'computer');assert.equal(await page.locator('.desktop-status').textContent(),'Disconnected');
+  await openPanel(page,'computer');await watching(page);
+  assert.equal(state.sockets.length,1,'returning resumes with a fresh grant, not the stale connect');
+  assert.equal(creates(state).length,2);
  });
 });
 test('disconnecting the console closes the active desktop socket and releases the originating session',async()=>{
@@ -162,4 +175,89 @@ test('mobile Computer uses the full screen and returns to the preserved conversa
   assert.equal(await page.locator('#panel-conversation').isVisible(),true);
   assert.equal(await page.locator('#message').inputValue(),'Mobile draft stays with Ada');
  },{width:390,height:844});
+});
+
+test('Watch survives short browser tab switches, pauses a long absence and resumes automatically on mobile',async()=>{
+ await withDesktop(async({page,login,open,state})=>{
+  await login();await page.clock.install();await open('view');
+  await visibility(page,true);await page.clock.runFor(5000);await visibility(page,false);await watching(page);
+  assert.equal(state.sockets.length,1);assert.equal(deletes(state).length,0);
+  await visibility(page,true);await page.clock.runFor(31000);
+  await page.locator('.desktop-status').filter({hasText:'Paused'}).waitFor();
+  await until(()=>state.sockets[0].closed&&deletes(state).length===1);
+  await visibility(page,false);await watching(page);
+  assert.equal(creates(state).length,2);assert.equal(creates(state)[1].body.mode,'view');
+  assert.equal(await page.locator('#app').isVisible(),true);
+ },{width:390,height:844});
+});
+
+test('a broken control socket reconnects with a fresh view-only grant',async()=>{
+ await withDesktop(async({page,login,open,state})=>{
+  await login();await open('control');state.sockets[0].drop();
+  await until(()=>creates(state).length===2);await watching(page);
+  assert.equal(creates(state)[1].body.mode,'view','recovery never takes control without a new user action');
+  await page.locator('.desktop-screen canvas').click({position:{x:100,y:100}});await page.keyboard.press('x');
+  assert.equal(state.sockets[1].inputs.length,0);
+ });
+});
+
+test('a failed heartbeat is retried without discarding a live framebuffer',async()=>{
+ await withDesktop(async({page,login,open,state})=>{
+  await login();await page.clock.install();await open('view');
+  state.renewReplies.push({status:503,json:{error:{code:'unavailable',message:'Temporarily unavailable'}}});
+  await page.clock.runFor(20000);await until(()=>state.calls.some(call=>call.path.endsWith('/renew')));
+  await page.clock.runFor(3000);await until(()=>state.calls.filter(call=>call.path.endsWith('/renew')).length>=2);
+  await watching(page);assert.equal(state.sockets.length,1);assert.equal(deletes(state).length,0);
+ });
+});
+
+test('expired desktop grants recover without logging out; revoked account sessions do log out',async()=>{
+ await withDesktop(async({page,login,open,state})=>{
+  await login();await page.clock.install();await open('view');
+  state.renewReplies.push({status:401,json:{error:{code:'desktop_session_expired',message:'Desktop lease expired'}}});
+  await page.clock.runFor(20000);await page.locator('.desktop-status').filter({hasText:'Reconnecting'}).waitFor();
+  await page.clock.runFor(1000);await watching(page);
+  assert.equal(creates(state).length,2);assert.equal(await page.locator('#app').isVisible(),true);
+  state.renewReplies.push({status:401,json:{error:{code:'unauthorized',message:'Session revoked'}}});
+  await page.clock.runFor(20000);await page.locator('#login').waitFor({state:'visible'});
+  await until(()=>state.sockets[1].closed);
+  assert.equal(creates(state).length,2);
+ });
+});
+
+test('leaving manual control releases it immediately and browser return resumes only Watch',async()=>{
+ await withDesktop(async({page,login,open,state})=>{
+  await login();await open('control');await visibility(page,true);
+  await until(()=>state.sockets[0].closed&&deletes(state).length===1);
+  await visibility(page,false);await watching(page);
+  assert.equal(creates(state)[1].body.mode,'view');
+  await page.evaluate(()=>window.dispatchEvent(new PageTransitionEvent('pagehide',{persisted:true})));
+  await until(()=>state.sockets[1].closed);
+  await page.evaluate(()=>window.dispatchEvent(new PageTransitionEvent('pageshow',{persisted:true})));
+  await watching(page);assert.equal(creates(state)[2].body.mode,'view');
+ });
+});
+
+test('network return resumes Watch, while explicit Stop cancels recovery',async()=>{
+ await withDesktop(async({page,login,open,state,context})=>{
+  await login();await open('view');await context.setOffline(true);
+  await page.locator('.desktop-status').filter({hasText:'Waiting for connection'}).waitFor();
+  await until(()=>state.sockets[0].closed);await context.setOffline(false);await watching(page);
+  assert.equal(creates(state).length,2);
+  await context.setOffline(true);await page.locator('[data-desktop="disconnect"]').click();
+  await context.setOffline(false);await visibility(page,true);await visibility(page,false);
+  await page.locator('.desktop-status').filter({hasText:'Disconnected'}).waitFor();
+  assert.equal(creates(state).length,2);
+ });
+});
+
+test('a Suspend event cancels Watch rather than waking the computer during recovery',async()=>{
+ await withDesktop(async({page,login,open,state,fixture})=>{
+  await login();await open('view');await until(()=>fixture.streams.size>0);
+  fixture.emit(BOT_A,'computer.suspended',{});
+  await page.locator('.desktop-status').filter({hasText:'Disconnected'}).waitFor();
+  await until(()=>state.sockets[0].closed);
+  await visibility(page,true);await visibility(page,false);
+  assert.equal(creates(state).length,1);
+ });
 });

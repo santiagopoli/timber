@@ -257,7 +257,9 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       return mode==="view" ? create() : this.serialize(create);
     }
     const session=/^\/desktop\/([a-f0-9-]{36})(\/renew)?$/.exec(url.pathname);
-    if(session && request.method==="POST" && session[2]) return this.withWorkspace(async()=>{const value=await this.live.renew(botId,session[1]);await this.touch();return Response.json(value);});
+    // Lease metadata must not wait behind a file read or checkpoint. Renewing
+    // an existing viewer neither reads the workspace nor starts a computer.
+    if(session && request.method==="POST" && session[2]) {const value=await this.live.renew(botId,session[1]);await this.touch();return Response.json(value);}
     if(session && request.method==="DELETE" && !session[2]) {await this.live.release(session[1]);return Response.json({released:true});}
     if(request.method!=="GET" || !/^\/workspace\/(tree|file|download|projects|changes|diff)$/.test(url.pathname)) throw new ComputerProviderError("computer_invalid_request");
     return this.withWorkspace(async()=>{

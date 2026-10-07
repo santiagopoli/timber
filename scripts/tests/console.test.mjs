@@ -98,7 +98,7 @@ test('explicitly stopping a run reports cancellation in the conversation without
   });
 });
 
-test('public progress stays visible beside collapsed tool activity and the final answer survives reload', async () => {
+test('public progress stays visible beside readable tool activity and the final answer survives reload', async () => {
   for (const width of [1440, 390]) await withPage(async ({page, login, state}) => {
     const createdAt = new Date().toISOString();
     const run = {id: 'activity-final-run', botId: BOT_A, operationId: 'activity-final-operation', status: 'running', createdAt, updatedAt: createdAt};
@@ -107,14 +107,14 @@ test('public progress stays visible beside collapsed tool activity and the final
     const progress = {id: 'activity-progress', botId: BOT_A, runId: run.id, role: 'assistant', kind: 'progress', text: 'Checking the actual computer workspace.', createdAt: new Date(Date.parse(createdAt) - 1000).toISOString()};
     state.runs.set(BOT_A, [run]); state.messages.set(BOT_A, [user, legacy, progress]);
     const toolCallId = 'call-activity-exec', operationId = 'pi-tool:activity-task:call-activity-exec';
-    state.emit(BOT_A, 'tool.started', {toolCallId, toolName: 'exec'}, run.id);
+    state.emit(BOT_A, 'tool.started', {toolCallId, toolName: 'exec', input: {command: 'pwd', timeoutMs: 10000}}, run.id);
     await login();
     const activity = page.locator(`[data-run-activity="${run.id}"]`);
     const publicProgress = page.locator(`[data-progress-message-id="${progress.id}"]`);
     await publicProgress.waitFor({state: 'visible'});
     assert.equal(await publicProgress.evaluate(node => node.closest('[data-run-activity]') === null), true, 'bot commentary remains a visible conversation message');
-    assert.equal(await activity.getByRole('button', {name: /^Activity/}).getAttribute('aria-expanded'), 'false', 'routine tool details start collapsed');
-    await activity.getByRole('button', {name: /^Activity/}).click();
+    assert.equal(await activity.locator('details[open]').count(), 0, 'diagnostics start collapsed');
+    assert.match(await activity.locator('summary').innerText(), /pwd[\s\S]*Running[\s\S]*timeout 10s/, 'the current command and parameters need no disclosure');
     assert.equal(await page.locator(`[data-message-id="${legacy.id}"]`).evaluate(node => node.closest('[data-run-activity]') === null), true);
     await activity.locator(`[data-tool-operation-id="${toolCallId}"]`).waitFor();
     assert.equal(await activity.locator('[data-tool-operation-id]').count(), 1);
@@ -123,9 +123,10 @@ test('public progress stays visible beside collapsed tool activity and the final
     await activity.locator(`[data-tool-operation-id="${operationId}"][data-tool-status="completed"]`).waitFor();
     // The native callback reports completion too, but represents the same effect.
     state.emit(BOT_A, 'tool.completed', {toolCallId, toolName: 'exec', operationId, status: 'completed'}, run.id);
-    await activity.getByRole('button', {name: /^Activity/}).filter({hasText: '1 action'}).waitFor();
+    await activity.locator('.timber-activity-count').filter({hasText: '1 action'}).waitFor();
     assert.equal(await activity.locator('[data-tool-operation-id]').count(), 1);
     const tool = activity.locator(`[data-tool-operation-id="${operationId}"]`);
+    assert.equal(await tool.locator('[data-tool-result-preview]').innerText(), '/workspace', 'the actual result is visible before details are opened');
     await tool.locator('summary').click();
     assert.equal(await tool.locator('pre').first().textContent(), '/workspace\n');
     assert.match(await tool.innerText(), /Completed.*exit 0/);
@@ -137,8 +138,6 @@ test('public progress stays visible beside collapsed tool activity and the final
     await answer.filter({hasText: 'Workspace verified.'}).waitFor();
     assert.equal(await answer.evaluate(node => node.closest('[data-run-activity]') === null), true, 'final text remains outside activity');
     assert.equal(await answer.getByRole('button', {name: 'Copy message', exact: true}).isVisible(), true);
-    const disclosure = activity.getByRole('button', {name: /^Activity/});
-    if (await disclosure.getAttribute('aria-expanded') === 'false') await disclosure.click();
     assert.equal(await activity.locator('[data-tool-operation-id]').count(), 1);
     assert.equal(await tool.locator('pre').first().textContent(), '/workspace\n', 'the native completion callback preserves the host result');
     assert.equal(await activity.locator(`[data-progress-message-id="${progress.id}"]`).count(), 0);
@@ -148,7 +147,8 @@ test('public progress stays visible beside collapsed tool activity and the final
     await page.reload(); await page.locator('#bot-workspace').waitFor({state: 'visible'});
     await page.locator(`[data-progress-message-id="${progress.id}"]`).waitFor({state: 'visible'});
     await page.locator(`[data-message-id="${final.id}"]`).waitFor({state: 'visible'});
-    assert.equal(await page.locator(`[data-run-activity="${run.id}"]`).getByRole('button', {name: /^Activity/}).getAttribute('aria-expanded'), 'false', 'reload does not hide public messages inside tools');
+    assert.equal(await page.locator(`[data-run-activity="${run.id}"] details[open]`).count(), 0, 'reload keeps diagnostics optional');
+    assert.equal(await page.locator(`[data-run-activity="${run.id}"] [data-tool-result-preview]`).innerText(), '/workspace', 'reloaded actions still expose their result');
     assert.equal(state.calls.some(call => call.method !== 'GET'), false); assert.equal(state.actions.length, 0);
   }, {viewport: {width, height: 1000}});
 });
@@ -166,8 +166,7 @@ test('a successful command followed by an empty model answer exposes the failure
     state.emit(BOT_A, 'run.updated', {run}, run.id);
     await until(page, '[data-message-id="empty-answer-request"]', 'without a visible answer');
     assert.match(await page.locator('[data-message-id="empty-answer-request"]').innerText(), /Failed/);
-    const activity = page.locator(`[data-run-activity="${run.id}"]`), disclosure = activity.getByRole('button', {name: /^Activity/});
-    if (await disclosure.getAttribute('aria-expanded') === 'false') await disclosure.click();
+    const activity = page.locator(`[data-run-activity="${run.id}"]`);
     assert.equal(await activity.locator(`[data-tool-operation-id="${operationId}"][data-tool-status="completed"]`).count(), 1);
     assert.equal(await page.locator('#streaming-message').isVisible(), false); assert.equal(state.messages.get(BOT_A).length, 1, 'no fabricated final response is introduced');
     assert.equal(sentMessages(state, BOT_A).length, 0); assert.equal(state.actions.length, 0);
@@ -187,13 +186,104 @@ test('a historical approval-request tool callback never claims the action comple
     state.emit(BOT_A, 'tool.completed', {toolCallId: 'historical-request-call', toolName: 'exec', status: 'pending_approval'}, run.id);
     await login();
     const activity = page.locator(`[data-run-activity="${run.id}"]`);
-    await activity.getByRole('button', {name: /^Activity/}).click();
     const step = activity.locator('[data-tool-operation-id="historical-request-call"]');
     await step.waitFor(); assert.equal(await step.getAttribute('data-tool-status'), 'pending_approval');
     assert.match(await step.innerText(), /Approval requested/); assert.doesNotMatch(await step.innerText(), /Completed|Awaiting approval/);
     assert.equal(await page.locator('#approval-shortcut').isVisible(), false);
     assert.equal(await page.locator('[data-approval-decision]').count(), 0);
     assert.equal(state.calls.some(call => call.method !== 'GET'), false);
+  });
+});
+
+test('action rows expose commands, parameters and results without nested disclosures on mobile and desktop', async () => {
+  for (const width of [390, 1440]) await withPage(async ({page, login, state}) => {
+    const createdAt = new Date().toISOString();
+    const run = {id: 'readable-actions', botId: BOT_A, operationId: 'readable-request', status: 'running', createdAt, updatedAt: createdAt};
+    state.runs.set(BOT_A, [run]);
+    state.messages.set(BOT_A, [{id: 'readable-user', botId: BOT_A, runId: run.id, role: 'user', text: 'Animate the scene, check the file and click the desktop.', createdAt}]);
+    state.emit(BOT_A, 'tool.started', {toolCallId: 'write-call', toolName: 'write_file'}, run.id);
+    state.emit(BOT_A, 'tool.started', {toolCallId: 'write-call', operationId: 'write-operation', actionType: 'writeFile', input: {path: 'blender/animar_escena.py'}}, run.id);
+    state.emit(BOT_A, 'tool.completed', {toolCallId: 'write-call', operationId: 'write-operation', actionType: 'writeFile', input: {path: 'blender/animar_escena.py'}, result: {status: 'completed', output: 'Wrote blender/animar_escena.py'}}, run.id);
+    state.emit(BOT_A, 'tool.started', {toolCallId: 'exec-call', operationId: 'exec-operation', toolName: 'exec', input: {command: 'python blender/animar_escena.py --frames 24 --output renders/scene.mp4', timeoutMs: 120000}}, run.id);
+    state.emit(BOT_A, 'tool.completed', {toolCallId: 'exec-call', operationId: 'exec-operation', actionType: 'exec', result: {status: 'completed', output: 'Rendered 24 frames\nrenders/scene.mp4\n', exitCode: 0}}, run.id);
+    state.emit(BOT_A, 'tool.started', {toolCallId: 'click-call', operationId: 'click-operation', actionType: 'click', input: {x: 460, y: 310, button: 'right'}}, run.id);
+    await login();
+    const group = page.locator(`[data-run-activity="${run.id}"]`), write = group.locator('[data-tool-operation-id="write-operation"]'), exec = group.locator('[data-tool-operation-id="exec-operation"]'), click = group.locator('[data-tool-operation-id="click-operation"]');
+    await click.locator('summary').filter({hasText: 'Running'}).waitFor();
+    assert.equal(await group.locator('[data-tool-operation-id]').count(), 3, 'native and host start events describe one write');
+    assert.equal(await group.locator('details[open]').count(), 0);
+    assert.equal(await group.locator('details details').count(), 0, 'each action has one optional disclosure');
+    assert.match(await write.locator('summary').innerText(), /Write blender\/animar_escena.py[\s\S]*Completed[\s\S]*Wrote blender\/animar_escena.py/);
+    assert.match(await exec.locator('summary').innerText(), /python blender\/animar_escena.py --frames 24 --output renders\/scene.mp4[\s\S]*Completed · exit 0[\s\S]*timeout 120s[\s\S]*Rendered 24 frames/);
+    assert.match(await click.locator('summary').innerText(), /Click \(460, 310\)[\s\S]*Running[\s\S]*right button/);
+    assert.equal(await group.evaluate(node => node.scrollWidth <= node.clientWidth + 1), true, 'action rows fit the viewport');
+    if (process.env.CONSOLE_SCREENSHOT_DIR) {await mkdir(process.env.CONSOLE_SCREENSHOT_DIR, {recursive: true}); await click.scrollIntoViewIfNeeded(); await page.screenshot({path: `${process.env.CONSOLE_SCREENSHOT_DIR}/activity-flat-${width}.png`, animations: 'disabled'});}
+    state.emit(BOT_A, 'tool.completed', {toolCallId: 'click-call', operationId: 'click-operation', actionType: 'click', result: {status: 'failed', error: 'The desktop is controlled by another session.'}}, run.id);
+    await click.locator('summary').filter({hasText: 'The desktop is controlled by another session.'}).waitFor();
+    assert.equal(await click.getAttribute('data-tool-status'), 'failed');
+    assert.equal(await group.locator('details[open]').count(), 0, 'failure is visible without expanding');
+    await exec.locator('summary').click();
+    assert.equal(await exec.locator('.timber-tool-output pre').innerText(), 'Rendered 24 frames\nrenders/scene.mp4\n');
+    assert.equal(await exec.locator('details').count(), 0);
+    assert.equal(state.actions.length, 0);
+  }, {viewport: {width, height: 920}, colorScheme: 'dark'});
+});
+
+test('Activity updates running actions immediately and retains them through long message streams', async () => {
+  await withPage(async ({page, login, state}) => {
+    const createdAt = new Date().toISOString();
+    const run = {id: 'live-panel-run', botId: BOT_A, operationId: 'live-panel-request', status: 'running', createdAt, updatedAt: createdAt};
+    state.runs.set(BOT_A, [run]); state.messages.set(BOT_A, [{id: 'live-panel-user', botId: BOT_A, runId: run.id, role: 'user', text: 'Run the workspace checks.', createdAt}]);
+    await login(); await openPanel(page, 'activity');
+    let release; state.readsGate = new Promise(resolve => {release = resolve;});
+    try {
+      state.emit(BOT_A, 'tool.started', {operationId: 'live-check-one', toolCallId: 'live-one', toolName: 'exec', input: {command: 'npm test -- --run', timeoutMs: 120000}}, run.id);
+      state.emit(BOT_A, 'tool.started', {operationId: 'live-check-two', toolCallId: 'live-two', actionType: 'readFile', input: {path: 'package.json'}}, run.id);
+      const first = page.locator('#activity-tools [data-activity-tool-operation-id="live-check-one"]'), second = page.locator('#activity-tools [data-activity-tool-operation-id="live-check-two"]');
+      await first.locator('summary').filter({hasText: 'npm test -- --run'}).waitFor();
+      await second.locator('summary').filter({hasText: 'Read package.json'}).waitFor();
+      assert.equal(await first.getAttribute('data-tool-status'), 'running');
+      assert.equal(await second.getAttribute('data-tool-status'), 'running');
+      for (let index = 0; index < 225; index++) state.emit(BOT_A, 'message.delta', {delta: index === 224 ? 'stream end' : 'working '}, run.id);
+      await page.locator('#streaming-text').filter({hasText: 'stream end'}).waitFor({state: 'attached'});
+      assert.equal(await first.getAttribute('data-tool-status'), 'running', 'token events cannot evict a still-running action');
+      assert.equal(await second.getAttribute('data-tool-status'), 'running');
+      state.emit(BOT_A, 'tool.completed', {operationId: 'live-check-one', toolCallId: 'live-one', actionType: 'exec', input: {command: 'npm test -- --run', timeoutMs: 120000}, result: {status: 'completed', output: '42 tests passed', exitCode: 0}}, run.id);
+      await first.locator('summary').filter({hasText: '42 tests passed'}).waitFor();
+      assert.equal(await first.getAttribute('data-tool-status'), 'completed');
+      assert.equal(await second.getAttribute('data-tool-status'), 'running');
+      assert.equal(await page.locator('#activity-tools [data-activity-tool-operation-id]').first().getAttribute('data-activity-tool-operation-id'), 'live-check-two', 'the current action stays first');
+      await openPanel(page, 'conversation');
+      const chatTool = page.locator('[data-tool-operation-id="live-check-one"]');
+      await chatTool.locator('summary').filter({hasText: '42 tests passed'}).waitFor();
+      assert.match(await chatTool.locator('summary').innerText(), /npm test -- --run/);
+      assert.equal(await page.locator('[data-tool-operation-id="live-check-two"]').getAttribute('data-tool-status'), 'running');
+      assert.equal(await page.locator('#messages details[open]').count(), 0);
+    } finally {release(); state.readsGate = null;}
+  }, {viewport: {width: 390, height: 900}, colorScheme: 'dark'});
+});
+
+test('activity preserves resolved host tools, hides private inputs, and does not invent missing file paths', async () => {
+  await withPage(async ({page, login, state}) => {
+    const createdAt = new Date().toISOString(), run = {id: 'safe-input-run', botId: BOT_A, operationId: 'safe-input-request', status: 'completed', createdAt, updatedAt: createdAt};
+    state.runs.set(BOT_A, [run]); state.messages.set(BOT_A, [{id: 'safe-input-user', botId: BOT_A, runId: run.id, role: 'user', text: 'Check the action history.', createdAt}]);
+    state.emit(BOT_A, 'tool.started', {toolCallId: 'host-call', toolName: 'call_tool'}, run.id);
+    state.emit(BOT_A, 'tool.completed', {operationId: 'host-operation', toolCallId: 'host-call', toolName: 'github_clone', input: {repository: 'santiagopoli/timber', path: 'projects/timber', branch: 'main'}, result: {status: 'completed', output: 'Repository cloned'}}, run.id);
+    state.emit(BOT_A, 'tool.completed', {operationId: 'host-operation', toolCallId: 'host-call', toolName: 'call_tool', status: 'completed'}, run.id);
+    state.emit(BOT_A, 'tool.completed', {operationId: 'typed-operation', toolCallId: 'typed-call', actionType: 'type', input: {characters: 24, text: 'fixture-private-typed-input'}, result: {status: 'completed', output: 'Typed 24 characters'}}, run.id);
+    state.emit(BOT_A, 'tool.completed', {operationId: 'historical-write', actionType: 'writeFile', result: {status: 'completed', output: 'Wrote notes.txt'}}, run.id);
+    await login();
+    const group = page.locator(`[data-run-activity="${run.id}"]`), host = group.locator('[data-tool-operation-id="host-operation"]'), typed = group.locator('[data-tool-operation-id="typed-operation"]'), historical = group.locator('[data-tool-operation-id="historical-write"]');
+    await host.locator('summary').filter({hasText: 'Clone santiagopoli/timber'}).waitFor();
+    assert.match(await host.locator('summary').innerText(), /path projects\/timber · branch main/);
+    assert.match(await typed.locator('summary').innerText(), /24 characters · input hidden/);
+    await typed.locator('summary').click();
+    assert.doesNotMatch(await typed.innerText(), /fixture-private-typed-input/);
+    assert.match(await typed.locator('.timber-tool-data').innerText(), /\[hidden\]/);
+    assert.equal(await historical.locator('.timber-tool-command').innerText(), 'Write file');
+    assert.equal(await historical.locator('[data-tool-result-preview]').innerText(), 'Wrote notes.txt');
+    assert.equal(await group.locator('[data-tool-operation-id]').count(), 3);
+    assert.equal(state.actions.length, 0);
   });
 });
 

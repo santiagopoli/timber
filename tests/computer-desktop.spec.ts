@@ -56,6 +56,47 @@ describe("live desktop and workspace boundary",()=>{
       await instance.fetch(internal(botId,`/desktop/${next.sessionId}`,"DELETE"));
     });
   });
+  it("lets the bot click while watched, blocks only human control and restores access after release",async()=>{
+    const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
+    await runInDurableObject(stub,async(instance,state)=>{
+      Object.defineProperty(instance,"initializeWorkspace",{value:async()=>({ok:true,desktop:true,capabilities:["liveDesktop"]})});
+      const actions:unknown[]=[];
+      Object.defineProperty(instance,"dispatchAction",{value:async(_bot:string,_op:string,action:unknown)=>{actions.push(action);return Response.json({status:"completed"});}});
+      const watch=await instance.fetch(internal(botId,"/desktop","POST",{mode:"view"}));
+      const viewer=await watch.json<{sessionId:string}>();
+      const click={type:"click",x:620,y:350,button:"left"};
+      const execute=(operationId:string)=>instance.fetch(new Request("https://computer.internal/actions",{method:"POST",body:JSON.stringify({botId,operationId,action:click})}));
+      expect(await (await execute(crypto.randomUUID())).json()).toMatchObject({status:"completed"});
+      expect(actions).toEqual([click]);
+      const control=await instance.fetch(internal(botId,"/desktop","POST",{mode:"control"}));
+      const controller=await control.json<{sessionId:string}>(),blocked=crypto.randomUUID();
+      expect(await (await execute(blocked)).json()).toMatchObject({status:"failed",error:expect.stringContaining("person has control")});
+      expect(await state.storage.get(`operation:${blocked}`)).toBeUndefined();
+      expect(actions).toHaveLength(1);
+      await instance.fetch(internal(botId,`/desktop/${controller.sessionId}`,"DELETE"));
+      expect(await (await execute(crypto.randomUUID())).json()).toMatchObject({status:"completed"});
+      expect(actions).toEqual([click,click]);
+      await instance.fetch(internal(botId,`/desktop/${viewer.sessionId}`,"DELETE"));
+    });
+  });
+  it("renews live access while workspace inspection is blocked",async()=>{
+    const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
+    await runInDurableObject(stub,async(instance)=>{
+      Object.defineProperty(instance,"initializeWorkspace",{value:async()=>({ok:true,desktop:true,capabilities:["workspace","liveDesktop"]})});
+      let entered!:()=>void,release!:()=>void,finished=false;
+      const reading=new Promise<void>(resolve=>{entered=resolve;}),gate=new Promise<void>(resolve=>{release=resolve;});
+      Object.defineProperty(instance,"call",{value:async()=>{entered();await gate;return Response.json({entries:[]});}});
+      const created=await instance.fetch(internal(botId,"/desktop","POST",{mode:"view"}));
+      const session=await created.json<{sessionId:string}>();
+      const tree=Promise.resolve(instance.fetch(internal(botId,"/workspace/tree"))).then(response=>{finished=true;return response;});
+      await reading;
+      let timeout:ReturnType<typeof setTimeout>|undefined;
+      try {
+        const response=await Promise.race([instance.fetch(internal(botId,`/desktop/${session.sessionId}/renew`,"POST")),new Promise<never>((_,reject)=>{timeout=setTimeout(()=>reject(new Error("Renewal waited behind the workspace read")),500);})]);
+        expect(response.status).toBe(200);expect(finished).toBe(false);
+      } finally {clearTimeout(timeout);release();await tree;await instance.fetch(internal(botId,`/desktop/${session.sessionId}`,"DELETE"));}
+    });
+  });
   it("waits for a new image's desktop bridge without reporting an obsolete image",async()=>{
     const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
     await runInDurableObject(stub,async(instance)=>{

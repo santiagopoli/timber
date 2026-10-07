@@ -2,7 +2,7 @@ import './desktop.css';
 
 type DesktopMode = 'view' | 'control';
 type DesktopSession = {url: string; protocols: string[]; sessionId: string; expiresAt: string};
-type ViewerState = 'disconnected' | 'connecting' | 'viewing' | 'controlling' | 'error';
+type ViewerState = 'disconnected' | 'connecting' | 'reconnecting' | 'paused' | 'viewing' | 'controlling' | 'error';
 type Rfb = {
   viewOnly: boolean; scaleViewport: boolean; resizeSession: boolean;
   showDotCursor: boolean; focusOnClick: boolean; qualityLevel: number;
@@ -13,12 +13,12 @@ type Rfb = {
 export interface DesktopViewerOptions {
   element: HTMLElement;
   connect(mode: DesktopMode): Promise<DesktopSession>;
-  renew(sessionId: string): Promise<unknown>;
+  renew(sessionId: string): Promise<{expiresAt: string}>;
   release(sessionId: string): Promise<unknown>;
   onState?(state: ViewerState): void;
 }
 
-/** Owns one live session. Navigation invalidates pending async connects as well. */
+/** Watch intent outlives its transport. Automatic recovery is always view-only. */
 export function createDesktopViewer(options: DesktopViewerOptions) {
   const root = options.element;
   root.classList.add('desktop-viewer');
@@ -33,64 +33,138 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
   const fullscreen = root.querySelector<HTMLButtonElement>('[data-desktop="fullscreen"]')!;
   const keys = root.querySelector<HTMLElement>('.desktop-keys')!;
   let active = true;
+  let wanted = false;
+  let pageActive = true;
   let destroyed = false;
   let generation = 0;
   let rfb: Rfb | undefined;
   let session: DesktopSession | undefined;
-  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let heartbeat: ReturnType<typeof setTimeout> | undefined;
   let handshakeTimeout: ReturnType<typeof setTimeout> | undefined;
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  let backgroundTimer: ReturnType<typeof setTimeout> | undefined;
+  let releasing = Promise.resolve();
   let renewPending = false;
+  let retryAttempt = 0;
+  let connectedAt = 0;
   let mode: DesktopMode = 'view';
   let state: ViewerState = 'disconnected';
   const setState = (next: ViewerState, message?: string) => {
     state = next;
     root.dataset.state = next;
-    status.textContent = message || ({disconnected: 'Disconnected', connecting: 'Connecting…', viewing: 'Live · watching', controlling: 'Live · you have control', error: 'Connection unavailable'}[next]);
+    status.textContent = message || ({disconnected: 'Disconnected', connecting: 'Connecting…', reconnecting: 'Reconnecting…', paused: 'Paused', viewing: 'Live · watching', controlling: 'Live · you have control', error: 'Connection unavailable'}[next]);
     observe.disabled = next === 'connecting' || next === 'viewing';
     control.disabled = next === 'connecting' || next === 'controlling';
-    stop.disabled = next === 'disconnected' || next === 'error';
+    stop.disabled = !wanted;
     keys.hidden = next !== 'controlling';
     root.querySelector<HTMLElement>('.desktop-footer')!.hidden = next !== 'controlling';
     empty.hidden = next === 'viewing' || next === 'controlling';
+    empty.textContent = next === 'connecting' || next === 'reconnecting' ? 'Connecting…' : next === 'paused' ? 'Preview paused' : 'Desktop offline';
     hint.textContent = next === 'controlling'
       ? 'You have control. Switch to Watch desktop to release it.'
       : next === 'viewing'
       ? 'View only'
-      : 'Connect to view the desktop.';
+      : next === 'paused' || next === 'reconnecting' ? 'Watch will resume automatically.' : 'Connect to view the desktop.';
     options.onState?.(next);
   };
-  const release = (current?: DesktopSession) => current
-    ? options.release(current.sessionId).catch(() => {}) : Promise.resolve();
+  const available = () => active && pageActive && !document.hidden && navigator.onLine;
+  const release = (current?: DesktopSession) => {
+    if (current) releasing = Promise.all([releasing, options.release(current.sessionId).catch(() => {})]).then(() => {});
+    return releasing;
+  };
   const clearConnection = () => {
     generation++;
-    if (heartbeat) clearInterval(heartbeat);
+    if (heartbeat) clearTimeout(heartbeat);
     if (handshakeTimeout) clearTimeout(handshakeTimeout);
+    if (retryTimer) clearTimeout(retryTimer);
+    if (backgroundTimer) clearTimeout(backgroundTimer);
     heartbeat = undefined;
     handshakeTimeout = undefined;
+    retryTimer = undefined;
+    backgroundTimer = undefined;
     const previous = rfb;
     rfb = undefined;
     previous?.disconnect();
     const released = release(session);
     session = undefined;
     renewPending = false;
+    connectedAt = 0;
     return released;
   };
   function disconnect() {
+    wanted = false;
+    retryAttempt = 0;
     const released = clearConnection();
     setState('disconnected');
     return released;
   }
+  function pause() {
+    void clearConnection();
+    mode = 'view';
+    if (wanted) setState('paused', navigator.onLine ? 'Paused' : 'Waiting for connection…');
+  }
+  function retry() {
+    if (!wanted || destroyed) return;
+    if (!available()) {setState('paused', navigator.onLine ? 'Paused' : 'Waiting for connection…'); return;}
+    setState('reconnecting');
+    const delay = Math.min(1000 * 2 ** Math.min(retryAttempt++, 4), 10_000);
+    retryTimer = setTimeout(() => {retryTimer = undefined; void start('view');}, delay);
+  }
+  function recover(error?: unknown) {
+    const failure = error as {status?: number; code?: string; message?: string} | undefined;
+    if (connectedAt && Date.now() - connectedAt > 15_000) retryAttempt = 0;
+    void clearConnection();
+    mode = 'view';
+    // A revoked account/bot or unsupported computer needs an explicit correction.
+    // Desktop lease expiry only replaces this viewer's grant, never the login.
+    if (failure?.status && [400, 401, 403, 404, 409].includes(failure.status) && failure.code !== 'desktop_session_expired') {
+      wanted = false;
+      setState('error', failure.message || 'Desktop access is unavailable.');
+    } else retry();
+  }
+  function scheduleRenew(current: number, delay = 20_000) {
+    if (heartbeat) clearTimeout(heartbeat);
+    heartbeat = setTimeout(() => {heartbeat = undefined; void renew(current);}, delay);
+  }
+  async function renew(current: number) {
+    if (current !== generation || !session || renewPending) return;
+    if (Date.parse(session.expiresAt) <= Date.now()) {recover(); return;}
+    renewPending = true;
+    try {
+      const result = await options.renew(session.sessionId);
+      if (current !== generation || !session) return;
+      if (!Number.isFinite(Date.parse(result.expiresAt))) throw new Error('Desktop access could not be renewed.');
+      session.expiresAt = result.expiresAt;
+      if (connectedAt) setState(mode === 'control' ? 'controlling' : 'viewing');
+      scheduleRenew(current);
+    } catch (error) {
+      if (current !== generation || !session) return;
+      const failure = error as {status?: number};
+      if (!failure.status && navigator.onLine && Date.parse(session.expiresAt) - Date.now() > 5000) {
+        // A lost heartbeat does not invalidate a still-live framebuffer/lease.
+        scheduleRenew(current, 2000);
+      } else if (failure.status && failure.status >= 500 && Date.parse(session.expiresAt) - Date.now() > 5000) {
+        scheduleRenew(current, 2000);
+      } else recover(error);
+    } finally {if (current === generation) renewPending = false;}
+  }
   async function connect(nextMode: DesktopMode = 'view') {
-    if (destroyed || !active || document.hidden) return;
+    if (destroyed || !active || !pageActive || document.hidden) return;
+    wanted = true;
+    retryAttempt = 0;
+    await start(nextMode);
+  }
+  async function start(nextMode: DesktopMode) {
+    if (destroyed || !wanted || !available()) {if (wanted) setState('paused', 'Waiting for connection…'); return;}
     const released = clearConnection();
     const current = generation;
     mode = nextMode;
     setState('connecting', 'Starting secure desktop…');
     try {
       await released;
-      if (current !== generation || destroyed || !active || document.hidden) return;
+      if (current !== generation || destroyed || !available()) return;
       const connection = await options.connect(nextMode);
-      if (current !== generation || destroyed || !active || document.hidden) { release(connection); return; }
+      if (current !== generation || destroyed || !available()) { void release(connection); return; }
       session = connection;
       // Credentials are one-use subprotocols, never a browser/history URL.
       const target = new URL(connection.url, window.location.href);
@@ -98,7 +172,7 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
       if (target.protocol === 'http:') target.protocol = 'ws:';
       if (!['ws:', 'wss:'].includes(target.protocol) || target.search || target.username || target.password) throw new Error('The desktop endpoint is invalid.');
       const {default: RFB} = await import('@novnc/novnc');
-      if (current !== generation || destroyed || !active || document.hidden) return;
+      if (current !== generation || destroyed || !available()) return;
       const client = new RFB(screen, target.href, {shared: true, wsProtocols: connection.protocols}) as Rfb;
       rfb = client;
       client.viewOnly = nextMode === 'view';
@@ -113,33 +187,24 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
         if (current !== generation) return;
         if (handshakeTimeout) clearTimeout(handshakeTimeout);
         handshakeTimeout = undefined;
+        connectedAt = Date.now();
         setState(nextMode === 'control' ? 'controlling' : 'viewing');
       });
       client.addEventListener('disconnect', () => {
         if (current !== generation) return;
-        clearConnection();
-        setState('error', 'Desktop disconnected. Connect again to resume.');
+        recover();
       });
       client.addEventListener('securityfailure', () => {
         if (current !== generation) return;
-        clearConnection();
-        setState('error', 'Desktop authorization expired. Connect again.');
+        recover();
       });
       handshakeTimeout = setTimeout(() => {
-        if (current === generation) { clearConnection(); setState('error', 'Desktop connection timed out. Connect again.'); }
+        if (current === generation) recover();
       }, 30_000);
-      heartbeat = setInterval(() => {
-        if (current !== generation || !session || renewPending) return;
-        if (!active || document.hidden) { disconnect(); return; }
-        renewPending = true;
-        void options.renew(connection.sessionId).catch(() => {
-          if (current === generation) { clearConnection(); setState('error', 'Desktop session expired. Connect again.'); }
-        }).finally(() => { if (current === generation) renewPending = false; });
-      }, 20_000);
+      scheduleRenew(current);
     } catch (error) {
       if (current !== generation) return;
-      clearConnection();
-      setState('error', error instanceof Error ? error.message : 'Could not connect to the desktop.');
+      recover(error);
     }
   }
   const onClick = (event: MouseEvent) => {
@@ -159,22 +224,46 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
       if (key) { rfb?.sendKey(key, target.dataset.key); rfb?.focus(); }
     }
   };
-  const onHidden = () => { if (document.hidden) disconnect(); };
-  const onLeave = () => disconnect();
+  function reconcile() {
+    if (!wanted || destroyed) return;
+    if (!available()) {
+      // Brief tab/panel switches keep Watch's existing socket. Background work
+      // stops after a grace period; control is released immediately.
+      if (!pageActive || !navigator.onLine || mode === 'control' || !connectedAt) pause();
+      else if (!backgroundTimer) backgroundTimer = setTimeout(pause, 30_000);
+      return;
+    }
+    if (backgroundTimer) clearTimeout(backgroundTimer);
+    backgroundTimer = undefined;
+    if (session && rfb) {void renew(generation); return;}
+    if (state === 'connecting') return;
+    if (retryTimer) clearTimeout(retryTimer);
+    retryTimer = undefined;
+    void start('view');
+  }
+  const onLeave = () => {pageActive = false; if (wanted) pause();};
+  const onReturn = () => {pageActive = true; reconcile();};
   root.addEventListener('click', onClick);
-  document.addEventListener('visibilitychange', onHidden);
+  document.addEventListener('visibilitychange', reconcile);
   window.addEventListener('pagehide', onLeave);
+  window.addEventListener('pageshow', onReturn);
+  window.addEventListener('online', reconcile);
+  window.addEventListener('offline', reconcile);
   fullscreen.hidden = !root.requestFullscreen;
   return {
     connect, disconnect,
-    setActive(value: boolean) { active = value; if (!value) disconnect(); },
+    setActive(value: boolean) {if (active === value) return; active = value; reconcile();},
     destroy() {
       if (destroyed) return;
       destroyed = true;
+      wanted = false;
       clearConnection();
       root.removeEventListener('click', onClick);
-      document.removeEventListener('visibilitychange', onHidden);
+      document.removeEventListener('visibilitychange', reconcile);
       window.removeEventListener('pagehide', onLeave);
+      window.removeEventListener('pageshow', onReturn);
+      window.removeEventListener('online', reconcile);
+      window.removeEventListener('offline', reconcile);
       root.replaceChildren();
     },
   };

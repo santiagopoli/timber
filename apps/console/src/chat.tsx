@@ -1,13 +1,12 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { ArrowUpIcon, CheckIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon } from 'lucide-react';
+import { ArrowUpIcon, CheckIcon, ChevronDownIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon } from 'lucide-react';
 import { useStickToBottomContext } from 'use-stick-to-bottom';
 import { defaultUrlTransform, type UrlTransform } from 'streamdown';
 import { Conversation, ConversationContent, ConversationEmptyState, ConversationScrollButton } from '@/components/ai-elements/conversation';
 import { Message, MessageActions, MessageAction, MessageContent, MessageResponse } from '@/components/ai-elements/message';
 import { PromptInput, PromptInputBody, PromptInputSubmit, PromptInputTextarea } from '@/components/ai-elements/prompt-input';
 import { Tool, ToolContent } from '@/components/ai-elements/tool';
-import { ChainOfThought, ChainOfThoughtHeader, ChainOfThoughtContent, ChainOfThoughtStep } from '@/components/ai-elements/chain-of-thought';
 import { Confirmation, ConfirmationAction, ConfirmationActions } from '@/components/ai-elements/confirmation';
 import { Button } from '@/components/ui/button';
 import type { ChatApproval, ChatCallbacks, ChatModel, ChatConnection, MessageDelivery } from './chat-types';
@@ -126,16 +125,29 @@ function DeliveryEntry({ delivery, busy, callbacks }: { delivery: MessageDeliver
 }
 
 type TimelineEntry = { key: string; at: number; order: number; node: ReactNode };
-type ToolActivity = { key: string; runId?: string; at: number; name: string; aliases: Set<string>; returned: boolean; status?: string; result?: {status?: string; output?: string; error?: string; exitCode?: number}; data: Record<string, unknown> };
+type ToolActivity = { key: string; runId?: string; at: number; name: string; aliases: Set<string>; returned: boolean; status?: string; result?: {status?: string; output?: string; error?: string; exitCode?: number; artifactId?: string}; data: Record<string, unknown> };
 type ActivityStep = {at: number; key: string; tool: ToolActivity};
-const toolNames: Record<string, string> = {exec: 'Command', read_file: 'Read file', readFile: 'Read file', write_file: 'Write file', writeFile: 'Write file', list_files: 'Browse files', listFiles: 'Browse files', desktop_screenshot: 'Screenshot', screenshot: 'Screenshot', browser_navigate: 'Open page', navigate: 'Open page', desktop_click: 'Click', desktop_type: 'Type', desktop_key: 'Press key', desktop_scroll: 'Scroll', checkpoint: 'Save checkpoint'};
+type ActivityModel = Pick<ChatModel, 'bot' | 'events' | 'runs' | 'approvals' | 'runFilter'>;
+const toolNames: Record<string, string> = {exec: 'Run command', read_file: 'Read file', readFile: 'Read file', write_file: 'Write file', writeFile: 'Write file', list_files: 'Browse files', listFiles: 'Browse files', desktop_screenshot: 'Capture desktop', screenshot: 'Capture desktop', browser_navigate: 'Open', navigate: 'Open', desktop_click: 'Click', click: 'Click', desktop_type: 'Type text', type: 'Type text', desktop_key: 'Press', key: 'Press', desktop_scroll: 'Scroll', scroll: 'Scroll', checkpoint: 'Save workspace', github_clone: 'Clone', gitClone: 'Clone', github_push: 'Push', gitPush: 'Push', github_connect: 'Connect GitHub', github_create_pull_request: 'Create pull request', github_list_pull_requests: 'List pull requests', github_list_repositories: 'List repositories', load_skill: 'Load skill', list_tools: 'Available tools', publish_app: 'Publish app', list_apps: 'List apps', remove_app: 'Remove app'};
+const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+// The host publishes an allowlisted input summary. Historical events may have
+// no input at all; never invent the command from its result or operation ID.
+const toolInput = (tool: ToolActivity) => record(tool.data.input || tool.data.action || tool.data.arguments);
+const displayText = (value: unknown) => typeof value === 'string' ? value : typeof value === 'number' || typeof value === 'boolean' ? String(value) : '';
+const bounded = (value: string, limit: number) => value.length > limit ? `${value.slice(0, limit).trimEnd()}…` : value;
+const privateInput = /^(?:content|text|body|token|secret|password|authorization|credential|api[_-]?key)$/i;
+function publicToolData(tool: ToolActivity) {
+  // Input bodies and typed text are not useful in a diagnostic disclosure and
+  // can contain credentials even when the enclosing property is innocuous.
+  return {...tool.data, ...Object.fromEntries(['input', 'action', 'arguments'].filter(key => tool.data[key]).map(key => [key, Object.fromEntries(Object.entries(record(tool.data[key])).map(([name, value]) => [name, privateInput.test(name) ? '[hidden]' : value]))]))};
+}
 
-function collectTools(model: ChatModel): ToolActivity[] {
+function collectTools(model: ActivityModel, includeApprovals = false): ToolActivity[] {
   // A host event bridges the native call ID and the durable computer operation ID.
   // Merge those explicit aliases only: identical command text is not identity.
   const aliases = new Map<string, ToolActivity>();
   for (const event of model.events) {
-    if (model.runFilter && event.runId !== model.runFilter) continue;
+    if (!['tool.started', 'tool.completed'].includes(event.type) || model.runFilter && event.runId !== model.runFilter) continue;
     const data = event.data, ids = [data.operationId, data.toolCallId].filter((id): id is string => typeof id === 'string' && Boolean(id));
     if (!ids.length) continue;
     const keys = ids.map(id => `${event.runId || ''}:${id}`), matches = [...new Set(keys.map(key => aliases.get(key)).filter((tool): tool is ToolActivity => Boolean(tool)))];
@@ -144,41 +156,113 @@ function collectTools(model: ChatModel): ToolActivity[] {
       tool.at = Math.min(tool.at, merged.at); tool.returned ||= merged.returned;
       if (!tool.result && merged.result) tool.result = merged.result;
       if (!tool.status && merged.status) tool.status = merged.status;
+      tool.data = {...merged.data, ...tool.data};
+      if (tool.name === 'Computer tool' || tool.name === 'call_tool') tool.name = merged.name;
       for (const alias of merged.aliases) {tool.aliases.add(alias); aliases.set(alias, tool);}
     }
     for (const key of keys) {tool.aliases.add(key); aliases.set(key, tool);}
     if (typeof data.actionType === 'string') tool.name = data.actionType;
-    else if (typeof data.toolName === 'string' && tool.name === 'Computer tool') tool.name = data.toolName;
+    else if (typeof data.toolName === 'string' && (data.toolName !== 'call_tool' || tool.name === 'Computer tool')) tool.name = data.toolName;
     tool.returned ||= event.type === 'tool.completed';
     if (typeof data.status === 'string') tool.status = data.status;
-    if (data.result && typeof data.result === 'object') tool.result = data.result as ToolActivity['result'];
+    if (data.result && typeof data.result === 'object') tool.result = {...tool.result, ...data.result as ToolActivity['result']};
     tool.data = {...tool.data, ...data};
   }
-  return [...new Set(aliases.values())].filter(tool => !model.approvals.some(approval => tool.aliases.has(`${approval.runId}:${approval.operationId}`)));
+  for (const approval of model.approvals) {
+    if (model.runFilter && approval.runId !== model.runFilter) continue;
+    const key = `${approval.runId}:${approval.operationId}`, tool = aliases.get(key);
+    if (!includeApprovals) {
+      if (tool) for (const alias of tool.aliases) aliases.delete(alias);
+      continue;
+    }
+    const value: ToolActivity = tool || {key, runId: approval.runId, at: timestamp(approval.createdAt), name: approval.action.type, aliases: new Set([key]), returned: false, data: {}};
+    value.data = {...value.data, operationId: approval.operationId, input: approval.action};
+    value.status = approval.status === 'pending' ? 'pending_approval' : ['approved', 'executing'].includes(approval.status) ? 'running' : approval.status;
+    value.returned = !['pending', 'approved', 'executing'].includes(approval.status);
+    if (approval.result) value.result = approval.result;
+    aliases.set(key, value);
+  }
+  return [...new Set(aliases.values())];
 }
 
-function ActivityGroup({model, runId, steps}: {model: ChatModel; runId?: string; steps: ActivityStep[]}) {
-  const run = model.runs.find(item => item.id === runId), active = Boolean(run && !terminal.has(run.status));
-  const [open, setOpen] = useState(false);
-  const tools = steps.length;
-  const working = active && run?.status === 'running';
-  const latestTool = [...steps].sort((a, b) => b.at - a.at)[0]?.tool;
-  const statusText = working ? latestTool && !latestTool.returned ? toolNames[latestTool.name] || label(latestTool.name) : 'Working' : run?.status === 'failed' || run?.status === 'interrupted' || run?.status === 'cancelled' ? label(run.status) : undefined;
-  return <ChainOfThought className="timber-activity-group" data-run-activity={runId || 'unassigned'} open={open} onOpenChange={setOpen}>
-    <ChainOfThoughtHeader className="timber-activity-header"><span className="timber-activity-title">{working ? <LoaderCircleIcon className="timber-spinner" aria-hidden="true" /> : <ActivityIcon aria-hidden="true" />}<span className="timber-activity-name">Activity</span>{tools > 0 && <span className="timber-activity-count">{tools} {tools === 1 ? 'action' : 'actions'}</span>}{statusText && <span className="timber-activity-status" data-status={run?.status}>{statusText}</span>}</span></ChainOfThoughtHeader>
-    <ChainOfThoughtContent className="timber-activity-content">
-      {steps.sort((a, b) => a.at - b.at).map(step => {
-        const tool = step.tool, status = tool.result?.status || tool.status;
-        const failed = status === 'failed' || status === 'interrupted', pending = status === 'pending_approval' || status === 'pending_connection';
-        const waiting = !tool.returned && !status, unknown = waiting && !active;
-        const state = failed ? label(status!) : status === 'pending_connection' ? 'Connection requested' : pending ? 'Approval requested' : status === 'completed' ? 'Completed' : unknown ? 'Outcome unconfirmed' : waiting ? 'Running' : 'Tool returned';
-        return <ChainOfThoughtStep key={step.key} data-tool-operation-id={String(tool.data.operationId || tool.data.toolCallId)} data-tool-status={status || (unknown ? 'unconfirmed' : waiting ? 'running' : 'returned')} icon={failed || unknown ? CircleAlertIcon : pending ? ShieldCheckIcon : waiting ? LoaderCircleIcon : CheckIcon} status={waiting && active ? 'active' : 'complete'} className={`timber-tool-step${failed || unknown ? ' timber-tool-error' : ''}`} label={<span className="timber-activity-label">{toolNames[tool.name] || label(tool.name)}<span className="timber-tool-status">{state}{tool.result?.exitCode !== undefined ? ` · exit ${tool.result.exitCode}` : ''}</span></span>}>
-          {tool.result?.error && <p className={tool.result.status === "completed" ? "timber-save-warning" : "timber-inline-error"}>{tool.result.error}</p>}
-          <details className="timber-tool-details"><summary>Details{tool.result?.output ? ' & output' : ''}</summary>{tool.result?.output && <pre className="timber-action"><code>{tool.result.output}</code></pre>}<pre className="timber-action"><code>{safeJSON(tool.data)}</code></pre></details>
-        </ChainOfThoughtStep>;
-      })}
-    </ChainOfThoughtContent>
-  </ChainOfThought>;
+function toolPresentation(tool: ToolActivity) {
+  const input = toolInput(tool), value = (key: string) => displayText(input[key]);
+  let title = toolNames[tool.name] || label(tool.name), parameters: string[] = [], command = false;
+  if (tool.name === 'exec') {
+    title = value('command') || 'Run command'; command = Boolean(value('command'));
+    if (value('timeoutMs')) parameters.push(`timeout ${Number(input.timeoutMs) / 1000}s`);
+    if (value('cwd')) parameters.push(value('cwd'));
+  } else if (['read_file', 'readFile', 'write_file', 'writeFile', 'list_files', 'listFiles'].includes(tool.name)) {
+    if (value('path')) title = `${tool.name === 'read_file' || tool.name === 'readFile' ? 'Read' : tool.name === 'write_file' || tool.name === 'writeFile' ? 'Write' : 'Browse'} ${value('path')}`;
+  } else if (['desktop_click', 'click'].includes(tool.name)) {
+    if (value('x') && value('y')) title += ` (${value('x')}, ${value('y')})`;
+    parameters.push(`${value('button') || 'left'} button`);
+  } else if (['desktop_scroll', 'scroll'].includes(tool.name)) {
+    if (value('direction')) title += ` ${value('direction')}`;
+    if (value('amount')) parameters.push(`${value('amount')} steps`);
+  } else if (['desktop_type', 'type'].includes(tool.name)) {
+    parameters.push(value('characters') ? `${value('characters')} characters · input hidden` : 'Input hidden');
+  } else if (['desktop_key', 'key'].includes(tool.name)) {
+    if (value('key')) title += ` ${value('key')}`;
+  } else if (['browser_navigate', 'navigate'].includes(tool.name)) {
+    if (value('url')) title += ` ${value('url')}`;
+  } else {
+    if (value('repository')) title += ` ${value('repository')}`;
+    else if (value('name')) title += ` ${value('name')}`;
+    else if (value('appId')) title += ` ${value('appId')}`;
+    for (const key of ['path', 'branch', 'head', 'base', 'permission', 'port', 'page']) if (value(key)) parameters.push(`${key} ${value(key)}`);
+  }
+  return {title: bounded(title, 900), parameters: parameters.join(' · '), command};
+}
+
+function toolState(tool: ToolActivity, model: ActivityModel) {
+  const run = model.runs.find(item => item.id === tool.runId), active = Boolean(run && !terminal.has(run.status));
+  const status = tool.result?.status || tool.status;
+  const pending = status === 'pending_approval' || status === 'pending_connection';
+  const running = (!tool.returned && !status || status === 'running') && active;
+  const unknown = !tool.returned && (!status || status === 'running') && !active;
+  const failed = ['failed', 'interrupted', 'cancelled', 'denied', 'expired'].includes(status || '') || unknown;
+  const text = unknown ? 'Outcome unconfirmed' : status === 'pending_connection' ? 'Connection requested' : pending ? 'Approval requested' : status === 'completed' ? 'Completed' : running ? 'Running' : status ? label(status).replace(/^./, character => character.toUpperCase()) : 'Returned';
+  return {status: status || (unknown ? 'unconfirmed' : running ? 'running' : 'returned'), text, running, failed, pending};
+}
+
+function ToolActivityRow({tool, model, panel = false}: {tool: ToolActivity; model: ActivityModel; panel?: boolean}) {
+  const state = toolState(tool, model), presentation = toolPresentation(tool);
+  const Icon = state.running ? LoaderCircleIcon : state.failed ? CircleAlertIcon : state.pending ? ShieldCheckIcon : CheckIcon;
+  const output = typeof tool.result?.output === 'string' ? tool.result.output.trim() : '';
+  const error = tool.result?.error;
+  const preview = error || output || (tool.result?.artifactId ? 'Image captured' : tool.name === 'exec' && state.status === 'completed' ? 'No output' : '');
+  const operation = String(tool.data.operationId || tool.data.toolCallId || tool.key);
+  const attributes = panel ? {'data-activity-tool-operation-id': operation} : {'data-tool-operation-id': operation};
+  return <details className={`timber-tool-row${state.failed ? ' timber-tool-error' : ''}`} {...attributes} data-tool-status={state.status}>
+    <summary className="timber-tool-summary" title="Show full output and details">
+      <Icon className={`timber-tool-icon${state.running ? ' timber-spinner' : ''}`} aria-hidden="true" />
+      <div className="timber-tool-overview">
+        <div className="timber-tool-heading"><span className={`timber-tool-command${presentation.command ? ' is-command' : ''}`}>{presentation.title}</span><span className="timber-tool-status" role="status">{state.text}{tool.result?.exitCode !== undefined ? ` · exit ${tool.result.exitCode}` : ''}</span></div>
+        {presentation.parameters && <div className="timber-tool-parameters">{presentation.parameters}</div>}
+        {preview && <div className={`timber-tool-preview${error ? tool.result?.status === 'completed' ? ' timber-save-warning' : ' timber-inline-error' : ''}`} data-tool-result-preview>{bounded(preview, 420)}</div>}
+      </div>
+      <ChevronDownIcon className="timber-tool-chevron" aria-hidden="true" />
+    </summary>
+    <div className="timber-tool-expanded">
+      {output && <div className="timber-tool-output"><span className="timber-tool-detail-label">Output</span><pre className="timber-action"><code>{tool.result?.output}</code></pre></div>}
+      {error && <p className={tool.result?.status === 'completed' ? 'timber-save-warning' : 'timber-inline-error'}>{error}</p>}
+      <span className="timber-tool-detail-label">Details</span><pre className="timber-action timber-tool-data"><code>{safeJSON(publicToolData(tool))}</code></pre>
+    </div>
+  </details>;
+}
+
+function ActivityGroup({model, runId, steps}: {model: ActivityModel; runId?: string; steps: ActivityStep[]}) {
+  const run = model.runs.find(item => item.id === runId), working = run?.status === 'running';
+  return <section className="timber-activity-group" data-run-activity={runId || 'unassigned'} aria-label="Activity">
+    <div className="timber-activity-header"><ActivityIcon aria-hidden="true" /><span>Activity</span><span className="timber-activity-count">{steps.length} {steps.length === 1 ? 'action' : 'actions'}</span>{working && <span className="timber-activity-status"><LoaderCircleIcon className="timber-spinner" aria-hidden="true" />Working</span>}</div>
+    <div className="timber-activity-content">{[...steps].sort((a, b) => a.at - b.at).map(step => <ToolActivityRow key={step.key} tool={step.tool} model={model} />)}</div>
+  </section>;
+}
+
+function ActivityPanel({model}: {model: ActivityModel}) {
+  const tools = collectTools(model, true).sort((a, b) => Number(toolState(b, model).running) - Number(toolState(a, model).running) || b.at - a.at);
+  return <div className="timber-activity-panel">{tools.length ? tools.map(tool => <ToolActivityRow key={tool.key} tool={tool} model={model} panel />) : <p className="timber-activity-empty">No actions yet.</p>}</div>;
 }
 
 function timeline(model: ChatModel, callbacks: ChatCallbacks): TimelineEntry[] {
@@ -290,4 +374,9 @@ function Chat({ model, callbacks }: { model: ChatModel; callbacks: ChatCallbacks
 export function mountChat(element: HTMLElement, callbacks: ChatCallbacks) {
   const root = createRoot(element);
   return { update(model: ChatModel) {root.render(<Chat key={model.bot.id} model={model} callbacks={callbacks} />);}, clear() {root.render(null);} };
+}
+
+export function mountToolActivity(element: HTMLElement) {
+  const root = createRoot(element);
+  return { update(model: ActivityModel) {root.render(<ActivityPanel key={model.bot.id} model={model} />);}, clear() {root.render(null);} };
 }
