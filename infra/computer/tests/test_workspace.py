@@ -119,8 +119,10 @@ class WorkspaceTests(unittest.TestCase):
         self.git(repo,'config','diff.evil.textconv',f'touch {marker}')
         (repo/'.gitattributes').write_text('*.py diff=evil\n')
         (repo/'code.py').write_text('change\n')
-        self.inspector.changes('repo')
-        self.inspector.diff('repo','code.py')
+        with self.assertRaisesRegex(ValueError,'unsupported Git configuration'):
+            self.inspector.changes('repo')
+        with self.assertRaisesRegex(ValueError,'unsupported Git configuration'):
+            self.inspector.diff('repo','code.py')
         self.assertFalse(marker.exists())
 
     def test_git_metadata_outside_is_rejected(self):
@@ -131,6 +133,29 @@ class WorkspaceTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.inspector.changes('evil')
         (repo/'.git/commondir').write_text('/tmp/outside')
         with self.assertRaises(ValueError):self.inspector.changes('repo')
+
+
+    def test_clean_filters_includes_and_config_symlinks_cannot_execute(self):
+        repo=self.repo('repo')
+        marker=self.root/'filter-executed'
+        self.git(repo,'config','filter.evil.clean',f'touch {marker}; cat')
+        (repo/'.gitattributes').write_text('*.py filter=evil\n')
+        (repo/'code.py').write_text('modified\n')
+        for inspect in (lambda:self.inspector.changes('repo'),lambda:self.inspector.diff('repo','code.py')):
+            with self.assertRaisesRegex(ValueError,'unsupported Git configuration'):inspect()
+        self.assertFalse(marker.exists())
+        self.git(repo,'config','--remove-section','filter.evil')
+        included=self.root/'included.config'
+        included.write_text('[filter "evil"]\n clean = touch '+str(marker)+'; cat\n')
+        self.git(repo,'config','include.path',str(included))
+        with self.assertRaisesRegex(ValueError,'unsupported Git configuration'):self.inspector.changes('repo')
+        self.assertFalse(marker.exists())
+        self.git(repo,'config','--unset','include.path')
+        config=repo/'.git/config'
+        replacement=self.root/'config-copy'
+        config.rename(replacement)
+        config.symlink_to(replacement)
+        with self.assertRaisesRegex(ValueError,'Symbolic Git metadata'):self.inspector.changes('repo')
 
     def test_scan_ignores_dependencies(self):
         dependency=self.root/'node_modules'

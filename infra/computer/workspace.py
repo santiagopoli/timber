@@ -3,6 +3,7 @@ from __future__ import annotations
 import difflib
 import mimetypes
 import os
+import re
 from pathlib import Path, PurePosixPath
 import selectors
 import stat
@@ -107,13 +108,23 @@ class WorkspaceInspector:
             gitdir = dotgit.resolve()
         if not gitdir.is_relative_to(self.workspace) or not gitdir.is_dir():
             raise ValueError('Git metadata must remain inside the workspace')
+        self.path(self.relative(gitdir))
         common = gitdir / 'commondir'
+        if common.is_symlink():
+            raise ValueError('Symbolic Git metadata is not supported')
         if common.exists():
             destination = (gitdir / common.read_text()[:4096].strip()).resolve()
             if not destination.is_relative_to(self.workspace):
                 raise ValueError('Shared Git metadata must remain inside the workspace')
+            self.path(self.relative(destination))
         # Disable alternate object stores escaping the workspace.
         for metadata in (gitdir, (gitdir / common.read_text().strip()).resolve() if common.exists() else gitdir):
+            for name in ('config', 'config.worktree', 'HEAD', 'index', 'objects', 'objects/info', 'refs', 'info'):
+                candidate = metadata / name
+                if candidate.is_symlink():
+                    raise ValueError('Symbolic Git metadata is not supported')
+            if (metadata / 'config.worktree').exists():
+                raise ValueError('Custom Git worktree configuration is not supported')
             if (metadata / 'objects/info/alternates').exists():
                 raise ValueError('Alternate Git object stores are not supported')
         return root, gitdir
@@ -122,6 +133,22 @@ class WorkspaceInspector:
         root, gitdir = self.repository(project)
         env = {'PATH':os.environ.get('PATH','/usr/bin:/bin'), 'HOME':'/nonexistent', 'GIT_CONFIG_NOSYSTEM':'1', 'GIT_CONFIG_GLOBAL':'/dev/null', 'GIT_OPTIONAL_LOCKS':'0', 'GIT_TERMINAL_PROMPT':'0', 'GIT_PAGER':'cat', 'LC_ALL':'C'}
         command = ['git', '--no-pager', '--git-dir='+str(gitdir), '--work-tree='+str(root), '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'diff.external=', '-c', 'core.quotePath=false', *args]
+        # Even read-only status/diff can invoke repository clean/process filters.
+        # Inspect keys without expanding includes before allowing any operation.
+        metadata = [gitdir]
+        if (gitdir / 'commondir').exists():
+            metadata.append((gitdir / (gitdir / 'commondir').read_text().strip()).resolve())
+        safe_keys = re.compile(r'(?:core\.(?:repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode)|remote\.[A-Za-z0-9_-]+\.(?:url|fetch|pushurl)|branch\..+\.(?:remote|merge)|user\.(?:name|email))', re.IGNORECASE)
+        for directory in metadata:
+            config = directory / 'config'
+            if not config.exists():
+                continue
+            raw, oversized = self._run(root, ['git', 'config', '--file', str(config), '--no-includes', '--name-only', '--list'], env, 65536)
+            if oversized or any(not safe_keys.fullmatch(key) for key in raw.decode('utf-8', 'replace').splitlines()):
+                raise ValueError('Repository has unsupported Git configuration; custom includes, helpers, filters and hooks cannot run in the read-only viewer')
+        return self._run(root, command, env, limit, allow_missing=allow_missing)
+
+    def _run(self, root, command, env, limit, allow_missing=False):
         process = subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         result = bytearray()
         started = time.monotonic()

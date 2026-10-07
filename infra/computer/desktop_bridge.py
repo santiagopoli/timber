@@ -58,6 +58,11 @@ def main():
     mode = sys.argv[1] if len(sys.argv) == 2 else ""
     if mode not in {"view", "control"}:
         raise SystemExit("Expected desktop mode: view or control")
+    # A checkpoint restore atomically replaces /workspace. websockify inherits
+    # SimpleHTTPRequestHandler, whose constructor resolves the process cwd on
+    # every connection, including WebSocket upgrades. Keep it outside that
+    # replaceable directory so a restore cannot break every subsequent handshake.
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
     offset = 0 if mode == "view" else 1
     WebSocketProxy(
         listen_host="0.0.0.0", listen_port=6080 + offset,
