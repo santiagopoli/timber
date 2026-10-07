@@ -28,7 +28,7 @@ Wrangler bundles `server.py` and `start.sh` as Text modules.
 
 The Python HTTP server listens on port 8080. Every endpoint, including its health
 check, requires a random per-computer bearer token. Only `ComputerDO` proxies this
-port; the API does not publish a generic container proxy. The token is not a model
+port; app previews cannot access this management port. The token is not a model
 provider or R2 credential. The shell and desktop share the VM trust boundary and
 must not be treated as mutually isolated users.
 
@@ -63,6 +63,31 @@ already performed external action. A later client retry with the same operation 
 returns the stored result. Different arguments with an existing ID are rejected.
 The durable journal treats unknown interrupted operations as interrupted, never
 as permission to execute them again.
+
+Managed `gitClone` and `gitPush` receive only `owner/repository`, a workspace path,
+and an optional clone branch or required push branch. The host obtains a short-lived
+repository-scoped transport capability from its GitHub connection broker. That
+capability goes in a private request envelope and transient Git process environment;
+it is absent from command arguments, action identities, journals and `.git/config`.
+The remote stored on disk is the ordinary `https://github.com/owner/repository.git`.
+The GitHub installation credential remains in the host broker. Arbitrary processes
+within the same VM can inspect transient process environments, so the transport
+capability grants only the explicitly authorized repository and is revoked after use.
+
+Clone is shallow (depth 1), does not recurse into submodules, and checkpoints the
+result. Push specifies one exact local branch and the same remote branch, with no
+force or implicit tag pushes. Both operations disable custom global configuration,
+credential helpers, hooks, redirects and non-HTTPS protocols. Managed push rejects
+repository configuration that could activate custom helpers, filters or includes.
+Existing computers on an older image return `computer_upgrade_required` before any
+Git effect is journaled. Explicit suspension saves their workspace; the next natural
+start uses the newly deployed image without destroying active tasks.
+
+Registered app previews forward HTTP and WebSocket traffic only to the matching
+bot's already running computer. They retain the application's base path and remove
+platform credentials. A preview never starts a stopped computer or retries a write.
+Ports below 1024 and the management port 8080 are excluded. Successful requests renew
+the normal idle lease; an idle open tab alone does not keep a computer running forever.
 
 ## Persistence and limits
 
@@ -104,6 +129,11 @@ Run `npm run test:computer` from the repository root. The standard-library tests
 execute real shell processes and exercise auth, deduplication, restart recovery,
 timeouts, bounds, traversal, symlink handling and checkpoint restore. They do not
 require Docker or claim to validate Chromium without an X11 desktop.
+
+The Git test uses a real temporary HTTPS smart-HTTP repository requiring a scoped
+test credential. It clones, commits and pushes a branch, verifies the remote result,
+checks duplicate operation handling, and inspects the saved checkpoint and journal
+for credential leakage. The fixture requires local `git` and `openssl` binaries.
 
 The deployed smoke test must verify a screenshot is a PNG and run file write,
 checkpoint, suspend, restart/read and a duplicate shell action against cloud.

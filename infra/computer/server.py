@@ -75,7 +75,7 @@ class Computer:
             raise ValueError("Path must remain inside the workspace")
         return candidate
 
-    def execute(self, operation_id: str, action: dict) -> dict:
+    def execute(self, operation_id: str, action: dict, git_transport: dict | None = None) -> dict:
         if not re.fullmatch(r"[A-Za-z0-9:_.-]{1,160}", operation_id):
             raise ValueError("Invalid operationId")
         digest = hashlib.sha256(json.dumps(action, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -88,15 +88,17 @@ class Computer:
             self.db.execute("INSERT INTO operations(id,digest) VALUES(?,?)", (operation_id, digest))
             self.db.commit()
             try:
-                result = self.action(action)
+                result = self.action(action, git_transport)
             except (ValueError, OSError, subprocess.SubprocessError) as exc:
                 result = {"status": "failed", "error": str(exc)[:1000]}
             self.db.execute("UPDATE operations SET result=? WHERE id=?", (json.dumps(result), operation_id))
             self.db.commit()
             return {"operationId": operation_id, **result}
 
-    def action(self, action: dict) -> dict:
+    def action(self, action: dict, git_transport: dict | None = None) -> dict:
         kind = action.get("type")
+        if kind in {"gitClone", "gitPush"}:
+            return self.git_action(action, git_transport)
         if kind == "exec":
             command = action.get("command")
             if not isinstance(command, str) or not command or len(command) > 32768:
@@ -218,7 +220,10 @@ class Computer:
         return {key: value for key, value in os.environ.items() if key != "BOTSPACE_COMPUTER_TOKEN"}
 
     def run_shell(self, command: str, timeout: float) -> dict:
-        proc = subprocess.Popen(["/bin/bash", "-lc", command], cwd=self.workspace, env=self.child_env(),
+        return self.run_process(["/bin/bash", "-lc", command], timeout, self.workspace, self.child_env())
+
+    def run_process(self, argv: list[str], timeout: float, cwd: Path, env: dict) -> dict:
+        proc = subprocess.Popen(argv, cwd=cwd, env=env,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
         selector = selectors.DefaultSelector()
         selector.register(proc.stdout, selectors.EVENT_READ)
@@ -268,6 +273,89 @@ class Computer:
         if timed_out:
             result["error"] = "Command timed out; its process group was terminated. External effects may have occurred."
         return result
+
+    def git_action(self, action: dict, transport: dict | None) -> dict:
+        """The short-lived transport capability is never journaled or written to Git config.
+
+        It is scoped to one repository by the host. A process with arbitrary access
+        to this VM can inspect another process's environment, so it is deliberately
+        not an account credential. The host revokes it after this operation.
+        """
+        repository = action.get("repository")
+        if not isinstance(repository, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}", repository) or repository.split("/")[1] in {".", ".."}:
+            raise ValueError("Invalid GitHub repository")
+        branch = action.get("branch")
+        if branch is not None and (not isinstance(branch, str) or len(branch) > 200 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch) or ".." in branch or "//" in branch or branch.endswith(("/", ".", ".lock")) or any(part.startswith(".") or part.endswith(".lock") for part in branch.split("/"))):
+            raise ValueError("Invalid Git branch")
+        if action["type"] == "gitPush" and not branch:
+            raise ValueError("A branch is required for Git push")
+        if not isinstance(transport, dict):
+            raise ValueError("GitHub connection is required")
+        url, token = transport.get("url"), transport.get("token")
+        parsed = urlparse(url) if isinstance(url, str) else None
+        if not parsed or parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or not parsed.path.endswith(".git"):
+            raise ValueError("Invalid private Git transport")
+        if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9._~-]{20,512}", token):
+            raise ValueError("Invalid private Git capability")
+        destination = self.path(action.get("path"))
+        canonical = f"https://github.com/{repository}.git"
+        # Ignore inherited Git configuration and all global helpers. Credentials
+        # are scoped to the exact proxy URL; redirects and other protocols are off.
+        env = {key: value for key, value in self.child_env().items() if not key.startswith("GIT_")}
+        # A deployment may supply a private trust store; this does not disable
+        # certificate or hostname verification and is not repository controlled.
+        if os.environ.get("GIT_SSL_CAINFO"):
+            env["GIT_SSL_CAINFO"] = os.environ["GIT_SSL_CAINFO"]
+        env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false", "SSH_ASKPASS": "/bin/false"})
+        settings = [("credential.helper", ""), ("http.extraHeader", ""), ("http.followRedirects", "false"), ("http.sslVerify", "true"), ("core.hooksPath", "/dev/null"), ("core.fsmonitor", "false"), ("core.sshCommand", "/bin/false"), ("protocol.allow", "never"), ("protocol.https.allow", "always"), ("submodule.recurse", "false"), ("maintenance.auto", "false"), ("gc.auto", "0"), ("init.templateDir", "")]
+
+        def git(args: list[str], cwd: Path, authenticated: bool = False) -> dict:
+            config = settings + ([(f"http.{url}.extraHeader", f"Authorization: Bearer {token}")] if authenticated else [])
+            call_env = dict(env, GIT_CONFIG_COUNT=str(len(config)))
+            for index, (key, value) in enumerate(config):
+                call_env[f"GIT_CONFIG_KEY_{index}"] = key
+                call_env[f"GIT_CONFIG_VALUE_{index}"] = value
+            result = self.run_process(["git", *args], 120, cwd, call_env)
+            for key in ("output", "error"):
+                if key in result:
+                    result[key] = result[key].replace(token, "[redacted]").replace(url, canonical).replace(f"{parsed.scheme}://{parsed.netloc}", "https://github.com")
+            return result
+
+        try:
+            if action["type"] == "gitClone":
+                if destination.exists():
+                    raise ValueError("Clone destination already exists; inspect it before choosing another path")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                result = git(["clone", "--no-local", "--no-checkout", "--depth", "1", "--single-branch", *(["--branch", branch] if branch else []), "--", url, str(destination)], self.workspace, True)
+                if (destination / ".git").is_dir():
+                    clean = git(["remote", "set-url", "origin", canonical], destination)
+                    if clean["status"] != "completed":
+                        return {"status": "failed", "error": "Clone transport finished, but its remote could not be normalized. Inspect the destination before retrying."}
+                if result["status"] == "completed":
+                    checked = git(["reset", "--hard", "HEAD"], destination)
+                    if checked["status"] != "completed":
+                        return checked
+                    result["output"] = f"Cloned {repository} into {action['path']} (depth 1)."
+                return result
+
+            git_dir = destination / ".git"
+            if not git_dir.is_dir() or git_dir.is_symlink() or not git_dir.resolve().is_relative_to(self.workspace):
+                raise ValueError("Push requires a regular repository inside the workspace")
+            for name in ("config", "config.worktree", "commondir", "objects/info/alternates"):
+                candidate = git_dir / name
+                if candidate.is_symlink() or (name != "config" and candidate.exists()):
+                    raise ValueError("Repository uses unsupported shared or external Git configuration")
+            configured = git(["config", "--local", "--no-includes", "--name-only", "--list"], destination)
+            if configured["status"] != "completed":
+                raise ValueError("Cannot inspect repository configuration")
+            safe_keys = re.compile(r"(?:core\.(?:repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode)|remote\.[A-Za-z0-9_-]+\.(?:url|fetch|pushurl)|branch\..+\.(?:remote|merge)|user\.(?:name|email))", re.IGNORECASE)
+            if any(not safe_keys.fullmatch(key) for key in configured.get("output", "").splitlines()):
+                raise ValueError("Repository has unsupported Git configuration; remove custom includes, helpers, filters or hooks before managed push")
+            # Explicit refspec and transport prevent push.default, pushurl, force,
+            # tags or a malicious origin from broadening this operation.
+            return git(["push", "--porcelain", "--no-verify", "--", url, f"refs/heads/{branch}:refs/heads/{branch}"], destination, True)
+        except (OSError, subprocess.SubprocessError):
+            return {"status": "failed", "error": "Git transport failed; inspect repository and remote state before retrying."}
 
     def checkpoint(self, resume_browser: bool = True) -> Path:
         """Quiesce Chromium, archive only portable filesystem contents, detect races.
@@ -440,7 +528,7 @@ def create_handler(computer: Computer, token: str):
                 desktop = all(shutil.which(tool) for tool in ["scrot", "xdotool", "chromium", "xclip"])
                 if desktop:
                     desktop = subprocess.run(["xdotool", "getdisplaygeometry"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2).returncode == 0
-                return self.respond(200, {"ok": True, "bootId": computer.boot_id, "desktop": desktop})
+                return self.respond(200, {"ok": True, "bootId": computer.boot_id, "desktop": desktop, "capabilities": ["gitClone", "gitPush"]})
             if self.path.startswith("/artifacts/"):
                 name = self.path.removeprefix("/artifacts/")
                 if re.fullmatch(r"[a-f0-9-]{36}\.png", name) and (computer.state / name).is_file():
@@ -474,7 +562,7 @@ def create_handler(computer: Computer, token: str):
                     return self.respond(413, {"error": "Request too large"})
                 body = json.loads(self.rfile.read(length)) if length else {}
                 if self.path == "/actions":
-                    return self.respond(200, computer.execute(body["operationId"], body["action"]))
+                    return self.respond(200, computer.execute(body["operationId"], body["action"], body.get("gitTransport")))
                 if self.path == "/checkpoint":
                     path = computer.checkpoint(resume_browser=not body.get("quiesce", False))
                     try:
