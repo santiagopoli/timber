@@ -29,9 +29,9 @@ const hostRequest = (run: Run, input: Partial<RuntimeHostToolRequest> = {}): Run
 });
 const readRun = async (bot: Bot, run: Run) => (await (await api(`/v1/bots/${bot.id}/runs/${run.id}`)).json<{run: Run}>()).run;
 const readConnections = async (bot: Bot) => (await (await api(`/v1/bots/${bot.id}/connections`)).json<{connections: ConnectionRequest[]}>()).connections;
-async function pausedBot() {
+async function pausedBot(text="fixture:github") {
   const {bot} = await (await api('/v1/bots', {name: 'GitHub connection fixture'})).json<{bot: Bot}>();
-  const {run} = await (await api(`/v1/bots/${bot.id}/messages`, {text: 'fixture:github', operationId: crypto.randomUUID()})).json<{run: Run}>();
+  const {run} = await (await api(`/v1/bots/${bot.id}/messages`, {text, operationId: crypto.randomUUID()})).json<{run: Run}>();
   await expect.poll(async () => (await readRun(bot, run)).status).toBe('waiting_connection');
   // Wait for the native fixture observer to settle, so later tests exercise callback state.
   await expect.poll(() => runInDurableObject(stubFor(bot), (_instance, state) => state.storage.get(`fixture-host-result:${run.operationId}`))).toMatchObject({status: 'pending_connection'});
@@ -102,7 +102,7 @@ it('routes the GitHub notification to the same owner-scoped bot as the public AP
   });
   const github = bindings.GITHUB!.get(bindings.GITHUB!.idFromName('owner'));
   const delivered = await runInDurableObject(github, instance => (instance as unknown as {
-    notify(flow: {botId: string; requestId: string; repository: string; permission: string}): Promise<boolean>;
+    notify(flow: {botId: string; requestId: string; repository?: string; permission: string}): Promise<boolean>;
   }).notify({botId: bot.id, requestId: connection.id, repository: connection.repository, permission: connection.permission}));
   expect(delivered).toBe(true);
   await expect.poll(async () => (await readRun(bot, run)).status).toBe('completed');
@@ -252,3 +252,57 @@ it.each(['https://github.com/owner/repo', 'owner/repo/extra', '../repo', 'owner/
     });
   },
 );
+
+
+it('connects the account without a repository and resumes the original task after owner authorization',async()=>{
+  const {bot,run,connection}=await pausedBot('fixture:github-account');
+  expect(connection.repository).toBeUndefined();
+  expect(connection).toMatchObject({provider:'github',permission:'read',status:'pending'});
+  const response=await api(`/v1/bots/${bot.id}/connections/${connection.id}/connect`,{});
+  expect(response.status).toBe(200);expect(await response.json()).toMatchObject({url:expect.stringContaining('/github/setup/start?state=')});
+  await runInDurableObject(stubFor(bot),async instance=>{
+    const target=instance as unknown as Internals;target.github=async(path,_method,input)=>{expect(path).toBe('/authorize');expect((input as Record<string,unknown>).repository).toBeUndefined();return {authorized:true};};
+    await target.completeConnection(connection.id);
+  });
+  await expect.poll(async()=>(await readRun(bot,run)).status).toBe('completed');
+});
+
+it('reconciles pending tasks in multiple bots after account authorization outside their original cards',async()=>{
+  const first=await pausedBot(),second=await pausedBot();
+  for(const {bot} of [first,second]) await runInDurableObject(stubFor(bot),instance=>{(instance as unknown as Internals).github=async()=>({authorized:true});});
+  const github=bindings.GITHUB!.get(bindings.GITHUB!.idFromName('owner'));
+  await runInDurableObject(github,async(instance,state)=>{
+    // These watchers were registered by the original failed access checks.
+    expect(await state.storage.get(`waiting-bot:${first.bot.id}`)).toBeTruthy();
+    const reconcile=(instance as unknown as {reconcileWaitingBots():Promise<void>}).reconcileWaitingBots.bind(instance);
+    await reconcile();await reconcile();
+  });
+  for(const {bot,run,connection} of [first,second]) {
+    await expect.poll(async()=>(await readRun(bot,run)).status).toBe('completed');
+    await runInDurableObject(stubFor(bot),(_instance,state)=>{
+      expect(state.storage.sql.exec('SELECT operation_id FROM submissions WHERE operation_id=?',`connection:${connection.id}`).toArray()).toHaveLength(1);
+      expect(JSON.parse(state.storage.sql.exec<{data:string}>('SELECT data FROM connections WHERE id=?',connection.id).one().data).status).toBe('connected');
+    });
+  }
+});
+
+it('does not resume a cancelled task when shared GitHub authorization is reconciled',async()=>{
+  const {bot,run}=await pausedBot();await api(`/v1/bots/${bot.id}/runs/${run.id}/cancel`,{});
+  await runInDurableObject(stubFor(bot),instance=>{(instance as unknown as Internals).github=async()=>({authorized:true});});
+  const github=bindings.GITHUB!.get(bindings.GITHUB!.idFromName('owner'));
+  await runInDurableObject(github,instance=>(instance as unknown as {reconcileWaitingBots():Promise<void>}).reconcileWaitingBots());
+  expect((await readRun(bot,run)).status).toBe('cancelled');
+  await runInDurableObject(stubFor(bot),(_instance,state)=>{expect(state.storage.sql.exec('SELECT operation_id FROM submissions WHERE operation_id LIKE ?', 'connection:%').toArray()).toHaveLength(0);});
+});
+
+
+it('does not rewind a newer native operation when an old connection request is reconciled',async()=>{
+  const {bot,run,connection}=await pausedBot();
+  await runInDurableObject(stubFor(bot),async(instance,state)=>{
+    const target=instance as unknown as Internals;target.github=async()=>({authorized:true});
+    state.storage.sql.exec('UPDATE runs SET native_operation_id=? WHERE id=?','newer-native-input',run.id);
+    expect((await target.completeConnection(connection.id)).status).toBe('cancelled');
+    expect(state.storage.sql.exec<{native_operation_id:string}>('SELECT native_operation_id FROM runs WHERE id=?',run.id).one().native_operation_id).toBe('newer-native-input');
+    expect(state.storage.sql.exec('SELECT operation_id FROM submissions WHERE operation_id=?',`connection:${connection.id}`).toArray()).toHaveLength(0);
+  });
+});

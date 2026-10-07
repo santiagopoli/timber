@@ -184,6 +184,8 @@ The owner must complete GitHub consent. This registration flow currently targets
 personal accounts; organization-owned Apps require a separate registration policy.
 
 - GET /v1/connections/github returns safe account/App connection metadata.
+- POST /v1/connections/github/connect starts account-wide setup, including when
+  no bots exist. Settings and conversation setup use the same owner connection.
 - DELETE /v1/connections/github revokes Timber grants/capabilities and removes local
   credentials. Uninstall the App in GitHub to revoke the GitHub-side installation.
 - GET /v1/bots/:id/connections returns pending requests first plus recent history.
@@ -196,13 +198,23 @@ personal accounts; organization-owned Apps require a separate registration polic
   GitHub installation tokens never leave the host; the Linux process receives only
   a transient scoped capability, which is revoked after the Git operation.
 
-A missing repository grant saves a ConnectionRequest and pauses the run as
+The GitHub connection belongs to the Timber account and is shared by all bots.
+GitHub All/selected repositories and installation permissions are checked live;
+per-bot grants are not a second access gate. Existing installations migrate from
+verified legacy grants or the authorizing user's installation list.
+
+Missing provider access saves a ConnectionRequest and pauses the run as
 `waiting_connection`. Authorization persists the connected state and a new native
 continuation atomically; callback retries admit that exact continuation. Cancellation,
 bot deletion and newer native operations fence stale callbacks/tool calls. Authorizing
 access does not claim that the original tool ran: the resumed agent dispatches it.
+Bot recovery, connection reads, OAuth completion and a durable retry reconcile
+pending requests against provider access, including permissions changed outside
+the original request. Continuations are admitted once.
 
-`github_connect` requests read or write scope. `github_clone` and `github_push` use
+`github_connect` connects the account without requiring a repository; an optional
+repository asks for the access needed by that task. `github_list_repositories` lists
+the installation's authorized repositories with pagination. `github_clone` and `github_push` use
 native Git in the existing computer; `github_create_pull_request` and
 `github_list_pull_requests` use the fixed, host-validated remote GitHub MCP endpoint.
 PR writes are journaled and reconciled by marker before retrying an uncertain result.

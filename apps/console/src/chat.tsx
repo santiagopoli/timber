@@ -96,13 +96,13 @@ function ConnectionEntry({ connection, callbacks }: { connection: ChatConnection
   const pending = connection.status === 'pending';
   return <article className="timber-connection-entry" data-connection-id={connection.id} data-connection-status={connection.status} data-run-id={connection.runId}>
     <div className="timber-connection-heading"><GitBranchIcon aria-hidden="true" /><strong>{pending ? 'Connect GitHub to continue' : connection.status === 'connected' ? 'GitHub access connected' : 'GitHub request cancelled'}</strong><time>{time(connection.createdAt)}</time></div>
-    <p className="timber-connection-repository">{connection.repository}</p>
-    <p className="timber-connection-scope">{connection.permission === 'write' ? 'Read this repository, push branches, and create pull requests.' : 'Read and clone this repository.'}</p>
+    <p className="timber-connection-repository">{connection.repository || 'Your GitHub account'}</p>
+    <p className="timber-connection-scope">{!connection.repository ? 'Connect GitHub to your Timber account. Your bots can use the repositories and permissions you authorize in GitHub.' : connection.permission === 'write' ? 'This task needs write access. Connect GitHub to Timber and choose which repositories your bots may use.' : 'This task needs read access. Connect GitHub to Timber and choose which repositories your bots may use.'}</p>
     {pending && <>
       <Button disabled={connection.busy} data-connect-github onClick={() => callbacks.onConnect(connection.botId, connection.id)}>{connection.busy ? <LoaderCircleIcon className="timber-spinner" /> : <ExternalLinkIcon />}{connection.busy ? 'Opening GitHub…' : connection.opened ? 'Continue in GitHub' : 'Connect GitHub'}</Button>
-      <p className="timber-approval-help">{connection.opened ? 'Finish connecting in the new tab. This task will continue automatically.' : 'Choose the repository in GitHub. This task will continue when access is connected.'}</p>
+      <p className="timber-approval-help">{connection.opened ? 'Finish connecting in the new tab. This task will continue automatically.' : connection.repository ? 'Choose the repository in GitHub. This task will continue when access is connected.' : 'Choose repository access in GitHub. The connection is shared by your bots, and this task will resume automatically.'}</p>
     </>}
-    {connection.status === 'connected' && <p className="timber-approval-help"><CheckIcon />Access was connected for this task.</p>}
+    {connection.status === 'connected' && <p className="timber-approval-help"><CheckIcon />GitHub is connected to your Timber account.</p>}
     {connection.error && <p className="timber-inline-error" role="alert">{connection.error}</p>}
   </article>;
 }

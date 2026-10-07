@@ -9,12 +9,13 @@ import { body, string } from "./validation";
 
 type Permission = "read" | "write";
 interface Scope { botId:string; repository:string; permission:Permission; }
-interface Flow extends Scope { requestId:string; origin:string; state:string; expiresAt:number; stage:"new"|"manifest"|"install"|"oauth"|"complete"; installationId?:number; }
+interface ConnectionScope { botId:string; repository?:string; permission:Permission; }
+interface Flow { botId?:string; repository?:string; permission:Permission; requestId?:string; origin:string; state:string; expiresAt:number; stage:"new"|"manifest"|"install"|"oauth"|"complete"; installationId?:number; }
 interface App { id:number; slug:string; clientId:string; clientSecret:string; pem:string; ownerId:number; }
 interface UserToken { accessToken:string; refreshToken?:string; expiresAt:number; }
 interface Credentials { app:App; user?:UserToken; }
 interface Ciphertext { iv:string; ciphertext:string; }
-interface Connection { account?:{login:string; id:number}; app:{id:number; slug:string}; revision:string; connected:boolean; }
+interface Connection { account?:{login:string; id:number}; app:{id:number; slug:string}; revision:string; connected:boolean; installationId?:number; permissions?:{contents?:Permission;pull_requests?:Permission}; repositorySelection?:"all"|"selected"; }
 interface Grant extends Scope { installationId:number; revision:string; }
 interface Capability extends Grant { id:string; expiresAt:number; origin:string; }
 interface GitHubPR { number:number; html_url:string; title:string; state:string; body?:string; head?:{ref:string}; base?:{ref:string}; }
@@ -35,6 +36,14 @@ function scope(value:Record<string,unknown>):Scope {
   const botId=string(value.botId,"botId",64);
   if(!/^[0-9a-f-]{36}$/i.test(botId)) throw new ApiError(400,"invalid_bot","Invalid bot identity.");
   return {botId,repository:repository(value.repository),permission:permission(value.permission)};
+}
+function connectionScope(value:Record<string,unknown>):ConnectionScope {
+  if(value.repository!==undefined) return scope({...value,permission:value.permission??"read"});
+  const botId=string(value.botId,"botId",64);
+  if(!/^[0-9a-f-]{36}$/i.test(botId)) throw new ApiError(400,"invalid_bot","Invalid bot identity.");
+  // The provider installation is the account-wide permission boundary.
+  if(value.permission!==undefined) permission(value.permission);
+  return {botId,permission:"read"};
 }
 function escapes(value:string):string {return value.replace(/[&<>"']/g,x=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[x]!);}
 function page(title:string,content:string,status=200,headers:HeadersInit={}):Response {
@@ -82,7 +91,7 @@ export class GitHubAuthDO extends DurableObject<Env> {
   }
   private async status():Promise<Response> {
     const connection=await this.ctx.storage.get<Connection>("connection");
-    return json({provider:"github",connected:connection?.connected??false,...(connection?{account:connection.account,app:connection.app}:{} )});
+    return json({provider:"github",connected:connection?.connected??false,...(connection?{account:connection.account?{id:connection.account.id,login:connection.account.login}:undefined,app:connection.app,repositorySelection:connection.repositorySelection,permissions:connection.permissions}:{} )});
   }
   private origin(value:unknown):string {
     const configured=(this.env as Env & {GITHUB_PUBLIC_ORIGIN?:string}).GITHUB_PUBLIC_ORIGIN;
@@ -91,7 +100,7 @@ export class GitHubAuthDO extends DurableObject<Env> {
   }
   private async api(path:string,token:string,method="GET",payload?:unknown):Promise<Response> {
     const response=await fetch(`${API}${path}`,{method,headers:{authorization:`Bearer ${token}`,accept:"application/vnd.github+json","x-github-api-version":"2022-11-28","user-agent":"Timber/0.1","content-type":"application/json"},...(payload!==undefined?{body:JSON.stringify(payload)}:{}),redirect:"manual",signal:AbortSignal.timeout(20_000)});
-    if(!response.ok) {await response.body?.cancel();throw new ApiError(response.status===401?401:response.status===403?403:502,"github_request_failed",response.status===401?"GitHub access expired or was revoked. Connect GitHub again.":response.status===403?"GitHub did not allow this repository operation.":"GitHub could not complete this request.");}
+    if(!response.ok) {await response.body?.cancel();throw new ApiError(response.status===401?401:response.status===403?403:response.status===404?404:502,"github_request_failed",response.status===401?"GitHub access expired or was revoked. Connect GitHub again.":response.status===403?"GitHub did not allow this repository operation.":"GitHub could not complete this request.");}
     return response;
   }
   private async appJWT(app:App):Promise<string> {
@@ -114,12 +123,64 @@ export class GitHubAuthDO extends DurableObject<Env> {
     if(!response.ok || typeof data.access_token!=="string" || data.error) throw new ApiError(401,"github_authorization_failed","GitHub authorization failed. Start a new connection.");
     return {accessToken:data.access_token,...(typeof data.refresh_token==="string"?{refreshToken:data.refresh_token}:{}),expiresAt:typeof data.expires_in==="number"?Date.now()+data.expires_in*1000:Number.MAX_SAFE_INTEGER};
   }
-  private async grant(value:Scope):Promise<Grant|undefined> {
-    const grant=await this.ctx.storage.get<Grant>(`grant:${value.botId}:${value.repository}`),connection=await this.ctx.storage.get<Connection>("connection");
-    if(!connection?.connected || !grant || grant.revision!==connection.revision || (value.permission==="write" && grant.permission!=="write")) return undefined;
-    return grant;
+  private async connectedInstallation():Promise<Connection|undefined> {
+    let connection=await this.ctx.storage.get<Connection>("connection");
+    if(!connection?.connected) return undefined;
+    // Older versions recorded the verified installation on a per-bot grant.
+    // Recover that evidence and reverify it with GitHub without another OAuth.
+    if(!connection.installationId) {
+      const grants=await this.ctx.storage.list<Grant>({prefix:"grant:"});
+      const legacy=[...grants.values()].find(grant=>grant.revision===connection!.revision);
+      const {app}=await this.credentials();
+      let installationId=legacy?.installationId;
+      if(!installationId) {
+        const token=await this.userToken();
+        for(let page=1;page<=10 && !installationId;page++) {
+          const list=await (await this.api(`/user/installations?per_page=100&page=${page}`,token)).json<{installations:{id:number;app_id:number;account?:{id:number};suspended_at?:unknown}[]}>();
+          installationId=list.installations.find(item=>item.app_id===app.id && item.account?.id===connection!.account?.id && !item.suspended_at)?.id;
+          if(list.installations.length<100) break;
+        }
+      }
+      if(!installationId) return undefined;
+      const installation=await (await this.api(`/app/installations/${installationId}`,await this.appJWT(app))).json<{app_id:number;suspended_at:unknown;permissions:Connection["permissions"];repository_selection:Connection["repositorySelection"]}>();
+      if(installation.app_id!==app.id || installation.suspended_at) return undefined;
+      const latest=await this.ctx.storage.get<Connection>("connection");
+      if(!latest?.connected || latest.revision!==connection.revision) return undefined;
+      connection={...connection,installationId,permissions:installation.permissions,repositorySelection:installation.repository_selection};
+      await this.ctx.storage.put("connection",connection);
+    }
+    return connection;
   }
-  private async requireGrant(value:Scope):Promise<Grant> {const grant=await this.grant(value);if(!grant) throw new ApiError(403,"github_access_required","Connect GitHub and authorize this bot for the requested repository.");return grant;}
+  private async grant(value:Scope):Promise<Grant|undefined> {
+    const connection=await this.connectedInstallation();
+    if(!connection?.installationId || await this.ctx.storage.get(`deleted:${value.botId}`)) return undefined;
+    const {app}=await this.credentials();
+    let installation:{id:number;app_id:number;suspended_at:unknown;permissions:Connection["permissions"]};
+    // Resolve every repository against GitHub's current All/selected installation.
+    // The owner connection is shared by bots; the token remains repository-narrow.
+    try {installation=await (await this.api(`/repos/${value.repository}/installation`,await this.appJWT(app))).json<typeof installation>();}
+    catch(error) {if(error instanceof ApiError && [403,404].includes(error.status)) return undefined;throw error;}
+    if(installation.id!==connection.installationId || installation.app_id!==app.id || installation.suspended_at) return undefined;
+    const actual=installation.permissions?.contents;
+    if(actual!=="write" && (value.permission==="write" || actual!=="read")) return undefined;
+    const latest=await this.ctx.storage.get<Connection>("connection");
+    if(!latest?.connected || latest.revision!==connection.revision || await this.ctx.storage.get(`deleted:${value.botId}`)) return undefined;
+    return {...value,installationId:connection.installationId,revision:connection.revision};
+  }
+  private async repositories(request:Request):Promise<Response> {
+    const input=await body(request),access=connectionScope(input),connection=await this.connectedInstallation();
+    if(await this.ctx.storage.get(`deleted:${access.botId}`)) throw new ApiError(410,"bot_deleted","This bot was deleted.");
+    if(!connection?.installationId) throw new ApiError(403,"github_account_access_required","Connect GitHub to your Timber account before listing repositories.");
+    const page=input.page??1;
+    if(typeof page!=="number" || !Number.isSafeInteger(page) || page<1 || page>10000) throw new ApiError(400,"invalid_page","Repository page must be an integer from 1 to 10000.");
+    const data=await (await this.api(`/user/installations/${connection.installationId}/repositories?per_page=100&page=${page}`,await this.userToken())).json<{total_count:number;repositories:{id:number;full_name:string;name:string;private:boolean;html_url:string;default_branch:string;description:string|null}[]}>();
+    const latest=await this.ctx.storage.get<Connection>("connection");
+    if(!latest?.connected || latest.revision!==connection.revision || await this.ctx.storage.get(`deleted:${access.botId}`)) throw new ApiError(403,"github_access_revoked","GitHub access was disconnected while loading repositories.");
+    if(!Array.isArray(data.repositories)) throw new ApiError(502,"github_invalid_response","GitHub did not return a repository list.");
+    const repositories=data.repositories.slice(0,100).map(repo=>({id:repo.id,repository:repo.full_name,name:repo.name,private:repo.private,url:repo.html_url,defaultBranch:repo.default_branch,description:repo.description?.slice(0,500)??null}));
+    return json({repositories,page,totalCount:data.total_count,nextPage:page*100<data.total_count && page<10000?page+1:null,scope:"Repositories selected in this GitHub installation; All bots use the permissions and repository selection authorized in GitHub."});
+  }
+  private async requireGrant(value:Scope):Promise<Grant> {const grant=await this.grant(value);if(!grant) throw new ApiError(403,"github_access_required","This repository or permission is not available through the Timber account’s GitHub integration. Check the repository selection and permissions in GitHub.");return grant;}
   private async installationToken(grant:Grant):Promise<string> {
     const {app}=await this.credentials();
     const data=await (await this.api(`/app/installations/${grant.installationId}/access_tokens`,await this.appJWT(app),"POST",{repositories:[grant.repository.split("/")[1]],permissions:{contents:grant.permission,pull_requests:grant.permission,metadata:"read"}})).json<{token:string}>();
@@ -127,28 +188,42 @@ export class GitHubAuthDO extends DurableObject<Env> {
     return data.token;
   }
   private async notify(flow:Flow):Promise<boolean> {
+    if(!flow.botId || !flow.requestId || await this.ctx.storage.get(`deleted:${flow.botId}`)) return true;
     const response=await this.env.BOT.get(this.env.BOT.idFromName(`owner:${flow.botId}`)).fetch(`https://bot/connections/${encodeURIComponent(flow.requestId)}/complete`,{method:"POST",headers:{"content-type":"application/json","x-timber-internal":"github"},body:JSON.stringify({provider:"github",repository:flow.repository,permission:flow.permission})});
     await response.body?.cancel();return response.ok || response.status===404 || response.status===410;
   }
-  private async complete(flow:Flow,installationId:number,account:{id:number;login:string}):Promise<Response> {
-    const alive=await this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName("owner")).fetch(`https://workspace/${flow.botId}`);
-    const exists=alive.ok;await alive.body?.cancel();
-    if(!exists || await this.ctx.storage.get(`deleted:${flow.botId}`)) throw new ApiError(410,"bot_deleted","This bot was deleted. Its GitHub request is no longer active.");
+  private async reconcileWaitingBots():Promise<void> {
+    const waiting=await this.ctx.storage.list<{botId:string}>({prefix:"waiting-bot:",limit:100});
+    for(const [key,{botId}] of waiting) {
+      try {
+        const response=await this.env.BOT.get(this.env.BOT.idFromName(`owner:${botId}`)).fetch("https://bot/connections/reconcile",{method:"POST",headers:{"x-timber-internal":"github"}});
+        if(response.status===404 || response.status===410) {await response.body?.cancel();await this.ctx.storage.delete(key);continue;}
+        if(response.ok) {const data=await response.json<{pending:number}>();if(data.pending===0) await this.ctx.storage.delete(key);}
+        else await response.body?.cancel();
+      } catch { /* Recovery and the alarm retry transient provider failures. */ }
+    }
+    if((await this.ctx.storage.list({prefix:"waiting-bot:",limit:1})).size) await this.alarmAt(Date.now()+30_000);
+  }
+  private async complete(flow:Flow,installationId:number,account:{id:number;login:string},installation:{permissions:Connection["permissions"];repository_selection:Connection["repositorySelection"]}):Promise<Response> {
     const connection=(await this.ctx.storage.get<Connection>("connection"))!;
-    connection.connected=true;connection.account=account;
-    const grant:Grant={botId:flow.botId,repository:flow.repository,permission:flow.permission,installationId,revision:connection.revision};
-    const old=await this.grant({...flow,permission:"read"});if(old?.permission==="write") grant.permission="write";
+    connection.connected=true;connection.account={id:account.id,login:account.login};connection.installationId=installationId;connection.permissions=installation.permissions;connection.repositorySelection=installation.repository_selection;
     flow.stage="complete";
-    await this.ctx.storage.put({connection,[`grant:${flow.botId}:${flow.repository}`]:grant,[`flow:${flow.state}`]:flow,[`notify:${flow.state}`]:flow});
-    if(await this.notify(flow).catch(()=>false)) await this.ctx.storage.delete(`notify:${flow.state}`);
-    else await this.alarmAt(Date.now()+5_000);
-    return page("GitHub connected",`<p>Connection saved. Timber is resuming your task.</p><p>This bot now has ${escapes(grant.permission)} access to <strong>${escapes(flow.repository)}</strong>.</p><p>You can close this tab and return to your existing Timber conversation.</p><p><a href="${escapes(`${flow.origin}/console/?bot=${encodeURIComponent(flow.botId)}`)}">Open Timber</a></p>`,200,{"set-cookie":cookie("",0)});
+    // Integration belongs to the Timber owner, even when setup started from a bot
+    // that was cancelled or deleted while the provider consent page was open.
+    await this.ctx.storage.put({connection,[`flow:${flow.state}`]:flow,...(flow.botId && flow.requestId?{[`notify:${flow.state}`]:flow}:{})});
+    if(flow.botId && flow.requestId) {
+      if(await this.notify(flow).catch(()=>false)) await this.ctx.storage.delete(`notify:${flow.state}`);
+      else await this.alarmAt(Date.now()+5_000);
+    }
+    this.ctx.waitUntil(this.reconcileWaitingBots());
+    return page("GitHub connected",`<p>GitHub is now connected to your Timber account. Your bots can use the repositories and permissions you authorized in GitHub.</p><p>${flow.botId?"Timber will resume the originating task if it is still active. ":""}You can close this tab and return to Timber.</p><p><a href="${escapes(`${flow.origin}/console/`)}">Open Timber</a></p>`,200,{"set-cookie":cookie("",0)});
   }
   private async startConnection(request:Request):Promise<Response> {
-    const input=await body(request),access=scope(input),origin=this.origin(input.origin),requestId=string(input.requestId,"requestId",160);
+    const input=await body(request),origin=this.origin(input.origin);
+    const access=input.botId===undefined?{permission:"read" as const}:{...connectionScope(input),requestId:string(input.requestId,"requestId",160)};
     await this.encryptionKey();
     // Owner approval is explicit here. A bot cannot call this internal endpoint.
-    const flow:Flow={...access,requestId,origin,state:random(),expiresAt:Date.now()+FLOW_TTL,stage:"new"};
+    const flow:Flow={...access,origin,state:random(),expiresAt:Date.now()+FLOW_TTL,stage:"new"};
     await this.ctx.storage.put(`flow:${flow.state}`,flow);
     await this.alarmAt(Date.now()+FLOW_TTL);
     return json({url:`${origin}/github/setup/start?state=${flow.state}`,connected:false});
@@ -168,8 +243,8 @@ export class GitHubAuthDO extends DurableObject<Env> {
       if(connection) {flow.stage="install";await this.ctx.storage.put(`flow:${flow.state}`,flow);return redirect(`${GITHUB}/apps/${encodeURIComponent(connection.app.slug)}/installations/new?state=${flow.state}`,cookie(flow.state));}
       if(flow.stage!=="new") throw new ApiError(409,"github_setup_in_progress","A GitHub registration is already in progress.");
       flow.stage="manifest";await this.ctx.storage.put(`flow:${flow.state}`,flow);
-      const manifest={name:`Timber ${flow.state.slice(0,8)}`,url:flow.origin,public:false,description:"Private Timber bots: selected repository development and pull requests.",redirect_url:`${flow.origin}/github/setup/manifest`,setup_url:`${flow.origin}/github/setup/install`,callback_urls:[`${flow.origin}/github/setup/oauth`],setup_on_update:true,request_oauth_on_install:false,hook_attributes:{url:`${flow.origin}/github/webhook`,active:false},default_permissions:{contents:"write",pull_requests:"write",metadata:"read"},default_events:[]};
-      return page("Connect GitHub",`<p>Create your private Timber GitHub App, then select the repositories it may access. This bot is requesting ${escapes(flow.permission)} access to <strong>${escapes(flow.repository)}</strong>.</p><form method="post" action="https://github.com/settings/apps/new?state=${flow.state}"><input type="hidden" name="manifest" value="${escapes(JSON.stringify(manifest))}"><button type="submit">Continue to GitHub</button></form>`,200,{"set-cookie":cookie(flow.state)});
+      const manifest={name:`Timber ${flow.state.slice(0,8)}`,url:flow.origin,public:false,description:"Timber account integration: authorized repository development and pull requests.",redirect_url:`${flow.origin}/github/setup/manifest`,setup_url:`${flow.origin}/github/setup/install`,callback_urls:[`${flow.origin}/github/setup/oauth`],setup_on_update:true,request_oauth_on_install:false,hook_attributes:{url:`${flow.origin}/github/webhook`,active:false},default_permissions:{contents:"write",pull_requests:"write",metadata:"read"},default_events:[]};
+      return page("Connect GitHub",`<p>Create your private Timber GitHub App, then select the repositories it may access. Connect GitHub to your Timber account. Choose selected repositories or all repositories in GitHub; your bots will use the access you authorize.${flow.repository?` This task requested <strong>${escapes(flow.repository)}</strong>.`:""}</p><form method="post" action="https://github.com/settings/apps/new?state=${flow.state}"><input type="hidden" name="manifest" value="${escapes(JSON.stringify(manifest))}"><button type="submit">Continue to GitHub</button></form>`,200,{"set-cookie":cookie(flow.state)});
     }
     if(url.pathname==="/github/setup/manifest") {
       if(flow.stage!=="manifest" || await this.ctx.storage.get("credentials")) throw new ApiError(409,"github_setup_used","This registration has already been handled.");
@@ -200,7 +275,7 @@ export class GitHubAuthDO extends DurableObject<Env> {
       if(account.id!==credentials.app.ownerId) throw new ApiError(403,"github_account_mismatch","Authorize with the GitHub account that owns this private Timber App.");
       // Do not trust the installation_id callback. Verify authenticated user membership,
       // this exact App and repository access through GitHub before granting anything.
-      const installation=await (await this.api(`/app/installations/${flow.installationId}`,await this.appJWT(credentials.app))).json<{app_id:number;suspended_at:unknown}>();
+      const installation=await (await this.api(`/app/installations/${flow.installationId}`,await this.appJWT(credentials.app))).json<{app_id:number;suspended_at:unknown;permissions:Connection["permissions"];repository_selection:Connection["repositorySelection"]}>();
       if(installation.app_id!==credentials.app.id || installation.suspended_at) throw new ApiError(403,"github_installation_mismatch","This installation is not active for the Timber App.");
       let found=false;
       for(let page=1;page<=10 && !found;page++) {
@@ -209,14 +284,8 @@ export class GitHubAuthDO extends DurableObject<Env> {
         if(list.installations.length<100) break;
       }
       if(!found) throw new ApiError(403,"github_installation_mismatch","The GitHub installation does not belong to this authorized account.");
-      const connection=(await this.ctx.storage.get<Connection>("connection"))!;
-      const check:Grant={...flow,installationId:flow.installationId,revision:connection.revision};
-      // A repository-narrow installation token independently enforces selected repos.
-      const token=await this.installationToken(check);
-      const repo=await (await this.api(`/repos/${flow.repository}`,token)).json<{full_name:string}>();
-      if(repo.full_name.toLowerCase()!==flow.repository) throw new ApiError(403,"github_repository_mismatch","The requested repository is not accessible through this installation.");
       credentials.user=user;await this.save(credentials);
-      return this.complete(flow,flow.installationId,account);
+      return this.complete(flow,flow.installationId,account,installation);
     }
     throw new ApiError(404,"not_found","GitHub setup endpoint not found.");
   }
@@ -241,7 +310,7 @@ export class GitHubAuthDO extends DurableObject<Env> {
     for(const key of ["content-type","accept","git-protocol"]) {const value=request.headers.get(key);if(value) headers.set(key,value);}
     const response=await fetch(`${GITHUB}/${cap.repository}.git/${endpoint}${url.search}`,{method:request.method,headers,body:request.body,redirect:"manual",signal:request.signal});
     // Credentials and upstream redirect targets never escape the transport host.
-    if(!response.ok) {await response.body?.cancel();throw new ApiError(response.status===401 || response.status===403?403:502,"github_transport_failed","GitHub could not complete the repository transfer.");}
+    if(!response.ok) {await response.body?.cancel();throw new ApiError(response.status===401 || response.status===403?403:response.status===404?404:502,"github_transport_failed","GitHub could not complete the repository transfer.");}
     const out=new Headers({"cache-control":"no-store","x-content-type-options":"nosniff"});for(const key of ["content-type","content-encoding"]) {const value=response.headers.get(key);if(value) out.set(key,value);}
     return new Response(response.body,{status:response.status,headers:out});
   }
@@ -307,24 +376,30 @@ export class GitHubAuthDO extends DurableObject<Env> {
     // Revoke grants/capabilities before remote work. Clearing credentials is local and final.
     const connection=await this.ctx.storage.get<Connection>("connection");
     if(connection) await this.ctx.storage.put("connection",{...connection,connected:false,revision:random()});
-    for(const prefix of ["grant:","cap:","flow:","notify:"]) {const entries=await this.ctx.storage.list({prefix});if(entries.size) await this.ctx.storage.delete([...entries.keys()]);}
+    for(const prefix of ["grant:","account-grant:","cap:","flow:","notify:"]) {const entries=await this.ctx.storage.list({prefix});if(entries.size) await this.ctx.storage.delete([...entries.keys()]);}
     await this.ctx.storage.delete("credentials");await this.ctx.storage.delete("connection");
     return json({provider:"github",connected:false,revokedLocally:true,message:"Timber access was removed. You can also uninstall the private Timber App in GitHub Settings."});
   }
   async alarm():Promise<void> {
     await this.lock(async()=>{
       let retry=false;
+      await this.reconcileWaitingBots();
       for(const [key,flow] of await this.ctx.storage.list<Flow>({prefix:"notify:"})) {if(await this.notify(flow).catch(()=>false)) await this.ctx.storage.delete(key);else retry=true;}
       for(const prefix of ["flow:","cap:"]) for(const [key,value] of await this.ctx.storage.list<{expiresAt:number}>({prefix})) if(value.expiresAt<Date.now()) await this.ctx.storage.delete(key);
       const pending=(await this.ctx.storage.list({prefix:"flow:"})).size+(await this.ctx.storage.list({prefix:"cap:"})).size;
-      if(retry || pending) await this.ctx.storage.setAlarm(Date.now()+(retry?30_000:5*60_000));
+      if(retry || pending) await this.alarmAt(Date.now()+(retry?30_000:5*60_000));
     });
   }
   async fetch(request:Request):Promise<Response> {
     try {
       const path=new URL(request.url).pathname;
       if(path==="/status" && request.method==="GET") return this.status();
-      if(path==="/authorize" && request.method==="POST") {const access=scope(await body(request));return json({authorized:Boolean(await this.grant(access))});}
+      if(path==="/authorize" && request.method==="POST") {
+        const access=connectionScope(await body(request));
+        const authorized=!(await this.ctx.storage.get(`deleted:${access.botId}`)) && Boolean(access.repository?await this.grant({...access,repository:access.repository}):await this.connectedInstallation());
+        if(!authorized && !(await this.ctx.storage.get(`deleted:${access.botId}`))) {await this.ctx.storage.put(`waiting-bot:${access.botId}`,{botId:access.botId});await this.alarmAt(Date.now()+30_000);}
+        return json({authorized});
+      }
       if(path.startsWith("/github/git/")) return await this.git(request);
       return await this.lock(async()=>{
         if(path.startsWith("/github/setup/") && request.method==="GET") return this.setup(request);
@@ -333,11 +408,12 @@ export class GitHubAuthDO extends DurableObject<Env> {
         const botMatch=/^\/bots\/([0-9a-f-]{36})$/i.exec(path);
         if(botMatch && request.method==="DELETE") {
           await this.ctx.storage.put(`deleted:${botMatch[1]}`,true);
-          for(const prefix of ["grant:","cap:","flow:","notify:","operation:"]) for(const [key,value] of await this.ctx.storage.list<{botId:string}>({prefix})) if(value.botId===botMatch[1]) await this.ctx.storage.delete(key);
+          for(const prefix of ["grant:","account-grant:","cap:","notify:","operation:","waiting-bot:"]) for(const [key,value] of await this.ctx.storage.list<{botId:string}>({prefix})) if(value.botId===botMatch[1]) await this.ctx.storage.delete(key);
           return json({revoked:true});
         }
         if(path==="/git-capability" && request.method==="POST") return this.capability(request);
         if(/^\/git-capability\/[a-f0-9]{64}$/.test(path) && request.method==="DELETE") {await this.ctx.storage.delete(`cap:${path.split("/").pop()}`);return json({revoked:true});}
+        if(path==="/repositories" && request.method==="POST") return this.repositories(request);
         if(path==="/mcp" && request.method==="POST") return this.mcp(request);
         throw new ApiError(404,"not_found","GitHub connection endpoint not found.");
       });

@@ -70,6 +70,11 @@ export default {
         const connection=env.CHATGPT.get(env.CHATGPT.idFromName(owner));
         return connection.fetch(internalRequest(request,`https://chatgpt/${verification?"verify":""}`));
       }
+      if(url.pathname==="/v1/connections/github/connect") {
+        if(request.method!=="POST") throw new ApiError(405,"method_not_allowed","Method not allowed.");
+        if(!env.GITHUB) throw new ApiError(503,"github_not_configured","GitHub is not configured.");
+        return env.GITHUB.get(env.GITHUB.idFromName(owner)).fetch(new Request("https://github/connect",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({origin:env.GITHUB_PUBLIC_ORIGIN})}));
+      }
       if(url.pathname==="/v1/connections/github") {
         if(!["GET","DELETE"].includes(request.method)) throw new ApiError(405,"method_not_allowed","Method not allowed.");
         if(!env.GITHUB) throw new ApiError(503,"github_not_configured","GitHub is not configured.");

@@ -28,6 +28,8 @@ export class BotDO extends DurableObject<Env> {
   private admitting=new Map<string,Promise<void>>();
   private observing=new Set<string>();
   private recovering?:Promise<void>;
+  private reconcilingConnections?:Promise<void>;
+  private lastConnectionCheck=0;
   private finishingApprovals=new Map<string,Promise<void>>();
   private streams=0;
   private lastComputerTouch=0;
@@ -394,6 +396,7 @@ export class BotDO extends DurableObject<Env> {
     if(this.deleted) return Promise.resolve();
     if(this.recovering) return this.recovering;
     this.recovering=(async()=>{
+      await this.reconcileConnections();
       const rows=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs").toArray();
       for(const row of rows) {
         const run=JSON.parse(row.data) as Run;
@@ -450,6 +453,21 @@ export class BotDO extends DurableObject<Env> {
   private apps():WorkspaceApps {
     return new WorkspaceApps(this.ctx.storage,this.env.COMPUTER,this.bot().id,{previewOrigin:this.env.PREVIEW_ORIGIN??'',consoleOrigin:this.env.GITHUB_PUBLIC_ORIGIN??''});
   }
+  private reconcileConnections(force=false):Promise<void> {
+    if(this.deleted) return Promise.resolve();
+    if(this.reconcilingConnections) return this.reconcilingConnections;
+    if(!force && Date.now()-this.lastConnectionCheck<5_000) return Promise.resolve();
+    this.lastConnectionCheck=Date.now();
+    this.reconcilingConnections=(async()=>{
+      const pending=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM connections WHERE json_extract(data,'$.status')='pending' LIMIT 16").toArray();
+      for(const row of pending) {
+        const connection=JSON.parse(row.data) as ConnectionRequest;
+        if(terminal.has(this.getRun(connection.runId).status)) {connection.status='cancelled';this.saveConnection(connection);continue;}
+        try {await this.completeConnection(connection.id);} catch { /* Missing access stays pending. Never replay a tool effect. */ }
+      }
+    })().finally(()=>{this.reconcilingConnections=undefined;});
+    return this.reconcilingConnections;
+  }
   private listConnections():ConnectionRequest[] {
     return this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM connections ORDER BY (json_extract(data,'$.status')='pending') DESC, rowid DESC LIMIT 100").toArray().map(row=>JSON.parse(row.data));
   }
@@ -473,7 +491,7 @@ export class BotDO extends DurableObject<Env> {
     }
     return data;
   }
-  private async requireConnection(input:RuntimeHostToolRequest,run:Run,repository:string,permission:'read'|'write'):Promise<RuntimeToolResult|undefined> {
+  private async requireConnection(input:RuntimeHostToolRequest,run:Run,repository:string|undefined,permission:'read'|'write'):Promise<RuntimeToolResult|undefined> {
     const access={botId:run.botId,repository,permission};
     const authorized=await this.github('/authorize','POST',access);
     this.active();
@@ -484,7 +502,7 @@ export class BotDO extends DurableObject<Env> {
     if(terminal.has(this.getRun(run.id).status) || this.getRunRow(run.id).native_operation_id!==input.runOperationId || input.signal.aborted) return {operationId:input.operationId,status:'interrupted',error:'Run is no longer active.'};
     const previous=this.ctx.storage.sql.exec<{fingerprint:string;data:string}>("SELECT fingerprint,data FROM connections WHERE operation_id=?",input.operationId).toArray()[0];
     if(previous && previous.fingerprint!==hash) throw new ApiError(409,'idempotency_conflict','Tool arguments changed.');
-    const connection:ConnectionRequest=previous?JSON.parse(previous.data):{id:crypto.randomUUID(),botId:run.botId,runId:run.id,provider:'github',repository,permission,status:'pending',createdAt:timestamp()};
+    const connection:ConnectionRequest=previous?JSON.parse(previous.data):{id:crypto.randomUUID(),botId:run.botId,runId:run.id,nativeOperationId:input.runOperationId,provider:'github',repository,permission,status:'pending',createdAt:timestamp()};
     if(connection.status!=='pending') return {operationId:input.operationId,status:'failed',error:'This connection request is no longer pending. Request access again.'};
     this.ctx.storage.sql.exec("INSERT OR IGNORE INTO connections(id,operation_id,fingerprint,data) VALUES(?,?,?,?)",connection.id,input.operationId,hash,JSON.stringify(connection));
     this.updateStatus(run.id,'waiting_connection');
@@ -505,20 +523,20 @@ export class BotDO extends DurableObject<Env> {
       return connection;
     }
     const access=await this.github('/authorize','POST',connection);
-    if(access.authorized!==true) throw new ApiError(403,'connection_not_authorized','Repository access has not been granted.');
+    if(access.authorized!==true) throw new ApiError(403,'connection_not_authorized','GitHub access has not been granted.');
     this.active();
     let continuation:string|undefined;
     this.ctx.storage.transactionSync(()=>{
       connection=this.getConnection(id)!;
       if(connection.status!=='pending') return;
       const run=this.getRun(connection.runId);
-      if(terminal.has(run.status)) {connection.status='cancelled';this.saveConnection(connection);return;}
+      if(terminal.has(run.status) || (connection.nativeOperationId ? this.getRunRow(run.id).native_operation_id!==connection.nativeOperationId : run.status!=='waiting_connection')) {connection.status='cancelled';this.saveConnection(connection);return;}
       connection.status='connected';this.saveConnection(connection);
       this.emit('connection.updated',{connection},run.id);
       const nativeOperationId=`connection:${id}`;
       const exists=this.ctx.storage.sql.exec("SELECT operation_id FROM submissions WHERE operation_id=?",nativeOperationId).toArray().length;
       if(exists) return;
-      const text=`GitHub access is now connected for ${connection.repository} (${connection.permission}) for this bot. Continue the original task. The tool that requested access was NOT executed. You may issue that operation now. Do not repeat previously completed effects. Use the host GitHub tools; credentials are managed by the host.`;
+      const text=`${connection.repository?`GitHub is now connected to your Timber account. This task requested ${connection.repository} (${connection.permission}).`:"GitHub is now connected to the Timber account and available to its bots. Use github_list_repositories to discover repositories authorized in the installation; use the access and permissions granted by GitHub."} Continue the original task. The tool that requested access was NOT executed. You may issue that operation now. Do not repeat previously completed effects. Use the host GitHub tools; credentials are managed by the host.`;
       this.ctx.storage.sql.exec("INSERT INTO submissions(operation_id,run_id,text) VALUES(?,?,?)",nativeOperationId,run.id,text);
       this.ctx.storage.sql.exec("UPDATE runs SET native_operation_id=? WHERE id=?",nativeOperationId,run.id);
       this.updateStatus(run.id,'queued');continuation=nativeOperationId;
@@ -545,10 +563,16 @@ export class BotDO extends DurableObject<Env> {
       this.emit('workspace.app.updated',{app},run.id);result=completed(app);
     } else if(input.name==='list_apps') result=completed({apps:await this.apps().refresh()});
     else if(input.name==='remove_app') {await this.apps().remove(args.appId as string);this.emit('workspace.app.removed',{appId:args.appId},run.id);result=completed({removed:true});}
-    else {
+    else if(input.name==='github_list_repositories' || (input.name==='github_connect' && args.repository===undefined)) {
+      const pending=await this.requireConnection(input,run,undefined,'read');
+      if(pending) return pending;
+      result=input.name==='github_connect'
+        ?completed({connected:true,scope:'account',nextTool:'github_list_repositories',message:'GitHub is connected to your Timber account. Bots use the repository selection and permissions authorized in GitHub.'})
+        :completed(await this.github('/repositories','POST',{botId:run.botId,...(args.page===undefined?{}:{page:args.page})}));
+    } else {
       const repository=String(args.repository).toLowerCase();
       if(!/^[a-z0-9][a-z0-9-]{0,38}\/[a-z0-9._-]{1,100}$/.test(repository) || repository.endsWith('/.') || repository.endsWith('/..')) throw new ApiError(400,'invalid_repository','Use a GitHub repository in owner/name format.');
-      const permission=input.name==='github_connect'?args.permission as 'read'|'write':['github_clone','github_list_pull_requests'].includes(input.name)?'read':'write';
+      const permission=input.name==='github_connect'?(args.permission??'read') as 'read'|'write':['github_clone','github_list_pull_requests'].includes(input.name)?'read':'write';
       const pending=await this.requireConnection(input,run,repository,permission);
       if(pending) return pending;
       if(input.name==='github_connect') result=completed({connected:true,repository,permission});
@@ -765,6 +789,11 @@ export class BotDO extends DurableObject<Env> {
         return json({botId:id,deleted:true});
       }
       this.active();
+      if(path==="/connections/reconcile" && request.method==="POST" && request.headers.get("x-timber-internal")==="github") {
+        await this.currentBot();await this.reconcileConnections(true);
+        const pending=this.ctx.storage.sql.exec("SELECT id FROM connections WHERE json_extract(data,'$.status')='pending'").toArray().length;
+        return json({pending});
+      }
       const completedConnection=/^\/connections\/([^/]+)\/complete$/.exec(path);
       if(completedConnection && request.method==="POST" && request.headers.get("x-timber-internal")==="github") {
         await this.currentBot();
@@ -772,7 +801,7 @@ export class BotDO extends DurableObject<Env> {
       }
       this.configure(request);
       this.ctx.waitUntil(this.recover());
-      if(path==="/connections" && request.method==="GET") return json({connections:this.listConnections()});
+      if(path==="/connections" && request.method==="GET") {await this.reconcileConnections();return json({connections:this.listConnections()});}
       const connect=/^\/connections\/([^/]+)\/connect$/.exec(path);
       if(connect && request.method==="POST") return json(await this.startConnection(connect[1]));
       if(path==="/apps/refresh" && request.method==="POST") return json({apps:await this.apps().refresh()});

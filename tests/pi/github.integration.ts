@@ -30,16 +30,19 @@ it('resumes actual BotDO and Pi after a verified GitHub callback and saves the f
   expect(await runInDurableObject(inference,(_instance,state)=>state.storage.sql.exec<{total:number}>('SELECT COUNT(*) AS total FROM inference_calls').one().total)).toBe(beforeCalls+1);
 
   const github=bindings.GITHUB!.get(bindings.GITHUB!.idFromName('owner'));
-  type GitHubInternals={notify(flow:{botId:string;requestId:string;repository:string;permission:'read'|'write'}):Promise<boolean>};
+  type GitHubInternals={notify(flow:{botId:string;requestId:string;repository?:string;permission:'read'|'write'}):Promise<boolean>};
   const flow={botId:bot.id,requestId:connection.id,repository:connection.repository,permission:connection.permission};
   await runInDurableObject(github,async(instance,state)=>{
-    // OAuth is external to this test. Persist exactly its verified grant shape;
-    // all following authorization checks, notification, host and Pi are real.
+    // OAuth/provider networking is external to this test. The owner connection
+    // and current provider installation are fixtures; host authorization and Pi
+    // continuation remain real and do not rely on an obsolete per-bot grant.
     const revision=crypto.randomUUID();
     await state.storage.put({
-      connection:{connected:true,revision,app:{id:123,slug:'timber-test'},account:{id:456,login:'fixture-owner'}},
-      [`grant:${bot.id}:${connection.repository}`]:{botId:bot.id,repository:connection.repository,permission:'write',installationId:789,revision},
+      connection:{connected:true,revision,installationId:789,permissions:{contents:'write',pull_requests:'write'},app:{id:123,slug:'timber-test'},account:{id:456,login:'fixture-owner'}},
     });
+    const provider=instance as unknown as {credentials():Promise<unknown>;appJWT():Promise<string>;api(path:string):Promise<Response>};
+    provider.credentials=async()=>({app:{id:123}});provider.appJWT=async()=>"fixture-app-jwt";
+    provider.api=async path=>{expect(path).toBe('/repos/owner/private/installation');return Response.json({id:789,app_id:123,suspended_at:null,permissions:{contents:'write',pull_requests:'write'}});};
     expect(await (instance as unknown as GitHubInternals).notify(flow)).toBe(true);
   });
   await expect.poll(async()=>(await storedRun()).status).toBe('completed');

@@ -54,11 +54,11 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
         return paused;
       }
     }
-    if (operation.text === "fixture:github") {
+    if (["fixture:github", "fixture:github-account"].includes(operation.text)) {
       if (!options.tools.call) throw new Error("Host tools fixture requires a host bridge");
       const result = await options.tools.call({
         operationId: `fixture-host:${operationId}`, runOperationId: operationId,
-        name: "github_clone", arguments: {repository: "Owner/Private", path: "project"},
+        name: operation.text === "fixture:github-account" ? "github_connect" : "github_clone", arguments: operation.text === "fixture:github-account" ? {} : {repository: "Owner/Private", path: "project"},
         signal: new AbortController().signal,
       });
       await options.storage.put(`fixture-host-result:${operationId}`, result);

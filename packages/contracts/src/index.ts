@@ -26,4 +26,4 @@ export interface Approval {id:string;botId:string;runId:string;operationId:strin
 export interface ComputerProvider {exec(botId:string,operationId:string,action:ComputerAction):Promise<ComputerResult>;status(botId:string):Promise<ComputerStatus>;checkpoint(botId:string):Promise<ComputerResult>;}
 export interface ApiError {error:{code:string;message:string};}
 
-export interface ConnectionRequest {id:string;botId:string;runId:string;provider:"github";repository:string;permission:"read"|"write";status:"pending"|"connected"|"cancelled";createdAt:string;}
+export interface ConnectionRequest {id:string;botId:string;runId:string;nativeOperationId?:string;provider:"github";repository?:string;permission:"read"|"write";status:"pending"|"connected"|"cancelled";createdAt:string;}

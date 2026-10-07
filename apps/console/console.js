@@ -112,7 +112,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
     for (const id of ['token', 'type-text', 'exec-command', 'navigate-url', 'key-name', 'file-content', 'bot-search']) $(id).value = '';
     $('create-form').reset(); $('edit-form').reset(); $('delete-error').textContent = ''; $('delete-form').reset(); renderDeleteControls(); $('file-path').value = '.'; $('computer-result').textContent = 'No actions yet.';
     $('result-raw').textContent = ''; $('result-details').hidden = true; $('computer-warning').hidden = true; $('computer-progress').hidden = true;
-    $('github-status').textContent = 'Connection not checked.'; $('github-error').textContent = ''; $('disconnect-github').hidden = true; $('disconnect-github').disabled = false;
+    $('github-status').textContent = 'Connection not checked.'; $('github-error').textContent = ''; $('disconnect-github').hidden = true; $('disconnect-github').disabled = false; $('connect-github').hidden = false; $('connect-github').disabled = false;
     $('chatgpt-status').textContent = 'Connection not checked.'; $('chatgpt-account').textContent = ''; $('chatgpt-account').hidden = true;
     $('chatgpt-verification').textContent = 'Model access has not been verified.'; $('chatgpt-error').textContent = ''; $('disconnect-chatgpt').hidden = true; $('verify-chatgpt').disabled = true;
     $('app').hidden = true; $('login').hidden = false; $('disconnect').hidden = true; $('settings-button').hidden = true;
@@ -420,8 +420,26 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   }
   async function loadGitHubStatus() {
     const session = authSession; $('github-error').textContent = '';
-    try {const status = await request('/v1/connections/github'); if (session !== authSession) return; $('github-status').textContent = status.connected ? 'GitHub connected. Each bot gets access only to the repositories you approve.' : 'Not connected. Ask a bot to work with a repository to connect GitHub in its conversation.'; $('disconnect-github').hidden = !status.connected;}
+    try {const status = await request('/v1/connections/github'); if (session !== authSession) return; $('github-status').textContent = status.connected ? `Connected${status.account?.login ? ' as ' + status.account.login : ''}. Available to all your bots.` : 'GitHub is not connected to your Timber account.'; $('disconnect-github').hidden = !status.connected; $('connect-github').hidden = status.connected;}
     catch (error) {if (session === authSession && error.name !== 'AbortError') $('github-error').textContent = errorText(error);}
+  }
+  async function connectAccountGitHub() {
+    const session = authSession, button = $('connect-github');
+    if (!token || button.disabled) return;
+    button.disabled = true; $('github-error').textContent = ''; let popup;
+    try {
+      popup = newWindow('Connecting GitHub');
+      const result = await request('/v1/connections/github/connect', {method: 'POST', body: {}});
+      if (session !== authSession) {popup.close(); return;}
+      if (result.connected) {popup.close(); await loadGitHubStatus(); return;}
+      if (typeof result.url !== 'string' || !result.url) throw new Error('GitHub did not return a connection address.');
+      const url = new URL(result.url, location.origin);
+      if ((url.origin !== location.origin && (url.protocol !== 'https:' || url.hostname !== 'github.com')) || url.username || url.password) throw new Error('GitHub returned an invalid connection address.');
+      if (popup.closed) throw new Error('The connection tab was closed. Select Connect GitHub to continue.');
+      popup.location.replace(url.href);
+      $('github-status').textContent = 'Complete the connection in GitHub. This account will be available to all your bots.';
+    } catch (error) {popup?.close(); if (session === authSession && error.name !== 'AbortError') $('github-error').textContent = errorText(error);}
+    finally {if (session === authSession) button.disabled = false;}
   }
   async function disconnectGitHub() {
     const session = authSession; $('disconnect-github').disabled = true; $('github-error').textContent = '';
@@ -683,9 +701,10 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   $('disconnect-chatgpt').addEventListener('click', () => chatGPTTask(async (session) => { const status = await request('/v1/connections/chatgpt', { method: 'DELETE' }); if (session !== authSession) return; renderChatGPT(status); $('chatgpt-verification').textContent = status.revoked === true ? 'ChatGPT disconnected and its renewable session revoked.' : 'Cloud credentials removed. Remote revocation was not confirmed; disconnect Timber in ChatGPT Settings.'; }));
   $('refresh-apps').addEventListener('click', () => guarded(refreshApps));
   $('apps-prompt').addEventListener('click', () => {if (!selected) return; showPanel('conversation'); $('message').focus();});
+  $('connect-github').addEventListener('click', () => {void connectAccountGitHub();});
   $('refresh-github').addEventListener('click', () => {void loadGitHubStatus();});
   $('disconnect-github').addEventListener('click', () => {void disconnectGitHub();});
-  window.addEventListener('focus', () => {if (token && selected && connections.some(item => item.status === 'pending')) void guarded(() => Promise.all([loadConnections(), loadRuns()]));});
+  window.addEventListener('focus', () => {if (token && $('settings-dialog').open) void loadGitHubStatus(); if (token && selected && connections.some(item => item.status === 'pending')) void guarded(() => Promise.all([loadConnections(), loadRuns()]));});
   document.addEventListener('visibilitychange', () => { desktop.setActive(!document.hidden && !$('panel-computer').hidden); });
   window.addEventListener('pagehide', () => disconnect());
 })();

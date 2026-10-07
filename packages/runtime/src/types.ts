@@ -11,7 +11,7 @@ export type PendingConnection = {
   status: 'pending_connection';
   requestId: string;
   provider: 'github';
-  repository: string;
+  repository?: string;
   permission: 'read' | 'write';
   message?: string;
 };

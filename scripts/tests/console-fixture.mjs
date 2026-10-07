@@ -74,6 +74,7 @@ export async function createConsoleFixture({port = 0} = {}) {
       if (state.rejectAuth || request.headers.authorization !== `Bearer ${TEST_TOKEN}`) return json({error: {code: 'unauthorized', message: 'Token rejected.'}}, 401);
       let body; if (!['GET', 'HEAD'].includes(request.method)) {let raw = ''; for await (const chunk of request) raw += chunk; body = raw ? JSON.parse(raw) : {};}
       state.calls.push({path: request.url, method: request.method, body});
+      if (path === '/v1/connections/github/connect' && request.method === 'POST') return json({url: '/github-connect', connected: false});
       if (path === '/v1/connections/github') {if (request.method === 'DELETE') state.githubConnected = false; return json({connected: state.githubConnected});}
       if (path === '/v1/connections/chatgpt') return json({connected: true, status: 'verified', model: 'gpt-6.1-sol', verifiedAt: date});
       if (path === '/v1/bots') {

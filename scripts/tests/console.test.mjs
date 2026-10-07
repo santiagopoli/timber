@@ -863,7 +863,7 @@ test('GitHub repository connection stays inline and updates when access is conne
     await card.filter({hasText: 'Connect GitHub to continue'}).waitFor();
     assert.equal(await card.evaluate(node => Boolean(node.closest('#messages'))), true, 'connection is in the conversation');
     assert.equal(await card.evaluate(node => Boolean(document.querySelector('[data-message-id="github-user"]').compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING)), true, 'connection follows its request');
-    assert.match(await card.innerText(), /example\/private-repo/); assert.match(await card.innerText(), /push branches/);
+    assert.match(await card.innerText(), /example\/private-repo/); assert.match(await card.innerText(), /write access/);
     await until(page, '.timber-work-status', 'Waiting for GitHub access');
     const newTab = context.waitForEvent('page'); await card.getByRole('button', {name: 'Connect GitHub', exact: true}).click();
     const consent = await newTab; await consent.waitForURL('**/github-connect');
@@ -957,5 +957,38 @@ test('Refresh apps explicitly checks services while background lists remain pass
       assert.deepEqual(state.calls.filter(call => call.path.endsWith('/apps/refresh')).map(call => ({path: call.path, method: call.method})), [{path: `/v1/bots/${BOT_A}/apps/refresh`, method: 'POST'}]);
       assert.equal(state.actions.length, 0);
     } finally {release();}
+  });
+});
+
+
+test('GitHub account setup works in Settings without any bot', async () => {
+  await withPage(async ({page, context, state, url}) => {
+    state.bots = [];
+    await page.goto(url); await page.locator('#token').fill(TEST_TOKEN); await page.locator('#connect-form button').click();
+    await page.locator('#settings-button').click();
+    await until(page, '#github-status', 'not connected');
+    const newTab = context.waitForEvent('page'); await page.locator('#connect-github').click();
+    const consent = await newTab; await consent.waitForURL('**/github-connect');
+    assert.equal(await consent.evaluate(() => window.opener), null);
+    assert.equal(state.calls.filter(call => call.method === 'POST' && call.path === '/v1/connections/github/connect').length, 1);
+    assert.equal(state.calls.filter(call => call.method === 'POST' && call.path.startsWith('/v1/bots')).length, 0);
+    state.githubConnected = true; await page.locator('#refresh-github').click();
+    await until(page, '#github-status', 'Available to all your bots');
+    assert.equal(await page.locator('#connect-github').isVisible(), false);
+    assert.equal(await page.locator('#disconnect-github').isVisible(), true);
+  });
+});
+
+test('GitHub account connection card needs no repository', async () => {
+  await withPage(async ({page, login, state}) => {
+    const createdAt = new Date().toISOString();
+    const run = {id: 'account-run', botId: BOT_A, operationId: 'account-op', status: 'waiting_connection', createdAt, updatedAt: createdAt};
+    state.runs.set(BOT_A, [run]);
+    state.connections.set(BOT_A, [{id: 'account-request', botId: BOT_A, runId: run.id, provider: 'github', permission: 'read', status: 'pending', createdAt}]);
+    await login();
+    const card = page.locator('[data-connection-id="account-request"]');
+    await card.filter({hasText: 'Timber account'}).waitFor();
+    assert.equal(await card.getByRole('button', {name: 'Connect GitHub', exact: true}).isVisible(), true);
+    assert.equal((await card.innerText()).includes('undefined'), false);
   });
 });
