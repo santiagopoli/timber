@@ -48,6 +48,9 @@ const COMPUTER_ERRORS = {
   computer_restore_missing: {status:503, message:"The latest workspace checkpoint is missing. The computer was not started with an empty workspace."},
   computer_restore_failed: {status:503, message:"The cloud computer could not restore its saved workspace."},
   computer_checkpoint_failed: {status:503, message:"The cloud computer could not create a workspace checkpoint."},
+  computer_checkpoint_changed: {status:409, message:"Background processes changed workspace files during checkpoint. Keep live logs and temporary build output outside /workspace, then retry checkpoint."},
+  computer_checkpoint_limit: {status:413, message:"The workspace exceeds the checkpoint limit of 256 MiB or 10,000 entries. Remove disposable build output or caches from /workspace, then retry checkpoint."},
+  computer_checkpoint_nonportable: {status:409, message:"The workspace contains an external symlink or a special file that cannot be checkpointed. Use regular files and relative symlinks within /workspace, then retry checkpoint."},
   computer_checkpoint_integrity_failed: {status:503, message:"The workspace checkpoint failed size or checksum validation."},
   computer_checkpoint_persist_failed: {status:503, message:"The workspace checkpoint could not be saved durably. Retry the checkpoint, not the previous action."},
   computer_invalid_request: {status:400, message:"The computer request is invalid."},
@@ -79,6 +82,19 @@ function safeError(error: unknown): ComputerProviderError {
   return error instanceof ComputerProviderError ? error : new ComputerProviderError("computer_unavailable");
 }
 
+async function checkpointResponseError(response:Response):Promise<ComputerProviderError> {
+  // Older images return a short error string. Classify only known server errors;
+  // never forward workspace paths, arbitrary provider responses or exceptions.
+  if(response.status===400) {
+    const body=await response.json<{error?:unknown}>().catch(()=>undefined);
+    const message=body?.error;
+    if(message==="Workspace changed during checkpoint; stop background writers and retry") return new ComputerProviderError("computer_checkpoint_changed");
+    if(message==="Workspace exceeds checkpoint limit (256 MiB, 10000 entries)" || message==="Compressed checkpoint exceeds limit") return new ComputerProviderError("computer_checkpoint_limit");
+    if(typeof message==="string" && (message.startsWith("Checkpoint contains an escaping symlink: ") || message.startsWith("Checkpoint contains a nonportable special file: "))) return new ComputerProviderError("computer_checkpoint_nonportable");
+  }
+  return new ComputerProviderError("computer_checkpoint_failed");
+}
+
 async function stage<T>(code: ComputerErrorCode, work: () => Promise<T>): Promise<T> {
   try { return await work(); }
   catch (error) {
@@ -93,6 +109,10 @@ async function stage<T>(code: ComputerErrorCode, work: () => Promise<T>): Promis
 export class ComputerDO extends DurableObject<ComputerEnv> {
   private live:DesktopSessions;
   private tail: Promise<unknown> = Promise.resolve();
+  // Effects stay ordered on tail. Files only share the shorter lifecycle gate,
+  // so inspecting a restored workspace never waits for a shell command to exit.
+  private workspaceTail: Promise<unknown> = Promise.resolve();
+  private workspaceHealth?: Health;
   private starting?: Promise<Health>;
   private flights = new Map<string, Promise<ComputerResult>>();
   private token = "";
@@ -132,6 +152,12 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     return result;
   }
   private active():void {if(this.deleted) throw new ComputerProviderError("computer_deleted");}
+  private withWorkspace<T>(fn: () => Promise<T>): Promise<T> {
+    const work = async () => { this.active(); return fn(); };
+    const result = this.workspaceTail.then(work, work);
+    this.workspaceTail = result.catch(() => undefined);
+    return result;
+  }
   private remove(botId:string):Promise<void> {
     if(this.deleting) return this.deleting;
     this.deleted=true;
@@ -144,6 +170,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       // Stop first, then drain queued/in-flight operations before acknowledging
       // deletion. Workspace can now remove R2 without a late uploader racing it.
       await this.tail;
+      await this.workspaceTail;
       if(this.starting) await this.starting.catch(()=>{});
       while(true) {
         const values=await this.ctx.storage.list({limit:128});
@@ -174,17 +201,18 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       if (path === "/status") return Response.json(await this.status(body.botId));
       if (path === "/touch") { await this.touch(); return Response.json({ok:true}); }
       if (path === "/suspend") {
-        return Response.json(await this.serialize(async () => {
+        return Response.json(await this.serialize(() => this.withWorkspace(async () => {
           this.active();
           await this.live.closeAll();
           if (this.container?.running) {
-            await this.ensureReady(body.botId);
+            await this.initializeWorkspace(body.botId);
             await this.saveCheckpoint(body.botId, true);
             await this.container.destroy("User suspended computer after durable checkpoint");
             this.desktop = false;
+            this.workspaceHealth = undefined;
           }
           return this.status(body.botId);
-        }));
+        })));
       }
       if (path !== "/actions" || !body.action || !body.operationId || !/^[A-Za-z0-9:_.-]{1,160}$/.test(body.operationId)) {
         throw new ComputerProviderError("computer_invalid_request");
@@ -213,8 +241,9 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       const input=await request.json<{mode?:unknown}>();
       if(input.mode!=="view" && input.mode!=="control") throw new ComputerProviderError("computer_invalid_request");
       const mode=input.mode;
-      return this.serialize(async()=>{
-        let health=await this.ensureReady(botId);
+      const create=()=>this.withWorkspace(async()=>{
+        let health=this.container?.running && this.workspaceHealth
+          ? this.workspaceHealth : await this.initializeWorkspace(botId);
         if(!health.capabilities?.includes("liveDesktop") && !health.capabilities?.includes("workspace")) throw new ComputerProviderError("computer_upgrade_required");
         // The HTTP process can become ready a moment before the desktop bridge.
         // Re-probe readiness, never replay an action or mislabel this as an old image.
@@ -225,13 +254,15 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         if(!health.capabilities?.includes("liveDesktop")) throw new DesktopError("desktop_unavailable",503,"The live desktop is still starting. Connect again shortly.");
         await this.touch();return Response.json(await this.live.create(botId,mode));
       });
+      return mode==="view" ? create() : this.serialize(create);
     }
     const session=/^\/desktop\/([a-f0-9-]{36})(\/renew)?$/.exec(url.pathname);
-    if(session && request.method==="POST" && session[2]) return this.serialize(async()=>{const value=await this.live.renew(botId,session[1]);await this.touch();return Response.json(value);});
+    if(session && request.method==="POST" && session[2]) return this.withWorkspace(async()=>{const value=await this.live.renew(botId,session[1]);await this.touch();return Response.json(value);});
     if(session && request.method==="DELETE" && !session[2]) {await this.live.release(session[1]);return Response.json({released:true});}
     if(request.method!=="GET" || !/^\/workspace\/(tree|file|download|projects|changes|diff)$/.test(url.pathname)) throw new ComputerProviderError("computer_invalid_request");
-    return this.serialize(async()=>{
-      const health=await this.ensureReady(botId);
+    return this.withWorkspace(async()=>{
+      const health=this.container?.running && this.workspaceHealth
+        ? this.workspaceHealth : await this.initializeWorkspace(botId);
       if(!health.capabilities?.includes("workspace")) throw new ComputerProviderError("computer_upgrade_required");
       await this.touch();
       const response=await this.call(url.pathname+url.search);
@@ -304,7 +335,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       try {
         if (action.type === "checkpoint") {
           operationStage = "checkpoint";
-          const checkpoint = await this.saveCheckpoint(botId);
+          const checkpoint = await this.withWorkspace(() => this.saveCheckpoint(botId));
           result = {operationId,status:"completed",checkpointId:checkpoint.id};
         } else {
           const response = await this.dispatchAction(botId,operationId,action);
@@ -327,13 +358,19 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
           // portable checkpoint before acknowledging these filesystem operations.
           if (action.type === "exec" || action.type === "writeFile" || action.type === "gitClone") {
             operationStage = "checkpoint";
-            try { result.checkpointId = (await this.saveCheckpoint(botId)).id; }
-            catch { result.error = `${result.error ? result.error + " " : ""}The action finished, but its files are not yet checkpointed. Retry checkpoint, not the action.`; }
+            try { result.checkpointId = (await this.withWorkspace(() => this.saveCheckpoint(botId))).id; }
+            catch(error) {
+              const failure=safeError(error);
+              console.error("computer.failure",{stage:"checkpoint",code:failure.code});
+              result.error = `${result.error ? result.error + " " : ""}The action finished, but its files are not yet checkpointed. ${failure.publicMessage} Do not repeat the action to save its files.`;
+            }
           }
         }
       } catch (error) {
         console.error("computer.failure", {stage:operationStage,code:safeError(error).code});
-        result = error instanceof ComputerProviderError && error.code==="computer_git_unavailable"
+        result = action.type==="checkpoint" && error instanceof ComputerProviderError
+          ? {operationId,status:"failed",error:error.publicMessage}
+          : error instanceof ComputerProviderError && error.code==="computer_git_unavailable"
           ? {operationId,status:"failed",error:`${error.publicMessage} No Git action was executed.`}
           : {operationId,status:"interrupted",error:"Computer connection or persistence failed; the action may have completed. Inspect effects before submitting a new operation."};
       }
@@ -418,7 +455,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
 
   async alarm(): Promise<void> {
     if(this.deleted) {await this.ctx.storage.deleteAlarm();return;}
-    await this.serialize(async () => {
+    await this.serialize(() => this.withWorkspace(async () => {
       if(this.deleted) return;
       const lastActivity = await this.ctx.storage.get<number>("lastActivity") ?? 0;
       if (Date.now() - lastActivity < IDLE_MS) {
@@ -429,16 +466,17 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       const botId = await this.ctx.storage.get<string>("botId");
       if (!botId) return;
       try {
-        await this.ensureReady(botId);
+        await this.initializeWorkspace(botId);
         await this.saveCheckpoint(botId, true);
         await this.container.destroy("Idle computer checkpointed");
         this.desktop = false;
+        this.workspaceHealth = undefined;
       } catch {
         // Do not intentionally discard an uncheckpointed filesystem. A later
         // infrastructure failure can still lose it; this is not a live volume.
         if(!this.deleted) await this.ctx.storage.setAlarm(Date.now() + 60_000);
       }
-    });
+    }));
   }
 
   private call(path: string, init: RequestInit = {}): Promise<Response> {
@@ -458,10 +496,17 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   }
 
   private ensureReady(botId: string): Promise<Health> {
+    return this.withWorkspace(() => this.initializeWorkspace(botId));
+  }
+
+  /** Called only inside the workspace gate: restoration cannot race a read. */
+  private initializeWorkspace(botId: string): Promise<Health> {
     this.active();
+    this.workspaceHealth = undefined;
     this.starting ??= this.startAndRestore(botId).then(async health => {
       this.active();
       await this.ctx.storage.delete("startupFailure");
+      this.workspaceHealth = health;
       return health;
     }, async error => {
       const failure = safeError(error);
@@ -562,7 +607,8 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   private async saveCheckpoint(botId: string, quiesce = false): Promise<Checkpoint> {
     this.active();
     const response = await stage("computer_checkpoint_failed", () => this.call("/checkpoint", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({quiesce})}));
-    if (!response.ok || !response.body) throw new ComputerProviderError("computer_checkpoint_failed");
+    if (!response.ok) throw await checkpointResponseError(response);
+    if (!response.body) throw new ComputerProviderError("computer_checkpoint_failed");
     const size = Number(response.headers.get("Content-Length"));
     if (!Number.isSafeInteger(size) || size <= 0 || size > 256 * 1024 * 1024) throw new ComputerProviderError("computer_checkpoint_integrity_failed");
     const id = crypto.randomUUID();

@@ -106,6 +106,14 @@ describe('runtime computer bridge', () => {
     }
     expect(tools.find(tool => tool.name === 'read_file')?.replay).toBe('safe');
   });
+  it('gives finite exec commands a 120-second default while retaining an explicit shorter bound', async () => {
+    const host = bridge();
+    const exec = computerTools(host).find(tool => tool.name === 'exec')!;
+    await exec.execute({command: 'install dependencies'}, api, context);
+    expect(vi.mocked(host.tools.execute).mock.calls[0]?.[0].action).toEqual({type: 'exec', command: 'install dependencies', timeoutMs: 120000});
+    await exec.execute({command: 'quick readiness probe', timeoutMs: 10000}, api, context);
+    expect(vi.mocked(host.tools.execute).mock.calls[1]?.[0].action).toEqual({type: 'exec', command: 'quick readiness probe', timeoutMs: 10000});
+  });
 });
 
 describe('runtime host tool bridge', () => {

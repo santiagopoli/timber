@@ -1,13 +1,13 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { ArrowUpIcon, BotIcon, CheckIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon } from 'lucide-react';
+import { ArrowUpIcon, CheckIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon } from 'lucide-react';
 import { useStickToBottomContext } from 'use-stick-to-bottom';
 import { Conversation, ConversationContent, ConversationEmptyState, ConversationScrollButton } from '@/components/ai-elements/conversation';
 import { Message, MessageActions, MessageAction, MessageContent, MessageResponse } from '@/components/ai-elements/message';
-import { PromptInput, PromptInputBody, PromptInputFooter, PromptInputSubmit, PromptInputTextarea } from '@/components/ai-elements/prompt-input';
+import { PromptInput, PromptInputBody, PromptInputSubmit, PromptInputTextarea } from '@/components/ai-elements/prompt-input';
 import { Tool, ToolContent } from '@/components/ai-elements/tool';
 import { ChainOfThought, ChainOfThoughtHeader, ChainOfThoughtContent, ChainOfThoughtStep } from '@/components/ai-elements/chain-of-thought';
-import { Confirmation, ConfirmationAction, ConfirmationActions, ConfirmationRequest } from '@/components/ai-elements/confirmation';
+import { Confirmation, ConfirmationAction, ConfirmationActions } from '@/components/ai-elements/confirmation';
 import { Button } from '@/components/ui/button';
 import type { ChatApproval, ChatCallbacks, ChatModel, ChatConnection, MessageDelivery } from './chat-types';
 import './chat.css';
@@ -24,7 +24,7 @@ function Response({ text, streaming = false }: { text: string; streaming?: boole
   return <MessageResponse className="timber-markdown" mode={streaming ? 'streaming' : 'static'} isAnimating={streaming} parseIncompleteMarkdown skipHtml plugins={{}} components={responseComponents} controls={false}>{text}</MessageResponse>;
 }
 
-function CopyMessage({ text, kind = 'message' }: { text: string; kind?: 'message' | 'pending' | 'streaming' }) {
+function CopyMessage({ text, kind = 'message', createdAt }: { text: string; kind?: 'message' | 'pending' | 'streaming'; createdAt?: string }) {
   const [state, setState] = useState<'idle' | 'copying' | 'copied' | 'failed'>('idle');
   const busy = useRef(false), mounted = useRef(true), reset = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const name = kind === 'streaming' ? 'Copy response so far' : kind === 'pending' ? 'Copy pending message' : 'Copy message';
@@ -43,7 +43,8 @@ function CopyMessage({ text, kind = 'message' }: { text: string; kind?: 'message
     <MessageAction label={name} aria-label={name} title={name} data-copy-message disabled={state === 'copying' || !text} onClick={copy}>
       {state === 'copied' ? <CheckIcon aria-hidden="true" /> : state === 'copying' ? <LoaderCircleIcon className="timber-spinner" aria-hidden="true" /> : <CopyIcon aria-hidden="true" />}
     </MessageAction>
-    <span className={state === 'failed' ? 'timber-copy-feedback timber-copy-error' : 'timber-copy-feedback'} role="status">{state === 'copied' ? kind === 'streaming' ? 'Response so far copied' : 'Copied' : state === 'failed' ? 'Copy failed. Select the message and copy it manually.' : ''}</span>
+    <span className={state === 'failed' ? 'timber-copy-feedback timber-copy-error' : 'timber-copy-feedback'} role="status">{state === 'copied' ? 'Copied' : state === 'failed' ? 'Couldn’t copy. Try again.' : ''}</span>
+    {createdAt && <time dateTime={createdAt} title={new Date(createdAt).toLocaleString()}>{time(createdAt)}</time>}
   </MessageActions>;
 }
 
@@ -56,17 +57,16 @@ function ApprovalEntry({ approval, current, automatic, callbacks }: { approval: 
       <div className="timber-approval-heading"><ShieldCheckIcon aria-hidden="true" /><strong>{title}</strong><time>{time(approval.createdAt)}</time></div>
       <pre className="timber-action"><code>{actionText(approval)}</code></pre>
       {pending && <Confirmation approval={{id: approval.id}} state="approval-requested" className="timber-confirmation">
-        <ConfirmationRequest><p className="timber-approval-help">Review this exact action before it runs on your bot’s computer.</p></ConfirmationRequest>
         <ConfirmationActions className="timber-approval-actions">
           <ConfirmationAction disabled={approval.busy} variant="outline" data-approval-decision="deny" onClick={() => callbacks.onDecision(approval.botId, approval.id, 'deny')}>Deny</ConfirmationAction>
           <ConfirmationAction disabled={approval.busy} data-approval-decision="approve" onClick={() => callbacks.onDecision(approval.botId, approval.id, 'approve')}>{approval.busy ? 'Working…' : 'Approve'}</ConfirmationAction>
           {!automatic && <ConfirmationAction disabled={approval.busy} variant="secondary" className="timber-approve-allow" data-approval-decision="approve-and-allow" onClick={() => callbacks.onDecision(approval.botId, approval.id, 'approve', true)}>Approve and allow computer use</ConfirmationAction>}
         </ConfirmationActions>
-        {!automatic && <p className="timber-approval-help">“Approve and allow” also authorizes future commands, file changes and desktop actions for this bot.</p>}
+        {!automatic && <p className="timber-approval-help">“Approve and allow” includes future commands, file changes and desktop actions for this bot.</p>}
       </Confirmation>}
-      {executing && <p className="timber-approval-help"><LoaderCircleIcon className="timber-spinner" aria-hidden="true" /> Approved action is executing. Its result will appear here.</p>}
-      {approval.status === 'expired' && <p className="timber-approval-help">This request expired and can no longer be approved.</p>}
-      {approval.result?.error && <p className="timber-inline-error">{approval.result.error}</p>}
+      {executing && <p className="timber-approval-help"><LoaderCircleIcon className="timber-spinner" aria-hidden="true" /> Approved action is executing</p>}
+      {approval.status === 'expired' && <p className="timber-approval-help">This request expired.</p>}
+      {approval.result?.error && <p className={approval.result.status === "completed" ? "timber-save-warning" : "timber-inline-error"}>{approval.result.error}</p>}
       {['failed', 'interrupted'].includes(approval.status) && <p className="timber-approval-help">Inspect its effects before retrying. This action will not be replayed automatically.</p>}
       {approval.result?.output && <pre className="timber-action timber-result-output"><code>{approval.result.output}</code></pre>}
       {!pending && <p className="timber-operation">Operation ID: {approval.operationId}</p>}
@@ -83,11 +83,12 @@ function ApprovalEntry({ approval, current, automatic, callbacks }: { approval: 
 
 function MessageRunStatus({ model, runId, callbacks }: { model: ChatModel; runId?: string; callbacks: ChatCallbacks }) {
   const run = model.runs.find(item => item.id === runId);
-  if (!run || (terminal.has(run.status) && !['cancelled', 'interrupted'].includes(run.status) && !run.error)) return null;
+  // The inline request or activity already explains an active task. Keep the
+  // receipt only when it adds delivery, failure or cancellation information.
+  if (!run || (!['queued', 'cancelled', 'interrupted'].includes(run.status) && !run.error)) return null;
   return <div className="timber-message-run" data-message-run-status={run.status}>
     <span className="timber-delivery-status">{['cancelled', 'interrupted'].includes(run.status) ? <CircleAlertIcon /> : run.status === 'queued' ? <ClockIcon /> : run.status === 'waiting_approval' ? <ShieldCheckIcon /> : <CheckIcon />}{label(run.status).replace(/^./, character => character.toUpperCase())}</span>
-    {['cancelled', 'interrupted'].includes(run.status) && <p className="timber-receipt-help">This run stopped. Review any completed actions before starting another task.</p>}
-    {run.status === 'queued' && !run.error && <p className="timber-receipt-help">Accepted · waiting for its turn</p>}
+    {run.status === 'interrupted' && <p className="timber-receipt-help">Review completed actions before retrying.</p>}
     {run.error && <div className="timber-delivery-error"><p>{run.error}</p>{run.status === 'queued' && run.error.includes('Retry this message') && <Button variant="outline" size="sm" disabled={model.sending} onClick={() => callbacks.onRetry(model.bot.id, run.operationId)}>Retry sending</Button>}</div>}
   </div>;
 }
@@ -96,13 +97,12 @@ function ConnectionEntry({ connection, callbacks }: { connection: ChatConnection
   const pending = connection.status === 'pending';
   return <article className="timber-connection-entry" data-connection-id={connection.id} data-connection-status={connection.status} data-run-id={connection.runId}>
     <div className="timber-connection-heading"><GitBranchIcon aria-hidden="true" /><strong>{pending ? 'Connect GitHub to continue' : connection.status === 'connected' ? 'GitHub access connected' : 'GitHub request cancelled'}</strong><time>{time(connection.createdAt)}</time></div>
-    <p className="timber-connection-repository">{connection.repository || 'Your GitHub account'}</p>
-    <p className="timber-connection-scope">{!connection.repository ? 'Connect GitHub to your Timber account. Your bots can use the repositories and permissions you authorize in GitHub.' : connection.permission === 'write' ? 'This task needs write access. Connect GitHub to Timber and choose which repositories your bots may use.' : 'This task needs read access. Connect GitHub to Timber and choose which repositories your bots may use.'}</p>
+    {connection.repository && <p className="timber-connection-repository">{connection.repository}</p>}
+    {pending && <p className="timber-connection-scope">{!connection.repository ? 'One connection for all your bots.' : connection.permission === 'write' ? 'Read and write access needed.' : 'Read access needed.'}</p>}
     {pending && <>
       <Button disabled={connection.busy} data-connect-github onClick={() => callbacks.onConnect(connection.botId, connection.id)}>{connection.busy ? <LoaderCircleIcon className="timber-spinner" /> : <ExternalLinkIcon />}{connection.busy ? 'Opening GitHub…' : connection.opened ? 'Continue in GitHub' : 'Connect GitHub'}</Button>
-      <p className="timber-approval-help">{connection.opened ? 'Finish connecting in the new tab. This task will continue automatically.' : connection.repository ? 'Choose the repository in GitHub. This task will continue when access is connected.' : 'Choose repository access in GitHub. The connection is shared by your bots, and this task will resume automatically.'}</p>
+      {connection.opened && <p className="timber-approval-help">Finish in GitHub. This task will resume automatically.</p>}
     </>}
-    {connection.status === 'connected' && <p className="timber-approval-help"><CheckIcon />GitHub is connected to your Timber account.</p>}
     {connection.error && <p className="timber-inline-error" role="alert">{connection.error}</p>}
   </article>;
 }
@@ -116,14 +116,13 @@ function DeliveryEntry({ delivery, busy, callbacks }: { delivery: MessageDeliver
       {delivery.state === 'sending' ? <LoaderCircleIcon className="timber-spinner" /> : delivery.state === 'accepted' ? <CheckIcon /> : <CircleAlertIcon />}
       <span>{state}</span><time>{time(delivery.createdAt)}</time>
     </div>
-    {delivery.state === 'accepted' && <p className="timber-receipt-help">Accepted by {delivery.botId ? 'your bot' : 'Timber'}. {delivery.runStatus === 'queued' ? 'Waiting to start; it will run after the current task.' : 'Conversation history is syncing.'}</p>}
     {delivery.error && <div className="timber-delivery-error"><p>{delivery.error}</p>{delivery.canRetry && <Button variant="outline" size="sm" disabled={busy} onClick={() => callbacks.onRetry(delivery.botId, delivery.operationId)}>Retry sending</Button>}</div>}
   </Message>;
 }
 
 type TimelineEntry = { key: string; at: number; order: number; node: ReactNode };
 type ToolActivity = { key: string; runId?: string; at: number; name: string; aliases: Set<string>; returned: boolean; status?: string; result?: {status?: string; output?: string; error?: string; exitCode?: number}; data: Record<string, unknown> };
-type ActivityStep = {at: number; key: string} & ({type: 'progress'; message: ChatModel['messages'][number]} | {type: 'tool'; tool: ToolActivity});
+type ActivityStep = {at: number; key: string; tool: ToolActivity};
 const toolNames: Record<string, string> = {exec: 'Command', read_file: 'Read file', readFile: 'Read file', write_file: 'Write file', writeFile: 'Write file', list_files: 'Browse files', listFiles: 'Browse files', desktop_screenshot: 'Screenshot', screenshot: 'Screenshot', browser_navigate: 'Open page', navigate: 'Open page', desktop_click: 'Click', desktop_type: 'Type', desktop_key: 'Press key', desktop_scroll: 'Scroll', checkpoint: 'Save checkpoint'};
 
 function collectTools(model: ChatModel): ToolActivity[] {
@@ -155,20 +154,21 @@ function collectTools(model: ChatModel): ToolActivity[] {
 
 function ActivityGroup({model, runId, steps}: {model: ChatModel; runId?: string; steps: ActivityStep[]}) {
   const run = model.runs.find(item => item.id === runId), active = Boolean(run && !terminal.has(run.status));
-  const [open, setOpen] = useState(active), manuallyToggled = useRef(false);
-  useEffect(() => {if (!manuallyToggled.current) setOpen(active);}, [active]);
-  const tools = steps.filter(step => step.type === 'tool').length;
-  return <ChainOfThought className="timber-activity-group" data-run-activity={runId || 'unassigned'} open={open} onOpenChange={value => {manuallyToggled.current = true; setOpen(value);}}>
-    <ChainOfThoughtHeader className="timber-activity-header"><span className="timber-activity-title"><ActivityIcon aria-hidden="true" /> Activity <span>{tools ? `${tools} ${tools === 1 ? 'action' : 'actions'}` : 'Updates'}</span>{run && <span className="timber-activity-status" data-status={run.status}>{label(run.status)}</span>}</span></ChainOfThoughtHeader>
+  const [open, setOpen] = useState(false);
+  const tools = steps.length;
+  const working = active && run?.status === 'running';
+  const latestTool = [...steps].sort((a, b) => b.at - a.at)[0]?.tool;
+  const statusText = working ? latestTool && !latestTool.returned ? toolNames[latestTool.name] || label(latestTool.name) : 'Working' : run?.status === 'failed' || run?.status === 'interrupted' || run?.status === 'cancelled' ? label(run.status) : undefined;
+  return <ChainOfThought className="timber-activity-group" data-run-activity={runId || 'unassigned'} open={open} onOpenChange={setOpen}>
+    <ChainOfThoughtHeader className="timber-activity-header"><span className="timber-activity-title">{working ? <LoaderCircleIcon className="timber-spinner" aria-hidden="true" /> : <ActivityIcon aria-hidden="true" />}<span className="timber-activity-name">Activity</span>{tools > 0 && <span className="timber-activity-count">{tools} {tools === 1 ? 'action' : 'actions'}</span>}{statusText && <span className="timber-activity-status" data-status={run?.status}>{statusText}</span>}</span></ChainOfThoughtHeader>
     <ChainOfThoughtContent className="timber-activity-content">
       {steps.sort((a, b) => a.at - b.at).map(step => {
-        if (step.type === 'progress') return <ChainOfThoughtStep key={step.key} icon={BotIcon} label={<span className="timber-activity-label">{model.bot.name}<time>{time(step.message.createdAt)}</time></span>} status="complete" data-message-id={step.message.id} data-message-kind="progress" data-progress-message-id={step.message.id} className="timber-progress-step"><Response text={step.message.text} /><CopyMessage text={step.message.text} /></ChainOfThoughtStep>;
         const tool = step.tool, status = tool.result?.status || tool.status;
         const failed = status === 'failed' || status === 'interrupted', pending = status === 'pending_approval' || status === 'pending_connection';
         const waiting = !tool.returned && !status, unknown = waiting && !active;
         const state = failed ? label(status!) : status === 'pending_connection' ? 'Connection requested' : pending ? 'Approval requested' : status === 'completed' ? 'Completed' : unknown ? 'Outcome unconfirmed' : waiting ? 'Running' : 'Tool returned';
         return <ChainOfThoughtStep key={step.key} data-tool-operation-id={String(tool.data.operationId || tool.data.toolCallId)} data-tool-status={status || (unknown ? 'unconfirmed' : waiting ? 'running' : 'returned')} icon={failed || unknown ? CircleAlertIcon : pending ? ShieldCheckIcon : waiting ? LoaderCircleIcon : CheckIcon} status={waiting && active ? 'active' : 'complete'} className={`timber-tool-step${failed || unknown ? ' timber-tool-error' : ''}`} label={<span className="timber-activity-label">{toolNames[tool.name] || label(tool.name)}<span className="timber-tool-status">{state}{tool.result?.exitCode !== undefined ? ` · exit ${tool.result.exitCode}` : ''}</span></span>}>
-          {tool.result?.error && <p className="timber-inline-error">{tool.result.error}</p>}
+          {tool.result?.error && <p className={tool.result.status === "completed" ? "timber-save-warning" : "timber-inline-error"}>{tool.result.error}</p>}
           <details className="timber-tool-details"><summary>Details{tool.result?.output ? ' & output' : ''}</summary>{tool.result?.output && <pre className="timber-action"><code>{tool.result.output}</code></pre>}<pre className="timber-action"><code>{safeJSON(tool.data)}</code></pre></details>
         </ChainOfThoughtStep>;
       })}
@@ -183,11 +183,14 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks): TimelineEntry[] {
   const entries: TimelineEntry[] = [], groups = new Map<string, {runId?: string; steps: ActivityStep[]}>();
   const addActivity = (runId: string | undefined, step: ActivityStep) => {const key = runId || step.key, group = groups.get(key) || {runId, steps: []}; group.steps.push(step); groups.set(key, group);};
   messages.forEach((message, index) => {
-    if (message.role === 'assistant' && message.kind === 'progress') {addActivity(message.runId, {type: 'progress', message, key: message.id, at: timestamp(message.createdAt)}); return;}
-    entries.push({key: `message:${message.id}`, at: timestamp(message.createdAt), order: index * 2, node: <Message from={message.role === 'user' ? 'user' : 'assistant'} data-message-id={message.id} data-run-id={message.runId} className={`timber-message timber-message-${message.role}`}>
-      <div className="timber-message-meta"><span>{message.role === 'user' ? 'You' : message.role === 'assistant' ? model.bot.name : label(message.role)}</span><time>{time(message.createdAt)}</time></div>
+    // Progress is public assistant text accompanying a tool call. It belongs in
+    // the transcript just like a final answer, never in a reasoning disclosure.
+    const request = message.role === 'assistant' && message.runId ? messages.find(item => item.role === 'user' && item.runId === message.runId) : undefined;
+    const at = Math.max(timestamp(message.createdAt), timestamp(request?.createdAt));
+    entries.push({key: `message:${message.id}`, at, order: index * 2, node: <Message from={message.role === 'user' ? 'user' : 'assistant'} data-message-id={message.id} data-message-kind={message.kind} data-progress-message-id={message.kind === 'progress' ? message.id : undefined} data-run-id={message.runId} className={`timber-message timber-message-${message.role}`}>
+      {message.role !== 'user' && <div className="timber-message-meta"><span>{message.role === 'assistant' ? model.bot.name : label(message.role)}</span></div>}
       <MessageContent className="timber-message-content"><Response text={message.text} /></MessageContent>
-      {['user', 'assistant'].includes(message.role) && <CopyMessage text={message.text} />}
+      {['user', 'assistant'].includes(message.role) && <CopyMessage text={message.text} createdAt={message.createdAt} />}
       {message.role === 'user' && <MessageRunStatus model={model} runId={message.runId} callbacks={callbacks} />}
     </Message>});
   });
@@ -199,7 +202,7 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks): TimelineEntry[] {
     entries.push({key: `connection:${connection.id}`, at, order: afterRequest(connection.runId, at), node: <ConnectionEntry connection={connection} callbacks={callbacks} />});
   }
   for (const delivery of model.deliveries.filter(item => !model.runFilter || item.runId === model.runFilter)) entries.push({key: `delivery:${delivery.operationId}`, at: timestamp(delivery.createdAt), order: messages.length * 2 + 3, node: <DeliveryEntry delivery={delivery} busy={model.sending} callbacks={callbacks} />});
-  for (const tool of collectTools(model)) addActivity(tool.runId, {type: 'tool', tool, key: tool.key, at: tool.at});
+  for (const tool of collectTools(model)) addActivity(tool.runId, {tool, key: tool.key, at: tool.at});
   for (const [key, group] of groups) {const request = messages.find(message => message.role === 'user' && message.runId === group.runId); const at = Math.max(Math.min(...group.steps.map(step => step.at)), timestamp(request?.createdAt)); entries.push({key: `activity:${key}`, at, order: afterRequest(group.runId, at), node: <ActivityGroup model={model} runId={group.runId} steps={group.steps} />});}
   return entries.sort((a, b) => a.at - b.at || a.order - b.order);
 }
@@ -220,9 +223,15 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
   }, [model.focusApproval, scrollRef]);
   const entries = timeline(model, callbacks);
   const visibleRun = model.currentRun && (!model.runFilter || model.runFilter === model.currentRun.id) ? model.currentRun : null;
+  const hasInlineStatus = visibleRun && (
+    model.approvals.some(item => item.runId === visibleRun.id && ['pending', 'executing', 'approved'].includes(item.status)) ||
+    model.connections.some(item => item.runId === visibleRun.id && item.status === 'pending') ||
+    (visibleRun.status === 'queued' && model.messages.some(item => item.runId === visibleRun.id && item.role === 'user')) ||
+    (visibleRun.status === 'running' && collectTools(model).some(item => item.runId === visibleRun.id))
+  );
   return <>
     <ConversationContent className="timber-conversation-content">
-      {!entries.length && <ConversationEmptyState className="timber-chat-empty" icon={<BotIcon size={28} />} title={model.loading ? 'Loading conversation…' : `What should ${model.bot.name} work on?`} description={model.loading ? 'Restoring messages and active tasks.' : 'One bot, one continuous conversation. Give it a task to get started.'} />}
+      {!entries.length && <ConversationEmptyState className="timber-chat-empty" title={model.loading ? 'Loading…' : `Ask ${model.bot.name}`} description="" />}
       {entries.map(entry => <div className="timber-timeline-entry" key={entry.key}>{entry.node}</div>)}
       {model.feedback && (!model.runFilter || model.feedback.runId === model.runFilter) && <div id="approval-feedback" role="status" className={model.feedback.error ? 'timber-feedback timber-inline-error' : 'timber-feedback'}>{model.feedback.text}</div>}
       {model.stream && <Message from="assistant" id="streaming-message" className="timber-message" data-run-id={model.stream.runId}>
@@ -230,9 +239,9 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
         <MessageContent className="timber-message-content"><div id="streaming-text"><Response text={model.stream.text} streaming /></div></MessageContent>
         <CopyMessage text={model.stream.text} kind="streaming" />
       </Message>}
-      {!model.stream && visibleRun && !terminal.has(visibleRun.status) && <div className="timber-work-status" role="status">
+      {!model.stream && visibleRun && !terminal.has(visibleRun.status) && !hasInlineStatus && <div className="timber-work-status" role="status">
         {visibleRun.status === 'waiting_connection' ? <GitBranchIcon /> : visibleRun.status === 'waiting_approval' ? <ShieldCheckIcon /> : visibleRun.status === 'queued' ? <ClockIcon /> : <LoaderCircleIcon className="timber-spinner" />}
-        <span>{visibleRun.status === 'waiting_connection' ? 'Waiting for GitHub access' : visibleRun.status === 'waiting_approval' ? 'Waiting for your approval' : visibleRun.status === 'queued' ? 'Task queued · waiting to start' : `${model.bot.name} is working`}</span>
+        <span>{visibleRun.status === 'waiting_connection' ? 'Waiting for GitHub access' : visibleRun.status === 'waiting_approval' ? 'Waiting for your approval' : visibleRun.status === 'queued' ? 'Queued' : `${model.bot.name} is working`}</span>
       </div>}
       {visibleRun?.error && !model.messages.some(message => message.role === 'user' && message.runId === visibleRun.id) && <div className="timber-delivery-error" role="status"><p>{visibleRun.error}</p>{visibleRun.status === 'queued' && visibleRun.error.includes('Retry this message') && <Button variant="outline" size="sm" disabled={model.sending} onClick={() => callbacks.onRetry(model.bot.id, visibleRun.operationId)}>Retry sending</Button>}</div>}
     </ConversationContent>
@@ -241,18 +250,34 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
 }
 
 function Chat({ model, callbacks }: { model: ChatModel; callbacks: ChatCallbacks }) {
-  const active = model.currentRun && !terminal.has(model.currentRun.status);
+  const textarea = useRef<HTMLTextAreaElement>(null);
+  useLayoutEffect(() => {
+    const input = textarea.current;
+    if (!input) return;
+    const resize = () => {
+      input.style.height = '0px';
+      input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
+      input.style.overflowY = input.scrollHeight > 160 ? 'auto' : 'hidden';
+    };
+    resize();
+    let width = input.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (width === input.clientWidth) return;
+      width = input.clientWidth;
+      resize();
+    });
+    observer.observe(input);
+    return () => observer.disconnect();
+  }, [model.draft]);
   return <div className="timber-chat-layout">
-    {model.runFilter && <div id="run-filter" className="timber-filter"><span>Showing messages from this run</span><Button id="clear-run-filter" variant="ghost" size="sm" onClick={callbacks.onClearFilter}>Show all messages</Button></div>}
+    {model.runFilter && <div id="run-filter" className="timber-filter"><span>Filtered by task</span><Button id="clear-run-filter" variant="ghost" size="sm" onClick={callbacks.onClearFilter}>Show all messages</Button></div>}
     <Conversation className="timber-conversation" initial="instant" resize="instant"><ConversationBody model={model} callbacks={callbacks} /></Conversation>
     <div className="timber-composer-wrap">
       <PromptInput id="message-form" className="timber-composer" maxFiles={0} onReset={event => event.preventDefault()} onSubmit={({text}) => {if (!model.sending && text.trim()) callbacks.onSend(model.bot.id, text);}}>
-        <PromptInputBody><PromptInputTextarea id="message" aria-label={`Message ${model.bot.name}`} placeholder={`Message ${model.bot.name}…`} value={model.draft} onChange={event => callbacks.onDraft(model.bot.id, event.currentTarget.value)} /></PromptInputBody>
-        <PromptInputFooter className="timber-composer-footer"><span className="timber-composer-hint">{active ? 'New messages queue as separate tasks' : 'Enter to send · Shift + Enter for a new line'}</span><div className="timber-composer-actions">
-          <PromptInputSubmit aria-label="Send message" title="Send message" disabled={model.sending || !model.draft.trim()}>{model.sending ? <LoaderCircleIcon className="timber-spinner" /> : <ArrowUpIcon />}</PromptInputSubmit>
-        </div></PromptInputFooter>
+        <PromptInputBody><PromptInputTextarea ref={textarea} id="message" rows={1} aria-label={`Message ${model.bot.name}`} placeholder={`Message ${model.bot.name}…`} value={model.draft} onChange={event => callbacks.onDraft(model.bot.id, event.currentTarget.value)} />
+          <PromptInputSubmit className="timber-send" aria-label="Send message" title="Send message" disabled={model.sending || !model.draft.trim()}>{model.sending ? <LoaderCircleIcon className="timber-spinner" /> : <ArrowUpIcon />}</PromptInputSubmit>
+        </PromptInputBody>
       </PromptInput>
-      <div className="timber-composer-caption"><ShieldCheckIcon aria-hidden="true" /><span>{model.bot.computerApprovalMode === 'automatic' ? 'Computer use allowed for this bot' : 'Computer actions require your approval'}</span></div>
     </div>
   </div>;
 }

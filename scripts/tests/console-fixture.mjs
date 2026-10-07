@@ -29,6 +29,7 @@ export async function createConsoleFixture({port = 0} = {}) {
   await readFile(resolve(consoleRoot, 'index.html'));
   const date = '2026-10-05T10:00:00.000Z';
   const state = {
+    sessions: new Set(), sessionCalls: [], requestAuth: [],
     githubConnected: false, connectionGate: null, appOpenGate: null, appRefreshStates: new Map(), appRefreshGate: null, previewCalls: [], rejectAuth: false, actionGate: null, readsGate: null, messageGates: new Map(), messageResponseGates: new Map(), messageOperations: new Map(), patchGate: null, patchError: null, deleteGates: new Map(), deleteError: null, deletingBots: new Set(), deletedBots: new Set(), approvalGate: null, approvalError: null, approvalStatus: null, computerStates: new Map(), computerStatusGate: null, failures: [], actions: [], calls: [], streams: new Set(), events: [],
     bots: [
       {id: BOT_A, name: 'Ada', instructions: 'Research and turn findings into useful notes.', model: 'gpt-6.1-sol', runtime: 'pi', createdAt: date, updatedAt: date},
@@ -71,7 +72,25 @@ export async function createConsoleFixture({port = 0} = {}) {
         response.writeHead(200, {'content-type': contentType, 'content-security-policy': `default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob: data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' ${state.previewOrigin}`}); response.end(data); return;
       }
       if (path === '/github-connect') {response.writeHead(200, {'content-type': 'text/html'}).end('<!doctype html><title>GitHub connection</title><p>GitHub consent fixture</p>'); return;}
-      if (state.rejectAuth || request.headers.authorization !== `Bearer ${TEST_TOKEN}`) return json({error: {code: 'unauthorized', message: 'Token rejected.'}}, 401);
+      const sessionId = /(?:^|;\s*)timber_fixture_session=([^;]+)/.exec(request.headers.cookie || '')?.[1];
+      const sessionValid = Boolean(sessionId && state.sessions.has(sessionId) && !state.rejectAuth);
+      if (path === '/v1/session') {
+        state.sessionCalls.push({method: request.method, hasBearer: Boolean(request.headers.authorization), hasCookie: Boolean(sessionId)});
+        if (request.method === 'POST') {
+          if (state.rejectAuth || request.headers.authorization !== `Bearer ${TEST_TOKEN}`) return json({error: {code: 'unauthorized', message: 'Token rejected.'}}, 401);
+          const id = randomUUID(); state.sessions.add(id);
+          response.setHeader('set-cookie', `timber_fixture_session=${id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000`);
+          return json({authenticated: true, expiresAt: new Date(Date.now() + 2592000000).toISOString()});
+        }
+        if (request.method === 'DELETE') {
+          state.sessions.delete(sessionId);
+          response.setHeader('set-cookie', 'timber_fixture_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
+          return json({authenticated: false});
+        }
+        return sessionValid ? json({authenticated: true}) : json({error: {code: 'unauthorized', message: 'Session expired.'}}, 401);
+      }
+      state.requestAuth.push({path: request.url, hasBearer: Boolean(request.headers.authorization), hasCookie: sessionValid, client: request.headers['x-timber-client']});
+      if (!sessionValid || request.headers['x-timber-client'] !== 'console' || request.headers.authorization) return json({error: {code: 'unauthorized', message: 'Session rejected.'}}, 401);
       let body; if (!['GET', 'HEAD'].includes(request.method)) {let raw = ''; for await (const chunk of request) raw += chunk; body = raw ? JSON.parse(raw) : {};}
       state.calls.push({path: request.url, method: request.method, body});
       if (path === '/v1/connections/github/connect' && request.method === 'POST') return json({url: '/github-connect', connected: false});

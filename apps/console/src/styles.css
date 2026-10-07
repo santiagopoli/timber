@@ -32,46 +32,24 @@
 
 @layer base {
   :root {
-    --background: #f6f7f4;
-    --foreground: #202923;
-    --card: #fff;
-    --card-foreground: #202923;
-    --popover: #fff;
-    --popover-foreground: #202923;
-    --primary: #276346;
-    --primary-foreground: #fff;
-    --secondary: #eef1eb;
-    --secondary-foreground: #202923;
-    --chat-muted: #eef1eb;
-    --muted-foreground: #637168;
-    --chat-accent: #e5efe5;
-    --accent-foreground: #276346;
-    --destructive: #a43b30;
-    --border: #dfe5dc;
-    --input: #dfe5dc;
-    --ring: #276346;
+    --background: var(--bg);
+    --foreground: var(--ink);
+    --card: var(--surface);
+    --card-foreground: var(--ink);
+    --popover: var(--surface);
+    --popover-foreground: var(--ink);
+    --primary: var(--accent);
+    --primary-foreground: var(--bg);
+    --secondary: var(--soft);
+    --secondary-foreground: var(--ink);
+    --chat-muted: var(--soft);
+    --muted-foreground: var(--muted);
+    --chat-accent: var(--accent-soft);
+    --accent-foreground: var(--ink);
+    --destructive: var(--danger);
+    --border: var(--line);
+    --input: var(--line);
+    --ring: var(--ink);
     --radius: 0.625rem;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --background: #141b16;
-      --foreground: #e3ebe3;
-      --card: #1b241e;
-      --card-foreground: #e3ebe3;
-      --popover: #1b241e;
-      --popover-foreground: #e3ebe3;
-      --primary: #91bda0;
-      --primary-foreground: #15251a;
-      --secondary: #263027;
-      --secondary-foreground: #e3ebe3;
-      --chat-muted: #263027;
-      --muted-foreground: #9ba99b;
-      --chat-accent: #293b2d;
-      --accent-foreground: #91bda0;
-      --destructive: #f0a093;
-      --border: #334033;
-      --input: #334033;
-      --ring: #91bda0;
-    }
   }
 }

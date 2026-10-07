@@ -11,7 +11,7 @@ describe("live desktop and workspace boundary",()=>{
   it("uses single-use bot-bound tickets, private transport credentials and closes revoked sockets",async()=>{
     const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
     await runInDurableObject(stub,async(instance,state)=>{
-      Object.defineProperty(instance,"ensureReady",{value:async()=>({ok:true,desktop:true,capabilities:["workspace","liveDesktop"]})});
+      Object.defineProperty(instance,"initializeWorkspace",{value:async()=>({ok:true,desktop:true,capabilities:["workspace","liveDesktop"]})});
       let chosenPort=0;
       let remote:WebSocket|undefined;
       Object.defineProperty(instance,"container",{get:()=>({running:true,async setInactivityTimeout(){},getTcpPort(port:number){chosenPort=port;return{fetch:async(request:Request)=>{
@@ -39,7 +39,7 @@ describe("live desktop and workspace boundary",()=>{
   it("enforces exclusive control, expiry and blocks effects before journaling",async()=>{
     const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
     await runInDurableObject(stub,async(instance,state)=>{
-      Object.defineProperty(instance,"ensureReady",{value:async()=>({ok:true,desktop:true,capabilities:["liveDesktop"]})});
+      Object.defineProperty(instance,"initializeWorkspace",{value:async()=>({ok:true,desktop:true,capabilities:["liveDesktop"]})});
       const create=()=>instance.fetch(internal(botId,"/desktop","POST",{mode:"control"}));
       const first=await create();expect(first.status).toBe(200);
       const {sessionId}=await first.json<{sessionId:string}>();
@@ -60,7 +60,7 @@ describe("live desktop and workspace boundary",()=>{
     const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
     await runInDurableObject(stub,async(instance)=>{
       let probes=0;
-      Object.defineProperty(instance,"ensureReady",{value:async()=>({ok:true,desktop:true,capabilities:["workspace"]})});
+      Object.defineProperty(instance,"initializeWorkspace",{value:async()=>({ok:true,desktop:true,capabilities:["workspace"]})});
       Object.defineProperty(instance,"health",{value:async()=>{probes++;return {ok:true,desktop:true,capabilities:["workspace","liveDesktop"]};}});
       const response=await instance.fetch(internal(botId,"/desktop","POST",{mode:"view"}));
       expect(response.status).toBe(200);expect(probes).toBe(1);
@@ -75,7 +75,7 @@ describe("live desktop and workspace boundary",()=>{
       for(let i=0;i<4;i++)await sessions.create(botId,"view");
       await expect(sessions.create(botId,"view")).rejects.toMatchObject({status:429});
       await sessions.closeAll();
-      Object.defineProperty(instance,"ensureReady",{value:async()=>({ok:true,desktop:true,capabilities:[]})});
+      Object.defineProperty(instance,"initializeWorkspace",{value:async()=>({ok:true,desktop:true,capabilities:[]})});
       expect((await instance.fetch(internal(botId,"/workspace/tree"))).status).toBe(409);
       expect((await instance.fetch(internal(botId,"/desktop","POST",{mode:"view"}))).status).toBe(409);
     });
@@ -84,7 +84,7 @@ describe("live desktop and workspace boundary",()=>{
     const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
     await runInDurableObject(stub,async(instance,state)=>{
       await state.storage.put("botId",botId);
-      Object.defineProperty(instance,"ensureReady",{value:async()=>({ok:true,desktop:true,capabilities:["workspace"]})});
+      Object.defineProperty(instance,"initializeWorkspace",{value:async()=>({ok:true,desktop:true,capabilities:["workspace"]})});
       Object.defineProperty(instance,"call",{value:async(path:string)=>{expect(path).toBe("/workspace/download?path=index.html");return new Response("<script>bad()</script>",{headers:{"content-type":"text/html"}});}});
       const response=await instance.fetch(internal(botId,"/workspace/download?path=index.html"));
       expect(response.status).toBe(200);expect(response.headers.get("content-disposition")).toContain("attachment");expect(response.headers.get("content-security-policy")).toContain("sandbox");

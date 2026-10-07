@@ -4,6 +4,7 @@ import {chromium} from 'playwright';
 import {mkdir} from 'node:fs/promises';
 import {createConsoleFixture,TEST_TOKEN,BOT_A,BOT_B} from './console-fixture.mjs';
 let browser;
+const openPanel=async(page,panel)=>{if(!await page.locator(`#tab-${panel}`).isVisible())await page.locator('#panel-menu > summary').click();await page.locator(`#tab-${panel}`).click();};
 before(async()=>{browser=await chromium.launch({headless:true,...(process.env.CONSOLE_CHROMIUM_PATH?{executablePath:process.env.CONSOLE_CHROMIUM_PATH}:{}),...(process.env.CONSOLE_CHROMIUM_ARGS?{args:JSON.parse(process.env.CONSOLE_CHROMIUM_ARGS)}:{})});});
 after(async()=>{await browser?.close();});
 const text='const message: string = "hello";\nconsole.log(message);';
@@ -16,7 +17,7 @@ async function withWorkspace(work,{width=1440}={}) {
  await page.addInitScript(()=>document.addEventListener('securitypolicyviolation',e=>globalThis.__workspaceCsp({directive:e.effectiveDirective,resource:e.blockedURI})));
  await page.route('**/v1/bots/*/workspace/**',async route=>{
   const url=new URL(route.request().url());calls.push(url.pathname+url.search);
-  assert.equal(route.request().headers().authorization,`Bearer ${TEST_TOKEN}`);
+  const headers=await route.request().allHeaders();assert.equal(headers.authorization,undefined);assert.equal(headers['x-timber-client'],'console');assert.match(headers.cookie||'',/timber_fixture_session=/);
   const path=url.searchParams.get('path'),endpoint=url.pathname.split('/').at(-1);
   const json=data=>route.fulfill({json:data});
   if(endpoint==='projects')return json({projects,truncated:false});
@@ -27,14 +28,14 @@ async function withWorkspace(work,{width=1440}={}) {
   if(endpoint==='download')return route.fulfill({body:Buffer.from([0,1,2]),headers:{'content-type':'application/octet-stream','content-disposition':'attachment; filename="data.bin"'}});
   return route.fulfill({status:404,json:{error:{message:'Unknown fixture endpoint'}}});
  });
- const login=async()=>{await page.goto(fixture.url);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('#bot-workspace').waitFor({state:'visible'});};
+ const login=async()=>{await page.goto(fixture.url);await page.locator('#login').waitFor({state:'visible'});await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('#app').waitFor({state:'visible'});if(width<=760)await page.locator('.bot-item').first().click();await page.locator('#bot-workspace').waitFor({state:'visible'});};
  try {await work({page,login,calls,context});assert.deepEqual(errors,[]);assert.deepEqual(violations,[]);}
  finally{await context.close();await fixture.close();}
 }
 test('workspace browser opens highlighted code, safely displays HTML and downloads binary files',async()=>{
  await withWorkspace(async({page,login,calls})=>{
   await login();assert.equal(calls.length,0,'hidden Files does not wake the computer');
-  await page.locator('#tab-files').click();await page.locator('.workspace-project').filter({hasText:'feature/preview'}).waitFor();
+  await openPanel(page,'files');await page.locator('.workspace-project').filter({hasText:'feature/preview'}).waitFor();
   assert.equal(await page.locator('.workspace-project').count(),2);
   assert.equal(await page.getByRole('button',{name:'outside ↗'}).isDisabled(),true);
   await page.locator('.workspace-entry').filter({hasText:'frontend'}).click();
@@ -52,7 +53,7 @@ test('workspace browser opens highlighted code, safely displays HTML and downloa
 });
 test('multiple Git projects expose branch state and staged/working diffs on mobile',async()=>{
  await withWorkspace(async({page,login})=>{
-  await login();await page.locator('#tab-files').click();
+  await login();await openPanel(page,'files');
   await page.locator('.workspace-project').filter({hasText:'feature/preview'}).click();
   await page.locator('.workspace-changes .workspace-entry').filter({hasText:'app.ts'}).click();
   await page.locator('.workspace-diff').filter({hasText:'+new'}).waitFor();
@@ -63,7 +64,7 @@ test('multiple Git projects expose branch state and staged/working diffs on mobi
   await page.getByRole('button',{name:'File',exact:true}).click();await page.locator('.workspace-source').filter({hasText:'const message'}).waitFor();
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
   if(process.env.CONSOLE_SCREENSHOT_DIR){await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/workspace-files-mobile.png`,fullPage:true});}
-  await page.locator(`[data-bot-id="${BOT_B}"]`).click();await page.locator('#selected-name').filter({hasText:'Linus'}).waitFor();
+  await page.locator('#mobile-back').click();await page.locator(`[data-bot-id="${BOT_B}"]`).click();await page.locator('#selected-name').filter({hasText:'Linus'}).waitFor();
   assert.equal(await page.locator('.workspace-source').count(),0,'switching bots removes old source');
  },{width:390});
 });

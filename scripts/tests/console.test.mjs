@@ -21,15 +21,41 @@ async function withPage(work, options = {}) {
     void globalThis.__consoleTestCspViolation({directive: event.effectiveDirective, resource: event.blockedURI});
   }));
   page.on('pageerror', error => errors.push(error.message)); page.setDefaultTimeout(6000);
-  const login = async () => {await page.goto(fixture.url); await page.locator('#token').fill(TEST_TOKEN); await page.locator('#connect-form button').click(); await page.locator('#bot-workspace').waitFor({state: 'visible'}); await page.locator('#stream-state').filter({hasText: 'Live'}).waitFor({state: 'attached'});};
+  const login = async ({selectFirstBot = true} = {}) => {
+    await page.goto(fixture.url); await page.locator('#login').waitFor({state: 'visible'});
+    await page.locator('#token').fill(TEST_TOKEN); await page.locator('#connect-form button').click(); await page.locator('#app').waitFor({state: 'visible'});
+    if (!selectFirstBot) return;
+    if (page.viewportSize().width <= 760) await page.locator('.bot-item').first().click();
+    await page.locator('#bot-workspace').waitFor({state: 'visible'}); await page.locator('#stream-state').filter({hasText: 'Live'}).waitFor({state: 'attached'});
+  };
   try {await work({...fixture, page, context, login}); assert.deepEqual(errors, [], 'no uncaught browser errors'); assert.deepEqual(cspViolations, [], 'bundled conversation works within the production content security policy'); assert.deepEqual(fixture.state.failures, [], 'fixture requests completed');}
   finally {await context.close(); await fixture.close();}
 }
-const until = async (page, id, text) => page.locator(id).filter({hasText: text}).waitFor();
+const until = async (page, id, text) => page.locator(id).filter({hasText: text}).waitFor({state: ['#selected-computer-mode', '#run-status'].includes(id) ? 'attached' : 'visible'});
+const selectBot = async (page, botId) => {
+  if (page.viewportSize().width <= 760 && !await page.locator(`[data-bot-id="${botId}"]`).isVisible()) await page.locator('#mobile-back').click();
+  await page.locator(`[data-bot-id="${botId}"]`).click();
+};
+const openPanel = async (page, panel) => {
+  if (!await page.locator(`#tab-${panel}`).isVisible()) await page.locator('#panel-menu > summary').click();
+  await page.locator(`#tab-${panel}`).click();
+};
+const openBotEditor = async page => {
+  if (!await page.locator('#edit-bot').isVisible()) await page.locator('#panel-menu > summary').click();
+  await page.locator('#edit-bot').click();
+};
+const signOut = async page => {
+  if (!await page.locator('#settings-dialog').isVisible()) {
+    if (await page.locator('#settings-button').isVisible()) await page.locator('#settings-button').click();
+    else {if (!await page.locator('#mobile-account').isVisible()) await page.locator('#panel-menu > summary').click(); await page.locator('#mobile-account').click();}
+  }
+  await page.locator('#disconnect').click();
+};
+
 const sentMessages = (state, botId) => state.calls.filter(call => call.method === 'POST' && call.path === `/v1/bots/${botId}/messages`);
 const sendMessage = page => page.locator('#message-form').getByRole('button', {name: /^Send(?: message)?(?:\s|$)/}).click();
 const deletedBots = state => state.calls.filter(call => call.method === 'DELETE' && /^\/v1\/bots\//.test(call.path));
-const openDelete = async page => {await page.locator('#edit-bot').click(); await page.locator('#delete-bot').click(); await page.locator('#delete-dialog').waitFor({state: 'visible'});};
+const openDelete = async page => {await openBotEditor(page); await page.locator('#delete-bot').click(); await page.locator('#delete-dialog').waitFor({state: 'visible'});};
 
 test('Enter and Send enqueue follow-up messages without cancelling the active run', async () => {
   await withPage(async ({page, login, state}) => {
@@ -62,9 +88,9 @@ test('explicitly stopping a run reports cancellation in the conversation without
     assert.equal(run.status, 'cancelled');
     assert.deepEqual(state.calls.filter(call => call.path.endsWith('/cancel')).map(call => ({path: call.path, method: call.method})), [{path: `/v1/bots/${BOT_A}/runs/${run.id}/cancel`, method: 'POST'}]);
     state.emit(BOT_A, 'message.delta', {delta: 'Late text from a cancelled run'}, run.id);
-    await page.locator('#tab-activity').click();
+    await openPanel(page, 'activity');
     await Promise.all([page.waitForResponse(response => response.url().endsWith('/messages')), page.locator('#refresh-history').click()]);
-    await page.locator('#tab-conversation').click();
+    await openPanel(page, 'conversation');
     assert.equal(await page.locator('#streaming-message').isVisible(), false);
     assert.equal((await page.locator('#messages').innerText()).includes('Late text from a cancelled run'), false);
     assert.equal(sentMessages(state, BOT_A).length, 0); assert.equal(state.actions.length, 0);
@@ -72,7 +98,7 @@ test('explicitly stopping a run reports cancellation in the conversation without
   });
 });
 
-test('public progress and correlated tool callbacks form one activity entry while the final answer stays visible', async () => {
+test('public progress stays visible beside collapsed tool activity and the final answer survives reload', async () => {
   for (const width of [1440, 390]) await withPage(async ({page, login, state}) => {
     const createdAt = new Date().toISOString();
     const run = {id: 'activity-final-run', botId: BOT_A, operationId: 'activity-final-operation', status: 'running', createdAt, updatedAt: createdAt};
@@ -84,7 +110,11 @@ test('public progress and correlated tool callbacks form one activity entry whil
     state.emit(BOT_A, 'tool.started', {toolCallId, toolName: 'exec'}, run.id);
     await login();
     const activity = page.locator(`[data-run-activity="${run.id}"]`);
-    await activity.locator(`[data-progress-message-id="${progress.id}"]`).waitFor();
+    const publicProgress = page.locator(`[data-progress-message-id="${progress.id}"]`);
+    await publicProgress.waitFor({state: 'visible'});
+    assert.equal(await publicProgress.evaluate(node => node.closest('[data-run-activity]') === null), true, 'bot commentary remains a visible conversation message');
+    assert.equal(await activity.getByRole('button', {name: /^Activity/}).getAttribute('aria-expanded'), 'false', 'routine tool details start collapsed');
+    await activity.getByRole('button', {name: /^Activity/}).click();
     assert.equal(await page.locator(`[data-message-id="${legacy.id}"]`).evaluate(node => node.closest('[data-run-activity]') === null), true);
     await activity.locator(`[data-tool-operation-id="${toolCallId}"]`).waitFor();
     assert.equal(await activity.locator('[data-tool-operation-id]').count(), 1);
@@ -111,9 +141,14 @@ test('public progress and correlated tool callbacks form one activity entry whil
     if (await disclosure.getAttribute('aria-expanded') === 'false') await disclosure.click();
     assert.equal(await activity.locator('[data-tool-operation-id]').count(), 1);
     assert.equal(await tool.locator('pre').first().textContent(), '/workspace\n', 'the native completion callback preserves the host result');
-    assert.equal(await activity.locator(`[data-progress-message-id="${progress.id}"]`).count(), 1);
+    assert.equal(await activity.locator(`[data-progress-message-id="${progress.id}"]`).count(), 0);
+    assert.equal(await page.locator(`[data-progress-message-id="${progress.id}"]`).count(), 1);
     assert.equal(await activity.locator(`[data-message-id="${final.id}"]`).count(), 0);
     if (process.env.CONSOLE_SCREENSHOT_DIR) {await mkdir(process.env.CONSOLE_SCREENSHOT_DIR, {recursive: true}); await answer.scrollIntoViewIfNeeded(); await page.screenshot({path: `${process.env.CONSOLE_SCREENSHOT_DIR}/activity-final-${width}.png`, animations: 'disabled'});}
+    await page.reload(); await page.locator('#bot-workspace').waitFor({state: 'visible'});
+    await page.locator(`[data-progress-message-id="${progress.id}"]`).waitFor({state: 'visible'});
+    await page.locator(`[data-message-id="${final.id}"]`).waitFor({state: 'visible'});
+    assert.equal(await page.locator(`[data-run-activity="${run.id}"]`).getByRole('button', {name: /^Activity/}).getAttribute('aria-expanded'), 'false', 'reload does not hide public messages inside tools');
     assert.equal(state.calls.some(call => call.method !== 'GET'), false); assert.equal(state.actions.length, 0);
   }, {viewport: {width, height: 1000}});
 });
@@ -223,8 +258,8 @@ test('pending and streaming message copy uses the text visible at that moment', 
 
 test('bot deletion requires confirmation and retains the captured target during a selection change', async () => {
   await withPage(async ({page, login, state}) => {
-    await login(); await page.locator(`[data-bot-id="${BOT_B}"]`).click(); await until(page, '#selected-name', 'Linus');
-    await page.locator('#message').fill('Keep Linus draft'); await page.locator(`[data-bot-id="${BOT_A}"]`).click();
+    await login(); await selectBot(page, BOT_B); await until(page, '#selected-name', 'Linus');
+    await page.locator('#message').fill('Keep Linus draft'); await selectBot(page, BOT_A);
     await openDelete(page); assert.match(await page.locator('#delete-title').innerText(), /Ada/);
     await page.locator('#cancel-delete-bot').click(); await page.locator('#delete-dialog').waitFor({state: 'hidden'});
     assert.equal(deletedBots(state).length, 0); assert.equal(state.bots.length, 2);
@@ -284,8 +319,8 @@ test('deleting the final bot clears its conversation, computer view and selectio
   await withPage(async ({page, login, state}) => {
     state.bots = state.bots.filter(bot => bot.id === BOT_A);
     await login(); await page.locator('#message').fill('Draft belonging only to the deleted bot');
-    await page.locator('#tab-computer').click(); await page.locator('#computer-tools > summary').click(); await page.locator('#take-screenshot').click(); await page.locator('#screenshot').waitFor({state: 'visible'});
-    await page.locator('#tab-conversation').click(); await openDelete(page); await page.locator('#confirm-delete-bot').click();
+    await openPanel(page, 'computer'); await page.locator('#computer-tools > summary').click(); await page.locator('#take-screenshot').click(); await page.locator('#screenshot').waitFor({state: 'visible'});
+    await openPanel(page, 'conversation'); await openDelete(page); await page.locator('#confirm-delete-bot').click();
     await page.locator('#delete-dialog').waitFor({state: 'hidden'}); await page.locator('#empty').waitFor({state: 'visible'});
     assert.equal(await page.locator('#bot-workspace').isVisible(), false); assert.equal(await page.locator('.bot-item').count(), 0);
     assert.equal(await page.locator('[data-message-id], [data-operation-id], [data-approval-id]').count(), 0);
@@ -375,7 +410,7 @@ test('a pending send stays scoped to its bot while another bot sends and keeps a
     await page.locator('#message').fill('Task captured for Ada'); await sendMessage(page);
     await until(page, '#messages [data-operation-id]', 'Sending');
     await page.locator('#message').fill('Ada next draft');
-    await page.locator(`[data-bot-id="${BOT_B}"]`).click(); await until(page, '#selected-name', 'Linus');
+    await selectBot(page, BOT_B); await until(page, '#selected-name', 'Linus');
     assert.equal(await page.locator('#message').inputValue(), '');
     await page.locator('#message').fill('Independent task for Linus'); await sendMessage(page);
     await page.locator('[data-message-id]').filter({hasText: 'Independent task for Linus'}).waitFor();
@@ -384,7 +419,7 @@ test('a pending send stays scoped to its bot while another bot sends and keeps a
     release(); await completed;
     assert.equal(await page.locator('#message').inputValue(), 'Linus next draft');
     assert.equal((await page.locator('#messages').innerText()).includes('Task captured for Ada'), false);
-    await page.locator(`[data-bot-id="${BOT_A}"]`).click(); await until(page, '#selected-name', 'Ada');
+    await selectBot(page, BOT_A); await until(page, '#selected-name', 'Ada');
     await page.locator('[data-message-id]').filter({hasText: 'Task captured for Ada'}).waitFor();
     assert.equal(await page.locator('#message').inputValue(), 'Ada next draft');
     assert.equal(sentMessages(state, BOT_A).length, 1); assert.equal(sentMessages(state, BOT_B).length, 1);
@@ -498,17 +533,17 @@ test('bot administration, isolated drafts, safe message rendering and session cl
     assert.match(await page.locator('#messages pre').innerText(), /cat notes/);
     await page.locator('#message').fill('Draft only for Ada');
     await page.locator('#bot-search').fill('Linus'); assert.equal(await page.locator('.bot-item').count(), 1);
-    await page.locator(`[data-bot-id="${BOT_B}"]`).click(); await until(page, '#selected-name', 'Linus'); assert.equal(await page.locator('#message').inputValue(), '');
+    await selectBot(page, BOT_B); await until(page, '#selected-name', 'Linus'); assert.equal(await page.locator('#message').inputValue(), '');
     await page.locator('#message').fill('Draft only for Linus'); await page.locator('#bot-search').fill('');
-    await page.locator(`[data-bot-id="${BOT_A}"]`).click(); await until(page, '#selected-name', 'Ada'); assert.equal(await page.locator('#message').inputValue(), 'Draft only for Ada');
-    await page.locator('#edit-bot').click(); await page.locator('#edit-name').fill('Ada research'); await page.locator('#edit-instructions').fill('Keep concise research notes.'); await page.locator('#edit-form [type=submit]').click(); await until(page, '#selected-name', 'Ada research');
+    await selectBot(page, BOT_A); await until(page, '#selected-name', 'Ada'); assert.equal(await page.locator('#message').inputValue(), 'Draft only for Ada');
+    await openBotEditor(page); await page.locator('#edit-name').fill('Ada research'); await page.locator('#edit-instructions').fill('Keep concise research notes.'); await page.locator('#edit-form [type=submit]').click(); await until(page, '#selected-name', 'Ada research');
     assert.equal(state.bots[0].instructions, 'Keep concise research notes.');
     await page.locator('#new-bot').click(); await page.locator('#bot-name').fill('Grace'); await page.locator('#bot-instructions').fill('Review software.'); await page.locator('#create-form [type=submit]').click(); await until(page, '#selected-name', 'Grace');
     assert.equal(state.bots[0].name, 'Grace'); assert.match(page.url(), /#bot=/);
     const storage = await page.evaluate(() => ({local: {...localStorage}, session: {...sessionStorage}})); assert.equal(JSON.stringify(storage).includes(TEST_TOKEN), false);
-    await page.locator('#disconnect').click(); await page.locator('#login').waitFor({state: 'visible'}); assert.equal(await page.locator('#token').inputValue(), ''); assert.deepEqual((await page.locator('#messages').allTextContents()).filter(text => text.trim()), [], 'disconnect clears or unmounts conversation content');
+    await signOut(page); await page.locator('#login').waitFor({state: 'visible'}); assert.equal(await page.locator('#token').inputValue(), ''); assert.deepEqual((await page.locator('#messages').allTextContents()).filter(text => text.trim()), [], 'disconnect clears or unmounts conversation content');
     await login(); assert.equal(await page.locator('#message').inputValue(), '', 'drafts removed on disconnect');
-    await page.reload(); await page.locator('#login').waitFor({state: 'visible'}); assert.equal(await page.locator('#app').isVisible(), false);
+    await page.reload(); await page.locator('#bot-workspace').waitFor({state: 'visible'}); assert.equal(await page.locator('#login').isVisible(), false, 'the authenticated session survives reload');
   });
 });
 
@@ -522,14 +557,14 @@ test('computer permission defaults to ask and persists explicit create/edit sett
     state.approvals.set(BOT_A, structuredClone(previousApprovals));
     assert.equal(state.bots[0].computerApprovalMode, undefined, 'fixture includes a legacy bot');
     await login(); await until(page, '#selected-computer-mode', 'Ask for each action');
-    await page.locator('#edit-bot').click(); assert.equal(await page.locator('#edit-computer-approval-mode').inputValue(), 'ask');
-    assert.match(await page.locator('#edit-computer-approval-help').innerText(), /commands, write files, and control the browser/);
+    await openBotEditor(page); assert.equal(await page.locator('#edit-computer-approval-mode').inputValue(), 'ask');
+    assert.match(await page.locator('#edit-computer-approval-help').innerText(), /commands, file changes and desktop control/);
     assert.match(await page.locator('#edit-computer-approval-help').innerText(), /Existing requests stay unchanged/);
     await page.locator('#edit-computer-approval-mode').selectOption('automatic'); await page.locator('#edit-form [type=submit]').click();
     await until(page, '#selected-computer-mode', 'Use authorized');
     assert.equal(state.bots.find(bot => bot.id === BOT_A).computerApprovalMode, 'automatic');
     assert.equal(state.calls.find(call => call.method === 'PATCH').body.computerApprovalMode, 'automatic');
-    await page.locator('#disconnect').click(); await login(); await page.locator('#edit-bot').click();
+    await signOut(page); await login(); await openBotEditor(page);
     assert.equal(await page.locator('#edit-computer-approval-mode').inputValue(), 'automatic', 'saved permission survives reconnect');
     await page.locator('#edit-computer-approval-mode').selectOption('ask'); await page.locator('#edit-form [type=submit]').click();
     await until(page, '#selected-computer-mode', 'Ask for each action'); assert.equal(state.bots.find(bot => bot.id === BOT_A).computerApprovalMode, 'ask');
@@ -537,7 +572,7 @@ test('computer permission defaults to ask and persists explicit create/edit sett
     await page.locator('#bot-name').fill('Authorized bot'); await page.locator('#bot-computer-approval-mode').selectOption('automatic');
     await page.locator('#create-form [type=submit]').click(); await until(page, '#selected-name', 'Authorized bot'); await until(page, '#selected-computer-mode', 'Use authorized');
     assert.equal(state.bots[0].computerApprovalMode, 'automatic');
-    await page.locator('#edit-bot').click(); assert.equal(await page.locator('#edit-computer-approval-mode').inputValue(), 'automatic'); await page.locator('#edit-dialog [data-close-dialog]').first().click();
+    await openBotEditor(page); assert.equal(await page.locator('#edit-computer-approval-mode').inputValue(), 'automatic'); await page.locator('#edit-dialog [data-close-dialog]').first().click();
     await page.locator('#new-bot').click(); assert.equal(await page.locator('#bot-computer-approval-mode').inputValue(), 'ask', 'each new bot starts with per-action approval');
     await page.locator('#bot-name').fill('Ask bot'); await page.locator('#create-form [type=submit]').click(); await until(page, '#selected-name', 'Ask bot');
     assert.equal(state.bots[0].computerApprovalMode, 'ask');
@@ -555,7 +590,7 @@ test('restores older active runs, ignores stale SSE and retains pagination throu
     state.runs.set(BOT_A, history); state.emit(BOT_A, 'run.updated', {run: {...history[0], status: 'running', updatedAt: '2026-10-05T11:00:00Z'}}, history[0].id);
     state.emit(BOT_A, 'message.delta', {delta: 'stale response must stay hidden'}, history[0].id);
     await login(); await until(page, '#run-status', 'waiting approval'); assert.equal(await page.locator('#streaming-message').isVisible(), false);
-    await page.locator('#tab-runs').click(); await page.locator('#load-more-runs').waitFor({state: 'visible'}); await page.locator('#load-more-runs').click();
+    await openPanel(page, 'runs'); await page.locator('#load-more-runs').waitFor({state: 'visible'}); await page.locator('#load-more-runs').click();
     await page.locator(`[data-run-id="${history[59].id}"]`).waitFor();
     state.emit(BOT_A, 'run.updated', {run: history[0]}, history[0].id);
     await page.waitForResponse(response => response.url().includes('/runs?limit=30') && !response.url().includes('before'));
@@ -570,7 +605,7 @@ test('restores older active runs, ignores stale SSE and retains pagination throu
 test('approval navigation works across panels and hides secure typing text', async () => {
   await withPage(async ({page, login, state}) => {
     const approval = {id: '30000000-0000-4000-8000-000000000001', botId: BOT_A, runId: 'pending', status: 'pending', action: {type: 'type', text: 'test-only-sensitive-input'}, expiresAt: new Date(Date.now() + 3600000).toISOString()};
-    state.approvals.set(BOT_A, [approval]); await login(); await page.locator('#tab-computer').click(); await page.locator('#approval-shortcut').click();
+    state.approvals.set(BOT_A, [approval]); await login(); await openPanel(page, 'computer'); await page.locator('#close-computer').click();
     assert.equal(await page.locator('#panel-conversation').isVisible(), true); assert.equal((await page.locator('#messages').innerText()).includes(approval.action.text), false);
     await page.locator('#messages').getByRole('button', {name: 'Deny', exact: true}).click(); await page.locator('#approval-shortcut').waitFor({state: 'hidden'}); assert.equal(approval.status, 'denied');
   });
@@ -601,9 +636,9 @@ test('interrupted approval history is collapsed and exposes safe diagnostics wit
     }
     assert.equal((await cards.first().innerText()).includes('test-only-private-typing'), false);
     assert.equal(await page.locator('#approval-shortcut').isVisible(), false, 'interrupted actions are not pending decisions');
-    await page.locator('#tab-activity').click();
+    await openPanel(page, 'activity');
     await Promise.all([page.waitForResponse(response => response.url().endsWith('/approvals')), page.locator('#refresh-history').click()]);
-    await page.locator('#tab-conversation').click(); assert.equal(await cards.count(), 8);
+    await openPanel(page, 'conversation'); assert.equal(await cards.count(), 8);
     assert.equal(state.calls.some(call => call.method !== 'GET'), false, 'loading and refreshing diagnostics never retries or decides an action');
     assert.equal(state.actions.length, 0);
   });
@@ -654,8 +689,8 @@ test('timeline ties preserve user request, approval, then answer and retain a re
     state.emit(BOT_A, 'approval.updated', {approval}, approval.runId);
     await page.waitForResponse(response => response.url().endsWith('/approvals'));
     await page.waitForFunction(expected => document.querySelector('#messages').scrollTop === expected, before);
-    await page.locator('#tab-computer').click(); await page.locator('#approval-shortcut').click();
-    assert.equal(await page.locator('#current-approval button').first().evaluate(node => node === document.activeElement), true);
+    await openPanel(page, 'computer'); await page.locator('#close-computer').click();
+    await page.waitForFunction(expected => document.querySelector('#messages').scrollTop === expected, before);
   });
 });
 
@@ -719,14 +754,14 @@ test('combined approval patches then approves once despite refreshes and bot swi
     let release; state.patchGate = new Promise(resolve => {release = resolve;});
     const patch = page.waitForRequest(request => request.method() === 'PATCH');
     await page.locator('[data-approval-decision="approve-and-allow"]').click(); await patch;
-    await page.locator('#tab-activity').click();
+    await openPanel(page, 'activity');
     await Promise.all([page.waitForResponse(response => response.url().endsWith('/approvals')), page.locator('#refresh-history').click()]);
-    await page.locator('#tab-conversation').click();
+    await openPanel(page, 'conversation');
     assert.equal(await page.locator('#current-approval button:disabled').count(), 3, 'rerender retains all disabled decision controls');
     await page.locator('[data-approval-decision="approve-and-allow"]').dispatchEvent('click');
-    await page.locator(`[data-bot-id="${BOT_B}"]`).click(); await until(page, '#selected-name', 'Linus');
+    await selectBot(page, BOT_B); await until(page, '#selected-name', 'Linus');
     const approved = page.waitForResponse(response => response.url().endsWith(`/approvals/${approval.id}`)); release(); await approved;
-    await page.locator(`[data-bot-id="${BOT_A}"]`).click(); await until(page, '#selected-computer-mode', 'Use authorized');
+    await selectBot(page, BOT_A); await until(page, '#selected-computer-mode', 'Use authorized');
     await page.locator('#current-approval').waitFor({state: 'detached'});
     assert.deepEqual(state.calls.filter(call => ['POST', 'PATCH'].includes(call.method)).map(({path, method, body}) => ({path, method, body})), [
       {path: `/v1/bots/${BOT_A}`, method: 'PATCH', body: {computerApprovalMode: 'automatic'}},
@@ -749,7 +784,7 @@ test('combined approval handles failed permission updates and expired or unconfi
     if (failure.startsWith('patch')) {assert.match(feedback, /This request was not approved/); assert.equal(state.calls.filter(call => call.method === 'POST').length, 0);}
     else {assert.match(feedback, /Computer use is allowed for future actions, but approval of this request was not confirmed/); assert.equal(state.bots[0].computerApprovalMode, 'automatic'); assert.equal(await page.locator('[data-approval-decision="approve-and-allow"]').count(), 0);}
     if (failure === 'approval-expired') assert.match(feedback, /This approval expired/);
-    await page.locator('#tab-activity').click(); await Promise.all([page.waitForResponse(response => response.url().endsWith('/approvals')), page.locator('#refresh-history').click()]);
+    await openPanel(page, 'activity'); await Promise.all([page.waitForResponse(response => response.url().endsWith('/approvals')), page.locator('#refresh-history').click()]);
     assert.equal(state.calls.filter(call => call.method === 'PATCH').length, failure === 'patch-network' ? 0 : 1);
     assert.equal(state.calls.filter(call => call.method === 'POST').length, failure === 'approval-expired' ? 1 : 0);
     assert.equal(approval.status, 'pending'); assert.equal(state.actions.length, 0);
@@ -760,7 +795,7 @@ test('logout stops the combined action before its approval follow-up', async () 
   await withPage(async ({page, login, state}) => {
     state.approvals.set(BOT_A, [pendingApproval()]); await login(); let release; state.patchGate = new Promise(resolve => {release = resolve;});
     const patch = page.waitForRequest(request => request.method() === 'PATCH'); await page.locator('[data-approval-decision="approve-and-allow"]').click(); await patch;
-    await page.locator('#disconnect').click(); release(); await page.locator('#login').waitFor({state: 'visible'});
+    await signOut(page); release(); await page.locator('#login').waitFor({state: 'visible'});
     await login(); assert.equal(await page.locator('[data-approval-decision="approve-and-allow"]').count(), 0, 'saved mode is reflected after reconnect');
     assert.equal(state.calls.filter(call => call.method === 'POST').length, 0); assert.equal(state.actions.length, 0);
   });
@@ -774,7 +809,7 @@ test('expired requests stay read-only and fresh terminal state replaces a cached
     assert.equal(await page.locator('[data-approval-decision="approve-and-allow"]').count(), 0);
     await page.locator('[data-approval-history-id="expired-request"] summary').click();
     assert.equal(await page.locator('[data-approval-status="expired"] button').count(), 0);
-    assert.match(await page.locator('[data-approval-status="expired"]').innerText(), /can no longer be approved/);
+    assert.match(await page.locator('[data-approval-status="expired"]').innerText(), /request expired/i);
     await page.locator('#current-approval [data-approval-decision="approve"]').click(); await until(page, '#current-approval', 'Approved action is executing');
     pending.status = 'completed'; state.emit(BOT_A, 'approval.updated', {approval: pending}, pending.runId);
     await page.locator('#current-approval').waitFor({state: 'detached'});
@@ -786,7 +821,7 @@ test('expired requests stay read-only and fresh terminal state replaces a cached
 test('computer status polls only while starting and visible, refreshes on events, and isolates late responses', async () => {
   await withPage(async ({page, login, state}) => {
     await page.clock.install(); state.computerStates.set(BOT_A, {state: 'starting'}); await login();
-    await page.locator('#tab-computer').click(); await until(page, '#computer-status', 'starting');
+    await openPanel(page, 'computer'); await until(page, '#computer-status', 'starting');
     const reads = () => state.calls.filter(call => call.path.endsWith('/computer')).length;
     state.computerStates.set(BOT_A, {state: 'running'});
     const ready = page.waitForResponse(response => response.url().endsWith('/computer')); await page.clock.fastForward(1600); await ready;
@@ -796,27 +831,27 @@ test('computer status polls only while starting and visible, refreshes on events
     await until(page, '#computer-status', 'Computer control server did not respond.'); assert.match(await page.locator('#computer-status').innerText(), /computer_health_unavailable/);
     const unavailableReads = reads(); await page.clock.fastForward(5000); assert.equal(reads(), unavailableReads);
     state.computerStates.set(BOT_A, {state: 'starting'}); await page.locator('#refresh-computer').click(); await until(page, '#computer-status', 'starting');
-    await page.locator('#tab-activity').click(); const hiddenReads = reads(); await page.clock.fastForward(5000); assert.equal(reads(), hiddenReads);
+    await openPanel(page, 'activity'); const hiddenReads = reads(); await page.clock.fastForward(5000); assert.equal(reads(), hiddenReads);
     let release; state.computerStatusGate = new Promise(resolve => {release = resolve;});
-    const requested = page.waitForRequest(request => request.url().endsWith(`/bots/${BOT_A}/computer`)); await page.locator('#tab-computer').click(); await requested;
-    state.computerStatusGate = null; await page.locator(`[data-bot-id="${BOT_B}"]`).click(); await until(page, '#selected-name', 'Linus'); await until(page, '#computer-status', 'running');
+    const requested = page.waitForRequest(request => request.url().endsWith(`/bots/${BOT_A}/computer`)); await openPanel(page, 'computer'); await requested;
+    state.computerStatusGate = null; await selectBot(page, BOT_B); await until(page, '#selected-name', 'Linus'); await until(page, '#computer-status', 'running');
     const late = page.waitForResponse(response => response.url().endsWith(`/bots/${BOT_A}/computer`)); release(); await late;
     await page.clock.fastForward(2000); assert.match(await page.locator('#computer-status').innerText(), /^running/);
-    const finalReads = reads(); await page.locator('#disconnect').click(); await page.clock.fastForward(5000); assert.equal(reads(), finalReads);
+    const finalReads = reads(); await signOut(page); await page.clock.fastForward(5000); assert.equal(reads(), finalReads);
     assert.equal(state.calls.some(call => call.method !== 'GET'), false); assert.equal(state.actions.length, 0);
   });
 });
 
 test('computer actions require explicit screen input and preserve responsive progress and file paths', async () => {
   await withPage(async ({page, login, state}) => {
-    await login(); await page.locator('#tab-computer').click(); await page.locator('#computer-tools > summary').click();
+    await login(); await openPanel(page, 'computer'); await page.locator('#computer-tools > summary').click();
     let release; state.actionGate = new Promise(resolve => {release = resolve;});
     await page.locator('#take-screenshot').click(); await page.locator('#computer-progress').waitFor({state: 'visible'}); assert.equal(await page.locator('#take-screenshot').isDisabled(), true);
     release(); state.actionGate = null; await page.locator('#screenshot').waitFor({state: 'visible'}); await page.locator('#computer-progress').waitFor({state: 'hidden'});
     await page.waitForFunction(() => document.querySelector('#screenshot').naturalWidth === 1280);
     await page.locator('#screenshot').click(); assert.equal(state.actions.filter(item => item.action.type === 'click').length, 0);
-    await page.locator('#click-mode').check(); await page.locator('#screenshot').click(); await page.locator('#computer-progress').waitFor({state: 'hidden'});
-    const click = state.actions.find(item => item.action.type === 'click').action; assert.ok(Math.abs(click.x - 640) <= 2 && Math.abs(click.y - 400) <= 2, 'rendered image coordinates map to real desktop dimensions');
+    await page.locator('#click-mode').check(); const imageBox = await page.locator('#screenshot').boundingBox(); await page.locator('#screenshot').click({position: {x: imageBox.width / 2, y: imageBox.height / 2}}); await page.locator('#computer-progress').waitFor({state: 'hidden'});
+    const click = state.actions.find(item => item.action.type === 'click').action; assert.ok(Math.abs(click.x - 640) <= Math.ceil(1280 / imageBox.width) && Math.abs(click.y - 400) <= Math.ceil(800 / imageBox.height), `mapping stays within one rendered pixel after integer pointer coordinates: ${JSON.stringify({click, imageBox})}`);
     assert.equal(state.actions.filter(item => item.action.type === 'screenshot').length, 1, 'no implicit recurring screenshots');
     await page.locator('#auto-screenshot').check(); await page.locator('#screenshot').click(); await page.locator('#computer-progress').waitFor({state: 'hidden'}); assert.equal(state.actions.filter(item => item.action.type === 'screenshot').length, 2);
     await page.locator('#list-files').click(); await page.locator('[data-file-name="notes"]').waitFor(); await page.locator('[data-file-name="notes"]').click(); await page.locator('[data-file-name="summary.md"]').click();
@@ -830,10 +865,10 @@ test('late responses cannot overwrite the newly selected bot and 401 clears the 
   await withPage(async ({page, login, state}) => {
     await login();
     let release; state.readsGate = new Promise(resolve => {release = resolve;});
-    await page.locator('#tab-activity').click(); await page.locator('#refresh-history').click();
-    state.readsGate = null; await page.locator(`[data-bot-id="${BOT_B}"]`).click(); await until(page, '#selected-name', 'Linus'); release();
-    await page.locator('#tab-conversation').click(); await until(page, '#messages', 'What should Linus work on?'); assert.equal((await page.locator('#messages').innerText()).includes('Three themes'), false);
-    state.rejectAuth = true; await page.locator('#reload-bots').click(); await page.locator('#login').waitFor({state: 'visible'}); assert.match(await page.locator('#login-error').innerText(), /rejected or expired/); assert.equal(await page.locator('#token').inputValue(), '');
+    await openPanel(page, 'activity'); await page.locator('#refresh-history').click();
+    state.readsGate = null; await selectBot(page, BOT_B); await until(page, '#selected-name', 'Linus'); release();
+    await openPanel(page, 'conversation'); await until(page, '#messages', 'Ask Linus'); assert.equal((await page.locator('#messages').innerText()).includes('Three themes'), false);
+    state.rejectAuth = true; await page.locator('#reload-bots').click(); await page.locator('#login').waitFor({state: 'visible'}); assert.match(await page.locator('#login-error').innerText(), /session expired/i); assert.equal(await page.locator('#token').inputValue(), '');
   });
 });
 
@@ -843,10 +878,10 @@ test('desktop and mobile panels remain within the viewport in light and dark the
     for (const [width, colorScheme] of [[1440, 'light'], [390, 'light'], [390, 'dark']]) {
       await page.setViewportSize({width, height: 1000}); await page.emulateMedia({colorScheme});
       for (const panel of ['conversation', 'runs', 'computer', 'activity']) {
-        await page.locator(`#tab-${panel}`).click();
+        await openPanel(page, panel);
         const overflow = await page.evaluate(() => document.documentElement.scrollWidth - innerWidth); assert.ok(overflow <= 1, `${panel} overflows viewport by ${overflow}px at ${width}px`);
       }
-      if (process.env.CONSOLE_SCREENSHOT_DIR) {await mkdir(process.env.CONSOLE_SCREENSHOT_DIR, {recursive: true}); await page.locator('#tab-conversation').click(); await page.screenshot({path: `${process.env.CONSOLE_SCREENSHOT_DIR}/console-${width}-${colorScheme}.png`, fullPage: true});}
+      if (process.env.CONSOLE_SCREENSHOT_DIR) {await mkdir(process.env.CONSOLE_SCREENSHOT_DIR, {recursive: true}); await openPanel(page, 'conversation'); await page.screenshot({path: `${process.env.CONSOLE_SCREENSHOT_DIR}/console-${width}-${colorScheme}.png`, fullPage: true});}
     }
   });
 });
@@ -864,13 +899,14 @@ test('GitHub repository connection stays inline and updates when access is conne
     assert.equal(await card.evaluate(node => Boolean(node.closest('#messages'))), true, 'connection is in the conversation');
     assert.equal(await card.evaluate(node => Boolean(document.querySelector('[data-message-id="github-user"]').compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING)), true, 'connection follows its request');
     assert.match(await card.innerText(), /example\/private-repo/); assert.match(await card.innerText(), /write access/);
-    await until(page, '.timber-work-status', 'Waiting for GitHub access');
+    assert.equal(await card.getAttribute('data-connection-status'), 'pending');
+    assert.equal(await page.locator('.timber-work-status').isVisible(), false, 'the inline connection request owns the waiting status');
     const newTab = context.waitForEvent('page'); await card.getByRole('button', {name: 'Connect GitHub', exact: true}).click();
     const consent = await newTab; await consent.waitForURL('**/github-connect');
     assert.equal(await consent.evaluate(() => window.opener), null);
     assert.equal(new URL(consent.url()).search, '', 'no owner credentials in the navigation');
     assert.equal(state.calls.filter(call => call.method === 'POST' && call.path.endsWith('/connect')).length, 1);
-    await card.filter({hasText: 'Finish connecting in the new tab'}).waitFor();
+    await card.filter({hasText: 'Finish in GitHub'}).waitFor();
     connection.status = 'connected'; run.status = 'running'; run.updatedAt = new Date(Date.now() + 1000).toISOString();
     state.emit(BOT_A, 'connection.updated', {connection}, run.id); state.emit(BOT_A, 'run.updated', {run}, run.id);
     await card.filter({hasText: 'GitHub access connected'}).waitFor(); await until(page, '.timber-work-status', 'Ada is working');
@@ -886,7 +922,7 @@ test('workspace apps have independent protected links and open without sending t
       {id: 'admin', botId: BOT_A, name: 'Admin', port: 3001, basePath: '/apps/admin/', url: state.appURL(BOT_A, 'admin'), state: 'unavailable', createdAt, updatedAt: createdAt},
     ]);
     await context.grantPermissions(['clipboard-read', 'clipboard-write'], {origin: new URL(url).origin});
-    await login(); await page.locator('#tab-apps').click();
+    await login(); await openPanel(page, 'apps');
     assert.equal(await page.locator('[data-app-id]').count(), 2); assert.equal(await page.locator('#app-count').textContent(), '2');
     assert.equal(await page.getByRole('button', {name: 'Open Admin', exact: true}).isDisabled(), true);
     assert.match(await page.locator('[data-app-id="admin"]').innerText(), /not responding/);
@@ -904,7 +940,7 @@ test('workspace apps have independent protected links and open without sending t
     await admin.waitFor({state: 'hidden'}); assert.equal(await page.locator('[data-app-id="frontend"]').count(), 1);
     assert.equal(state.apps.get(BOT_A).length, 1); assert.equal(state.actions.length, 0, 'opening and removing access do not run computer commands');
     assert.match(await page.locator('#apps-feedback').innerText(), /server and files were kept/);
-    await page.locator(`[data-bot-id="${BOT_B}"]`).click(); await page.locator('#workspace-app-empty').waitFor();
+    await selectBot(page, BOT_B); await page.locator('#workspace-app-empty').waitFor();
     assert.equal(await page.locator('[data-app-id]').count(), 0, 'apps remain scoped to their bot');
   }, {viewport: {width, height: 1000}});
 });
@@ -915,9 +951,9 @@ test('disconnecting while app access is being prepared closes the tab without di
     state.apps.set(BOT_A, [{id: 'slow-app', botId: BOT_A, name: 'Slow app', port: 3000, basePath: '/', url: state.appURL(BOT_A, 'slow-app'), state: 'ready', createdAt, updatedAt: createdAt}]);
     let release; state.appOpenGate = new Promise(resolve => {release = resolve;});
     try {
-      await login(); await page.locator('#tab-apps').click();
+      await login(); await openPanel(page, 'apps');
       const opened = context.waitForEvent('page'); await page.getByRole('button', {name: 'Open Slow app', exact: true}).click(); const tab = await opened;
-      await page.locator('#disconnect').click(); release();
+      await signOut(page); release();
       if (!tab.isClosed()) await tab.waitForEvent('close');
       assert.equal(state.previewCalls.length, 0); assert.equal(await page.locator('#workspace-app-list').textContent(), '');
     } finally {release();}
@@ -928,7 +964,7 @@ test('apps remain a named collection on mobile and unsafe addresses never become
   await withPage(async ({page, login, state}) => {
     const createdAt = new Date().toISOString();
     state.apps.set(BOT_A, [{id: 'invalid', botId: BOT_A, name: 'Example application with a long name', port: 3000, basePath: '/', url: 'javascript:alert(1)', state: 'ready', createdAt, updatedAt: createdAt}]);
-    await login(); await page.locator('#tab-apps').click();
+    await login(); await openPanel(page, 'apps');
     const card = page.locator('[data-app-id="invalid"]');
     assert.equal(await card.getByRole('button', {name: /^Open /}).isDisabled(), true);
     assert.equal(await card.getByRole('button', {name: /^Copy /}).isDisabled(), true);
@@ -942,7 +978,7 @@ test('Refresh apps explicitly checks services while background lists remain pass
     const createdAt = new Date().toISOString(), appId = 'starting-web';
     state.apps.set(BOT_A, [{id: appId, botId: BOT_A, name: 'Website', port: 3000, basePath: '/', url: state.appURL(BOT_A, appId), state: 'unavailable', createdAt, updatedAt: createdAt}]);
     state.appRefreshStates.set(`${BOT_A}:${appId}`, 'ready');
-    await login(); await page.locator('#tab-apps').click();
+    await login(); await openPanel(page, 'apps');
     const open = page.getByRole('button', {name: 'Open Website', exact: true});
     assert.equal(await open.isDisabled(), true);
     assert.equal(state.calls.some(call => call.path.endsWith('/apps/refresh')), false, 'selecting the bot and viewing its apps do not probe services');
@@ -966,14 +1002,14 @@ test('GitHub account setup works in Settings without any bot', async () => {
     state.bots = [];
     await page.goto(url); await page.locator('#token').fill(TEST_TOKEN); await page.locator('#connect-form button').click();
     await page.locator('#settings-button').click();
-    await until(page, '#github-status', 'not connected');
+    await until(page, '#github-status', 'Not connected');
     const newTab = context.waitForEvent('page'); await page.locator('#connect-github').click();
     const consent = await newTab; await consent.waitForURL('**/github-connect');
     assert.equal(await consent.evaluate(() => window.opener), null);
     assert.equal(state.calls.filter(call => call.method === 'POST' && call.path === '/v1/connections/github/connect').length, 1);
     assert.equal(state.calls.filter(call => call.method === 'POST' && call.path.startsWith('/v1/bots')).length, 0);
     state.githubConnected = true; await page.locator('#refresh-github').click();
-    await until(page, '#github-status', 'Available to all your bots');
+    await until(page, '#github-status', 'Connected');
     assert.equal(await page.locator('#connect-github').isVisible(), false);
     assert.equal(await page.locator('#disconnect-github').isVisible(), true);
   });
@@ -987,8 +1023,102 @@ test('GitHub account connection card needs no repository', async () => {
     state.connections.set(BOT_A, [{id: 'account-request', botId: BOT_A, runId: run.id, provider: 'github', permission: 'read', status: 'pending', createdAt}]);
     await login();
     const card = page.locator('[data-connection-id="account-request"]');
-    await card.filter({hasText: 'Timber account'}).waitFor();
+    await card.filter({hasText: 'One connection for all your bots'}).waitFor();
     assert.equal(await card.getByRole('button', {name: 'Connect GitHub', exact: true}).isVisible(), true);
     assert.equal((await card.innerText()).includes('undefined'), false);
   });
+});
+
+test('console session survives reload and another tab while keeping the API token out of browser storage', async () => {
+  await withPage(async ({page, context, login, state, url}) => {
+    await login();
+    const persistedCookies = (await context.cookies()).filter(cookie => cookie.name === 'timber_fixture_session');
+    assert.equal(persistedCookies.length, 1);
+    assert.equal(persistedCookies[0].httpOnly, true, 'session credential is inaccessible to application JavaScript');
+    assert.ok(persistedCookies[0].expires > Date.now() / 1000, 'session cookie is persistent');
+    assert.equal(await page.locator('#token').inputValue(), '');
+    assert.equal(await page.evaluate(() => document.cookie.includes('timber_fixture_session')), false);
+    assert.equal(await page.evaluate(token => JSON.stringify({local: {...localStorage}, session: {...sessionStorage}}).includes(token), TEST_TOKEN), false);
+    assert.equal(page.url().includes(TEST_TOKEN), false);
+    await page.reload(); await page.locator('#bot-workspace').waitFor({state: 'visible'});
+    await until(page, '#selected-name', 'Ada');
+    const anotherTab = await context.newPage();
+    try {
+      await anotherTab.goto(url + '#bot=' + BOT_B); await anotherTab.locator('#bot-workspace').waitFor({state: 'visible'});
+      await until(anotherTab, '#selected-name', 'Linus');
+      assert.equal(await anotherTab.locator('#login').isVisible(), false);
+      assert.equal(state.sessionCalls.filter(call => call.method === 'POST').length, 1, 'reload and a new tab reuse the same session');
+      assert.equal(state.requestAuth.every(call => !call.hasBearer && call.hasCookie && call.client === 'console'), true, 'only the login exchange receives the API token');
+      await signOut(page); await page.locator('#login').waitFor({state: 'visible'});
+      assert.equal((await context.cookies()).some(cookie => cookie.name === 'timber_fixture_session'), false);
+      await anotherTab.reload(); await anotherTab.locator('#login').waitFor({state: 'visible'});
+      assert.equal(await anotherTab.locator('#app').isVisible(), false, 'logging out also invalidates a restored tab');
+      assert.equal(state.sessionCalls.filter(call => call.method === 'DELETE').length, 1);
+    } finally {await anotherTab.close();}
+  });
+});
+
+test('an expired persisted session returns to sign in without showing the old bot conversation', async () => {
+  await withPage(async ({page, login, state}) => {
+    await login(); state.sessions.clear();
+    await page.reload(); await page.locator('#login').waitFor({state: 'visible'});
+    assert.equal(await page.locator('#app').isVisible(), false);
+    assert.equal(await page.locator('#token').inputValue(), '');
+    assert.equal(await page.locator('#messages').isVisible(), false);
+  });
+});
+
+test('mobile opens the bot list, uses full-screen conversation navigation and keeps per-bot drafts', async () => {
+  await withPage(async ({page, login}) => {
+    await login({selectFirstBot: false});
+    assert.equal(await page.locator('body').getAttribute('data-mobile-view'), 'bots');
+    assert.equal(await page.locator('.sidebar').isVisible(), true);
+    assert.equal(await page.locator('.workbench').isVisible(), false);
+    await selectBot(page, BOT_A); await until(page, '#selected-name', 'Ada');
+    assert.equal(await page.locator('body').getAttribute('data-mobile-view'), 'bot');
+    assert.equal(await page.locator('.sidebar').isVisible(), false);
+    assert.equal(await page.locator('#mobile-back').isVisible(), true);
+    await page.locator('#message').fill('A draft for Ada');
+    await page.locator('#mobile-back').click(); await selectBot(page, BOT_B); await until(page, '#selected-name', 'Linus');
+    assert.equal(await page.locator('#message').inputValue(), '');
+    await page.locator('#message').fill('A different draft for Linus');
+    await page.locator('#mobile-back').click(); await selectBot(page, BOT_A); await until(page, '#selected-name', 'Ada');
+    assert.equal(await page.locator('#message').inputValue(), 'A draft for Ada');
+    assert.ok(await page.locator('#mobile-back').evaluate(node => node.getBoundingClientRect().width >= 40 && node.getBoundingClientRect().height >= 40), 'Back has a touch-sized hit target');
+    for (const panel of ['conversation', 'computer', 'files', 'apps', 'runs', 'activity']) assert.equal(await page.locator(`#tab-${panel}`).isVisible(), false, 'workspace navigation stays behind its disclosure');
+    await page.locator('#more-panels').focus(); await page.keyboard.press('Enter');
+    await page.locator('#tab-files').waitFor({state: 'visible'});
+    await page.keyboard.press('Escape');
+    assert.equal(await page.locator('#tab-files').isVisible(), false);
+    assert.equal(await page.locator('#more-panels').evaluate(node => node === document.activeElement), true, 'closing Workspace restores keyboard focus');
+    await openPanel(page, 'runs'); await page.locator('#panel-runs').waitFor({state: 'visible'});
+    await openPanel(page, 'conversation'); await page.locator('#message').waitFor({state: 'visible'});
+    assert.equal(await page.locator('#message').inputValue(), 'A draft for Ada');
+    await page.goBack();
+    await page.waitForFunction(() => document.body.dataset.mobileView === 'bots');
+    assert.equal(await page.locator('.sidebar').isVisible(), true, 'browser Back follows the mobile navigation state');
+  }, {viewport: {width: 390, height: 844}, isMobile: true, hasTouch: true});
+});
+
+test('mobile composer remains visible with a short keyboard-sized viewport and long messages', async () => {
+  await withPage(async ({page, login, state}) => {
+    state.messages.get(BOT_A).push({id: 'long-mobile-response', botId: BOT_A, role: 'assistant', text: `${'A long result with details.\n\n'.repeat(40)}\n\`\`\`text\n${'a'.repeat(240)}\n\`\`\``, createdAt: new Date().toISOString()});
+    await login();
+    for (const height of [844, 430]) {
+      await page.setViewportSize({width: 390, height});
+      await page.locator('#message').fill('A short follow-up'); await page.locator('#message').focus();
+      const geometry = await page.evaluate(() => {
+        const input = document.querySelector('#message'), composer = document.querySelector('#message-form'), send = composer.querySelector('[type=submit]');
+        const rect = node => {const {top, bottom, left, right, height} = node.getBoundingClientRect(); return {top, bottom, left, right, height};};
+        return {input: rect(input), composer: rect(composer), send: rect(send), font: parseFloat(getComputedStyle(input).fontSize), viewportHeight: visualViewport?.height || innerHeight, width: innerWidth, pageWidth: document.documentElement.scrollWidth};
+      });
+      assert.ok(geometry.input.top >= 0 && geometry.input.bottom <= geometry.viewportHeight + 1, `input is visible at ${height}px height: ${JSON.stringify(geometry)}`);
+      assert.ok(geometry.send.top >= 0 && geometry.send.bottom <= geometry.viewportHeight + 1, `send is visible above keyboard at ${height}px height`);
+      assert.ok(geometry.send.height >= 40, 'Send has a touch-sized hit target');
+      assert.ok(geometry.font >= 16, 'composer does not trigger iOS focus zoom');
+      assert.ok(geometry.pageWidth <= geometry.width + 1, 'long code scrolls internally without widening the page');
+    }
+    await sendMessage(page);
+    assert.equal(sentMessages(state, BOT_A).length, 1);
+  }, {viewport: {width: 390, height: 844}, isMobile: true, hasTouch: true, colorScheme: 'dark'});
 });

@@ -22,7 +22,7 @@ export interface DesktopViewerOptions {
 export function createDesktopViewer(options: DesktopViewerOptions) {
   const root = options.element;
   root.classList.add('desktop-viewer');
-  root.innerHTML = `<div class="desktop-toolbar"><div class="desktop-heading"><strong>Live desktop</strong><span class="desktop-status" role="status" aria-live="polite">Disconnected</span></div><div class="desktop-actions"><button type="button" data-desktop="observe">Watch desktop</button><button type="button" data-desktop="control">Take control</button><button type="button" data-desktop="disconnect" disabled>Disconnect</button><button type="button" data-desktop="fullscreen" aria-label="Show desktop fullscreen">Fullscreen</button></div></div><p class="desktop-hint">Watch the full Linux desktop, including its mouse pointer. Take control when the agent is idle to use the keyboard and mouse.</p><div class="desktop-screen" tabindex="-1" aria-label="Remote Linux desktop"><div class="desktop-empty">Your workspace desktop, live.<small>Connect to watch the agent work. Connecting starts the computer if it is asleep.</small></div></div><div class="desktop-footer"><span>Full desktop · encrypted connection</span><div class="desktop-keys" hidden><span>Send key</span><button type="button" data-key="Escape">Esc</button><button type="button" data-key="Tab">Tab</button><button type="button" data-key="Return">Enter</button></div></div>`;
+  root.innerHTML = `<div class="desktop-toolbar"><div class="desktop-heading"><strong>Live desktop</strong><span class="desktop-status" role="status" aria-live="polite">Disconnected</span></div><div class="desktop-actions"><button type="button" data-desktop="observe">Watch desktop</button><button type="button" class="quiet" data-desktop="control">Take control</button><button type="button" class="quiet" data-desktop="disconnect" disabled aria-label="Disconnect desktop" title="Disconnect desktop"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v9M6.5 5.5a8 8 0 1 0 11 0"/></svg></button><button type="button" class="quiet" data-desktop="fullscreen" aria-label="Show desktop fullscreen" title="Fullscreen"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/></svg></button></div></div><p class="desktop-hint">Connect to view the desktop.</p><div class="desktop-screen" tabindex="-1" aria-label="Remote Linux desktop"><div class="desktop-empty">Desktop offline</div></div><div class="desktop-footer"><div class="desktop-keys" hidden><span>Send key</span><button type="button" data-key="Escape">Esc</button><button type="button" data-key="Tab">Tab</button><button type="button" data-key="Return">Enter</button></div></div>`;
   const screen = root.querySelector<HTMLElement>('.desktop-screen')!;
   const empty = root.querySelector<HTMLElement>('.desktop-empty')!;
   const status = root.querySelector<HTMLElement>('.desktop-status')!;
@@ -50,12 +50,13 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
     control.disabled = next === 'connecting' || next === 'controlling';
     stop.disabled = next === 'disconnected' || next === 'error';
     keys.hidden = next !== 'controlling';
+    root.querySelector<HTMLElement>('.desktop-footer')!.hidden = next !== 'controlling';
     empty.hidden = next === 'viewing' || next === 'controlling';
     hint.textContent = next === 'controlling'
-      ? 'You have control. Click the desktop to type; your mouse and scroll act on the computer. Switch to Watch desktop to let the agent act again.'
+      ? 'You have control. Switch to Watch desktop to release it.'
       : next === 'viewing'
-      ? 'Watching live. Your clicks and keyboard cannot change the computer. Take control when you want to interact.'
-      : 'Watch the full Linux desktop, including its mouse pointer. Take control to use its keyboard and mouse.';
+      ? 'View only'
+      : 'Connect to view the desktop.';
     options.onState?.(next);
   };
   const release = (current?: DesktopSession) => current
@@ -75,8 +76,9 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
     return released;
   };
   function disconnect() {
-    clearConnection();
+    const released = clearConnection();
     setState('disconnected');
+    return released;
   }
   async function connect(nextMode: DesktopMode = 'view') {
     if (destroyed || !active || document.hidden) return;
@@ -106,7 +108,7 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
       client.showDotCursor = false;
       client.qualityLevel = 7;
       client.compressionLevel = 2;
-      client.background = '#101815';
+      client.background = '#111111';
       client.addEventListener('connect', () => {
         if (current !== generation) return;
         if (handshakeTimeout) clearTimeout(handshakeTimeout);

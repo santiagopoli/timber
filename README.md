@@ -79,12 +79,16 @@ until it settles; this does not start the container or renew its idle deadline.
 An unhealthy control server shows an explicit diagnostic instead of indefinite
 `starting`. Connection settings hold ChatGPT setup and verification.
 The layout supports desktop and mobile, light and dark appearance, and keyboard
-tab navigation. Credentials and drafts stay in memory; only the bot ID is kept in
-the URL fragment for reopening a selection.
+navigation. Sign-in exchanges the API token for a protected HttpOnly session
+cookie valid for 30 days. The token is then discarded. Reloading or reopening
+Timber preserves the session; Sign out clears it. Drafts stay in memory per bot;
+the selected bot ID is kept in the URL fragment. On mobile, the bot list opens
+into a full-screen conversation; Workspace contains Computer, Files and Apps.
 
 This is a single-owner development MVP. There is no multi-user login, native iOS
 client, inter-bot delegation, routine scheduling, Hermes adapter, local execution
-or live desktop video yet. The browser console is a test client, not the intended
+yet. Live desktop viewing/control and a Files/Git explorer are available in the
+browser console. It is a test client, not the intended
 product interface. Packages and environment variables retain the internal
 `@botspace/*` and `BOTSPACE_*` names.
 

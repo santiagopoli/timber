@@ -5,6 +5,7 @@ import {createServer,request as forward} from 'node:http';
 import {WebSocketServer} from 'ws';
 import {createConsoleFixture,TEST_TOKEN,BOT_A,BOT_B} from './console-fixture.mjs';
 let browser;
+const openPanel=async(page,panel)=>{if(!await page.locator(`#tab-${panel}`).isVisible())await page.locator('#panel-menu > summary').click();await page.locator(`#tab-${panel}`).click();};
 before(async()=>{browser=await chromium.launch({headless:true,...(process.env.CONSOLE_CHROMIUM_PATH?{executablePath:process.env.CONSOLE_CHROMIUM_PATH}:{}),...(process.env.CONSOLE_CHROMIUM_ARGS?{args:JSON.parse(process.env.CONSOLE_CHROMIUM_ARGS)}:{})});});
 after(async()=>{await browser?.close();});
 
@@ -38,14 +39,14 @@ function rfbPeer(socket, record) {
  socket.onClose(()=>{record.closed=true;});
  send(Buffer.from('RFB 003.008\n'));
 }
-async function withDesktop(work) {
- const fixture=await createConsoleFixture(),context=await browser.newContext({viewport:{width:1440,height:1050}}),page=await context.newPage();
+async function withDesktop(work,{width=1440,height=1050}={}) {
+ const fixture=await createConsoleFixture(),context=await browser.newContext({viewport:{width,height}}),page=await context.newPage();
  const state={calls:[],sockets:[],gates:[],gate:null},errors=[],violations=[];
  page.on('pageerror',e=>errors.push(e.message));page.setDefaultTimeout(6000);
  await page.exposeFunction('__desktopCsp',v=>violations.push(v));
  await page.addInitScript(()=>document.addEventListener('securitypolicyviolation',e=>globalThis.__desktopCsp({directive:e.effectiveDirective,resource:e.blockedURI})));
  await page.route('**/v1/bots/*/computer/live-session**',async route=>{
-  const req=route.request(),url=new URL(req.url());assert.equal(req.headers().authorization,`Bearer ${TEST_TOKEN}`);
+  const req=route.request(),url=new URL(req.url()),headers=await req.allHeaders();assert.equal(headers.authorization,undefined);assert.equal(headers['x-timber-client'],'console');assert.match(headers.cookie||'',/timber_fixture_session=/);
   const call={method:req.method(),path:url.pathname,body:req.method()==='POST'?req.postDataJSON():null};state.calls.push(call);
   if(req.method()==='POST'&&url.pathname.endsWith('/live-session')){
    const id=`session-${state.calls.filter(c=>c.method==='POST'&&c.path.endsWith('/live-session')).length}`;
@@ -60,8 +61,8 @@ async function withDesktop(work) {
  websocket.on('connection',(client,req)=>{const record={url:req.url,inputs:[],unrecognized:[],connected:false,closed:false};state.sockets.push(record);rfbPeer({send:bytes=>client.send(bytes),onMessage:callback=>client.on('message',callback),onClose:callback=>client.on('close',callback)},record);});
  await new Promise(resolve=>proxy.listen(0,'127.0.0.1',resolve));
  const consoleURL=`http://127.0.0.1:${proxy.address().port}/console/`;
- const login=async()=>{await page.goto(consoleURL);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('#bot-workspace').waitFor({state:'visible'});};
- const open=async mode=>{await page.locator('#tab-computer').click();await page.locator(`[data-desktop="${mode==='control'?'control':'observe'}"]`).click();await page.locator('#desktop-root').filter({has:page.locator(`.desktop-status:text-is("${mode==='control'?'Live · you have control':'Live · watching'}")`)}).waitFor();};
+ const login=async()=>{await page.goto(consoleURL);await page.locator('#login').waitFor({state:'visible'});await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('#app').waitFor({state:'visible'});if(width<=760)await page.locator('.bot-item').first().click();await page.locator('#bot-workspace').waitFor({state:'visible'});};
+ const open=async mode=>{await openPanel(page,'computer');await page.locator(`[data-desktop="${mode==='control'?'control':'observe'}"]`).click();await page.locator('#desktop-root').filter({has:page.locator(`.desktop-status:text-is("${mode==='control'?'Live · you have control':'Live · watching'}")`)}).waitFor();};
  try{await work({page,login,open,state,context});assert.deepEqual(errors,[],'real noVNC has no uncaught browser errors');assert.deepEqual(violations,[],'live desktop conforms to production strict CSP');}
  catch(error){console.error('Desktop diagnostic',JSON.stringify({status:await page.locator('.desktop-status').textContent(),state,errors,violations}));throw error;}
  finally{for(const release of state.gates)release();await context.close();for(const client of websocket.clients)client.terminate();await new Promise(resolve=>websocket.close(resolve));proxy.closeAllConnections();await new Promise(resolve=>proxy.close(resolve));await fixture.close();}
@@ -72,7 +73,7 @@ const deletes=state=>state.calls.filter(call=>call.method==='DELETE');
 test('live desktop negotiates a real framebuffer under strict CSP; Watch is read-only and Take control sends input',async()=>{
  await withDesktop(async({page,login,open,state})=>{
   await login();assert.equal(state.calls.length,0,'opening a bot must not create a live session');
-  await page.locator('#tab-computer').click();assert.equal(state.calls.length,0,'opening Computer alone must not start streaming');
+  await openPanel(page,'computer');assert.equal(state.calls.length,0,'opening Computer alone must not start streaming');
   await open('view');assert.equal(state.calls[0].body.mode,'view');
   await page.waitForFunction(()=>{const canvas=document.querySelector('.desktop-screen canvas');return canvas?.width===1280&&canvas?.height===800&&canvas.getContext('2d').getImageData(1,1,1,1).data[0]===40;});
   const canvas=page.locator('.desktop-screen canvas');await canvas.click({position:{x:100,y:100}});await page.keyboard.press('a');await page.mouse.wheel(0,100);
@@ -89,9 +90,9 @@ test('live desktop negotiates a real framebuffer under strict CSP; Watch is read
 });
 test('leaving Computer and switching bots release only the originating session without reconnecting',async()=>{
  await withDesktop(async({page,login,open,state})=>{
-  await login();await open('view');await page.locator('#tab-conversation').click();
+  await login();await open('view');await openPanel(page,'conversation');
   await until(()=>deletes(state).some(c=>c.path===`/v1/bots/${BOT_A}/computer/live-session/session-1`));
-  await page.locator('#tab-computer').click();assert.equal(state.sockets.length,1,'returning does not silently restart');
+  await openPanel(page,'computer');assert.equal(state.sockets.length,1,'returning does not silently restart');
   await open('view');await page.locator(`[data-bot-id="${BOT_B}"]`).click();await page.locator('#selected-name').filter({hasText:'Linus'}).waitFor();
   await until(()=>deletes(state).some(c=>c.path===`/v1/bots/${BOT_A}/computer/live-session/session-2`));
   assert.equal(deletes(state).some(c=>c.path.includes(BOT_B)),false,'a session created by Ada is never released against Linus');
@@ -101,19 +102,64 @@ test('leaving Computer and switching bots release only the originating session w
 test('late session creation after navigation is released and never opens a hidden socket',async()=>{
  await withDesktop(async({page,login,state})=>{
   await login();let release;state.gate=new Promise(r=>release=r);state.gates.push(release);
-  await page.locator('#tab-computer').click();await page.locator('[data-desktop="observe"]').click();
+  await openPanel(page,'computer');await page.locator('[data-desktop="observe"]').click();
   await until(()=>state.calls.some(c=>c.method==='POST'));
-  await page.locator('#tab-conversation').click();release();
+  await openPanel(page,'conversation');release();
   await until(()=>deletes(state).some(c=>c.path.endsWith('/session-1')));
   assert.equal(state.sockets.length,0);
-  await page.locator('#tab-computer').click();assert.equal(await page.locator('.desktop-status').textContent(),'Disconnected');
+  await openPanel(page,'computer');assert.equal(await page.locator('.desktop-status').textContent(),'Disconnected');
  });
 });
 test('disconnecting the console closes the active desktop socket and releases the originating session',async()=>{
  await withDesktop(async({page,login,open,state})=>{
-  await login();await open('control');await page.locator('#disconnect').click();
+  await login();await open('control');await page.locator('#settings-button').click();await page.locator('#disconnect').click();
   await until(()=>state.sockets[0].closed);
   await until(()=>deletes(state).some(call=>call.path===`/v1/bots/${BOT_A}/computer/live-session/session-1`));
   assert.equal(state.sockets.length,1);
  });
+});
+
+
+test('Computer docks beside the conversation on desktop, expands explicitly and closes its live session',async()=>{
+ await withDesktop(async({page,login,open,state})=>{
+  await login();await openPanel(page,'computer');
+  assert.equal(await page.locator('#workspace-panels').getAttribute('data-computer-docked'),'true');
+  assert.equal(await page.locator('#panel-conversation').isVisible(),true,'chat stays beside the live workspace');
+  assert.equal(await page.locator('#panel-computer').isVisible(),true);
+  assert.equal(state.calls.length,0,'opening the workspace does not start streaming');
+  const chat=await page.locator('#panel-conversation').boundingBox(),computer=await page.locator('#panel-computer').boundingBox();
+  assert.ok(chat.width>=300 && computer.width>=360 && chat.x+chat.width<=computer.x+1,'both panes have usable widths');
+  await page.locator('#message').fill('Keep my next instruction in the composer');
+  await open('view');
+  await page.locator('#expand-computer').click();
+  assert.equal(await page.locator('#panel-conversation').isVisible(),false);
+  assert.equal(await page.locator('#expand-computer').getAttribute('aria-label'),'Dock computer');
+  assert.equal(state.sockets.length,1,'expanding does not create a new desktop connection');
+  await page.locator('#expand-computer').click();
+  assert.equal(await page.locator('#panel-conversation').isVisible(),true);
+  assert.equal(await page.locator('#message').inputValue(),'Keep my next instruction in the composer');
+  await page.locator('#close-computer').click();
+  await page.locator('#panel-computer').waitFor({state:'hidden'});
+  assert.equal(await page.locator('#panel-conversation').isVisible(),true);
+  await until(()=>state.sockets[0].closed);
+  await until(()=>deletes(state).some(call=>call.path===`/v1/bots/${BOT_A}/computer/live-session/session-1`));
+  assert.equal(state.sockets.length,1);
+ });
+});
+
+test('mobile Computer uses the full screen and returns to the preserved conversation',async()=>{
+ await withDesktop(async({page,login,open,state})=>{
+  await login();await page.locator('#message').fill('Mobile draft stays with Ada');
+  await openPanel(page,'computer');
+  assert.equal(await page.locator('#workspace-panels').getAttribute('data-computer-docked'),'false');
+  assert.equal(await page.locator('#panel-conversation').isVisible(),false);
+  assert.equal(await page.locator('#panel-computer').isVisible(),true);
+  assert.equal(await page.locator('#expand-computer').isVisible(),false);
+  await open('view');
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+  await page.locator('#close-computer').click();
+  await until(()=>state.sockets[0].closed);
+  assert.equal(await page.locator('#panel-conversation').isVisible(),true);
+  assert.equal(await page.locator('#message').inputValue(),'Mobile draft stays with Ada');
+ },{width:390,height:844});
 });

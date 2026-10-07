@@ -13,16 +13,23 @@ that conversation. v1 is cloud-only; no iOS implementation in this milestone.
   Workers AI. No automatic fallback to separately billed inference.
 - ComputerDO owns one reusable Linux desktop container, lazily started.
 - Private single-owner MVP. BOTSPACE_API_TOKEN is a Worker secret; every /v1
-  API request requires Authorization: Bearer token, except the scoped live desktop
-  WebSocket upgrade described below. Health is public and
-  contains no account information. Never put token in URL or localStorage.
-- /console is a static unprivileged test UI; it prompts for token in memory only.
+  data API request requires Authorization: Bearer token or a valid same-origin
+  console session, except the scoped live desktop WebSocket upgrade below.
+  Health is public and contains no account information. Never put credentials in
+  URLs, localStorage or sessionStorage.
+- /console is a static unprivileged shell. Its persistent login exchanges an owner
+  token for an HttpOnly session cookie, then discards the token from JavaScript.
 - Cross-tenant design: deterministic owner identity "owner" after auth. Bot ids are
   server-generated UUIDs. Registry membership checked before any access.
 
 ## HTTP surface
 JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
 - GET /health -> {ok:true,service:"botspace"}
+- POST /v1/session with Authorization: Bearer token -> {authenticated:true,expiresAt}.
+- GET /v1/session with session cookie -> {authenticated:true,expiresAt}; invalid or
+  expired sessions return 401.
+- DELETE /v1/session -> {authenticated:false}; clears this browser's cookie,
+  including after expiration or owner-token rotation.
 - GET /v1/connections/chatgpt -> {connected,hostId,account?,model,status,verifiedAt?}
 - POST /v1/connections/chatgpt imports the locally completed OAuth registration;
   requires owner auth, validates OpenAI signed identity and direct-plan permission.
@@ -90,6 +97,24 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
 - GET /v1/bots/:id/artifacts/:artifactId -> authenticated bytes. All file access
   scoped to bot prefix. Generated HTML/SVG are attachments, never same-origin code.
 
+## Console sessions
+The cookie `__Host-timber_session` is Secure, HttpOnly, SameSite=Strict, host-only
+and Path=/, with an absolute 30-day expiry. Only HTTP loopback development uses
+the separate non-Secure `timber_session_dev` cookie. Other HTTP origins cannot
+create or authenticate console sessions. Sessions are versioned HMAC-SHA256
+capabilities with a random nonce, exact-origin binding and fixed expiry, signed
+using the owner secret. Rotating BOTSPACE_API_TOKEN invalidates all sessions.
+Logout clears only this browser's cookie; it does not revoke other devices or
+invalidate a separately copied capability before expiry.
+
+Session endpoints and all cookie-authenticated data requests require
+`X-Timber-Client: console` and same-origin provenance: an exact Origin header or
+`Sec-Fetch-Site: same-origin`. Conflicting Fetch Metadata and navigations are
+rejected, including GET requests. The console uses `credentials: same-origin`.
+Bearer-authenticated API clients retain their existing behavior, and an invalid
+Authorization header never falls back to a cookie. The desktop WebSocket still
+requires its independent one-use ticket and exact-origin check.
+
 ## Internal boundaries
 ChatGPTAuthDO stores one owner's encrypted OAuth registration separately from bots
 and workspace archives, serializes rotating-token refresh, and injects tokens only
@@ -108,6 +133,22 @@ ComputerAction is a discriminated union: exec, readFile, writeFile, listFiles,
 screenshot, click, type, key, scroll, navigate, checkpoint. Cloud provider and
 ComputerDO concrete implementation live under packages/computer. Container HTTP
 server and image live in infra/computer. Agree export names with API agent.
+
+Pi exec supplies a 120,000 ms default timeout and preserves an explicitly requested
+shorter timeout. The computer's existing HTTP exec default remains 30,000 ms for
+direct clients that omit it; its maximum is 120,000 ms. A timeout terminates the
+process group and retains the partial output and exit code. Long-running app
+servers must detach all standard streams, keep live logs outside /workspace and
+be checked separately for readiness. A shell exit code alone does not prove an
+app is responding.
+
+Checkpoint errors preserve the completed or failed command outcome. Known
+background-write conflicts, archive limits and nonportable files are classified
+into fixed safe diagnostics; arbitrary server responses and paths are not
+forwarded. Explicit checkpoint failure reports failed with the same safe cause.
+Retrying the original operation ID never reruns its command or its checkpoint;
+after fixing the persistence cause, a new checkpoint operation saves the existing
+files without repeating the command.
 
 Computer operation IDs accept 1–160 ASCII letters, digits, dots, colons, hyphens
 or underscores. Runtime adapters must map opaque model call IDs into this space

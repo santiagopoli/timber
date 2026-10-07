@@ -10,9 +10,9 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   const guiActions = new Set(['navigate', 'click', 'type', 'key', 'scroll']);
   const removedBots = new Set(), deletionPending = new Map();
   const drafts = new Map(), pendingMessages = new Map(), pendingActions = new Map(), computerPending = new Map(), stopping = new Set(), approvalWork = new Map(), approvalFeedback = new Map(), connectionWork = new Map(), appWork = new Map();
-  let token = '', bots = [], selected = null, currentRun = null, generation = 0, authSession = 0;
+  let authenticated = false, bots = [], selected = null, currentRun = null, generation = 0, authSession = 0;
   let sessionController = new AbortController(), streamController, refreshTimer, progressTimer, computerStatusTimer;
-  let computerStatusRequest = 0;
+  let computerStatusRequest = 0, currentPanel = 'conversation', computerExpanded = false;
   let messages = [], approvals = [], connections = [], workspaceApps = [], connectionsRequest = 0, appsRequest = 0, runs = new Map(), activeRunIds = new Set(), nextCursor = null, olderPagesLoaded = false, loadingOlderRuns = false, runFilter = null, runRevision = 0, runsRequest = 0, messagesRequest = 0, approvalsRequest = 0;
   let cursor = 0, boundary = '', events = [], streamDrafts = new Map(), chatLoading = false, focusApproval = 0, screenUrl = null, artifact = null, directoryPath = '.';
   let chatGPTConnected = false, chatGPTBusy = false, chatGPTAccount = null, editBotId = null, deleteTarget = null, deleteBusy = false, sendBusy = new Set();
@@ -23,12 +23,12 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   const date = (value) => new Date(value).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   const statusLabel = (status) => String(status || 'ready').replaceAll('_', ' ');
   const statusBadge = (status) => { const node = el('span', 'status', statusLabel(status)); node.dataset.status = status; return node; };
-  const validView = (version) => version === generation && Boolean(token);
+  const validView = (version) => version === generation && authenticated;
   const chat = mountChat($('chat-root'), {
-    onDraft: (botId, text) => { if (selected?.id === botId && token) { drafts.set(botId, text); renderMessages(); } },
+    onDraft: (botId, text) => { if (selected?.id === botId && authenticated) { drafts.set(botId, text); renderMessages(); } },
     onSend: (botId, text) => { void sendMessage(botId, text); },
     onRetry: (botId, operationId) => {
-      if (selected?.id !== botId || !token) return;
+      if (selected?.id !== botId || !authenticated) return;
       const run = [...runs.values()].find(item => item.operationId === operationId && item.status === 'queued' && item.error?.includes('Retry this message'));
       const message = run && messages.find(item => item.role === 'user' && item.runId === run.id);
       const delivery = pendingMessages.get(operationId);
@@ -45,7 +45,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
     element: $('desktop-root'),
     async connect(mode) {
       const id = selected?.id, version = generation;
-      if (!id || !token) throw new Error('Select a bot first.');
+      if (!id || !authenticated) throw new Error('Select a bot first.');
       const session = await request(`${botPath(id)}/computer/live-session`, {method: 'POST', body: {mode}});
       desktopSessions.set(session.sessionId, id);
       if (!validView(version) || selected?.id !== id) {
@@ -66,26 +66,26 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   async function releaseDesktop(sessionId) {
     const id = desktopSessions.get(sessionId);
     desktopSessions.delete(sessionId);
-    if (id && token) await request(`${botPath(id)}/computer/live-session/${sessionId}`, {method: 'DELETE'});
+    if (id && authenticated) await request(`${botPath(id)}/computer/live-session/${sessionId}`, {method: 'DELETE'});
   }
   const workspace = mountWorkspaceExplorer($('workspace-root'), {
-    request: (id, path) => request(`${botPath(id)}${path}`),
-    download: (id, path) => request(`${botPath(id)}${path}`, {raw: true}),
+    request: (id, path, signal) => request(`${botPath(id)}${path}`, {signal}),
+    download: (id, path, signal) => request(`${botPath(id)}${path}`, {raw: true, signal}),
   });
-  function showError(error) { if (token) $('app-error').textContent = errorText(error); }
+  function showError(error) { if (authenticated) $('app-error').textContent = errorText(error); }
   async function guarded(fn) { $('app-error').textContent = ''; try { return await fn(); } catch (error) { if (error.name !== 'AbortError') showError(error); } }
   async function request(path, { method = 'GET', body, signal, raw = false } = {}) {
-    if (!token) throw new Error('Reconnect with your Timber API token.');
+    if (!authenticated) throw new Error('Sign in to continue.');
     const targetId = /^\/v1\/bots\/([^/?]+)/.exec(path)?.[1];
     if (targetId && removedBots.has(targetId) && !(method === 'DELETE' && path === botPath(targetId))) throw new DOMException('This bot is no longer available.', 'AbortError');
-    const session = authSession, headers = { Authorization: `Bearer ${token}` };
+    const session = authSession, headers = { 'X-Timber-Client': 'console' };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     let response;
-    try { response = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: signal ? AbortSignal.any([signal, sessionController.signal]) : sessionController.signal, cache: 'no-store', credentials: 'omit', redirect: 'error' }); }
+    try { response = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: signal ? AbortSignal.any([signal, sessionController.signal]) : sessionController.signal, cache: 'no-store', credentials: 'same-origin', redirect: 'error' }); }
     catch (error) { if (error.name === 'AbortError') throw error; throw new Error(method === 'GET' ? 'Connection lost. Check your network, then refresh or reconnect.' : 'The response was lost. The action may have been accepted. Inspect its state before retrying; nothing was retried automatically.'); }
     if (!response.ok) {
       const detail = await response.json().catch(() => ({}));
-      if (response.status === 401 && !/^(chatgpt_|github_)/.test(String(detail.error?.code || '')) && session === authSession) disconnect('Your API token was rejected or expired. Enter the current token to reconnect.');
+      if (response.status === 401 && !/^(chatgpt_|github_)/.test(String(detail.error?.code || '')) && session === authSession) disconnect('Your session expired. Sign in again.');
       const error = new Error(detail.error?.message || `Request failed (${response.status}).`); error.status = response.status; error.code = detail.error?.code; throw error;
     }
     if (session !== authSession) throw new DOMException('The session ended.', 'AbortError');
@@ -98,12 +98,12 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   function clearScreen() {
     if (screenUrl) URL.revokeObjectURL(screenUrl); screenUrl = null; artifact = null;
     $('screenshot').removeAttribute('src'); $('screenshot').hidden = true; $('screen-placeholder').hidden = false;
-    $('download-artifact').hidden = true; $('screenshot-time').textContent = 'Still screenshots. No periodic refresh or background wake-ups.';
+    $('download-artifact').hidden = true; $('screenshot-time').textContent = 'No snapshot';
     $('click-mode').checked = false; $('auto-screenshot').checked = false; document.querySelector('.screen').classList.remove('click-enabled');
   }
   function disconnect(message = '') {
     desktop.disconnect(); workspace.clear();
-    stopComputerStatus(); generation++; authSession++; token = ''; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
+    stopComputerStatus(); generation++; authSession++; authenticated = false; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
     selected = null; currentRun = null; bots = []; messages = []; approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
     removedBots.clear(); deletionPending.clear(); deleteTarget = null; deleteBusy = false; editBotId = null; drafts.clear(); pendingMessages.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); connectionWork.clear(); appWork.clear(); closeDialogs(); clearScreen();
     chatGPTConnected = false; chatGPTAccount = null; chatGPTBusy = false;
@@ -114,19 +114,20 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
     $('result-raw').textContent = ''; $('result-details').hidden = true; $('computer-warning').hidden = true; $('computer-progress').hidden = true;
     $('github-status').textContent = 'Connection not checked.'; $('github-error').textContent = ''; $('disconnect-github').hidden = true; $('disconnect-github').disabled = false; $('connect-github').hidden = false; $('connect-github').disabled = false;
     $('chatgpt-status').textContent = 'Connection not checked.'; $('chatgpt-account').textContent = ''; $('chatgpt-account').hidden = true;
-    $('chatgpt-verification').textContent = 'Model access has not been verified.'; $('chatgpt-error').textContent = ''; $('disconnect-chatgpt').hidden = true; $('verify-chatgpt').disabled = true;
+    $('chatgpt-verification').textContent = 'Not verified'; $('chatgpt-error').textContent = ''; $('disconnect-chatgpt').hidden = true; $('verify-chatgpt').disabled = true;
     $('app').hidden = true; $('login').hidden = false; $('disconnect').hidden = true; $('settings-button').hidden = true;
+    document.body.dataset.authenticated = 'false'; document.body.dataset.mobileView = 'bots';
     $('connection').textContent = 'Disconnected'; $('login-error').textContent = typeof message === 'string' ? message : '';
   }
   function emptyState(title, detail) { const node = el('div', 'empty-state'); node.append(el('strong', '', title), el('p', '', detail)); return node; }
   function renderBots() {
     const query = $('bot-search').value.trim().toLowerCase(), matching = bots.filter((bot) => `${bot.name} ${bot.instructions}`.toLowerCase().includes(query));
     $('bot-count').textContent = String(bots.length); $('bot-list').replaceChildren();
-    if (!matching.length) $('bot-list').append(emptyState(bots.length ? 'No matching bots' : 'Your team starts here', bots.length ? 'Try another name or keyword.' : 'Use New bot to create one.'));
+    if (!matching.length) $('bot-list').append(emptyState(bots.length ? 'No matching bots' : 'No bots yet', bots.length ? 'Try another name or keyword.' : 'Create your first bot.'));
     for (const bot of matching) {
       const button = el('button', `bot-item${bot.id === selected?.id ? ' selected' : ''}`); button.type = 'button'; button.dataset.botId = bot.id;
       button.setAttribute('aria-pressed', String(bot.id === selected?.id)); button.append(el('span', 'avatar', bot.name.slice(0, 1).toUpperCase()));
-      const info = el('span', 'bot-info'); info.append(el('span', 'bot-name', bot.name), el('small', '', bot.instructions?.trim().split('\n')[0] || 'A persistent cloud bot'));
+      const info = el('span', 'bot-info'); info.append(el('span', 'bot-name', bot.name), el('small', '', bot.instructions?.trim().split('\n')[0] || 'Ready'));
       button.append(info); button.addEventListener('click', () => guarded(() => selectBot(bot))); $('bot-list').append(button);
     }
     for (const pending of deletionPending.values()) {
@@ -137,20 +138,26 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   async function loadBots() { const session = authSession, result = await request('/v1/bots'); if (session !== authSession) return; bots = result.bots.filter(bot => !removedBots.has(bot.id)); renderBots(); }
   function updateBotHeader() { $('selected-name').textContent = selected.name; $('selected-avatar').textContent = selected.name.slice(0, 1).toUpperCase(); $('selected-model').textContent = `${selected.runtime} · ${selected.model}`; $('selected-computer-mode').textContent = selected.computerApprovalMode === 'automatic' ? 'Computer · Use authorized' : 'Computer · Ask for each action'; }
   function chosenHash() { const value = new URLSearchParams(location.hash.slice(1)).get('bot'); return /^[a-f\d-]{36}$/i.test(value || '') ? value : null; }
-  async function selectBot(bot) {
-    if (selected?.id === bot.id || removedBots.has(bot.id)) return;
+  async function selectBot(bot, {replace = false} = {}) {
+    if (removedBots.has(bot.id)) return;
+    document.body.dataset.mobileView = 'bot';
+    if (selected?.id === bot.id) {
+      history[replace ? 'replaceState' : 'pushState'](null, '', `${location.pathname}${location.search}#bot=${encodeURIComponent(bot.id)}`);
+      if (!$('panel-computer').hidden) {desktop.setActive(true); void guarded(computerStatus);}
+      return;
+    }
     desktop.disconnect(); workspace.clear();
     if (!$('panel-files').hidden) workspace.setBot(bot.id);
     stopComputerStatus(); generation++; const version = generation; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
     selected = bot; chatLoading = true; currentRun = null; cursor = 0; boundary = ''; events = []; messages = []; approvals = []; connections = []; workspaceApps = []; runs = new Map(); activeRunIds = new Set(); streamDrafts = new Map(); nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; runFilter = null; runRevision = 0;
-    $('refresh-apps').disabled = false; $('refresh-apps').textContent = 'Refresh apps';
-    history.replaceState(null, '', `${location.pathname}${location.search}#bot=${encodeURIComponent(bot.id)}`);
+    $('refresh-apps').disabled = false; $('refresh-apps').textContent = 'Refresh';
+    history[replace ? 'replaceState' : 'pushState'](null, '', `${location.pathname}${location.search}#bot=${encodeURIComponent(bot.id)}`);
     $('empty').hidden = true; $('bot-workspace').hidden = false; updateBotHeader(); renderBots(); renderApps();
     for (const id of ['activity-list', 'run-list']) $(id).replaceChildren();
     $('app-count').textContent = '0'; $('apps-feedback').textContent = ''; $('event-count').textContent = '0';
     $('computer-result').textContent = 'No actions yet.'; $('result-details').hidden = true; $('computer-warning').hidden = true;
-    $('computer-status').textContent = 'Load status to inspect the environment.'; $('file-path').value = '.'; directoryPath = '.';
-    $('file-content').value = ''; $('type-text').value = ''; $('file-list').replaceChildren(el('p', 'hint', 'Browse to load files. This may wake the computer.'));
+    $('computer-status').textContent = 'Checking…'; $('file-path').value = '.'; directoryPath = '.';
+    $('file-content').value = ''; $('type-text').value = ''; $('file-list').replaceChildren(el('p', 'hint', 'No files loaded'));
     $('app-error').textContent = ''; $('approval-shortcut').hidden = true; renderCurrentRun(); renderStreamDraft(); renderProgress();
     try { await Promise.all([loadMessages(version), loadRuns(version), loadApprovals(version), loadConnections(version), loadApps(version)]); }
     finally { if (validView(version)) { chatLoading = false; renderMessages(); startStream(); if (!$('panel-computer').hidden) void guarded(computerStatus); } }
@@ -175,7 +182,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
     }
   }
   function renderMessages() {
-    if (!selected || !token) return;
+    if (!selected || !authenticated) return;
     const visibleApprovals = effectiveApprovals(), pending = visibleApprovals.filter(approval => approval.status === 'pending');
     $('approval-count').textContent = String(pending.length); $('approval-shortcut').hidden = !pending.length;
     const stream = [...streamDrafts.entries()].find(([id, text]) => text && activeRunIds.has(id) && !terminal.has(runs.get(id)?.status) && (!runFilter || id === runFilter));
@@ -184,7 +191,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
       currentRun, runFilter, focusApproval, stream: stream ? {runId: stream[0], text: stream[1]} : null, feedback: approvalFeedback.get(selected.id) });
   }
   async function sendMessage(botId, rawText, retryOperationId) {
-    const text = rawText.trim(); if (!token || selected?.id !== botId || !text || sendBusy.has(botId)) return;
+    const text = rawText.trim(); if (!authenticated || selected?.id !== botId || !text || sendBusy.has(botId)) return;
     const session = authSession;
     const previous = retryOperationId ? pendingMessages.get(retryOperationId) : [...pendingMessages.values()].find(item => item.botId === botId && item.text === text && ['unknown', 'rejected'].includes(item.state));
     if (previous && (previous.botId !== botId || previous.text !== text || previous.state === 'accepted' || previous.state === 'sending')) return;
@@ -203,7 +210,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
     } finally { if (session === authSession) { sendBusy.delete(botId); if (selected?.id === botId) renderMessages(); } }
   }
   async function retryAdmission(botId, run, text) {
-    if (!token || selected?.id !== botId || sendBusy.has(botId)) return;
+    if (!authenticated || selected?.id !== botId || sendBusy.has(botId)) return;
     const session = authSession; sendBusy.add(botId); renderMessages();
     try {
       const result = await request(`${botPath(botId)}/messages`, {method: 'POST', body: {text, operationId: run.operationId}});
@@ -272,7 +279,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   function actionSummary(action) { return JSON.stringify(action.type === 'type' ? { type: 'type', text: `[${String(action.text || '').length} characters hidden]` } : action, null, 2); }
   async function decideApproval(botId, approval, decision, allowComputer = false) {
     const key = `${botId}:${approval.id}`, session = authSession;
-    if (!token || approvalWork.get(key)?.busy || approvalWork.get(key)?.approval) return;
+    if (!authenticated || approvalWork.get(key)?.busy || approvalWork.get(key)?.approval) return;
     const work = { busy: true }; approvalWork.set(key, work); approvalFeedback.delete(botId);
     if (selected?.id === botId) renderApprovals();
     let permissionSaved = false;
@@ -283,7 +290,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
         permissionSaved = true; bots = bots.map((item) => item.id === botId ? bot : item);
         if (selected?.id === botId) { selected = bot; updateBotHeader(); renderApprovals(); } renderBots();
       }
-      if (session !== authSession || !token) return;
+      if (session !== authSession || !authenticated) return;
       const result = await request(`${botPath(botId)}/approvals/${encodeURIComponent(approval.id)}`, { method: 'POST', body: { decision } });
       if (session !== authSession) return;
       work.approval = result.approval;
@@ -322,7 +329,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   }
   async function connectGitHub(botId, requestId) {
     const key = `${botId}:${requestId}`, session = authSession;
-    if (!token || connectionWork.get(key)?.busy || !connections.some(item => item.id === requestId && item.status === 'pending')) return;
+    if (!authenticated || connectionWork.get(key)?.busy || !connections.some(item => item.id === requestId && item.status === 'pending')) return;
     const work = {busy: true}; connectionWork.set(key, work); let popup;
     try {
       popup = newWindow('Connecting GitHub'); renderMessages();
@@ -381,11 +388,11 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
       if (!validView(version)) return;
       // A prior passive snapshot must not overwrite the freshly probed state.
       appsRequest++; workspaceApps = result.apps; renderApps();
-    } finally {if (validView(version)) {$('refresh-apps').disabled = false; $('refresh-apps').textContent = 'Refresh apps';}}
+    } finally {if (validView(version)) {$('refresh-apps').disabled = false; $('refresh-apps').textContent = 'Refresh';}}
   }
   async function openWorkspaceApp(app) {
     const botId = selected?.id, session = authSession, key = `${botId}:${app.id}`;
-    if (!botId || !token || appWork.get(key)?.busy) return;
+    if (!botId || !authenticated || appWork.get(key)?.busy) return;
     const work = {busy: 'open'}; appWork.set(key, work); let popup;
     try {
       popup = newWindow(`Opening ${app.name}`); renderApps();
@@ -409,7 +416,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
     if (session === authSession && selected?.id === botId) renderApps();
   }
   async function removeWorkspaceApp(app) {
-    const botId = selected?.id, session = authSession, key = `${botId}:${app.id}`; if (!botId || !token || appWork.get(key)?.busy) return;
+    const botId = selected?.id, session = authSession, key = `${botId}:${app.id}`; if (!botId || !authenticated || appWork.get(key)?.busy) return;
     const work = {busy: 'remove'}; appWork.set(key, work); renderApps();
     try {
       await request(`${botPath(botId)}/apps/${encodeURIComponent(app.id)}`, {method: 'DELETE'});
@@ -420,12 +427,12 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   }
   async function loadGitHubStatus() {
     const session = authSession; $('github-error').textContent = '';
-    try {const status = await request('/v1/connections/github'); if (session !== authSession) return; $('github-status').textContent = status.connected ? `Connected${status.account?.login ? ' as ' + status.account.login : ''}. Available to all your bots.` : 'GitHub is not connected to your Timber account.'; $('disconnect-github').hidden = !status.connected; $('connect-github').hidden = status.connected;}
+    try {const status = await request('/v1/connections/github'); if (session !== authSession) return; $('github-status').textContent = status.connected ? `Connected${status.account?.login ? ' · ' + status.account.login : ''}` : 'Not connected'; $('disconnect-github').hidden = !status.connected; $('connect-github').hidden = status.connected;}
     catch (error) {if (session === authSession && error.name !== 'AbortError') $('github-error').textContent = errorText(error);}
   }
   async function connectAccountGitHub() {
     const session = authSession, button = $('connect-github');
-    if (!token || button.disabled) return;
+    if (!authenticated || button.disabled) return;
     button.disabled = true; $('github-error').textContent = ''; let popup;
     try {
       popup = newWindow('Connecting GitHub');
@@ -437,7 +444,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
       if ((url.origin !== location.origin && (url.protocol !== 'https:' || url.hostname !== 'github.com')) || url.username || url.password) throw new Error('GitHub returned an invalid connection address.');
       if (popup.closed) throw new Error('The connection tab was closed. Select Connect GitHub to continue.');
       popup.location.replace(url.href);
-      $('github-status').textContent = 'Complete the connection in GitHub. This account will be available to all your bots.';
+      $('github-status').textContent = 'Finish connecting in GitHub.';
     } catch (error) {popup?.close(); if (session === authSession && error.name !== 'AbortError') $('github-error').textContent = errorText(error);}
     finally {if (session === authSession) button.disabled = false;}
   }
@@ -477,7 +484,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
     scheduleRefresh(version);
   }
   const pause = (ms, signal) => new Promise((resolve) => { if (signal.aborted) return resolve(); const done = () => { clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); }; const timer = setTimeout(done, ms); signal.addEventListener('abort', done, { once: true }); });
-  function startStream() { streamController?.abort(); if (!selected || !token) return; streamController = new AbortController(); void streamEvents(selected.id, generation, streamController.signal); }
+  function startStream() { streamController?.abort(); if (!selected || !authenticated) return; streamController = new AbortController(); void streamEvents(selected.id, generation, streamController.signal); }
   async function streamEvents(id, version, signal) {
     let delay = 1000;
     while (!signal.aborted && validView(version)) {
@@ -504,9 +511,9 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   function finishComputer(id, pending) { if (computerPending.get(id) === pending) computerPending.delete(id); renderProgress(); }
   function warning(message) { $('computer-warning').textContent = message; $('computer-warning').hidden = false; }
   function stopComputerStatus() { clearTimeout(computerStatusTimer); computerStatusTimer = null; computerStatusRequest++; }
-  function queueComputerStatus() { if (!selected || !token || $('panel-computer').hidden) return; clearTimeout(computerStatusTimer); computerStatusTimer = setTimeout(() => { computerStatusTimer = null; void guarded(computerStatus); }, 250); }
+  function queueComputerStatus() { if (!selected || !authenticated || $('panel-computer').hidden) return; clearTimeout(computerStatusTimer); computerStatusTimer = setTimeout(() => { computerStatusTimer = null; void guarded(computerStatus); }, 250); }
   async function computerStatus() {
-    const version = generation, id = selected?.id; if (!id || !token || $('panel-computer').hidden) return;
+    const version = generation, id = selected?.id; if (!id || !authenticated || $('panel-computer').hidden) return;
     clearTimeout(computerStatusTimer); computerStatusTimer = null; const sequence = ++computerStatusRequest;
     try {
       const { computer } = await request(`${botPath(id)}/computer`);
@@ -574,9 +581,9 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   }
   function renderChatGPT(status) {
     chatGPTConnected = status.connected === true; const account = status.account ? `${status.account.clientId}:${status.account.subject}` : null;
-    if (account !== chatGPTAccount || !chatGPTConnected) $('chatgpt-verification').textContent = 'Model access has not been verified.'; chatGPTAccount = account;
-    if (chatGPTConnected && status.status === 'verified' && Number.isFinite(Date.parse(status.verifiedAt))) $('chatgpt-verification').textContent = `gpt-6.1-sol last verified ${new Date(status.verifiedAt).toLocaleString()}.`;
-    $('chatgpt-status').textContent = chatGPTConnected ? 'Connected to your ChatGPT account.' : 'Not connected. Run the local login command.'; $('chatgpt-account').textContent = status.account?.email || ''; $('chatgpt-account').hidden = !status.account?.email;
+    if (account !== chatGPTAccount || !chatGPTConnected) $('chatgpt-verification').textContent = 'Not verified'; chatGPTAccount = account;
+    if (chatGPTConnected && status.status === 'verified' && Number.isFinite(Date.parse(status.verifiedAt))) $('chatgpt-verification').textContent = `Verified ${new Date(status.verifiedAt).toLocaleDateString()}`;
+    $('chatgpt-status').textContent = chatGPTConnected ? 'Connected' : 'Not connected'; $('chatgpt-account').textContent = status.account?.email || ''; $('chatgpt-account').hidden = !status.account?.email;
     $('verify-chatgpt').disabled = chatGPTBusy || !chatGPTConnected; $('disconnect-chatgpt').hidden = !chatGPTConnected; document.querySelector('.setup-details').open = !chatGPTConnected;
   }
   async function chatGPTTask(task) {
@@ -592,7 +599,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
     $('cancel-delete-bot').textContent = deleteTarget?.pending ? 'Close' : 'Cancel';
   }
   function openDelete(bot) {
-    if (!token || deleteBusy) return;
+    if (!authenticated || deleteBusy) return;
     deleteTarget = {id: bot.id, name: bot.name, pending: deletionPending.has(bot.id)};
     $('delete-title').textContent = `Delete “${bot.name}”?`; $('delete-bot-name').textContent = bot.name;
     $('delete-error').textContent = deleteTarget.pending ? 'Bot access is disabled. Data cleanup is still pending. Retry cleanup to finish deleting this bot.' : '';
@@ -613,7 +620,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
       for (const element of ['activity-list', 'run-list', 'file-list', 'workspace-app-list']) $(element).replaceChildren();
       for (const element of ['file-content', 'type-text', 'exec-command', 'navigate-url', 'key-name']) $(element).value = '';
       for (const element of ['selected-name', 'selected-model', 'selected-computer-mode', 'app-error', 'run-error', 'result-raw']) $(element).textContent = '';
-      $('file-path').value = '.'; directoryPath = '.'; $('computer-result').textContent = 'No actions yet.'; $('computer-status').textContent = 'Load status to inspect the environment.';
+      $('file-path').value = '.'; directoryPath = '.'; $('computer-result').textContent = 'No actions yet.'; $('computer-status').textContent = 'Checking…';
       for (const element of ['result-details', 'computer-warning', 'run-error', 'approval-shortcut', 'active-run-count', 'cancel-run', 'reconnect-stream']) $(element).hidden = true;
       $('app-count').textContent = '0'; $('apps-feedback').textContent = ''; $('event-count').textContent = '0'; $('approval-count').textContent = '0'; $('stream-state').textContent = ''; $('bot-workspace').hidden = true; $('empty').hidden = false;
       history.replaceState(null, '', `${location.pathname}${location.search}`); showPanel('conversation');
@@ -623,7 +630,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   }
   async function deleteBot() {
     const target = deleteTarget, session = authSession;
-    if (!target || !token || deleteBusy) return;
+    if (!target || !authenticated || deleteBusy) return;
     deleteBusy = true; $('delete-error').textContent = ''; renderDeleteControls();
     try {
       const result = await request(botPath(target.id), {method: 'DELETE'});
@@ -640,7 +647,15 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
     } finally {if (session === authSession) {deleteBusy = false; renderDeleteControls();}}
   }
   function showPanel(name, focus = false) {
-    for (const button of document.querySelectorAll('[data-panel]')) { const active = button.dataset.panel === name; button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active)); button.tabIndex = active ? 0 : -1; $(`panel-${button.dataset.panel}`).hidden = !active; if (active && focus) button.focus(); }
+    currentPanel = name;
+    const docked = name === 'computer' && matchMedia('(min-width: 1024px)').matches && !computerExpanded;
+    if ($('workspace-panels')) $('workspace-panels').dataset.computerDocked = String(docked);
+    if ($('expand-computer')) {$('expand-computer').setAttribute('aria-label', computerExpanded ? 'Dock computer' : 'Expand computer'); $('expand-computer').title = computerExpanded ? 'Dock computer' : 'Expand computer'; $('expand-computer').dataset.expanded = String(computerExpanded);}
+    if ($('panel-menu')) {$('panel-menu').open = false; $('panel-menu').dataset.active = String(['runs', 'activity'].includes(name));}
+    for (const button of document.querySelectorAll('[data-panel]')) { const active = button.dataset.panel === name; button.classList.toggle('active', active); if (active) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current'); button.tabIndex = 0; $(`panel-${button.dataset.panel}`).hidden = !(active || (docked && button.dataset.panel === 'conversation')); }
+    if ($('current-panel')) {$('current-panel').textContent = ({computer: 'Computer', files: 'Files', apps: 'Apps', runs: 'Runs', activity: 'Activity'})[name] || ''; $('current-panel').hidden = name === 'conversation' || docked;}
+    if ($('back-to-chat')) $('back-to-chat').hidden = name === 'conversation' || docked;
+    if (focus) $('more-panels')?.focus();
     desktop.setActive(name === 'computer');
     if (name === 'files' && selected) workspace.setBot(selected.id);
     else workspace.clear();
@@ -651,24 +666,77 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   function openCreate() { $('create-error').textContent = ''; $('bot-dialog').showModal(); $('bot-name').focus(); }
   for (const id of ['new-bot', 'empty-new-bot']) $(id).addEventListener('click', openCreate);
   document.querySelectorAll('[data-close-dialog]').forEach((button) => button.addEventListener('click', () => $(button.dataset.closeDialog).close()));
-  $('connect-form').addEventListener('submit', async (event) => {
-    event.preventDefault(); const button = event.submitter || event.currentTarget.querySelector('[type=submit]'); button.disabled = true; $('login-error').textContent = ''; authSession++; sessionController = new AbortController(); token = $('token').value.trim();
-    try { await loadBots(); $('token').value = ''; $('login').hidden = true; $('app').hidden = false; $('disconnect').hidden = false; $('settings-button').hidden = false; $('connection').textContent = 'Cloud connected'; $('empty').hidden = false; $('bot-workspace').hidden = true; void chatGPTTask(loadChatGPT); const bot = bots.find((item) => item.id === chosenHash()) || bots[0]; if (bot) await guarded(() => selectBot(bot)); }
-    catch (error) { if (token) { disconnect(); $('login-error').textContent = errorText(error); } }
-    finally { button.disabled = false; }
+  async function sessionRequest(method, accessToken) {
+    const headers = {'X-Timber-Client': 'console'};
+    if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+    const response = await fetch('/v1/session', {method, headers, credentials: 'same-origin', cache: 'no-store', redirect: 'error', signal: AbortSignal.timeout(15000)});
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {const error = new Error(result.error?.message || 'Could not connect. Try again.'); error.status = response.status; throw error;}
+    if (result.authenticated !== (method !== 'DELETE')) throw new Error('The server did not confirm the session.');
+    return result;
+  }
+  async function openSession() {
+    authenticated = true; sessionController = new AbortController();
+    await loadBots();
+    $('token').value = ''; $('login').hidden = true; $('app').hidden = false; $('disconnect').hidden = false; $('settings-button').hidden = false;
+    document.body.dataset.authenticated = 'true';
+    $('connection').textContent = 'Connected'; $('empty').hidden = false; $('bot-workspace').hidden = true;
+    void chatGPTTask(loadChatGPT);
+    const bot = bots.find(item => item.id === chosenHash()) || (!matchMedia('(max-width: 760px)').matches ? bots[0] : null);
+    if (bot) await guarded(() => selectBot(bot, {replace: true}));
+    else showBotList(false);
+  }
+  function showBotList(updateHistory = true) {
+    document.body.dataset.mobileView = 'bots';
+    desktop.setActive(false); stopComputerStatus();
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+    if (updateHistory) history.pushState(null, '', `${location.pathname}${location.search}#bots`);
+  }
+  async function restoreSession() {
+    const current = ++authSession;
+    $('login').hidden = true; if ($('session-loading')) $('session-loading').hidden = false;
+    try {await sessionRequest('GET'); if (current === authSession) await openSession();}
+    catch (error) {if (current === authSession) {disconnect(error.status === 401 ? '' : 'Could not restore your session. Check your connection and reload.');}}
+    finally {if ($('session-loading')) $('session-loading').hidden = true;}
+  }
+  const sessionChannel = typeof BroadcastChannel === 'function' ? new BroadcastChannel('timber-session') : null;
+  sessionChannel?.addEventListener('message', event => {if (event.data === 'signed-out') disconnect();});
+  $('connect-form').addEventListener('submit', async event => {
+    event.preventDefault(); const button = event.submitter || event.currentTarget.querySelector('[type=submit]');
+    button.disabled = true; $('login-error').textContent = ''; const current = ++authSession;
+    try {
+      await sessionRequest('POST', $('token').value.trim()); $('token').value = '';
+      if (current === authSession) await openSession();
+    } catch (error) {if (current === authSession) disconnect(errorText(error));}
+    finally {button.disabled = false;}
   });
-  $('disconnect').addEventListener('click', () => disconnect()); $('bot-search').addEventListener('input', renderBots); $('reload-bots').addEventListener('click', () => guarded(loadBots));
-  window.addEventListener('hashchange', () => { const bot = bots.find((item) => item.id === chosenHash()); if (bot) void guarded(() => selectBot(bot)); });
+  $('disconnect').addEventListener('click', async () => {
+    const button = $('disconnect'); button.disabled = true;
+    try {await desktop.disconnect(); await sessionRequest('DELETE'); disconnect(); sessionChannel?.postMessage('signed-out');}
+    catch (error) {$('github-error').textContent = 'Sign out failed. Check your connection and try again.';}
+    finally {button.disabled = false;}
+  });
+  $('bot-search').addEventListener('input', renderBots); $('reload-bots').addEventListener('click', () => guarded(loadBots));
+  const navigateHistory = () => {const bot = bots.find(item => item.id === chosenHash()); if (bot) void guarded(() => selectBot(bot, {replace: true})); else showBotList(false);};
+  window.addEventListener('hashchange', navigateHistory); window.addEventListener('popstate', navigateHistory);
+  $('mobile-back')?.addEventListener('click', () => showBotList());
+  $('mobile-account')?.addEventListener('click', () => $('settings-button').click());
+  $('back-to-chat')?.addEventListener('click', () => showPanel('conversation'));
+  $('close-computer')?.addEventListener('click', () => {computerExpanded = false; showPanel('conversation');});
+  $('expand-computer')?.addEventListener('click', () => {computerExpanded = !computerExpanded; showPanel('computer');});
+  matchMedia('(min-width: 1024px)').addEventListener('change', () => {if (currentPanel === 'computer') showPanel('computer');});
+  document.addEventListener('click', event => {const menu = $('panel-menu'); if (menu?.open && !menu.contains(event.target)) menu.open = false;});
+  document.addEventListener('keydown', event => {if (event.key === 'Escape' && $('panel-menu')?.open) {$('panel-menu').open = false; $('more-panels').focus();}});
   $('create-form').addEventListener('submit', async (event) => {
     event.preventDefault(); const button = event.submitter || event.currentTarget.querySelector('[type=submit]'); button.disabled = true; $('create-error').textContent = '';
     try { const { bot } = await request('/v1/bots', { method: 'POST', body: { name: $('bot-name').value.trim(), instructions: $('bot-instructions').value.trim(), model: $('bot-model').value, computerApprovalMode: $('bot-computer-approval-mode').value } }); $('create-form').reset(); $('bot-dialog').close(); $('bot-search').value = ''; bots = [bot, ...bots.filter((item) => item.id !== bot.id)]; renderBots(); await guarded(() => selectBot(bot)); }
-    catch (error) { if (token) $('create-error').textContent = errorText(error); } finally { button.disabled = false; }
+    catch (error) { if (authenticated) $('create-error').textContent = errorText(error); } finally { button.disabled = false; }
   });
-  $('edit-bot').addEventListener('click', () => { if (!selected) return; editBotId = selected.id; $('edit-name').value = selected.name; $('edit-instructions').value = selected.instructions; $('edit-computer-approval-mode').value = selected.computerApprovalMode === 'automatic' ? 'automatic' : 'ask'; $('edit-error').textContent = ''; $('edit-dialog').showModal(); $('edit-name').focus(); });
+  $('edit-bot').addEventListener('click', () => { if (!selected) return; if ($('panel-menu')) $('panel-menu').open = false; editBotId = selected.id; $('edit-name').value = selected.name; $('edit-instructions').value = selected.instructions; $('edit-computer-approval-mode').value = selected.computerApprovalMode === 'automatic' ? 'automatic' : 'ask'; $('edit-error').textContent = ''; $('edit-dialog').showModal(); $('edit-name').focus(); });
   $('edit-form').addEventListener('submit', async (event) => {
     event.preventDefault(); const button = event.submitter || event.currentTarget.querySelector('[type=submit]'), id = editBotId; if (!id) return; button.disabled = true; $('edit-error').textContent = '';
     try { const { bot } = await request(botPath(id), { method: 'PATCH', body: { name: $('edit-name').value.trim(), instructions: $('edit-instructions').value.trim(), computerApprovalMode: $('edit-computer-approval-mode').value } }); bots = bots.map((item) => item.id === bot.id ? bot : item); if (selected?.id === bot.id) { selected = bot; updateBotHeader(); renderMessages(); renderApprovals(); } renderBots(); $('edit-dialog').close(); }
-    catch (error) { if (token) $('edit-error').textContent = errorText(error); } finally { button.disabled = false; }
+    catch (error) { if (authenticated) $('edit-error').textContent = errorText(error); } finally { button.disabled = false; }
   });
   $('delete-bot').addEventListener('click', () => {const bot = bots.find(item => item.id === editBotId); if (bot) openDelete(bot);});
   $('delete-form').addEventListener('submit', event => {event.preventDefault(); void deleteBot();});
@@ -678,7 +746,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   $('refresh-runs').addEventListener('click', () => guarded(() => loadRuns())); $('load-more-runs').addEventListener('click', () => guarded(() => loadRuns(generation, true)));
   $('approval-shortcut').addEventListener('click', () => { runFilter = null; focusApproval++; showPanel('conversation'); renderMessages(); });
   const tabs = [...document.querySelectorAll('[data-panel]')];
-  tabs.forEach((button, index) => { button.addEventListener('click', () => showPanel(button.dataset.panel)); button.addEventListener('keydown', (event) => { let next; if (event.key === 'ArrowRight') next = (index + 1) % tabs.length; if (event.key === 'ArrowLeft') next = (index + tabs.length - 1) % tabs.length; if (event.key === 'Home') next = 0; if (event.key === 'End') next = tabs.length - 1; if (next !== undefined) { event.preventDefault(); showPanel(tabs[next].dataset.panel, true); } }); });
+  tabs.forEach((button, index) => {button.addEventListener('click', () => showPanel(button.dataset.panel)); button.addEventListener('keydown', event => {let next; if (event.key === 'ArrowDown') next = (index + 1) % tabs.length; if (event.key === 'ArrowUp') next = (index + tabs.length - 1) % tabs.length; if (event.key === 'Home') next = 0; if (event.key === 'End') next = tabs.length - 1; if (next !== undefined) {event.preventDefault(); tabs[next].focus();}});});
   $('refresh-history').addEventListener('click', () => guarded(() => Promise.all([loadMessages(), loadRuns(), loadApprovals(), loadConnections(), loadApps()]))); $('reconnect-stream').addEventListener('click', startStream);
   $('refresh-computer').addEventListener('click', () => guarded(computerStatus)); $('take-screenshot').addEventListener('click', () => guarded(() => computerAction({ type: 'screenshot' })));
   $('checkpoint').addEventListener('click', () => guarded(() => computerAction({ type: 'checkpoint' }))); $('suspend-computer').addEventListener('click', () => guarded(suspendComputer));
@@ -695,7 +763,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   $('file-up').addEventListener('click', () => guarded(() => { const parent = directoryPath.split('/').slice(0, -1).join('/') || '.'; $('file-path').value = parent; return computerAction({ type: 'listFiles', path: parent }); }));
   $('clear-result').addEventListener('click', () => { $('computer-result').textContent = 'No actions yet.'; $('result-raw').textContent = ''; $('result-details').hidden = true; $('computer-warning').hidden = true; $('download-artifact').hidden = true; artifact = null; });
   $('download-artifact').addEventListener('click', () => guarded(async () => { if (!artifact) return; const { id, botId } = artifact, response = await request(`${botPath(botId)}/artifacts/${encodeURIComponent(id)}`, { raw: true }); const url = URL.createObjectURL(await response.blob()), anchor = el('a'); anchor.href = url; anchor.download = `artifact-${id.replaceAll(/[^a-zA-Z0-9._-]/g, '_')}`; anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 30000); }));
-  $('settings-button').addEventListener('click', () => { $('settings-dialog').showModal(); void chatGPTTask(loadChatGPT); void loadGitHubStatus(); }); $('refresh-chatgpt').addEventListener('click', () => chatGPTTask(loadChatGPT));
+  $('settings-button').addEventListener('click', () => { if ($('panel-menu')) $('panel-menu').open = false; $('settings-dialog').showModal(); void chatGPTTask(loadChatGPT); void loadGitHubStatus(); }); $('refresh-chatgpt').addEventListener('click', () => chatGPTTask(loadChatGPT));
   $('copy-chatgpt-login').addEventListener('click', async () => { try { await navigator.clipboard.writeText('npm run chatgpt:login'); $('chatgpt-verification').textContent = 'Login command copied. Run it in your local Timber checkout.'; } catch { $('chatgpt-error').textContent = 'Copy the command above and run it in your local Timber checkout.'; } });
   $('verify-chatgpt').addEventListener('click', () => chatGPTTask(async (session) => { $('chatgpt-verification').textContent = 'Testing gpt-6.1-sol with one small real request…'; try { const result = await request('/v1/connections/chatgpt/verify', { method: 'POST', body: {} }); if (session !== authSession) return; if (result.ok !== true || result.model !== 'gpt-6.1-sol') throw new Error('The backend did not confirm gpt-6.1-sol access.'); $('chatgpt-verification').textContent = 'Verified: gpt-6.1-sol completed a real request.'; } catch (error) { if (session === authSession) $('chatgpt-verification').textContent = 'Model access was not verified.'; throw error; } }));
   $('disconnect-chatgpt').addEventListener('click', () => chatGPTTask(async (session) => { const status = await request('/v1/connections/chatgpt', { method: 'DELETE' }); if (session !== authSession) return; renderChatGPT(status); $('chatgpt-verification').textContent = status.revoked === true ? 'ChatGPT disconnected and its renewable session revoked.' : 'Cloud credentials removed. Remote revocation was not confirmed; disconnect Timber in ChatGPT Settings.'; }));
@@ -704,7 +772,12 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   $('connect-github').addEventListener('click', () => {void connectAccountGitHub();});
   $('refresh-github').addEventListener('click', () => {void loadGitHubStatus();});
   $('disconnect-github').addEventListener('click', () => {void disconnectGitHub();});
-  window.addEventListener('focus', () => {if (token && $('settings-dialog').open) void loadGitHubStatus(); if (token && selected && connections.some(item => item.status === 'pending')) void guarded(() => Promise.all([loadConnections(), loadRuns()]));});
-  document.addEventListener('visibilitychange', () => { desktop.setActive(!document.hidden && !$('panel-computer').hidden); });
-  window.addEventListener('pagehide', () => disconnect());
+  window.addEventListener('focus', () => {if (authenticated && $('settings-dialog').open) void loadGitHubStatus(); if (authenticated && selected && connections.some(item => item.status === 'pending')) void guarded(() => Promise.all([loadConnections(), loadRuns()]));});
+  document.addEventListener('visibilitychange', () => { desktop.setActive(!document.hidden && !$('panel-computer').hidden && (!matchMedia('(max-width: 760px)').matches || document.body.dataset.mobileView === 'bot')); });
+  window.addEventListener('pagehide', () => {desktop.disconnect(); stopComputerStatus(); streamController?.abort();});
+  window.addEventListener('pageshow', event => {if (event.persisted && authenticated) {startStream(); void guarded(loadBots);}});
+  const updateViewport = () => {document.documentElement.style.setProperty('--app-height', `${Math.round(window.visualViewport?.height || innerHeight)}px`);};
+  window.visualViewport?.addEventListener('resize', updateViewport); window.addEventListener('resize', updateViewport); updateViewport();
+  document.body.dataset.mobileView = 'bots';
+  void restoreSession();
 })();

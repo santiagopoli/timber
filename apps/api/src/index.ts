@@ -1,4 +1,4 @@
-import { authenticate } from "./auth";
+import { authenticate, consoleSession } from "./auth";
 import { ApiError, errorResponse, json } from "./errors";
 import type { Env } from "./env";
 import { UUID } from "./validation";
@@ -61,6 +61,7 @@ export default {
         if(!record.ok) return record;
         return env.COMPUTER.get(env.COMPUTER.idFromName(desktop[1])).fetch(new Request("https://computer.internal/desktop-ws",{headers:{"x-timber-bot-id":desktop[1],Upgrade:"websocket","sec-websocket-protocol":protocols}}));
       }
+      if(url.pathname==="/v1/session") return await consoleSession(request,env.BOTSPACE_API_TOKEN);
       const owner=await authenticate(request,env.BOTSPACE_API_TOKEN);
       if(!url.pathname.startsWith("/v1/")) throw new ApiError(404,"not_found","Endpoint not found.");
       if(url.pathname==="/v1/connections/chatgpt" || url.pathname==="/v1/connections/chatgpt/verify") {
