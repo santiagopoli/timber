@@ -33,8 +33,7 @@ path needs a dedicated hostname; this MVP does not rewrite arbitrary HTML/JS.
 - `POST /v1/bots/:botId/apps` accepts `{name,port,operationId}` and returns `{app}`.
   The operation ID is idempotent and conflicts if its arguments change.
 - `DELETE /v1/bots/:botId/apps/:appId` revokes browser access and removes the card.
-  Repeating deletion is idempotent. It does not kill the server process or delete
-  workspace files.
+  It does not kill the server process or delete workspace files.
 - `POST /v1/bots/:botId/apps/:appId/open` returns `{actionUrl,ticket,expiresAt}`.
   The console submits the ticket using an HTML form POST in a new browser tab.
   The 60-second ticket is one-use, never a URL parameter. A successful exchange
@@ -79,6 +78,26 @@ preview tests. Cloud verification should create two isolated apps, open them via
 one-use grants, check independent HTML/assets and an HTTP POST, and verify access
 fails after revocation. Do not claim private browser or WebSocket cloud tests
 passed until they have actually run.
+
+Verified on 2026-10-07:
+
+- 11 gateway tests and 3 ComputerDO preview tests passed, including ticket
+  expiration/replay, bot and app boundaries, reviewed HTTP errors through BotDO,
+  credential stripping, and native WebSocket echo/passthrough.
+- Two real Node apps, Frontend and Admin, ran together in one Cloudflare computer.
+  Both returned the correct HTML, a CSS asset, and a POST body through the separately
+  deployed preview Worker. Both completed a real WebSocket echo round trip.
+- Unauthenticated app access returned 401; reusing an opening ticket returned
+  401. Neither owner Authorization nor gateway cookies reached either app.
+  Removing each app made its existing browser grant return 404 on the next request.
+- The isolated test bot, its computer and R2 prefix were deleted. The temporary API
+  and preview Workers, container application, and temporary owner token were also
+  removed. Production bots and credentials were not changed by these checks.
+
+The cloud check used API version `e8a45377-7cd4-4b57-9a1b-22a8666bfe36` in isolated
+diagnostic Workers and the existing production desktop image. It exercised actual
+Cloudflare HTTP/WebSocket forwarding; it did not claim arbitrary framework base
+path configuration or cross-app browser origin isolation.
 
 Primary platform references:
 - https://developers.cloudflare.com/sandbox/previews/
