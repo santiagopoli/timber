@@ -7,11 +7,11 @@ import { mountChat } from './src/chat.tsx';
   const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
   const guiActions = new Set(['navigate', 'click', 'type', 'key', 'scroll']);
   const removedBots = new Set(), deletionPending = new Map();
-  const drafts = new Map(), pendingMessages = new Map(), pendingActions = new Map(), computerPending = new Map(), stopping = new Set(), approvalWork = new Map(), approvalFeedback = new Map();
+  const drafts = new Map(), pendingMessages = new Map(), pendingActions = new Map(), computerPending = new Map(), stopping = new Set(), approvalWork = new Map(), approvalFeedback = new Map(), connectionWork = new Map(), appWork = new Map();
   let token = '', bots = [], selected = null, currentRun = null, generation = 0, authSession = 0;
   let sessionController = new AbortController(), streamController, refreshTimer, progressTimer, computerStatusTimer;
   let computerStatusRequest = 0;
-  let messages = [], approvals = [], runs = new Map(), activeRunIds = new Set(), nextCursor = null, olderPagesLoaded = false, loadingOlderRuns = false, runFilter = null, runRevision = 0, runsRequest = 0, messagesRequest = 0, approvalsRequest = 0;
+  let messages = [], approvals = [], connections = [], workspaceApps = [], connectionsRequest = 0, appsRequest = 0, runs = new Map(), activeRunIds = new Set(), nextCursor = null, olderPagesLoaded = false, loadingOlderRuns = false, runFilter = null, runRevision = 0, runsRequest = 0, messagesRequest = 0, approvalsRequest = 0;
   let cursor = 0, boundary = '', events = [], streamDrafts = new Map(), chatLoading = false, focusApproval = 0, screenUrl = null, artifact = null, directoryPath = '.';
   let chatGPTConnected = false, chatGPTBusy = false, chatGPTAccount = null, editBotId = null, deleteTarget = null, deleteBusy = false, sendBusy = new Set();
   const el = (tag, cls, text) => { const node = document.createElement(tag); if (cls) node.className = cls; if (text !== undefined) node.textContent = text; return node; };
@@ -36,6 +36,7 @@ import { mountChat } from './src/chat.tsx';
     onDecision: (botId, approvalId, decision, allowComputer) => { if (selected?.id !== botId) return; const approval = approvals.find(item => item.id === approvalId); if (approval) void decideApproval(botId, approval, decision, allowComputer); },
     onClearFilter: () => { runFilter = null; renderMessages(); },
     onStop: (botId, runId) => { if (selected?.id === botId) void guarded(() => cancelRun(runId)); },
+    onConnect: (botId, requestId) => { if (selected?.id === botId) void connectGitHub(botId, requestId); },
   });
   function showError(error) { if (token) $('app-error').textContent = errorText(error); }
   async function guarded(fn) { $('app-error').textContent = ''; try { return await fn(); } catch (error) { if (error.name !== 'AbortError') showError(error); } }
@@ -50,7 +51,7 @@ import { mountChat } from './src/chat.tsx';
     catch (error) { if (error.name === 'AbortError') throw error; throw new Error(method === 'GET' ? 'Connection lost. Check your network, then refresh or reconnect.' : 'The response was lost. The action may have been accepted. Inspect its state before retrying; nothing was retried automatically.'); }
     if (!response.ok) {
       const detail = await response.json().catch(() => ({}));
-      if (response.status === 401 && !String(detail.error?.code || '').startsWith('chatgpt_') && session === authSession) disconnect('Your API token was rejected or expired. Enter the current token to reconnect.');
+      if (response.status === 401 && !/^(chatgpt_|github_)/.test(String(detail.error?.code || '')) && session === authSession) disconnect('Your API token was rejected or expired. Enter the current token to reconnect.');
       const error = new Error(detail.error?.message || `Request failed (${response.status}).`); error.status = response.status; error.code = detail.error?.code; throw error;
     }
     if (session !== authSession) throw new DOMException('The session ended.', 'AbortError');
@@ -68,14 +69,15 @@ import { mountChat } from './src/chat.tsx';
   }
   function disconnect(message = '') {
     stopComputerStatus(); generation++; authSession++; token = ''; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
-    selected = null; currentRun = null; bots = []; messages = []; approvals = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
-    removedBots.clear(); deletionPending.clear(); deleteTarget = null; deleteBusy = false; editBotId = null; drafts.clear(); pendingMessages.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); closeDialogs(); clearScreen();
+    selected = null; currentRun = null; bots = []; messages = []; approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
+    removedBots.clear(); deletionPending.clear(); deleteTarget = null; deleteBusy = false; editBotId = null; drafts.clear(); pendingMessages.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); connectionWork.clear(); appWork.clear(); closeDialogs(); clearScreen();
     chatGPTConnected = false; chatGPTAccount = null; chatGPTBusy = false;
     chat.clear();
-    for (const id of ['activity-list', 'bot-list', 'run-list', 'file-list']) $(id).replaceChildren();
+    for (const id of ['activity-list', 'bot-list', 'run-list', 'file-list', 'workspace-app-list']) $(id).replaceChildren();
     for (const id of ['token', 'type-text', 'exec-command', 'navigate-url', 'key-name', 'file-content', 'bot-search']) $(id).value = '';
     $('create-form').reset(); $('edit-form').reset(); $('delete-error').textContent = ''; $('delete-form').reset(); renderDeleteControls(); $('file-path').value = '.'; $('computer-result').textContent = 'No actions yet.';
     $('result-raw').textContent = ''; $('result-details').hidden = true; $('computer-warning').hidden = true; $('computer-progress').hidden = true;
+    $('github-status').textContent = 'Connection not checked.'; $('github-error').textContent = ''; $('disconnect-github').hidden = true; $('disconnect-github').disabled = false;
     $('chatgpt-status').textContent = 'Connection not checked.'; $('chatgpt-account').textContent = ''; $('chatgpt-account').hidden = true;
     $('chatgpt-verification').textContent = 'Model access has not been verified.'; $('chatgpt-error').textContent = ''; $('disconnect-chatgpt').hidden = true; $('verify-chatgpt').disabled = true;
     $('app').hidden = true; $('login').hidden = false; $('disconnect').hidden = true; $('settings-button').hidden = true;
@@ -103,16 +105,17 @@ import { mountChat } from './src/chat.tsx';
   async function selectBot(bot) {
     if (selected?.id === bot.id || removedBots.has(bot.id)) return;
     stopComputerStatus(); generation++; const version = generation; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
-    selected = bot; chatLoading = true; currentRun = null; cursor = 0; boundary = ''; events = []; messages = []; approvals = []; runs = new Map(); activeRunIds = new Set(); streamDrafts = new Map(); nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; runFilter = null; runRevision = 0;
+    selected = bot; chatLoading = true; currentRun = null; cursor = 0; boundary = ''; events = []; messages = []; approvals = []; connections = []; workspaceApps = []; runs = new Map(); activeRunIds = new Set(); streamDrafts = new Map(); nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; runFilter = null; runRevision = 0;
+    $('refresh-apps').disabled = false; $('refresh-apps').textContent = 'Refresh apps';
     history.replaceState(null, '', `${location.pathname}${location.search}#bot=${encodeURIComponent(bot.id)}`);
-    $('empty').hidden = true; $('bot-workspace').hidden = false; updateBotHeader(); renderBots();
+    $('empty').hidden = true; $('bot-workspace').hidden = false; updateBotHeader(); renderBots(); renderApps();
     for (const id of ['activity-list', 'run-list']) $(id).replaceChildren();
-    $('event-count').textContent = '0';
+    $('app-count').textContent = '0'; $('apps-feedback').textContent = ''; $('event-count').textContent = '0';
     $('computer-result').textContent = 'No actions yet.'; $('result-details').hidden = true; $('computer-warning').hidden = true;
     $('computer-status').textContent = 'Load status to inspect the environment.'; $('file-path').value = '.'; directoryPath = '.';
     $('file-content').value = ''; $('type-text').value = ''; $('file-list').replaceChildren(el('p', 'hint', 'Browse to load files. This may wake the computer.'));
     $('app-error').textContent = ''; $('approval-shortcut').hidden = true; renderCurrentRun(); renderStreamDraft(); renderProgress();
-    try { await Promise.all([loadMessages(version), loadRuns(version), loadApprovals(version)]); }
+    try { await Promise.all([loadMessages(version), loadRuns(version), loadApprovals(version), loadConnections(version), loadApps(version)]); }
     finally { if (validView(version)) { chatLoading = false; renderMessages(); startStream(); if (!$('panel-computer').hidden) void guarded(computerStatus); } }
   }
   function effectiveApprovals() {
@@ -139,7 +142,7 @@ import { mountChat } from './src/chat.tsx';
     const visibleApprovals = effectiveApprovals(), pending = visibleApprovals.filter(approval => approval.status === 'pending');
     $('approval-count').textContent = String(pending.length); $('approval-shortcut').hidden = !pending.length;
     const stream = [...streamDrafts.entries()].find(([id, text]) => text && activeRunIds.has(id) && !terminal.has(runs.get(id)?.status) && (!runFilter || id === runFilter));
-    chat.update({ bot: selected, messages, runs: [...runs.values()], approvals: visibleApprovals, events: events.filter(event => ['tool.started', 'tool.completed'].includes(event.type)).map(event => ({...event, data: redact(event.data)})),
+    chat.update({ bot: selected, messages, runs: [...runs.values()], approvals: visibleApprovals, connections: connections.map(item => ({...item, ...connectionWork.get(`${selected.id}:${item.id}`)})), events: events.filter(event => ['tool.started', 'tool.completed'].includes(event.type)).map(event => ({...event, data: redact(event.data)})),
       deliveries: [...pendingMessages.values()].filter(delivery => delivery.botId === selected.id).map(delivery => ({...delivery})), draft: drafts.get(selected.id) || '', sending: sendBusy.has(selected.id), loading: chatLoading,
       currentRun, runFilter, focusApproval, stream: stream ? {runId: stream[0], text: stream[1]} : null, feedback: approvalFeedback.get(selected.id) });
   }
@@ -153,7 +156,7 @@ import { mountChat } from './src/chat.tsx';
     try {
       const {run} = await request(`${botPath(botId)}/messages`, {method: 'POST', body: {text, operationId: delivery.operationId}});
       if (session !== authSession) return;
-      if (!run || typeof run.id !== 'string' || !run.id || run.botId !== botId || run.operationId !== delivery.operationId || !['queued', 'running', 'waiting_approval', ...terminal].includes(run.status)) throw new Error('The server acknowledgment could not be verified. Your message may have been accepted. Retry sending to check the same request safely.');
+      if (!run || typeof run.id !== 'string' || !run.id || run.botId !== botId || run.operationId !== delivery.operationId || !['queued', 'running', 'waiting_approval', 'waiting_connection', ...terminal].includes(run.status)) throw new Error('The server acknowledgment could not be verified. Your message may have been accepted. Retry sending to check the same request safely.');
       delivery.state = 'accepted'; delivery.runId = run.id; delivery.runStatus = run.status;
       if ((drafts.get(botId) || '').trim() === text) drafts.delete(botId);
       if (selected?.id === botId) { mergeRun(run); if (!terminal.has(run.status)) activeRunIds.add(run.id); runRevision++; runFilter = null; reconcileDeliveries([run]); renderRuns(); scheduleRefresh(generation); }
@@ -168,7 +171,7 @@ import { mountChat } from './src/chat.tsx';
     try {
       const result = await request(`${botPath(botId)}/messages`, {method: 'POST', body: {text, operationId: run.operationId}});
       if (session !== authSession) return;
-      if (result.run?.id !== run.id || result.run.botId !== botId || result.run.operationId !== run.operationId || !['queued', 'running', 'waiting_approval', ...terminal].includes(result.run.status)) throw new Error('Delivery retry was not confirmed. Inspect this run before trying again.');
+      if (result.run?.id !== run.id || result.run.botId !== botId || result.run.operationId !== run.operationId || !['queued', 'running', 'waiting_approval', 'waiting_connection', ...terminal].includes(result.run.status)) throw new Error('Delivery retry was not confirmed. Inspect this run before trying again.');
       if (selected?.id === botId) {mergeRun(result.run); reconcileDeliveries([result.run]); renderRuns(); scheduleRefresh(generation);}
     } catch (error) { if (session === authSession && selected?.id === botId && error.name !== 'AbortError') showError(error); }
     finally {if (session === authSession) {sendBusy.delete(botId); if (selected?.id === botId) renderMessages();}}
@@ -187,7 +190,7 @@ import { mountChat } from './src/chat.tsx';
   const sortedRuns = () => [...runs.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   function renderCurrentRun() {
     const active = sortedRuns().filter((run) => activeRunIds.has(run.id) && !terminal.has(run.status));
-    currentRun = active.find((run) => run.status === 'running') || active.find((run) => run.status === 'waiting_approval') || active[0] || sortedRuns()[0] || null;
+    currentRun = active.find((run) => run.status === 'running') || active.find((run) => ['waiting_approval', 'waiting_connection'].includes(run.status)) || active[0] || sortedRuns()[0] || null;
     $('run-status').textContent = currentRun ? statusLabel(currentRun.status) : 'Ready'; $('run-status').dataset.status = currentRun?.status || 'ready';
     $('cancel-run').hidden = !currentRun || terminal.has(currentRun.status); $('cancel-run').disabled = currentRun ? stopping.has(currentRun.id) : false;
     $('active-run-count').hidden = !active.length; $('active-run-count').textContent = String(active.length);
@@ -265,7 +268,131 @@ import { mountChat } from './src/chat.tsx';
     const id = selected?.id, sequence = ++approvalsRequest; if (!id) return; const result = await request(`${botPath(id)}/approvals`); if (!validView(version) || sequence !== approvalsRequest) return;
     approvals = result.approvals; renderApprovals();
   }
-  function scheduleRefresh(version) { clearTimeout(refreshTimer); refreshTimer = setTimeout(() => { if (validView(version)) void guarded(() => Promise.all([loadMessages(version), loadRuns(version), loadApprovals(version)])); }, 300); }
+  async function loadConnections(version = generation) {
+    const id = selected?.id, sequence = ++connectionsRequest; if (!id) return;
+    const result = await request(`${botPath(id)}/connections`);
+    if (!validView(version) || sequence !== connectionsRequest) return;
+    connections = result.connections;
+    for (const item of connections) if (item.status !== 'pending') connectionWork.delete(`${id}:${item.id}`);
+    renderMessages();
+  }
+  function newWindow(title) {
+    const popup = window.open('about:blank', '_blank');
+    if (!popup) throw new Error('Your browser blocked the new tab. Allow pop-ups for Timber and try again.');
+    popup.opener = null; popup.document.title = title;
+    const message = popup.document.createElement('p'); message.textContent = `${title}…`; popup.document.body.append(message);
+    return popup;
+  }
+  async function connectGitHub(botId, requestId) {
+    const key = `${botId}:${requestId}`, session = authSession;
+    if (!token || connectionWork.get(key)?.busy || !connections.some(item => item.id === requestId && item.status === 'pending')) return;
+    const work = {busy: true}; connectionWork.set(key, work); let popup;
+    try {
+      popup = newWindow('Connecting GitHub'); renderMessages();
+      const result = await request(`${botPath(botId)}/connections/${encodeURIComponent(requestId)}/connect`, {method: 'POST', body: {}});
+      if (session !== authSession || removedBots.has(botId)) {popup.close(); return;}
+      if (typeof result.url !== 'string' || !result.url) throw new Error('GitHub did not return a connection address.');
+      const url = new URL(result.url, location.origin);
+      if ((url.origin !== location.origin && (url.protocol !== 'https:' || url.hostname !== 'github.com')) || url.username || url.password) throw new Error('GitHub returned an invalid connection address.');
+      if (popup.closed) throw new Error('The connection tab was closed. Select Connect GitHub to continue.');
+      popup.location.replace(url.href); work.opened = true;
+    } catch (error) {popup?.close(); if (session === authSession && error.name !== 'AbortError') work.error = errorText(error);}
+    finally {if (session === authSession) {work.busy = false; if (selected?.id === botId) renderMessages();}}
+  }
+  function appAddress(value) {
+    const url = new URL(value);
+    const localTest = ['127.0.0.1', 'localhost'].includes(location.hostname) && ['127.0.0.1', 'localhost'].includes(url.hostname);
+    if ((url.protocol !== 'https:' && !(localTest && url.protocol === 'http:')) || url.username || url.password || url.search || url.hash) throw new Error('This app does not have a valid access address.');
+    return url;
+  }
+  function renderApps() {
+    const list = $('workspace-app-list'); list.replaceChildren(); $('app-count').textContent = String(workspaceApps.length);
+    $('workspace-app-empty').hidden = workspaceApps.length > 0;
+    for (const app of workspaceApps) {
+      const work = appWork.get(`${selected.id}:${app.id}`), card = el('article', 'workspace-app'); card.dataset.appId = app.id;
+      const heading = el('div', 'workspace-app-heading'); heading.append(el('span', 'workspace-app-icon', app.name.slice(0, 1).toUpperCase()));
+      const title = el('div', 'workspace-app-title'); title.append(el('h3', '', app.name), el('span', 'hint', app.state === 'ready' ? 'Ready to use' : app.state === 'stopped' ? 'Workspace is asleep' : 'App is not responding'));
+      heading.append(title, statusBadge(app.state)); card.append(heading);
+      let address; try {address = appAddress(app.url);} catch { /* Invalid server URLs are never clickable. */ }
+      const description = app.state === 'ready' ? 'Available in your browser.' : app.state === 'stopped' ? 'Ask your bot to start this app again.' : 'Ask your bot to check the app, or refresh after it starts.';
+      card.append(el('p', 'workspace-app-description', description));
+      const controls = el('div', 'row wrap workspace-app-actions');
+      const open = el('button', '', work?.busy === 'open' ? 'Opening…' : 'Open'); open.type = 'button'; open.dataset.openApp = app.id; open.setAttribute('aria-label', `Open ${app.name}`); open.disabled = Boolean(work?.busy) || !address || app.state !== 'ready';
+      open.addEventListener('click', () => {void openWorkspaceApp(app);});
+      const copy = el('button', 'quiet', 'Copy link'); copy.type = 'button'; copy.dataset.copyApp = app.id; copy.disabled = Boolean(work?.busy) || !address; copy.setAttribute('aria-label', `Copy ${app.name} link`);
+      copy.addEventListener('click', () => {void copyAppLink(app);}); controls.append(open, copy); card.append(controls);
+      const details = el('details', 'workspace-app-details'); details.append(el('summary', '', 'App details'));
+      if (address) details.append(el('p', 'workspace-app-url', address.href));
+      details.append(el('p', 'hint', 'Links work in browsers you have opened from Timber. They do not grant public access.'), el('p', 'hint', `Workspace service: ${app.port} · App path: ${app.basePath || '/'}`));
+      const remove = el('button', 'danger-quiet', work?.busy === 'remove' ? 'Removing access…' : 'Remove access'); remove.type = 'button'; remove.dataset.removeApp = app.id; remove.disabled = Boolean(work?.busy); remove.addEventListener('click', () => {void removeWorkspaceApp(app);}); details.append(remove, el('p', 'hint', 'Removes this app link. Its server and files stay in the workspace.')); card.append(details);
+      if (work?.message) card.append(el('p', work.error ? 'error workspace-app-feedback' : 'hint workspace-app-feedback', work.message));
+      list.append(card);
+    }
+  }
+  async function loadApps(version = generation) {
+    const id = selected?.id, sequence = ++appsRequest; if (!id) return;
+    const result = await request(`${botPath(id)}/apps`);
+    if (!validView(version) || sequence !== appsRequest) return;
+    workspaceApps = result.apps; renderApps();
+  }
+  async function refreshApps() {
+    const id = selected?.id, version = generation;
+    if (!id || $('refresh-apps').disabled) return;
+    $('refresh-apps').disabled = true; $('refresh-apps').textContent = 'Checking apps…';
+    try {
+      const result = await request(`${botPath(id)}/apps/refresh`, {method: 'POST', body: {}});
+      if (!validView(version)) return;
+      // A prior passive snapshot must not overwrite the freshly probed state.
+      appsRequest++; workspaceApps = result.apps; renderApps();
+    } finally {if (validView(version)) {$('refresh-apps').disabled = false; $('refresh-apps').textContent = 'Refresh apps';}}
+  }
+  async function openWorkspaceApp(app) {
+    const botId = selected?.id, session = authSession, key = `${botId}:${app.id}`;
+    if (!botId || !token || appWork.get(key)?.busy) return;
+    const work = {busy: 'open'}; appWork.set(key, work); let popup;
+    try {
+      popup = newWindow(`Opening ${app.name}`); renderApps();
+      const result = await request(`${botPath(botId)}/apps/${encodeURIComponent(app.id)}/open`, {method: 'POST', body: {}});
+      if (session !== authSession || removedBots.has(botId)) {popup.close(); return;}
+      const address = appAddress(app.url), action = appAddress(result.actionUrl);
+      if (action.origin !== address.origin || typeof result.ticket !== 'string' || !result.ticket || !Number.isFinite(Date.parse(result.expiresAt)) || Date.parse(result.expiresAt) <= Date.now()) throw new Error('App access could not be verified. Refresh and try again.');
+      if (popup.closed) throw new Error('The app tab was closed. Select Open to try again.');
+      // Only this one-time app ticket crosses to the preview origin, in the POST
+      // body. The owner API token never enters the URL, app page, or storage.
+      const form = popup.document.createElement('form'); form.method = 'POST'; form.action = action.href;
+      const input = popup.document.createElement('input'); input.type = 'hidden'; input.name = 'ticket'; input.value = result.ticket; form.append(input); popup.document.body.append(form); form.submit();
+      work.message = 'Opened in a new tab.';
+    } catch (error) {popup?.close(); if (session === authSession && error.name !== 'AbortError') {work.message = errorText(error); work.error = true;}}
+    finally {if (session === authSession) {work.busy = false; if (selected?.id === botId) renderApps();}}
+  }
+  async function copyAppLink(app) {
+    const botId = selected?.id, session = authSession, key = `${botId}:${app.id}`, work = {}; appWork.set(key, work);
+    try {await navigator.clipboard.writeText(appAddress(app.url).href); work.message = 'Link copied. Open it from Timber first to grant this browser access.';}
+    catch {work.message = 'Could not copy the link. Select the URL under App details to copy it.'; work.error = true;}
+    if (session === authSession && selected?.id === botId) renderApps();
+  }
+  async function removeWorkspaceApp(app) {
+    const botId = selected?.id, session = authSession, key = `${botId}:${app.id}`; if (!botId || !token || appWork.get(key)?.busy) return;
+    const work = {busy: 'remove'}; appWork.set(key, work); renderApps();
+    try {
+      await request(`${botPath(botId)}/apps/${encodeURIComponent(app.id)}`, {method: 'DELETE'});
+      if (session !== authSession || selected?.id !== botId) return;
+      appsRequest++; workspaceApps = workspaceApps.filter(item => item.id !== app.id); $('apps-feedback').textContent = `${app.name} access removed. Its server and files were kept.`;
+    } catch (error) {if (session === authSession && error.name !== 'AbortError') {work.message = errorText(error); work.error = true;}}
+    finally {if (session === authSession) {work.busy = false; if (selected?.id === botId) renderApps();}}
+  }
+  async function loadGitHubStatus() {
+    const session = authSession; $('github-error').textContent = '';
+    try {const status = await request('/v1/connections/github'); if (session !== authSession) return; $('github-status').textContent = status.connected ? 'GitHub connected. Each bot gets access only to the repositories you approve.' : 'Not connected. Ask a bot to work with a repository to connect GitHub in its conversation.'; $('disconnect-github').hidden = !status.connected;}
+    catch (error) {if (session === authSession && error.name !== 'AbortError') $('github-error').textContent = errorText(error);}
+  }
+  async function disconnectGitHub() {
+    const session = authSession; $('disconnect-github').disabled = true; $('github-error').textContent = '';
+    try {await request('/v1/connections/github', {method: 'DELETE'}); if (session !== authSession) return; await loadGitHubStatus(); if (selected) await loadConnections();}
+    catch (error) {if (session === authSession && error.name !== 'AbortError') $('github-error').textContent = errorText(error);}
+    finally {if (session === authSession) $('disconnect-github').disabled = false;}
+  }
+  function scheduleRefresh(version) { clearTimeout(refreshTimer); refreshTimer = setTimeout(() => { if (validView(version)) void guarded(() => Promise.all([loadMessages(version), loadRuns(version), loadApprovals(version), loadConnections(version), loadApps(version)])); }, 300); }
   function redact(value, key = '') {
     if (/token|secret|password|authorization|credential/i.test(key)) return '[hidden]';
     if (Array.isArray(value)) return value.map((item) => redact(item));
@@ -419,20 +546,20 @@ import { mountChat } from './src/chat.tsx';
   function forgetBot(id) {
     removedBots.add(id); bots = bots.filter(bot => bot.id !== id); drafts.delete(id); sendBusy.delete(id); approvalFeedback.delete(id); computerPending.delete(id);
     for (const [key, message] of pendingMessages) if (message.botId === id) pendingMessages.delete(key);
-    for (const map of [pendingActions, approvalWork]) for (const key of map.keys()) if (key.startsWith(`${id}:`)) map.delete(key);
+    for (const map of [pendingActions, approvalWork, connectionWork, appWork]) for (const key of map.keys()) if (key.startsWith(`${id}:`)) map.delete(key);
     if (editBotId === id) {editBotId = null; $('edit-form').reset(); $('edit-dialog').close();}
     const wasSelected = selected?.id === id;
     if (wasSelected) {
       stopComputerStatus(); generation++; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
       for (const runId of runs.keys()) stopping.delete(runId);
-      selected = null; currentRun = null; messages = []; approvals = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
+      selected = null; currentRun = null; messages = []; approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
       cursor = 0; boundary = ''; runFilter = null; nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; chatLoading = false; chat.clear();
-      for (const element of ['activity-list', 'run-list', 'file-list']) $(element).replaceChildren();
+      for (const element of ['activity-list', 'run-list', 'file-list', 'workspace-app-list']) $(element).replaceChildren();
       for (const element of ['file-content', 'type-text', 'exec-command', 'navigate-url', 'key-name']) $(element).value = '';
       for (const element of ['selected-name', 'selected-model', 'selected-computer-mode', 'app-error', 'run-error', 'result-raw']) $(element).textContent = '';
       $('file-path').value = '.'; directoryPath = '.'; $('computer-result').textContent = 'No actions yet.'; $('computer-status').textContent = 'Load status to inspect the environment.';
       for (const element of ['result-details', 'computer-warning', 'run-error', 'approval-shortcut', 'active-run-count', 'cancel-run', 'reconnect-stream']) $(element).hidden = true;
-      $('event-count').textContent = '0'; $('approval-count').textContent = '0'; $('stream-state').textContent = ''; $('bot-workspace').hidden = true; $('empty').hidden = false;
+      $('app-count').textContent = '0'; $('apps-feedback').textContent = ''; $('event-count').textContent = '0'; $('approval-count').textContent = '0'; $('stream-state').textContent = ''; $('bot-workspace').hidden = true; $('empty').hidden = false;
       history.replaceState(null, '', `${location.pathname}${location.search}`); showPanel('conversation');
     }
     renderBots(); renderProgress();
@@ -459,7 +586,7 @@ import { mountChat } from './src/chat.tsx';
   function showPanel(name, focus = false) {
     for (const button of document.querySelectorAll('[data-panel]')) { const active = button.dataset.panel === name; button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active)); button.tabIndex = active ? 0 : -1; $(`panel-${button.dataset.panel}`).hidden = !active; if (active && focus) button.focus(); }
     if (name !== 'computer') stopComputerStatus();
-    if (name === 'computer' && selected) void guarded(computerStatus); if (name === 'runs' && selected) void guarded(() => loadRuns());
+    if (name === 'computer' && selected) void guarded(computerStatus); if (name === 'runs' && selected) void guarded(() => loadRuns()); if (name === 'apps' && selected) void guarded(() => loadApps());
   }
   function bindForm(id, fn) { $(id).addEventListener('submit', (event) => { event.preventDefault(); void guarded(fn); }); }
   function openCreate() { $('create-error').textContent = ''; $('bot-dialog').showModal(); $('bot-name').focus(); }
@@ -493,7 +620,7 @@ import { mountChat } from './src/chat.tsx';
   $('approval-shortcut').addEventListener('click', () => { runFilter = null; focusApproval++; showPanel('conversation'); renderMessages(); });
   const tabs = [...document.querySelectorAll('[data-panel]')];
   tabs.forEach((button, index) => { button.addEventListener('click', () => showPanel(button.dataset.panel)); button.addEventListener('keydown', (event) => { let next; if (event.key === 'ArrowRight') next = (index + 1) % tabs.length; if (event.key === 'ArrowLeft') next = (index + tabs.length - 1) % tabs.length; if (event.key === 'Home') next = 0; if (event.key === 'End') next = tabs.length - 1; if (next !== undefined) { event.preventDefault(); showPanel(tabs[next].dataset.panel, true); } }); });
-  $('refresh-history').addEventListener('click', () => guarded(() => Promise.all([loadMessages(), loadRuns(), loadApprovals()]))); $('reconnect-stream').addEventListener('click', startStream);
+  $('refresh-history').addEventListener('click', () => guarded(() => Promise.all([loadMessages(), loadRuns(), loadApprovals(), loadConnections(), loadApps()]))); $('reconnect-stream').addEventListener('click', startStream);
   $('refresh-computer').addEventListener('click', () => guarded(computerStatus)); $('take-screenshot').addEventListener('click', () => guarded(() => computerAction({ type: 'screenshot' })));
   $('checkpoint').addEventListener('click', () => guarded(() => computerAction({ type: 'checkpoint' }))); $('suspend-computer').addEventListener('click', () => guarded(suspendComputer));
   $('click-mode').addEventListener('change', () => document.querySelector('.screen').classList.toggle('click-enabled', $('click-mode').checked));
@@ -509,9 +636,14 @@ import { mountChat } from './src/chat.tsx';
   $('file-up').addEventListener('click', () => guarded(() => { const parent = directoryPath.split('/').slice(0, -1).join('/') || '.'; $('file-path').value = parent; return computerAction({ type: 'listFiles', path: parent }); }));
   $('clear-result').addEventListener('click', () => { $('computer-result').textContent = 'No actions yet.'; $('result-raw').textContent = ''; $('result-details').hidden = true; $('computer-warning').hidden = true; $('download-artifact').hidden = true; artifact = null; });
   $('download-artifact').addEventListener('click', () => guarded(async () => { if (!artifact) return; const { id, botId } = artifact, response = await request(`${botPath(botId)}/artifacts/${encodeURIComponent(id)}`, { raw: true }); const url = URL.createObjectURL(await response.blob()), anchor = el('a'); anchor.href = url; anchor.download = `artifact-${id.replaceAll(/[^a-zA-Z0-9._-]/g, '_')}`; anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 30000); }));
-  $('settings-button').addEventListener('click', () => { $('settings-dialog').showModal(); void chatGPTTask(loadChatGPT); }); $('refresh-chatgpt').addEventListener('click', () => chatGPTTask(loadChatGPT));
+  $('settings-button').addEventListener('click', () => { $('settings-dialog').showModal(); void chatGPTTask(loadChatGPT); void loadGitHubStatus(); }); $('refresh-chatgpt').addEventListener('click', () => chatGPTTask(loadChatGPT));
   $('copy-chatgpt-login').addEventListener('click', async () => { try { await navigator.clipboard.writeText('npm run chatgpt:login'); $('chatgpt-verification').textContent = 'Login command copied. Run it in your local Timber checkout.'; } catch { $('chatgpt-error').textContent = 'Copy the command above and run it in your local Timber checkout.'; } });
   $('verify-chatgpt').addEventListener('click', () => chatGPTTask(async (session) => { $('chatgpt-verification').textContent = 'Testing gpt-6.1-sol with one small real request…'; try { const result = await request('/v1/connections/chatgpt/verify', { method: 'POST', body: {} }); if (session !== authSession) return; if (result.ok !== true || result.model !== 'gpt-6.1-sol') throw new Error('The backend did not confirm gpt-6.1-sol access.'); $('chatgpt-verification').textContent = 'Verified: gpt-6.1-sol completed a real request.'; } catch (error) { if (session === authSession) $('chatgpt-verification').textContent = 'Model access was not verified.'; throw error; } }));
   $('disconnect-chatgpt').addEventListener('click', () => chatGPTTask(async (session) => { const status = await request('/v1/connections/chatgpt', { method: 'DELETE' }); if (session !== authSession) return; renderChatGPT(status); $('chatgpt-verification').textContent = status.revoked === true ? 'ChatGPT disconnected and its renewable session revoked.' : 'Cloud credentials removed. Remote revocation was not confirmed; disconnect Timber in ChatGPT Settings.'; }));
+  $('refresh-apps').addEventListener('click', () => guarded(refreshApps));
+  $('apps-prompt').addEventListener('click', () => {if (!selected) return; showPanel('conversation'); $('message').focus();});
+  $('refresh-github').addEventListener('click', () => {void loadGitHubStatus();});
+  $('disconnect-github').addEventListener('click', () => {void disconnectGitHub();});
+  window.addEventListener('focus', () => {if (token && selected && connections.some(item => item.status === 'pending')) void guarded(() => Promise.all([loadConnections(), loadRuns()]));});
   window.addEventListener('pagehide', () => disconnect());
 })();

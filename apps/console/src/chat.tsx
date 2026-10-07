@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { ArrowUpIcon, BotIcon, CheckIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon } from 'lucide-react';
+import { ArrowUpIcon, BotIcon, CheckIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon } from 'lucide-react';
 import { useStickToBottomContext } from 'use-stick-to-bottom';
 import { Conversation, ConversationContent, ConversationEmptyState, ConversationScrollButton } from '@/components/ai-elements/conversation';
 import { Message, MessageActions, MessageAction, MessageContent, MessageResponse } from '@/components/ai-elements/message';
@@ -9,7 +9,7 @@ import { Tool, ToolContent } from '@/components/ai-elements/tool';
 import { ChainOfThought, ChainOfThoughtHeader, ChainOfThoughtContent, ChainOfThoughtStep } from '@/components/ai-elements/chain-of-thought';
 import { Confirmation, ConfirmationAction, ConfirmationActions, ConfirmationRequest } from '@/components/ai-elements/confirmation';
 import { Button } from '@/components/ui/button';
-import type { ChatApproval, ChatCallbacks, ChatModel, MessageDelivery } from './chat-types';
+import type { ChatApproval, ChatCallbacks, ChatModel, ChatConnection, MessageDelivery } from './chat-types';
 import './chat.css';
 
 const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
@@ -92,6 +92,21 @@ function MessageRunStatus({ model, runId, callbacks }: { model: ChatModel; runId
   </div>;
 }
 
+function ConnectionEntry({ connection, callbacks }: { connection: ChatConnection; callbacks: ChatCallbacks }) {
+  const pending = connection.status === 'pending';
+  return <article className="timber-connection-entry" data-connection-id={connection.id} data-connection-status={connection.status} data-run-id={connection.runId}>
+    <div className="timber-connection-heading"><GitBranchIcon aria-hidden="true" /><strong>{pending ? 'Connect GitHub to continue' : connection.status === 'connected' ? 'GitHub access connected' : 'GitHub request cancelled'}</strong><time>{time(connection.createdAt)}</time></div>
+    <p className="timber-connection-repository">{connection.repository}</p>
+    <p className="timber-connection-scope">{connection.permission === 'write' ? 'Read this repository, push branches, and create pull requests.' : 'Read and clone this repository.'}</p>
+    {pending && <>
+      <Button disabled={connection.busy} data-connect-github onClick={() => callbacks.onConnect(connection.botId, connection.id)}>{connection.busy ? <LoaderCircleIcon className="timber-spinner" /> : <ExternalLinkIcon />}{connection.busy ? 'Opening GitHub…' : connection.opened ? 'Continue in GitHub' : 'Connect GitHub'}</Button>
+      <p className="timber-approval-help">{connection.opened ? 'Finish connecting in the new tab. This task will continue automatically.' : 'Choose the repository in GitHub. This task will continue when access is connected.'}</p>
+    </>}
+    {connection.status === 'connected' && <p className="timber-approval-help"><CheckIcon />Access was connected for this task.</p>}
+    {connection.error && <p className="timber-inline-error" role="alert">{connection.error}</p>}
+  </article>;
+}
+
 function DeliveryEntry({ delivery, busy, callbacks }: { delivery: MessageDelivery; busy: boolean; callbacks: ChatCallbacks }) {
   const state = delivery.state === 'sending' ? 'Sending' : delivery.state === 'unknown' ? 'Delivery unknown' : delivery.state === 'rejected' ? 'Not accepted' : delivery.runStatus === 'queued' ? 'Queued' : label(delivery.runStatus || 'queued').replace(/^./, character => character.toUpperCase());
   return <Message from="user" data-operation-id={delivery.operationId} className="timber-message timber-delivery">
@@ -149,9 +164,9 @@ function ActivityGroup({model, runId, steps}: {model: ChatModel; runId?: string;
       {steps.sort((a, b) => a.at - b.at).map(step => {
         if (step.type === 'progress') return <ChainOfThoughtStep key={step.key} icon={BotIcon} label={<span className="timber-activity-label">{model.bot.name}<time>{time(step.message.createdAt)}</time></span>} status="complete" data-message-id={step.message.id} data-message-kind="progress" data-progress-message-id={step.message.id} className="timber-progress-step"><Response text={step.message.text} /><CopyMessage text={step.message.text} /></ChainOfThoughtStep>;
         const tool = step.tool, status = tool.result?.status || tool.status;
-        const failed = status === 'failed' || status === 'interrupted', pending = status === 'pending_approval';
+        const failed = status === 'failed' || status === 'interrupted', pending = status === 'pending_approval' || status === 'pending_connection';
         const waiting = !tool.returned && !status, unknown = waiting && !active;
-        const state = failed ? label(status!) : pending ? 'Approval requested' : status === 'completed' ? 'Completed' : unknown ? 'Outcome unconfirmed' : waiting ? 'Running' : 'Tool returned';
+        const state = failed ? label(status!) : status === 'pending_connection' ? 'Connection requested' : pending ? 'Approval requested' : status === 'completed' ? 'Completed' : unknown ? 'Outcome unconfirmed' : waiting ? 'Running' : 'Tool returned';
         return <ChainOfThoughtStep key={step.key} data-tool-operation-id={String(tool.data.operationId || tool.data.toolCallId)} data-tool-status={status || (unknown ? 'unconfirmed' : waiting ? 'running' : 'returned')} icon={failed || unknown ? CircleAlertIcon : pending ? ShieldCheckIcon : waiting ? LoaderCircleIcon : CheckIcon} status={waiting && active ? 'active' : 'complete'} className={`timber-tool-step${failed || unknown ? ' timber-tool-error' : ''}`} label={<span className="timber-activity-label">{toolNames[tool.name] || label(tool.name)}<span className="timber-tool-status">{state}{tool.result?.exitCode !== undefined ? ` · exit ${tool.result.exitCode}` : ''}</span></span>}>
           {tool.result?.error && <p className="timber-inline-error">{tool.result.error}</p>}
           <details className="timber-tool-details"><summary>Details{tool.result?.output ? ' & output' : ''}</summary>{tool.result?.output && <pre className="timber-action"><code>{tool.result.output}</code></pre>}<pre className="timber-action"><code>{safeJSON(tool.data)}</code></pre></details>
@@ -178,6 +193,11 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks): TimelineEntry[] {
   });
   const afterRequest = (runId: string | undefined, at: number) => {const index = messages.findIndex(message => message.role === 'user' && message.runId === runId && timestamp(message.createdAt) === at); return index < 0 ? messages.length * 2 + 1 : index * 2 + 1;};
   for (const approval of approvals) entries.push({key: `approval:${approval.id}`, at: timestamp(approval.createdAt), order: afterRequest(approval.runId, timestamp(approval.createdAt)), node: <ApprovalEntry approval={approval} current={approval.id === current?.id} automatic={model.bot.computerApprovalMode === 'automatic'} callbacks={callbacks} />});
+  for (const connection of model.connections.filter(item => !model.runFilter || item.runId === model.runFilter)) {
+    const request = messages.find(message => message.role === 'user' && message.runId === connection.runId);
+    const at = Math.max(timestamp(connection.createdAt), timestamp(request?.createdAt));
+    entries.push({key: `connection:${connection.id}`, at, order: afterRequest(connection.runId, at), node: <ConnectionEntry connection={connection} callbacks={callbacks} />});
+  }
   for (const delivery of model.deliveries.filter(item => !model.runFilter || item.runId === model.runFilter)) entries.push({key: `delivery:${delivery.operationId}`, at: timestamp(delivery.createdAt), order: messages.length * 2 + 3, node: <DeliveryEntry delivery={delivery} busy={model.sending} callbacks={callbacks} />});
   for (const tool of collectTools(model)) addActivity(tool.runId, {type: 'tool', tool, key: tool.key, at: tool.at});
   for (const [key, group] of groups) {const request = messages.find(message => message.role === 'user' && message.runId === group.runId); const at = Math.max(Math.min(...group.steps.map(step => step.at)), timestamp(request?.createdAt)); entries.push({key: `activity:${key}`, at, order: afterRequest(group.runId, at), node: <ActivityGroup model={model} runId={group.runId} steps={group.steps} />});}
@@ -211,8 +231,8 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
         <CopyMessage text={model.stream.text} kind="streaming" />
       </Message>}
       {!model.stream && visibleRun && !terminal.has(visibleRun.status) && <div className="timber-work-status" role="status">
-        {visibleRun.status === 'waiting_approval' ? <ShieldCheckIcon /> : visibleRun.status === 'queued' ? <ClockIcon /> : <LoaderCircleIcon className="timber-spinner" />}
-        <span>{visibleRun.status === 'waiting_approval' ? 'Waiting for your approval' : visibleRun.status === 'queued' ? 'Task queued · waiting to start' : `${model.bot.name} is working`}</span>
+        {visibleRun.status === 'waiting_connection' ? <GitBranchIcon /> : visibleRun.status === 'waiting_approval' ? <ShieldCheckIcon /> : visibleRun.status === 'queued' ? <ClockIcon /> : <LoaderCircleIcon className="timber-spinner" />}
+        <span>{visibleRun.status === 'waiting_connection' ? 'Waiting for GitHub access' : visibleRun.status === 'waiting_approval' ? 'Waiting for your approval' : visibleRun.status === 'queued' ? 'Task queued · waiting to start' : `${model.bot.name} is working`}</span>
       </div>}
       {visibleRun?.error && !model.messages.some(message => message.role === 'user' && message.runId === visibleRun.id) && <div className="timber-delivery-error" role="status"><p>{visibleRun.error}</p>{visibleRun.status === 'queued' && visibleRun.error.includes('Retry this message') && <Button variant="outline" size="sm" disabled={model.sending} onClick={() => callbacks.onRetry(model.bot.id, visibleRun.operationId)}>Retry sending</Button>}</div>}
     </ConversationContent>

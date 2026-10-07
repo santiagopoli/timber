@@ -18,7 +18,7 @@
     "test:computer": "python3 -m unittest discover -s infra/computer/tests -v",
     "test:console": "npm run build:console && node --test scripts/tests/console.test.mjs",
     "check": "npm run typecheck && npm test && npm run test:runtime && npm run test:backend-pi && npm run test:computer && npm run test:chatgpt-cli",
-    "deploy": "npm run build:console && wrangler deploy --config apps/api/wrangler.production.jsonc",
+    "deploy": "npm run build:console && wrangler deploy --config apps/api/wrangler.production.jsonc && npm run deploy:preview",
     "smoke": "node scripts/smoke.mjs",
     "deploy:bootstrap": "npm run build:console && wrangler deploy --config apps/api/wrangler.bootstrap.jsonc",
     "test:runtime": "vitest run --config packages/runtime/vitest.config.ts",
@@ -30,12 +30,14 @@
     "test:chatgpt-cli": "node --test scripts/tests/chatgpt-login.test.mjs",
     "build:console": "npm run build --workspace @timber/console",
     "typecheck:console": "npm run typecheck --workspace @timber/console",
-    "deploy:build": "npm run build:console && wrangler deploy --config apps/api/wrangler.jsonc"
+    "deploy:build": "npm run build:console && wrangler deploy --config apps/api/wrangler.jsonc",
+    "deploy:preview": "wrangler deploy --config apps/preview/wrangler.jsonc"
   },
   "dependencies": {
     "@cloudflare/sandbox": "1.0.0",
     "@earendil-works/pi-ai": "1.0.3",
     "@earendil-works/pi-durable": "1.0.3",
+    "@modelcontextprotocol/sdk": "1.30.0",
     "agents": "0.26.0",
     "jose": "6.2.12"
   },

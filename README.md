@@ -308,3 +308,23 @@ with the owner's local credentials to verify the full production API and model
 flow. The isolated computer test does not validate ChatGPT OAuth.
 
 No credentials belong in this repository.
+
+
+### GitHub development and workspace apps
+
+The deployed console supports inline GitHub connection requests. Ask a bot to
+work on `owner/repository` and open a pull request: it discovers host tools, loads
+`github-development`, requests the needed repository access, and waits durably.
+Use **Connect GitHub** in that conversation to create/install the private personal
+GitHub App and authorize it. The original task resumes automatically; credentials
+stay outside chat and workspace archives. This setup currently supports personal
+GitHub accounts. See [contracts](docs/contracts.md) for scope and recovery behavior.
+
+One workspace can contain several named apps. Ask the bot to publish its Frontend,
+Admin, or API; each appears in **Apps** with its own status and URL. Preview code
+runs on a separate origin. Servers must support the returned base path; a copied
+URL requires access through Timber in that browser. **Refresh apps** explicitly
+checks readiness without starting a stopped computer. See [workspace apps](docs/workspace-apps.md).
+
+`npm run deploy` deploys the API and its separate preview gateway. `deploy:preview`
+only updates the gateway. Neither command changes existing authentication secrets.

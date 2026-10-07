@@ -79,6 +79,20 @@ export function parseAction(value:unknown):ComputerAction {
     case "readFile": return {type:"readFile",path:path(data.path)};
     case "writeFile": return {type:"writeFile",path:path(data.path),content:string(data.content,"content",200_000,0)};
     case "listFiles": return {type:"listFiles",...(data.path===undefined?{}:{path:path(data.path)})};
+    case "gitClone":
+    case "gitPush": {
+      const repository=string(data.repository,"repository",140);
+      if(!/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/.test(repository) || [".",".."].includes(repository.split("/")[1])) invalid("repository must be a GitHub owner/repository name.");
+      const workspacePath=path(data.path);
+      if(workspacePath==="." || !workspacePath.split("/").some(part=>part && part!==".")) invalid("A repository subdirectory is required.");
+      const branch=data.branch===undefined?undefined:string(data.branch,"branch",200);
+      if(branch!==undefined && (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) || branch.includes("..") || branch.includes("//") || /[/.]$/.test(branch) || branch.split("/").some(part=>part.startsWith(".") || part.endsWith(".lock")))) invalid("Invalid Git branch.");
+      if(data.type==="gitPush") {
+        if(!branch) invalid("branch is required for Git push.");
+        return {type:"gitPush",repository,path:workspacePath,branch};
+      }
+      return {type:"gitClone",repository,path:workspacePath,...(branch===undefined?{}:{branch})};
+    }
     case "screenshot": return {type:"screenshot"};
     case "click": {
       if(!Number.isInteger(data.x) || !Number.isInteger(data.y)) invalid("Mouse coordinates must be integers.");

@@ -20,11 +20,13 @@ export function responsesFixture(payload: { input: Record<string, unknown>[] }):
   }
   const vision = text.includes('request-vision') && !hasToolOutput;
   const exec = text.includes('request-exec') && !hasToolOutput;
+  const host = text.includes('request-host') && !hasToolOutput;
+  const catalog = text.includes('request-catalog') && !hasToolOutput;
   const loop = text.includes('request-loop');
   const namespace = text.includes('bad-namespace') ? 'untrusted' : TOOL_NAMESPACE;
-  const tool = vision || exec || loop || text.includes('bad-namespace');
-  const name = vision ? 'desktop_screenshot' : loop ? 'read_file' : 'exec';
-  const args = vision ? '{}' : loop ? '{"path":"/workspace/test.txt"}' : '{"command":"echo fixture"}';
+  const tool = vision || exec || loop || host || catalog || text.includes('bad-namespace');
+  const name = host ? 'call_tool' : catalog ? 'list_tools' : vision ? 'desktop_screenshot' : loop ? 'read_file' : 'exec';
+  const args = host ? '{"name":"github_clone","arguments":{"repository":"owner/private","path":"project"}}' : vision || catalog ? '{}' : loop ? '{"path":"/workspace/test.txt"}' : '{"command":"echo fixture"}';
   const answer = text.includes('output-limit') ? 'x'.repeat(MAX_OUTPUT_CHARACTERS + 1) : 'Hello from ChatGPT via the real Pi harness.';
   const finalItem = tool
     ? { type: 'function_call', id: 'fc_fixture_1', call_id: 'call_fixture_1', name, namespace, arguments: args, status: 'completed' }

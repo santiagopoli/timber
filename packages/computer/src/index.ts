@@ -6,14 +6,16 @@ import startSource from "../../../infra/computer/start.sh";
 
 export interface ComputerEnv {
   FILES: R2Bucket;
+  GITHUB?: DurableObjectNamespace;
   /** Temporary deployment mode. Installs desktop packages at cold start. */
   COMPUTER_BOOTSTRAP?: string;
 }
 
 interface OperationRecord { digest: string; result?: ComputerResult; }
 interface Checkpoint { id: string; key: string; size: number; sha256: string; createdAt: string; }
-interface Health { ok: boolean; bootId: string; desktop: boolean; }
+interface Health { ok: boolean; bootId: string; desktop: boolean; capabilities?:string[]; }
 interface ContainerResult extends ComputerResult { artifactName?: string; }
+interface GitTransport { id:string; url:string; token:string; }
 
 const IDLE_MS = 5 * 60_000;
 const SAFETY_TIMEOUT_MS = 15 * 60_000;
@@ -49,6 +51,9 @@ const COMPUTER_ERRORS = {
   computer_method_not_allowed: {status:405, message:"The computer request method is not allowed."},
   computer_owner_mismatch: {status:403, message:"This computer belongs to another bot."},
   computer_deleted: {status:410, message:"This bot's computer has been permanently deleted."},
+  computer_upgrade_required: {status:409, message:"This computer is running an older image. Suspend it after its current work finishes to save its workspace, then retry on the updated image. No Git action was executed."},
+  computer_git_unavailable: {status:503, message:"The GitHub transport is unavailable. Reconnect GitHub and verify this bot's repository access."},
+  computer_app_not_running: {status:503, message:"This app's computer is stopped. Ask the bot to start the app again."},
 } as const;
 
 export type ComputerErrorCode = keyof typeof COMPUTER_ERRORS;
@@ -88,6 +93,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   private flights = new Map<string, Promise<ComputerResult>>();
   private token = "";
   private desktop = false;
+  private capabilities:string[]=[];
   private deleted=false;
   private deleting?:Promise<void>;
   private shutdown=new AbortController();
@@ -148,6 +154,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
     try {
+      if(path.startsWith("/preview/")) return await this.preview(request);
       if (request.method !== "POST") throw new ComputerProviderError("computer_method_not_allowed");
       const body = await request.json<{botId:string; operationId?:string; action?:ComputerAction}>();
       if (!/^[A-Za-z0-9_-]{1,100}$/.test(body.botId)) throw new ComputerProviderError("computer_invalid_request");
@@ -198,6 +205,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       try {
         const health = await this.health();
         this.desktop = health.desktop;
+        this.capabilities=health.capabilities??[];
       } catch {
         // A failed probe is not an active startup. Status never boots, repairs,
         // touches idle activity, or replays an action just to update the UI.
@@ -208,7 +216,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     if (state !== "running") this.desktop = false;
     return {
       id:botId, provider:"cloudflare", state,
-      capabilities: container ? [...BASE_CAPABILITIES, ...(this.desktop ? DESKTOP_CAPABILITIES : [])] : [],
+      capabilities: container ? [...BASE_CAPABILITIES, ...(this.desktop ? DESKTOP_CAPABILITIES : []), ...this.capabilities.filter(value=>value==="gitClone" || value==="gitPush")] : [],
       ...(checkpoint ? {lastCheckpointId:checkpoint.id} : {}),
       ...(error ? {error:{code:error.code,message:error.publicMessage}} : {}),
     };
@@ -231,7 +239,8 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         if (existingRecord.digest !== digest) return {operationId, status:"failed" as const, error:"operationId was already used with different arguments"};
         return existingRecord.result ?? {operationId, status:"interrupted" as const, error:"Operation outcome is unknown; it will not be replayed"};
       }
-      await this.ensureReady(botId);
+      const health=await this.ensureReady(botId);
+      if((action.type==="gitClone" || action.type==="gitPush") && !health.capabilities?.includes(action.type)) throw new ComputerProviderError("computer_upgrade_required");
       await this.touch();
       this.active();
       await this.ctx.storage.put<OperationRecord>(key, {digest});
@@ -244,10 +253,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
           const checkpoint = await this.saveCheckpoint(botId);
           result = {operationId,status:"completed",checkpointId:checkpoint.id};
         } else {
-          const response = await this.call("/actions", {
-            method:"POST", body:JSON.stringify({operationId,action}),
-            headers:{"Content-Type":"application/json"},
-          });
+          const response = await this.dispatchAction(botId,operationId,action);
           if (!response.ok) throw new Error(`Computer rejected action (${response.status})`);
           const value = await response.json<ContainerResult>();
           result = {operationId,status:value.status,output:value.output,exitCode:value.exitCode,error:value.error};
@@ -265,7 +271,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
           }
           // Terminal commands can mutate files even on nonzero exit. Confirm a
           // portable checkpoint before acknowledging these filesystem operations.
-          if (action.type === "exec" || action.type === "writeFile") {
+          if (action.type === "exec" || action.type === "writeFile" || action.type === "gitClone") {
             operationStage = "checkpoint";
             try { result.checkpointId = (await this.saveCheckpoint(botId)).id; }
             catch { result.error = `${result.error ? result.error + " " : ""}The action finished, but its files are not yet checkpointed. Retry checkpoint, not the action.`; }
@@ -273,7 +279,9 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         }
       } catch (error) {
         console.error("computer.failure", {stage:operationStage,code:safeError(error).code});
-        result = {operationId,status:"interrupted",error:"Computer connection or persistence failed; the action may have completed. Inspect effects before submitting a new operation."};
+        result = error instanceof ComputerProviderError && error.code==="computer_git_unavailable"
+          ? {operationId,status:"failed",error:`${error.publicMessage} No Git action was executed.`}
+          : {operationId,status:"interrupted",error:"Computer connection or persistence failed; the action may have completed. Inspect effects before submitting a new operation."};
       }
       this.active();
       await this.ctx.storage.put<OperationRecord>(key, {digest,result});
@@ -296,6 +304,62 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     await this.ctx.storage.setAlarm(Date.now() + IDLE_MS);
     this.active();
     if (this.container?.running) await stage("computer_lifecycle_failed", () => this.container!.setInactivityTimeout(SAFETY_TIMEOUT_MS));
+  }
+
+  private async dispatchAction(botId:string,operationId:string,action:ComputerAction):Promise<Response> {
+    if(action.type!=="gitClone" && action.type!=="gitPush") return this.call("/actions", {
+      method:"POST",body:JSON.stringify({operationId,action}),headers:{"Content-Type":"application/json"},
+    });
+    const binding=this.env.GITHUB;
+    if(!binding) throw new ComputerProviderError("computer_git_unavailable");
+    const github=binding.get(binding.idFromName("owner"));
+    let transport:GitTransport;
+    try {
+      const response=await github.fetch("https://github.internal/git-capability", {
+        method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({botId,repository:action.repository,permission:action.type==="gitClone"?"read":"write"}),
+      });
+      if(!response.ok) throw new ComputerProviderError("computer_git_unavailable");
+      transport=await response.json<GitTransport>();
+      if(typeof transport.id!=="string" || !/^[A-Za-z0-9_-]{1,160}$/.test(transport.id) || typeof transport.token!=="string" || typeof transport.url!=="string") throw new ComputerProviderError("computer_git_unavailable");
+    } catch {throw new ComputerProviderError("computer_git_unavailable");}
+    try {
+      // Credential material is a private envelope, never part of the public
+      // action, digest, journal, checkpoint or result.
+      return await this.call("/actions", {method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({operationId,action,gitTransport:{url:transport.url,token:transport.token}})});
+    } finally {
+      try {await github.fetch(`https://github.internal/git-capability/${transport.id}`,{method:"DELETE"});}
+      catch {console.error("computer.failure",{stage:"git_capability_revoke",code:"computer_git_unavailable"});}
+    }
+  }
+
+  private async preview(request:Request):Promise<Response> {
+    this.active();
+    const url=new URL(request.url);
+    const match=/^\/preview\/([0-9]{1,5})(\/.*)$/.exec(url.pathname);
+    const port=match?Number(match[1]):0;
+    if(!match || port<1024 || port>65535 || port===PORT) throw new ComputerProviderError("computer_invalid_request");
+    const botId=request.headers.get("x-timber-bot-id");
+    if(!botId || !/^[A-Za-z0-9_-]{1,100}$/.test(botId)) throw new ComputerProviderError("computer_invalid_request");
+    const owner=await this.ctx.storage.get<string>("botId");
+    if(owner!==botId) throw new ComputerProviderError("computer_owner_mismatch");
+    this.active();
+    const container=this.container;
+    if(!container?.running) throw new ComputerProviderError("computer_app_not_running");
+    const headers=new Headers(request.headers);
+    for(const name of [...headers.keys()]) if(name.toLowerCase()==="authorization" || /^x-(?:timber|botspace)-/i.test(name)) headers.delete(name);
+    headers.set("Host",`localhost:${port}`);
+    const target=`http://127.0.0.1:${port}${match[2]}${url.search}`;
+    const response=await container.getTcpPort(port).fetch(new Request(target,{method:request.method,headers,
+      ...(["GET","HEAD"].includes(request.method)?{}:{body:request.body}),redirect:"manual",signal:request.signal}));
+    // Preserve native WebSocket responses. Preview reads reuse this running
+    // computer, but can neither start a VM nor replay a write on failure.
+    if(response.status<400) {
+      try {await this.touch();}
+      catch {console.error("computer.failure",{stage:"preview_touch",code:"computer_lifecycle_failed"});}
+    }
+    return response;
   }
 
   async alarm(): Promise<void> {
@@ -387,6 +451,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     if (!health) throw new ComputerProviderError("computer_not_ready");
     this.active();
     this.desktop = health.desktop;
+    this.capabilities=health.capabilities??[];
     const storedBoot = await this.ctx.storage.get<string>("restoredBoot");
     this.active();
     if (storedBoot !== health.bootId) {
@@ -511,3 +576,10 @@ export function createCloudComputerProvider(binding: DurableObjectNamespace): Co
 export const touchCloudComputer = (binding: DurableObjectNamespace, botId: string) => rpc<{ok:true}>(binding,botId,"/touch");
 export const suspendCloudComputer = (binding: DurableObjectNamespace, botId: string) => rpc<ComputerStatus>(binding,botId,"/suspend");
 export const deleteCloudComputer = (binding: DurableObjectNamespace, botId: string) => rpc<{botId:string;deleted:true}>(binding,botId,"/delete");
+export function previewCloudComputer(binding:DurableObjectNamespace,botId:string,port:number,request:Request):Promise<Response> {
+  const url=new URL(request.url),headers=new Headers(request.headers);
+  headers.set("x-timber-bot-id",botId);
+  return binding.get(binding.idFromName(botId)).fetch(new Request(`https://computer.internal/preview/${port}${url.pathname}${url.search}`,{
+    method:request.method,headers,...(["GET","HEAD"].includes(request.method)?{}:{body:request.body}),redirect:"manual",signal:request.signal,
+  }));
+}

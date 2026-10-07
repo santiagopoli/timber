@@ -39,7 +39,7 @@ export function toolCompletion(entry: EntryRecord | undefined): { operationId?: 
     const result = JSON.parse(textContent(message.content)) as { operationId?: unknown; status?: unknown };
     return {
       ...(typeof result.operationId === 'string' && /^[A-Za-z0-9:_.-]{1,160}$/.test(result.operationId) ? { operationId: result.operationId } : {}),
-      ...(typeof result.status === 'string' && ['completed', 'failed', 'interrupted', 'pending_approval'].includes(result.status) ? { status: result.status } : message.isError ? { status: 'failed' } : {}),
+      ...(typeof result.status === 'string' && ['completed', 'failed', 'interrupted', 'pending_approval', 'pending_connection'].includes(result.status) ? { status: result.status } : message.isError ? { status: 'failed' } : {}),
     };
   } catch { return message.isError ? { status: 'failed' } : {}; }
 }

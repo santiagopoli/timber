@@ -1,4 +1,4 @@
-export type RunStatus = "queued" | "running" | "waiting_approval" | "completed" | "failed" | "cancelled" | "interrupted";
+export type RunStatus = "queued" | "running" | "waiting_approval" | "waiting_connection" | "completed" | "failed" | "cancelled" | "interrupted";
 export type ComputerApprovalMode = "ask" | "automatic";
 export interface Bot { id: string; name: string; instructions: string; runtime: "pi"; model: string; computerApprovalMode?: ComputerApprovalMode; createdAt: string; updatedAt: string; }
 export interface Message { id: string; botId: string; runId?: string; role: "user" | "assistant" | "tool" | "system"; kind?: "progress" | "final"; text: string; createdAt: string; }
@@ -17,9 +17,13 @@ export type ComputerAction =
  | {type:"key";key:string}
  | {type:"scroll";direction:"up"|"down";amount?:number}
  | {type:"navigate";url:string}
+ | {type:"gitClone";repository:string;path:string;branch?:string}
+ | {type:"gitPush";repository:string;path:string;branch:string}
  | {type:"checkpoint"};
 export interface ComputerResult { operationId:string;status:"completed"|"failed"|"interrupted";output?:string;exitCode?:number;artifactId?:string;mimeType?:string;checkpointId?:string;error?:string; }
 export interface ComputerStatus { id:string;provider:"cloudflare";state:"stopped"|"starting"|"running"|"unavailable";capabilities:string[];lastCheckpointId?:string;error?:{code:string;message:string}; }
 export interface Approval {id:string;botId:string;runId:string;operationId:string;toolCallId?:string;action:ComputerAction;status:"pending"|"approved"|"denied"|"executing"|"completed"|"failed"|"interrupted";createdAt:string;expiresAt:string;result?:ComputerResult;}
 export interface ComputerProvider {exec(botId:string,operationId:string,action:ComputerAction):Promise<ComputerResult>;status(botId:string):Promise<ComputerStatus>;checkpoint(botId:string):Promise<ComputerResult>;}
 export interface ApiError {error:{code:string;message:string};}
+
+export interface ConnectionRequest {id:string;botId:string;runId:string;provider:"github";repository:string;permission:"read"|"write";status:"pending"|"connected"|"cancelled";createdAt:string;}

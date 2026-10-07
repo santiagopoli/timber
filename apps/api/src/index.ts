@@ -5,6 +5,8 @@ import { UUID } from "./validation";
 import type { Bot } from "@botspace/contracts";
 export { WorkspaceDO } from "./workspace";
 export { BotDO } from "./bot";
+export { GitHubAuthDO } from "./github";
+export { WorkspacePreviewGateway } from "./workspace-apps";
 export { ChatGPTAuthDO } from "./chatgpt";
 export { ComputerDO } from "@botspace/computer";
 
@@ -31,13 +33,20 @@ export default {
         assetUrl.pathname=assetUrl.pathname.slice("/console".length);
         const response=await env.ASSETS.fetch(new Request(assetUrl,request));
         const headers=new Headers(response.headers);
-        headers.set("content-security-policy","default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob: data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+        const previewOrigin=env.PREVIEW_ORIGIN && /^https:\/\/[a-z0-9.-]+$/.test(env.PREVIEW_ORIGIN)?env.PREVIEW_ORIGIN:"";
+        headers.set("content-security-policy",`default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob: data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' ${previewOrigin}`);
         headers.set("referrer-policy","no-referrer");
         headers.set("x-content-type-options","nosniff");
         // Always load the current shell; its fingerprinted JS/CSS retain their
         // own asset cache policy. This never reloads an active conversation.
         if(assetUrl.pathname==="/" || headers.get("content-type")?.includes("text/html")) headers.set("cache-control","no-store");
         return new Response(response.body,{status:response.status,headers});
+      }
+      // Provider callbacks are one-time, browser-bound flows. Git transport is
+      // authenticated independently with short-lived repository-scoped capabilities.
+      if((/^\/github\/setup\/(start|manifest|install|oauth)$/.test(url.pathname) && request.method==="GET") || url.pathname.startsWith("/github/git/")) {
+        if(!env.GITHUB) throw new ApiError(503,"github_not_configured","GitHub is not configured.");
+        return env.GITHUB.get(env.GITHUB.idFromName("owner")).fetch(request);
       }
       const owner=await authenticate(request,env.BOTSPACE_API_TOKEN);
       if(!url.pathname.startsWith("/v1/")) throw new ApiError(404,"not_found","Endpoint not found.");
@@ -47,6 +56,11 @@ export default {
         if(!env.CHATGPT) throw new ApiError(503,"chatgpt_not_configured","ChatGPT connections are not configured on this server.");
         const connection=env.CHATGPT.get(env.CHATGPT.idFromName(owner));
         return connection.fetch(internalRequest(request,`https://chatgpt/${verification?"verify":""}`));
+      }
+      if(url.pathname==="/v1/connections/github") {
+        if(!["GET","DELETE"].includes(request.method)) throw new ApiError(405,"method_not_allowed","Method not allowed.");
+        if(!env.GITHUB) throw new ApiError(503,"github_not_configured","GitHub is not configured.");
+        return env.GITHUB.get(env.GITHUB.idFromName(owner)).fetch(internalRequest(request,"https://github/status"));
       }
       const registry=env.WORKSPACE.get(env.WORKSPACE.idFromName(owner));
       if(url.pathname==="/v1/bots") {

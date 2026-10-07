@@ -1,7 +1,7 @@
 import { Type } from '@earendil-works/pi-ai';
 import { defineTool, type ToolExecutionApi, type ToolExecutionResult } from '@earendil-works/pi-durable';
 import type { ComputerAction } from '@botspace/contracts';
-import type { PendingApproval, RuntimeTools } from './types.js';
+import type { RuntimeHostToolRequest, RuntimePause, RuntimeToolResult, RuntimeTools } from './types.js';
 
 type Context = Parameters<ToolExecutionApi['agent']>[0];
 export interface ToolBridge {
@@ -9,8 +9,8 @@ export interface ToolBridge {
   imageInputSupported?(): Promise<boolean>;
   operationForCall(api: ToolExecutionApi, context: Context): Promise<string>;
   consume(runOperationId: string, kind: 'tool', itemId: string): void;
-  paused?(runOperationId: string): PendingApproval | undefined;
-  pause?(runOperationId: string, approval: PendingApproval): void;
+  paused?(runOperationId: string): RuntimePause | undefined;
+  pause?(runOperationId: string, pending: RuntimePause): void;
 }
 
 /** Keep admitted journal identities stable; opaque provider IDs need a bounded wire identity. */
@@ -24,15 +24,13 @@ export async function computerToolOperationId(taskId: string, callId: string): P
   return `pi-tool-sha256:${hex}`;
 }
 
-export async function executeComputerTool(
+async function executeBridgeTool(
   bridge: ToolBridge,
-  action: ComputerAction,
   api: ToolExecutionApi,
   context: Context,
+  dispatch: (request: Omit<RuntimeHostToolRequest, 'name' | 'arguments'>) => Promise<RuntimeToolResult>,
+  render?: (result: Exclude<RuntimeToolResult, RuntimePause>) => Promise<NonNullable<ToolExecutionResult['content']>>,
 ): Promise<ToolExecutionResult> {
-  if (action.type === 'screenshot' && bridge.imageInputSupported && !(await bridge.imageInputSupported())) {
-    return { content: [{ type: 'text', text: 'The configured model does not accept screenshot images. Select a vision-capable model to use visual computer tools.' }], isError: true };
-  }
   const runOperationId = await bridge.operationForCall(api, context);
   const operationId = await computerToolOperationId(String(api.taskId), api.callId);
   const paused = bridge.paused?.(runOperationId);
@@ -48,8 +46,8 @@ export async function executeComputerTool(
   }
   const signal = context.abortSignal ?? new AbortController().signal;
   signal.throwIfAborted();
-  const result = await bridge.tools.execute({ operationId, runOperationId, toolCallId: api.callId, action, signal });
-  if (result.status === 'pending_approval') {
+  const result = await dispatch({ operationId, runOperationId, toolCallId: api.callId, signal });
+  if (result.status === 'pending_approval' || result.status === 'pending_connection') {
     bridge.pause?.(runOperationId, result);
     return {
       content: [{ type: 'text', text: JSON.stringify(result) }],
@@ -58,14 +56,54 @@ export async function executeComputerTool(
     };
   }
   const content: NonNullable<ToolExecutionResult['content']> = [{ type: 'text', text: JSON.stringify(result) }];
-  if (action.type === 'screenshot' && result.status === 'completed' && result.artifactId && bridge.tools.readImage) {
+  if (render) content.push(...await render(result));
+  return { content, isError: result.status !== 'completed' };
+}
+
+export async function executeComputerTool(
+  bridge: ToolBridge,
+  action: ComputerAction,
+  api: ToolExecutionApi,
+  context: Context,
+): Promise<ToolExecutionResult> {
+  if (action.type === 'screenshot' && bridge.imageInputSupported && !(await bridge.imageInputSupported())) {
+    return { content: [{ type: 'text', text: 'The configured model does not accept screenshot images. Select a vision-capable model to use visual computer tools.' }], isError: true };
+  }
+  return executeBridgeTool(bridge, api, context, request => bridge.tools.execute({ ...request, action }), async result => {
+    if (action.type !== 'screenshot' || result.status !== 'completed' || !result.artifactId || !bridge.tools.readImage) return [];
     const image = await bridge.tools.readImage(result.artifactId);
     if (!['image/png', 'image/jpeg', 'image/webp'].includes(image.mimeType) || image.data.length > 8_000_000) {
       throw new Error('Screenshot exceeds supported image limits');
     }
-    content.push({ type: 'image', data: image.data, mimeType: image.mimeType });
-  }
-  return { content, isError: result.status !== 'completed' };
+    return [{ type: 'image', data: image.data, mimeType: image.mimeType }];
+  });
+}
+
+export async function executeHostTool(
+  bridge: ToolBridge,
+  input: Pick<RuntimeHostToolRequest, 'name' | 'arguments'>,
+  api: ToolExecutionApi,
+  context: Context,
+): Promise<ToolExecutionResult> {
+  return executeBridgeTool(bridge, api, context, request => {
+    if (!bridge.tools.call) return Promise.resolve({ operationId: request.operationId, status: 'failed', error: 'Connected tools are not configured for this bot.' });
+    // The host validates the current schema, connection and scope on every call.
+    return bridge.tools.call({ ...request, ...input });
+  });
+}
+
+/** Keep service integrations and skills independent of the agent engine. */
+export function hostTools(bridge: ToolBridge) {
+  if (!bridge.tools.catalog || !bridge.tools.call) return [];
+  return [
+    defineTool({ name: 'list_tools', description: 'Discover available connected-service tools, workspace app tools, and skills. Returns names, descriptions and input schemas; does not grant permissions or start the computer.', replay: 'safe',
+      parameters: Type.Object({}), execute: (_args, api, context) => executeBridgeTool(bridge, api, context, async request => ({
+        operationId: request.operationId, status: 'completed', output: JSON.stringify(await bridge.tools.catalog!()),
+      })) }),
+    defineTool({ name: 'call_tool', description: 'Call a host tool from list_tools using its exact input schema. Connection and repository permissions are enforced by the host. A pending_connection or pending_approval result pauses this run until the host resumes it.', replay: 'unsafe', executionMode: 'sequential',
+      parameters: Type.Object({ name: Type.String({ minLength: 1, maxLength: 128 }), arguments: Type.Record(Type.String(), Type.Unknown()) }),
+      execute: (input, api, context) => executeHostTool(bridge, input, api, context) }),
+  ];
 }
 
 export function computerTools(bridge: ToolBridge) {

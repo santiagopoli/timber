@@ -1,6 +1,6 @@
 declare namespace Cloudflare {
   interface GlobalProps {
     mainModule: typeof import("./fixtures/worker");
-    durableNamespaces: "WorkspaceDO" | "BotDO" | "ComputerDO" | "RealComputerDO" | "ChatGPTAuthDO" | "KeylessChatGPTAuthDO";
+    durableNamespaces: "WorkspaceDO" | "BotDO" | "ComputerDO" | "RealComputerDO" | "ChatGPTAuthDO" | "KeylessChatGPTAuthDO" | "GitHubAuthDO";
   }
 }

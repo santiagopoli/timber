@@ -97,3 +97,8 @@
 .timber-activity-content,.timber-progress-step,.timber-tool-step{animation:none}
 .timber-progress-step .timber-markdown{color:var(--ink)}
 .timber-tool-details summary{color:var(--ink);font-size:11px}
+
+.timber-connection-entry{padding:18px;border:1px solid color-mix(in srgb,var(--accent) 35%,var(--line));border-radius:14px;background:var(--surface);display:flex;flex-direction:column;align-items:flex-start;gap:12px;min-width:0}
+.timber-connection-heading{display:flex;align-items:center;gap:9px;width:100%;font-size:12px}.timber-connection-heading svg{width:17px;height:17px;flex-shrink:0}.timber-connection-heading time{margin-left:auto;color:var(--muted);font-size:10px}
+.timber-connection-repository{font-size:15px;font-weight:600;overflow-wrap:anywhere;margin:0}.timber-connection-scope{font-size:12px;line-height:1.6;color:var(--muted);margin:0}.timber-connection-entry [data-connect-github]{background:var(--accent);color:var(--surface);font-size:12px}.timber-connection-entry[data-connection-status="cancelled"]{border-color:var(--line);opacity:.8}
+@media(max-width:600px){.timber-connection-entry{padding:14px}.timber-connection-heading{flex-wrap:wrap}.timber-connection-heading time{display:none}}

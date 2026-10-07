@@ -54,6 +54,21 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
         return paused;
       }
     }
+    if (operation.text === "fixture:github") {
+      if (!options.tools.call) throw new Error("Host tools fixture requires a host bridge");
+      const result = await options.tools.call({
+        operationId: `fixture-host:${operationId}`, runOperationId: operationId,
+        name: "github_clone", arguments: {repository: "Owner/Private", path: "project"},
+        signal: new AbortController().signal,
+      });
+      await options.storage.put(`fixture-host-result:${operationId}`, result);
+      if (result.status === "pending_connection") {
+        const paused: Result = {operationId, session: "1", status: "unanswered", reason: "terminated"};
+        await options.storage.put(key(operationId), {...operation, status: "unanswered", result: paused});
+        await emit(operationId, "run.failed", {reason: "terminated"});
+        return paused;
+      }
+    }
     const result: Result = {operationId, session: "1", status: "done", text: `Fixture answer: ${operation.text}`};
     const message: RuntimeMessage = {id: `fixture-answer:${operationId}`, role: "assistant", text: result.text!, createdAt: new Date().toISOString()};
     await options.storage.put(`fixture-message:${operationId}`, message);

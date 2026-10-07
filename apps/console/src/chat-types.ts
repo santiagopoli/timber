@@ -1,13 +1,14 @@
-import type { Approval, Bot, BotEvent, Message, Run } from '../../../packages/contracts/src/index';
+import type { Approval, Bot, BotEvent, ConnectionRequest, Message, Run } from '../../../packages/contracts/src/index';
 
 export type ChatApproval = Omit<Approval, 'status'> & { status: Approval['status'] | 'expired'; busy: boolean };
+export type ChatConnection = ConnectionRequest & { busy?: boolean; opened?: boolean; error?: string };
 export type MessageDelivery = {
   botId: string; operationId: string; text: string; createdAt: string;
   state: 'sending' | 'accepted' | 'unknown' | 'rejected';
   runId?: string; runStatus?: Run['status']; error?: string; canRetry?: boolean;
 };
 export type ChatModel = {
-  bot: Bot; messages: Message[]; runs: Run[]; approvals: ChatApproval[]; events: BotEvent[];
+  bot: Bot; messages: Message[]; runs: Run[]; approvals: ChatApproval[]; connections: ChatConnection[]; events: BotEvent[];
   deliveries: MessageDelivery[]; draft: string; sending: boolean; loading: boolean;
   currentRun: Run | null; runFilter: string | null; focusApproval: number;
   stream: { runId: string; text: string } | null;
@@ -20,4 +21,5 @@ export type ChatCallbacks = {
   onDecision(botId: string, approvalId: string, decision: 'approve' | 'deny', allowComputer?: boolean): void;
   onClearFilter(): void;
   onStop(botId: string, runId: string): void;
+  onConnect(botId: string, requestId: string): void;
 };

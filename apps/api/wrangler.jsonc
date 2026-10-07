@@ -20,7 +20,9 @@
     "binding": "AI"
   },
   "vars": {
-    "BOTSPACE_DEFAULT_MODEL": "gpt-6.1-sol"
+    "BOTSPACE_DEFAULT_MODEL": "gpt-6.1-sol",
+    "GITHUB_PUBLIC_ORIGIN": "https://timber-api.santiagopoli.workers.dev",
+    "PREVIEW_ORIGIN": "https://timber-preview.santiagopoli.workers.dev"
   },
   "durable_objects": {
     "bindings": [
@@ -39,6 +41,10 @@
       {
         "name": "CHATGPT",
         "class_name": "ChatGPTAuthDO"
+      },
+      {
+        "name": "GITHUB",
+        "class_name": "GitHubAuthDO"
       }
     ]
   },
@@ -55,6 +61,12 @@
       "tag": "v2-chatgpt",
       "new_sqlite_classes": [
         "ChatGPTAuthDO"
+      ]
+    },
+    {
+      "tag": "v3-github",
+      "new_sqlite_classes": [
+        "GitHubAuthDO"
       ]
     }
   ],
@@ -81,7 +93,8 @@
       "type": "Text",
       "globs": [
         "**/*.py",
-        "**/*.sh"
+        "**/*.sh",
+        "**/SKILL.md"
       ],
       "fallthrough": true
     }

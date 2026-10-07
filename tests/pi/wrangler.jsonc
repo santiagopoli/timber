@@ -1,15 +1,61 @@
 {
-  "name":"timber-bot-pi-tests",
-  "main":"./worker.ts",
-  "compatibility_date":"2026-10-01",
-  "compatibility_flags":["nodejs_compat"],
-  "vars":{"BOTSPACE_API_TOKEN":"test-only-botspace-owner-token-000000","BOTSPACE_DEFAULT_MODEL":"gpt-6.1-sol"},
-  "durable_objects":{"bindings":[
-    {"name":"WORKSPACE","class_name":"WorkspaceDO"},
-    {"name":"BOT","class_name":"BotDO"},
-    {"name":"COMPUTER","class_name":"ComputerDO"},
-    {"name":"CHATGPT","class_name":"ChatGPTFixture"}
-  ]},
-  "migrations":[{"tag":"v1","new_sqlite_classes":["WorkspaceDO","BotDO","ComputerDO","ChatGPTFixture"]}],
-  "r2_buckets":[{"binding":"FILES","bucket_name":"timber-bot-pi-test-files"}]
+  "name": "timber-bot-pi-tests",
+  "main": "./worker.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "vars": {
+    "BOTSPACE_API_TOKEN": "test-only-botspace-owner-token-000000",
+    "BOTSPACE_DEFAULT_MODEL": "gpt-6.1-sol",
+    "GITHUB_PUBLIC_ORIGIN": "https://timber.test",
+    "PREVIEW_ORIGIN": "https://preview.test"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "WORKSPACE",
+        "class_name": "WorkspaceDO"
+      },
+      {
+        "name": "BOT",
+        "class_name": "BotDO"
+      },
+      {
+        "name": "COMPUTER",
+        "class_name": "ComputerDO"
+      },
+      {
+        "name": "CHATGPT",
+        "class_name": "ChatGPTFixture"
+      },
+      {
+        "name": "GITHUB",
+        "class_name": "GitHubAuthDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "WorkspaceDO",
+        "BotDO",
+        "ComputerDO",
+        "ChatGPTFixture"
+      ]
+    },
+    {
+      "tag": "v3-github",
+      "new_sqlite_classes": [
+        "GitHubAuthDO"
+      ]
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "FILES",
+      "bucket_name": "timber-bot-pi-test-files"
+    }
+  ]
 }

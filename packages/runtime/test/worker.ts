@@ -16,6 +16,7 @@ export class HarnessProbe extends DurableObject {
     super(ctx, env);
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS calls(id INTEGER PRIMARY KEY AUTOINCREMENT, input TEXT)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS tool_calls(id INTEGER PRIMARY KEY AUTOINCREMENT, input TEXT)');
+    ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS host_calls(id INTEGER PRIMARY KEY AUTOINCREMENT, input TEXT)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS projected(id INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS admission_wakes(id INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY,value TEXT)');
@@ -49,6 +50,13 @@ export class HarnessProbe extends DurableObject {
         return JSON.parse(this.setting('approvalContext') ?? '{"active":[],"recent":[]}') as RuntimeApprovalContext;
       },
       tools: {
+        catalog: async () => [{ name: 'github_clone', description: 'Clone an authorized repository.', inputSchema: { type: 'object', properties: { repository: { type: 'string' }, path: { type: 'string' } }, required: ['repository', 'path'] } }],
+        call: async ({ operationId, runOperationId, toolCallId, name, arguments: args }) => {
+          ctx.storage.sql.exec('INSERT INTO host_calls(input) VALUES(?)', JSON.stringify({ operationId, runOperationId, toolCallId, name, arguments: args }));
+          return this.setting('githubConnected') === 'true'
+            ? { operationId, status: 'completed', output: 'Repository cloned by the host.' }
+            : { status: 'pending_connection', requestId: 'connection-fixture', provider: 'github', repository: 'owner/private', permission: 'write' };
+        },
         execute: async ({ operationId, runOperationId, toolCallId, action }) => {
           // Enforce the real computer boundary, even though execution is a fixture.
           if (operationId.length > 160 || /[^A-Za-z0-9:_.-]/.test(operationId)) throw new Error('Invalid computer operation ID');
@@ -75,10 +83,11 @@ export class HarnessProbe extends DurableObject {
   async onRequest(request: Request) {
     const path = new URL(request.url).pathname;
     if (path === '/host-context') {
-      const input = await request.json<{ approvals?: RuntimeApprovalContext | 'unavailable'; afterToolApprovals?: RuntimeApprovalContext; mode?: 'ask' | 'automatic' }>();
+      const input = await request.json<{ approvals?: RuntimeApprovalContext | 'unavailable'; afterToolApprovals?: RuntimeApprovalContext; mode?: 'ask' | 'automatic'; githubConnected?: boolean }>();
       if (input.approvals) this.ctx.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)', 'approvalContext', input.approvals === 'unavailable' ? 'unavailable' : JSON.stringify(input.approvals));
       if (input.afterToolApprovals) this.ctx.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)', 'afterToolApprovalContext', JSON.stringify(input.afterToolApprovals));
       if (input.mode) this.ctx.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)', 'approvalMode', input.mode);
+      if (typeof input.githubConnected === 'boolean') this.ctx.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)', 'githubConnected', JSON.stringify(input.githubConnected));
       return Response.json({ ok: true });
     }
     if (path === '/submit') {
@@ -91,6 +100,7 @@ export class HarnessProbe extends DurableObject {
       messages: await this.runtime.messages(),
       calls: ctxRows(this.ctx.storage, 'SELECT input FROM calls'),
       toolCalls: ctxRows(this.ctx.storage, 'SELECT input FROM tool_calls'),
+      hostCalls: ctxRows(this.ctx.storage, 'SELECT input FROM host_calls'),
       events: ctxRows(this.ctx.storage, 'SELECT event FROM projected'),
     });
     return new Response('Not found', { status: 404 });

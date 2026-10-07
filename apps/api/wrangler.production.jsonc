@@ -20,7 +20,9 @@
     "binding": "AI"
   },
   "vars": {
-    "BOTSPACE_DEFAULT_MODEL": "gpt-6.1-sol"
+    "BOTSPACE_DEFAULT_MODEL": "gpt-6.1-sol",
+    "GITHUB_PUBLIC_ORIGIN": "https://timber-api.santiagopoli.workers.dev",
+    "PREVIEW_ORIGIN": "https://timber-preview.santiagopoli.workers.dev"
   },
   "durable_objects": {
     "bindings": [
@@ -39,6 +41,10 @@
       {
         "name": "CHATGPT",
         "class_name": "ChatGPTAuthDO"
+      },
+      {
+        "name": "GITHUB",
+        "class_name": "GitHubAuthDO"
       }
     ]
   },
@@ -56,6 +62,12 @@
       "new_sqlite_classes": [
         "ChatGPTAuthDO"
       ]
+    },
+    {
+      "tag": "v3-github",
+      "new_sqlite_classes": [
+        "GitHubAuthDO"
+      ]
     }
   ],
   "r2_buckets": [
@@ -70,7 +82,7 @@
       "scheduling_policy": "durable_object",
       "images": {
         "base": {
-          "image": "registry.cloudflare.com/3acfff91febe1ba644c6358ae5612736/timber-computer@sha256:7fe12aa97f04f977499156805faf0d386e2799186c0287bb9c195a61508630bf"
+          "image": "registry.cloudflare.com/3acfff91febe1ba644c6358ae5612736/timber-computer@sha256:dcdd45c3a7b0fe0249671e4b601cef3e98625fbf3c64e8ce9cf265c3be57ac36"
         }
       }
     }
@@ -80,7 +92,8 @@
       "type": "Text",
       "globs": [
         "**/*.py",
-        "**/*.sh"
+        "**/*.sh",
+        "**/SKILL.md"
       ],
       "fallthrough": true
     }

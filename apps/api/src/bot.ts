@@ -1,7 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
-import type { Approval, Bot, BotEvent, ComputerAction, ComputerResult, ComputerStatus, Message, Run, RunPage, RunStatus } from "@botspace/contracts";
+import type { Approval, Bot, BotEvent, ComputerAction, ComputerResult, ComputerStatus, ConnectionRequest, Message, Run, RunPage, RunStatus } from "@botspace/contracts";
 import { createCloudComputerProvider, touchCloudComputer, suspendCloudComputer, deleteCloudComputer, ComputerProviderError } from "@botspace/computer";
-import { createPiRuntime, type AgentRuntime, type RuntimeApprovalContext, type RuntimeApprovalSummary, type RuntimeToolResult } from "@botspace/runtime";
+import { createPiRuntime, type AgentRuntime, type RuntimeApprovalContext, type RuntimeApprovalSummary, type RuntimeToolResult, type RuntimeHostToolRequest } from "@botspace/runtime";
+import { hostTools, validateHostArguments, githubDevelopmentSkill, workspaceAppsSkill } from "./host-tools";
+import { WorkspaceApps } from "./workspace-apps";
 import type { Env } from "./env";
 import { ApiError, errorResponse, json } from "./errors";
 import { body, fingerprint, operationId, parseAction, parseMessage, UUID } from "./validation";
@@ -51,6 +53,7 @@ export class BotDO extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, source_key TEXT UNIQUE, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, fingerprint TEXT NOT NULL, data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS approvals_status_expiry_idx ON approvals (json_extract(data,'$.status'),json_extract(data,'$.expiresAt'));
+      CREATE TABLE IF NOT EXISTS connections (id TEXT PRIMARY KEY, operation_id TEXT UNIQUE NOT NULL, fingerprint TEXT NOT NULL, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, source_key TEXT UNIQUE, data TEXT NOT NULL);
     `);
     this.runtime=createPiRuntime({
@@ -68,6 +71,8 @@ export class BotDO extends DurableObject<Env> {
       onAdmissionRetry:async(operationId)=>this.admit(operationId),
       tools:{
         execute:async(input)=>this.executeTool(input),
+        catalog:async()=>hostTools,
+        call:async(input)=>this.executeHostTool(input),
         readImage:async(artifactId)=>this.readImage(artifactId),
       },
       onEvent:async(event)=>this.project(event),
@@ -86,7 +91,7 @@ export class BotDO extends DurableObject<Env> {
     const work=(async()=>{
       // Stop the computer alongside Pi: a native task may be awaiting its tool
       // response. Neither side may acknowledge cleanup before it is quiescent.
-      await Promise.all([this.runtime?.destroy(),deleteCloudComputer(this.env.COMPUTER,id)]);
+      await Promise.all([this.runtime?.destroy(),deleteCloudComputer(this.env.COMPUTER,id),...(this.env.GITHUB?[this.github(`/bots/${id}`,"DELETE")]:[])]);
       await Promise.allSettled([...this.admitting.values(),...this.finishingApprovals.values(),...(this.recovering?[this.recovering]:[]),...(this.suspending?[this.suspending]:[])]);
       const tables=this.ctx.storage.sql.exec<{name:string}>("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name!='bot_deletion'").toArray();
       this.ctx.storage.transactionSync(()=>{
@@ -168,7 +173,7 @@ export class BotDO extends DurableObject<Env> {
       : this.ctx.storage.sql.exec<PageRow>("SELECT rowid AS cursor,data FROM runs WHERE rowid<? ORDER BY rowid DESC LIMIT ?",before,limit+1).toArray();
     const page=rows.slice(0,limit);
     // Active runs can be older than the requested page. Admission permits at most 16.
-    const activeRows=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM runs WHERE json_extract(data,'$.status') IN ('queued','running','waiting_approval') ORDER BY rowid DESC LIMIT 16").toArray();
+    const activeRows=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM runs WHERE json_extract(data,'$.status') IN ('queued','running','waiting_approval','waiting_connection') ORDER BY rowid DESC LIMIT 16").toArray();
     return {
       runs:page.map(row=>JSON.parse(row.data) as Run),
       activeRuns:activeRows.map(row=>JSON.parse(row.data) as Run),
@@ -249,10 +254,11 @@ export class BotDO extends DurableObject<Env> {
       this.lastComputerTouch=Date.now();
       this.ctx.waitUntil(touchCloudComputer(this.env.COMPUTER,run.botId).catch(()=>{}));
     }
-    if(event.type==="run.started" && !this.hasPendingApproval(run.id)) this.updateStatus(run.id,"running");
+    if(event.type==="run.started" && !this.hasPendingApproval(run.id) && !this.hasPendingConnection(run.id)) this.updateStatus(run.id,"running");
     if(event.type==="run.completed") await this.completeOperation(event.operationId!,"done",typeof event.data.text==="string"?event.data.text:undefined,undefined,event.data.kind==="progress"?"progress":"final");
     if(event.type==="run.failed") {
-      if(this.hasPendingApproval(run.id)) this.updateStatus(run.id,"waiting_approval");
+      if(this.hasPendingConnection(run.id)) this.updateStatus(run.id,"waiting_connection");
+      else if(this.hasPendingApproval(run.id)) this.updateStatus(run.id,"waiting_approval");
       else {
         const failure=this.operationFailure(typeof event.data.reason==="string"?event.data.reason:undefined,typeof event.data.publicMessage==="string"?event.data.publicMessage:undefined);
         this.updateStatus(run.id,failure.status,failure.error);
@@ -273,6 +279,7 @@ export class BotDO extends DurableObject<Env> {
     const run=JSON.parse(row.data) as Run;
     if(text && kind!=="progress") this.addMessage({id:crypto.randomUUID(),botId:run.botId,runId:run.id,role:"assistant",kind:"final",text,createdAt:timestamp()},`answer:${nativeOperationId}`);
     if(row.native_operation_id!==nativeOperationId || terminal.has(run.status)) return;
+    if(this.hasPendingConnection(run.id)) {this.updateStatus(run.id,"waiting_connection");return;}
     if(this.hasPendingApproval(run.id)) {this.updateStatus(run.id,"waiting_approval");return;}
     // The provider checkpoints file mutations before returning their results.
     // Read-only/GUI turns must not stop a warm browser just to copy its profile.
@@ -283,7 +290,7 @@ export class BotDO extends DurableObject<Env> {
   private async createRun(input:{text:string;operationId:string}):Promise<Run> {
     const hash=await fingerprint({text:input.text});
     this.active();
-    if(input.operationId.startsWith("approval:") || input.operationId.startsWith("delegate:")) throw new ApiError(400,"reserved_operation_id","This operationId prefix is reserved.");
+    if(input.operationId.startsWith("approval:") || input.operationId.startsWith("delegate:") || input.operationId.startsWith("connection:")) throw new ApiError(400,"reserved_operation_id","This operationId prefix is reserved.");
     const existing=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs WHERE operation_id=?",input.operationId).toArray()[0];
     if(existing) {
       if(existing.fingerprint!==hash) throw new ApiError(409,"idempotency_conflict","operationId was already used with different input.");
@@ -301,7 +308,7 @@ export class BotDO extends DurableObject<Env> {
       return this.getRun(existing.id);
     }
     if(this.suspending) throw new ApiError(409,"computer_busy","The computer is being suspended. Retry after it stops.");
-    const activeCount=this.ctx.storage.sql.exec<{total:number}>("SELECT COUNT(*) AS total FROM runs WHERE json_extract(data,'$.status') IN ('queued','running','waiting_approval')").toArray()[0].total;
+    const activeCount=this.ctx.storage.sql.exec<{total:number}>("SELECT COUNT(*) AS total FROM runs WHERE json_extract(data,'$.status') IN ('queued','running','waiting_approval','waiting_connection')").toArray()[0].total;
     if(activeCount>=16) throw new ApiError(429,"too_many_runs","This bot already has 16 active runs.");
     const now=timestamp();
     const run:Run={id:crypto.randomUUID(),botId:this.bot().id,operationId:input.operationId,status:"queued",createdAt:now,updatedAt:now};
@@ -328,7 +335,7 @@ export class BotDO extends DurableObject<Env> {
     const submission=this.ctx.storage.sql.exec<Submission>("SELECT * FROM submissions WHERE operation_id=?",nativeOperationId).toArray()[0];
     if(!submission) return;
     const row=this.getRunRow(submission.run_id),run=JSON.parse(row.data) as Run;
-    if(row.native_operation_id!==nativeOperationId || terminal.has(run.status) || run.status==="waiting_approval") return;
+    if(row.native_operation_id!==nativeOperationId || terminal.has(run.status) || ["waiting_approval","waiting_connection"].includes(run.status)) return;
     const retry=this.ctx.storage.sql.exec<AdmissionRetry>("SELECT attempts,next_at FROM admission_retries WHERE operation_id=?",nativeOperationId).toArray()[0];
     if(!submission.admitted && retry && (retry.attempts>=maxAdmissionAttempts || retry.next_at>Date.now())) return;
     try {
@@ -366,7 +373,7 @@ export class BotDO extends DurableObject<Env> {
   private canAdmit(nativeOperationId:string,runId:string):boolean {
     if(this.deleted) return false;
     const current=this.getRunRow(runId),run=JSON.parse(current.data) as Run;
-    return current.native_operation_id===nativeOperationId && !terminal.has(run.status) && run.status!=="waiting_approval";
+    return current.native_operation_id===nativeOperationId && !terminal.has(run.status) && !["waiting_approval","waiting_connection"].includes(run.status);
   }
   private observe(nativeOperationId:string):void {
     if(this.deleted) return;
@@ -376,7 +383,7 @@ export class BotDO extends DurableObject<Env> {
       try {
         const result=await this.runtime.wait(nativeOperationId);
         await this.completeOperation(nativeOperationId,result.status,result.text,result.reason,result.kind);
-      } catch {if(!this.deleted) {const row=this.findRun(nativeOperationId);if(row?.native_operation_id===nativeOperationId) {const run=JSON.parse(row.data) as Run;if(!terminal.has(run.status) && run.status!=="waiting_approval") this.updateStatus(run.id,"interrupted","The agent run was interrupted.");}}}
+      } catch {if(!this.deleted) {const row=this.findRun(nativeOperationId);if(row?.native_operation_id===nativeOperationId) {const run=JSON.parse(row.data) as Run;if(!terminal.has(run.status) && !["waiting_approval","waiting_connection"].includes(run.status)) this.updateStatus(run.id,"interrupted","The agent run was interrupted.");}}}
       finally {this.observing.delete(nativeOperationId);}
     })());
   }
@@ -387,7 +394,7 @@ export class BotDO extends DurableObject<Env> {
       const rows=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs").toArray();
       for(const row of rows) {
         const run=JSON.parse(row.data) as Run;
-        if(!terminal.has(run.status) && run.status!=="waiting_approval") await this.admit(row.native_operation_id);
+        if(!terminal.has(run.status) && !["waiting_approval","waiting_connection"].includes(run.status)) await this.admit(row.native_operation_id);
       }
       // The computer provider deduplicates these operation IDs, including interrupted operations.
       const approvals=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM approvals").toArray().map(row=>JSON.parse(row.data) as Approval);
@@ -412,7 +419,7 @@ export class BotDO extends DurableObject<Env> {
     const row=this.findRun(input.runOperationId);
     if(!row) throw new ApiError(409,"run_not_found","Tool has no active run.");
     const run=JSON.parse(row.data) as Run;
-    if(terminal.has(run.status) || input.signal?.aborted) return {operationId:input.operationId,status:"interrupted",error:"Run is no longer active."};
+    if(row.native_operation_id!==input.runOperationId || terminal.has(run.status) || input.signal?.aborted) return {operationId:input.operationId,status:"interrupted",error:"Run is no longer active."};
     const action=parseAction(input.action);
     const hash=await fingerprint(action);
     this.active();
@@ -420,7 +427,7 @@ export class BotDO extends DurableObject<Env> {
     if(existing) return existing;
     const bot=await this.currentBot();
     this.active();
-    if(terminal.has(this.getRun(run.id).status) || input.signal?.aborted) return {operationId:input.operationId,status:"interrupted",error:"Run is no longer active."};
+    if(this.getRunRow(run.id).native_operation_id!==input.runOperationId || terminal.has(this.getRun(run.id).status) || input.signal?.aborted) return {operationId:input.operationId,status:"interrupted",error:"Run is no longer active."};
     // Another invocation may have persisted this exact decision while the
     // registry read was pending. Recheck before dispatching under fresh policy.
     const concurrentDecision=this.existingToolDecision(input.operationId,hash);
@@ -437,6 +444,124 @@ export class BotDO extends DurableObject<Env> {
     this.emit("approval.created",{approval},run.id,`approval:${approval.id}`);
     return {status:"pending_approval",approvalId:approval.id,message:"The exact action needs user approval. Stop and wait for the decision."};
   }
+  private apps():WorkspaceApps {
+    return new WorkspaceApps(this.ctx.storage,this.env.COMPUTER,this.bot().id,{previewOrigin:this.env.PREVIEW_ORIGIN??'',consoleOrigin:this.env.GITHUB_PUBLIC_ORIGIN??''});
+  }
+  private listConnections():ConnectionRequest[] {
+    return this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM connections ORDER BY (json_extract(data,'$.status')='pending') DESC, rowid DESC LIMIT 100").toArray().map(row=>JSON.parse(row.data));
+  }
+  private getConnection(id:string):ConnectionRequest|undefined {
+    const row=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM connections WHERE id=?",id).toArray()[0];
+    return row?JSON.parse(row.data):undefined;
+  }
+  private saveConnection(connection:ConnectionRequest):void {
+    this.ctx.storage.sql.exec("UPDATE connections SET data=? WHERE id=?",JSON.stringify(connection),connection.id);
+  }
+  private hasPendingConnection(runId:string):boolean {
+    return this.ctx.storage.sql.exec("SELECT id FROM connections WHERE json_extract(data,'$.runId')=? AND json_extract(data,'$.status')='pending' LIMIT 1",runId).toArray().length>0;
+  }
+  private async github(path:string,method='POST',input?:unknown):Promise<Record<string,unknown>> {
+    if(!this.env.GITHUB) throw new ApiError(503,'github_not_configured','GitHub connections are not configured.');
+    const response=await this.env.GITHUB.get(this.env.GITHUB.idFromName('owner')).fetch(new Request(`https://github${path}`,{method,headers:{'content-type':'application/json'},...(input===undefined?{}:{body:JSON.stringify(input)})}));
+    const data=await response.json<Record<string,unknown>>();
+    if(!response.ok) {
+      const error=data.error as {code?:string;message?:string}|undefined;
+      throw new ApiError(response.status,error?.code??'github_unavailable',error?.message??'GitHub could not complete this operation.');
+    }
+    return data;
+  }
+  private async requireConnection(input:RuntimeHostToolRequest,run:Run,repository:string,permission:'read'|'write'):Promise<RuntimeToolResult|undefined> {
+    const access={botId:run.botId,repository,permission};
+    const authorized=await this.github('/authorize','POST',access);
+    this.active();
+    if(this.getRunRow(run.id).native_operation_id!==input.runOperationId || terminal.has(this.getRun(run.id).status) || input.signal.aborted) return {operationId:input.operationId,status:'interrupted',error:'Run is no longer active.'};
+    if(authorized.authorized===true) return;
+    const hash=await fingerprint({name:input.name,arguments:input.arguments});
+    this.active();
+    if(terminal.has(this.getRun(run.id).status) || this.getRunRow(run.id).native_operation_id!==input.runOperationId || input.signal.aborted) return {operationId:input.operationId,status:'interrupted',error:'Run is no longer active.'};
+    const previous=this.ctx.storage.sql.exec<{fingerprint:string;data:string}>("SELECT fingerprint,data FROM connections WHERE operation_id=?",input.operationId).toArray()[0];
+    if(previous && previous.fingerprint!==hash) throw new ApiError(409,'idempotency_conflict','Tool arguments changed.');
+    const connection:ConnectionRequest=previous?JSON.parse(previous.data):{id:crypto.randomUUID(),botId:run.botId,runId:run.id,provider:'github',repository,permission,status:'pending',createdAt:timestamp()};
+    if(connection.status!=='pending') return {operationId:input.operationId,status:'failed',error:'This connection request is no longer pending. Request access again.'};
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO connections(id,operation_id,fingerprint,data) VALUES(?,?,?,?)",connection.id,input.operationId,hash,JSON.stringify(connection));
+    this.updateStatus(run.id,'waiting_connection');
+    this.emit('connection.requested',{connection},run.id,`connection:${connection.id}`);
+    return {status:'pending_connection',requestId:connection.id,provider:'github',repository,permission,message:'Connect GitHub using the inline card. The host will resume this task after authorization. Do not request a token in chat.'};
+  }
+  private async startConnection(id:string):Promise<Record<string,unknown>> {
+    const connection=this.getConnection(id);
+    if(!connection) throw new ApiError(404,'not_found','Connection request not found.');
+    if(connection.status!=='pending' || terminal.has(this.getRun(connection.runId).status)) throw new ApiError(409,'connection_inactive','This connection request is no longer active.');
+    return this.github('/connect','POST',{...connection,requestId:id,origin:this.env.GITHUB_PUBLIC_ORIGIN});
+  }
+  private async completeConnection(id:string):Promise<ConnectionRequest> {
+    let connection=this.getConnection(id);
+    if(!connection) throw new ApiError(404,'not_found','Connection request not found.');
+    if(connection.status!=='pending') {
+      if(connection.status==='connected') await this.admit(`connection:${id}`);
+      return connection;
+    }
+    const access=await this.github('/authorize','POST',connection);
+    if(access.authorized!==true) throw new ApiError(403,'connection_not_authorized','Repository access has not been granted.');
+    this.active();
+    let continuation:string|undefined;
+    this.ctx.storage.transactionSync(()=>{
+      connection=this.getConnection(id)!;
+      if(connection.status!=='pending') return;
+      const run=this.getRun(connection.runId);
+      if(terminal.has(run.status)) {connection.status='cancelled';this.saveConnection(connection);return;}
+      connection.status='connected';this.saveConnection(connection);
+      this.emit('connection.updated',{connection},run.id);
+      const nativeOperationId=`connection:${id}`;
+      const exists=this.ctx.storage.sql.exec("SELECT operation_id FROM submissions WHERE operation_id=?",nativeOperationId).toArray().length;
+      if(exists) return;
+      const text=`GitHub access is now connected for ${connection.repository} (${connection.permission}) for this bot. Continue the original task. The tool that requested access was NOT executed. You may issue that operation now. Do not repeat previously completed effects. Use the host GitHub tools; credentials are managed by the host.`;
+      this.ctx.storage.sql.exec("INSERT INTO submissions(operation_id,run_id,text) VALUES(?,?,?)",nativeOperationId,run.id,text);
+      this.ctx.storage.sql.exec("UPDATE runs SET native_operation_id=? WHERE id=?",nativeOperationId,run.id);
+      this.updateStatus(run.id,'queued');continuation=nativeOperationId;
+    });
+    if(continuation) await this.admit(continuation);
+    return connection;
+  }
+  private async executeHostTool(input:RuntimeHostToolRequest):Promise<RuntimeToolResult> {
+    this.active();
+    validateHostArguments(input.name,input.arguments);
+    const row=this.findRun(input.runOperationId);
+    if(!row) throw new ApiError(409,'run_not_found','Tool has no active run.');
+    const run=JSON.parse(row.data) as Run;
+    if(row.native_operation_id!==input.runOperationId || terminal.has(run.status) || input.signal.aborted) return {operationId:input.operationId,status:'interrupted',error:'Run is no longer active.'};
+    await this.currentBot();
+    this.active();
+    if(this.getRunRow(run.id).native_operation_id!==input.runOperationId || terminal.has(this.getRun(run.id).status) || input.signal.aborted) return {operationId:input.operationId,status:'interrupted',error:'Run is no longer active.'};
+    const args=input.arguments;
+    const completed=(value:unknown):ComputerResult=>({operationId:input.operationId,status:'completed',output:typeof value==='string'?value:JSON.stringify(value)});
+    let result:ComputerResult;
+    if(input.name==='load_skill') result=completed(args.name==='github-development'?githubDevelopmentSkill:workspaceAppsSkill);
+    else if(input.name==='publish_app') {
+      const app=await this.apps().publish({name:args.name as string,port:args.port as number,operationId:input.operationId});
+      this.emit('workspace.app.updated',{app},run.id);result=completed(app);
+    } else if(input.name==='list_apps') result=completed({apps:await this.apps().refresh()});
+    else if(input.name==='remove_app') {await this.apps().remove(args.appId as string);this.emit('workspace.app.removed',{appId:args.appId},run.id);result=completed({removed:true});}
+    else {
+      const repository=String(args.repository).toLowerCase();
+      if(!/^[a-z0-9][a-z0-9-]{0,38}\/[a-z0-9._-]{1,100}$/.test(repository) || repository.endsWith('/.') || repository.endsWith('/..')) throw new ApiError(400,'invalid_repository','Use a GitHub repository in owner/name format.');
+      const permission=input.name==='github_connect'?args.permission as 'read'|'write':['github_clone','github_list_pull_requests'].includes(input.name)?'read':'write';
+      const pending=await this.requireConnection(input,run,repository,permission);
+      if(pending) return pending;
+      if(input.name==='github_connect') result=completed({connected:true,repository,permission});
+      else if(input.name==='github_clone' || input.name==='github_push') {
+        const action=parseAction({type:input.name==='github_clone'?'gitClone':'gitPush',repository,path:args.path,...(args.branch?{branch:args.branch}:{})});
+        result=await this.computer.exec(run.botId,input.operationId,action);
+      } else {
+        const {repository:_,...providerArgs}=args;
+        const response=await this.github('/mcp','POST',{botId:run.botId,repository,name:input.name==='github_create_pull_request'?'create_pull_request':'list_pull_requests',args:providerArgs,operationId:input.operationId});
+        result=response.status==='completed'?completed(response.data):{operationId:input.operationId,status:response.status==='interrupted'?'interrupted':'failed',error:(response.error as {message?:string}|undefined)?.message??'GitHub could not confirm the operation. Inspect its state before retrying.'};
+      }
+    }
+    this.emit('tool.completed',{operationId:input.operationId,...(input.toolCallId?{toolCallId:input.toolCallId}:{}),toolName:input.name,result},run.id,`tool:${input.operationId}`);
+    return result;
+  }
+
   private async readImage(artifactId:string):Promise<{data:string;mimeType:string}> {
     if(!UUID.test(artifactId)) throw new ApiError(404,"not_found","Image not found.");
     const stored=await this.env.FILES.get(`bots/${this.bot().id}/artifacts/${artifactId}`);
@@ -557,6 +682,10 @@ export class BotDO extends DurableObject<Env> {
     for(const approval of pending) if(approval.runId===id && approval.status==="pending") {
       approval.status="denied";this.saveApproval(approval);this.emit("approval.updated",{approval},id);
     }
+    for(const row of this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM connections WHERE json_extract(data,'$.runId')=? AND json_extract(data,'$.status')='pending'",id).toArray()) {const connection=JSON.parse(row.data) as ConnectionRequest; if(connection.status==="pending") {
+      connection.status="cancelled";this.saveConnection(connection);this.emit("connection.updated",{connection},id);
+    }
+    }
     await this.runtime.cancel(row.native_operation_id);
     return this.getRun(id);
   }
@@ -627,8 +756,27 @@ export class BotDO extends DurableObject<Env> {
         return json({botId:id,deleted:true});
       }
       this.active();
+      const completedConnection=/^\/connections\/([^/]+)\/complete$/.exec(path);
+      if(completedConnection && request.method==="POST" && request.headers.get("x-timber-internal")==="github") {
+        await this.currentBot();
+        return json({connection:await this.completeConnection(completedConnection[1])});
+      }
       this.configure(request);
       this.ctx.waitUntil(this.recover());
+      if(path==="/connections" && request.method==="GET") return json({connections:this.listConnections()});
+      const connect=/^\/connections\/([^/]+)\/connect$/.exec(path);
+      if(connect && request.method==="POST") return json(await this.startConnection(connect[1]));
+      if(path==="/apps/refresh" && request.method==="POST") return json({apps:await this.apps().refresh()});
+      if(path==="/apps" && request.method==="GET") return json({apps:await this.apps().list()});
+      if(path==="/apps" && request.method==="POST") {
+        const input=await body(request);
+        return json({app:await this.apps().publish(input)});
+      }
+      const appRoute=/^\/apps\/([^/]+)(\/open)?$/.exec(path);
+      if(appRoute && request.method==="DELETE" && !appRoute[2]) {await this.apps().remove(appRoute[1]);return json({deleted:true});}
+      if(appRoute && request.method==="POST" && appRoute[2]) return json(await this.apps().open(appRoute[1]));
+      const preview=/^\/workspace-app-preview\/([^/]+)$/.exec(path);
+      if(preview && request.headers.has("x-timber-preview-path")) return await this.apps().preview(request,preview[1],request.headers.get("x-timber-preview-path")!);
       if(path==="/messages" && request.method==="GET") {
         const messages=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM messages ORDER BY rowid DESC LIMIT 500").toArray().reverse().map(row=>JSON.parse(row.data));
         return json({messages});

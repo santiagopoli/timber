@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { EntryRecord, ToolExecutionApi } from '@earendil-works/pi-durable';
 import { classifyFailure, normalizeEntries, textContent, toolCompletion } from '../src/normalize.js';
-import { computerToolOperationId, computerTools, executeComputerTool, type ToolBridge } from '../src/tools.js';
+import { computerToolOperationId, computerTools, executeComputerTool, executeHostTool, hostTools, type ToolBridge } from '../src/tools.js';
+import type { RuntimePause } from '../src/types.js';
 import { chatgptModel, chatgptPayload, createChatGPTProvider } from '../src/chatgpt.js';
 import { createModels } from '@earendil-works/pi-ai/models';
 
@@ -107,6 +108,53 @@ describe('runtime computer bridge', () => {
   });
 });
 
+describe('runtime host tool bridge', () => {
+  it('only advertises host tools when both discovery and dispatch exist', () => {
+    const host = bridge();
+    expect(hostTools(host)).toEqual([]);
+    host.tools.catalog = async () => [];
+    expect(hostTools(host)).toEqual([]);
+    host.tools.call = vi.fn(async ({ operationId }) => ({ operationId, status: 'completed' as const }));
+    expect(hostTools(host).map(tool => [tool.name, tool.replay])).toEqual([['list_tools', 'safe'], ['call_tool', 'unsafe']]);
+    expect(hostTools(host)[1]?.executionMode).toBe('sequential');
+  });
+  it('passes stable host identities without starting the computer or altering arguments', async () => {
+    const host = bridge();
+    host.tools.call = vi.fn(async ({ operationId }) => ({ operationId, status: 'completed' as const, output: 'repository checked' }));
+    const input = { name: 'github_clone', arguments: { repository: 'owner/repo', path: 'project' } };
+    const result = await executeHostTool(host, input, api, context);
+    expect(host.tools.call).toHaveBeenCalledWith({ ...input, operationId: 'pi-tool:task-17:call-42', runOperationId: 'user-operation', toolCallId: api.callId, signal: context.abortSignal });
+    expect(host.tools.execute).not.toHaveBeenCalled();
+    expect(result.isError).toBe(false);
+  });
+  it('persists a connection pause and prevents any remaining host or computer dispatch in that run', async () => {
+    const host = bridge();
+    const pending: RuntimePause = { status: 'pending_connection', requestId: 'connect-1', provider: 'github', repository: 'owner/private', permission: 'write' };
+    host.tools.call = vi.fn(async () => pending);
+    let saved: RuntimePause | undefined;
+    host.pause = vi.fn((_operationId, result) => { saved = result; });
+    host.paused = () => saved;
+    const result = await executeHostTool(host, { name: 'github_clone', arguments: { repository: 'owner/private' } }, api, context);
+    expect(result.control).toEqual({ terminate: true });
+    expect(host.pause).toHaveBeenCalledWith('user-operation', pending);
+    await executeHostTool(host, { name: 'github_push', arguments: {} }, api, context);
+    await executeComputerTool(host, { type: 'exec', command: 'git clone forbidden-fallback' }, api, context);
+    expect(host.tools.call).toHaveBeenCalledTimes(1);
+    expect(host.tools.execute).not.toHaveBeenCalled();
+    expect(host.consume).toHaveBeenCalledTimes(1);
+  });
+  it('checks cancellation and the durable budget before calling a host service', async () => {
+    const host = bridge();
+    host.tools.call = vi.fn(async ({ operationId }) => ({ operationId, status: 'completed' as const }));
+    const abort = new AbortController();
+    abort.abort();
+    await expect(executeHostTool(host, { name: 'github_push', arguments: {} }, api, { ...context, abortSignal: abort.signal })).rejects.toThrow();
+    host.consume = () => { throw new Error('exhausted'); };
+    expect((await executeHostTool(host, { name: 'github_push', arguments: {} }, api, context)).control).toEqual({ terminate: true });
+    expect(host.tools.call).not.toHaveBeenCalled();
+  });
+});
+
 describe('public transcript projection', () => {
   it('classifies public tool-call commentary and final answers from native metadata only', () => {
     const entries = [{ id: '12', conversationId: '1', kind: 'assistant', model: [
@@ -121,6 +169,10 @@ describe('public transcript projection', () => {
     const entry = { model: [{ role: 'toolResult', toolCallId: 'call1', toolName: 'exec', content: [{ type: 'text', text: JSON.stringify({ operationId: 'pi-tool:12:call1', status: 'pending_approval', output: 'private output' }) }] }] } as unknown as EntryRecord;
     expect(toolCompletion(entry)).toEqual({ operationId: 'pi-tool:12:call1', status: 'pending_approval' });
     expect(toolCompletion({ model: [{ role: 'toolResult', isError: true, content: [{ type: 'text', text: 'Validation detail' }] }] } as unknown as EntryRecord)).toEqual({ status: 'failed' });
+  });
+  it('projects a pending connection without disclosing its repository or request payload', () => {
+    const entry = { model: [{ role: 'toolResult', content: [{ type: 'text', text: JSON.stringify({ operationId: 'host:1', status: 'pending_connection', repository: 'owner/private', arguments: { private: true } }) }] }] } as unknown as EntryRecord;
+    expect(toolCompletion(entry)).toEqual({ operationId: 'host:1', status: 'pending_connection' });
   });
   it('does not serialize private reasoning, tool arguments, or image payloads as text', () => {
     expect(textContent([{ type: 'thinking', thinking: 'internal' }, { type: 'text', text: 'Answer' }, { type: 'image', data: 'secret-pixels' }])).toBe('Answer');

@@ -41,7 +41,7 @@ export function chatgptPayload(value: unknown): JsonObject {
   return {
     model: CHATGPT_MODEL, input, store: false, stream: true,
     reasoning: { effort: 'low', summary: 'auto' }, include: ['reasoning.encrypted_content'],
-    ...(functions.length ? { tools: [{ type: 'namespace', name: TOOL_NAMESPACE, description: 'Tools for this bot’s reusable computer, subject to host approval.', tools: functions }] } : {}),
+    ...(functions.length ? { tools: [{ type: 'namespace', name: TOOL_NAMESPACE, description: 'Tools for this bot’s reusable computer, connected services, skills and apps, subject to host policy.', tools: functions }] } : {}),
   };
 }
 

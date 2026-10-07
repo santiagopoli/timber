@@ -2,20 +2,71 @@
   "name": "botspace-tests",
   "main": "./fixtures/worker.ts",
   "compatibility_date": "2026-10-01",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
   "vars": {
     "BOTSPACE_API_TOKEN": "test-only-botspace-owner-token-000000",
     "BOTSPACE_DEFAULT_MODEL": "@cf/test/mock",
-    "CHATGPT_CREDENTIAL_KEY": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    "CHATGPT_CREDENTIAL_KEY": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "GITHUB_PUBLIC_ORIGIN": "https://timber.test",
+    "PREVIEW_ORIGIN": "https://preview.test"
   },
-  "durable_objects": {"bindings": [
-    {"name": "WORKSPACE", "class_name": "WorkspaceDO"},
-    {"name": "BOT", "class_name": "BotDO"},
-    {"name": "COMPUTER", "class_name": "ComputerDO"},
-    {"name": "REAL_COMPUTER", "class_name": "RealComputerDO"},
-    {"name": "CHATGPT", "class_name": "ChatGPTAuthDO"},
-    {"name": "KEYLESS_CHATGPT", "class_name": "KeylessChatGPTAuthDO"}
-  ]},
-  "migrations": [{"tag": "v1", "new_sqlite_classes": ["WorkspaceDO", "BotDO", "ComputerDO", "RealComputerDO", "ChatGPTAuthDO", "KeylessChatGPTAuthDO"]}],
-  "r2_buckets": [{"binding": "FILES", "bucket_name": "botspace-test-files"}]
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "WORKSPACE",
+        "class_name": "WorkspaceDO"
+      },
+      {
+        "name": "BOT",
+        "class_name": "BotDO"
+      },
+      {
+        "name": "COMPUTER",
+        "class_name": "ComputerDO"
+      },
+      {
+        "name": "REAL_COMPUTER",
+        "class_name": "RealComputerDO"
+      },
+      {
+        "name": "CHATGPT",
+        "class_name": "ChatGPTAuthDO"
+      },
+      {
+        "name": "KEYLESS_CHATGPT",
+        "class_name": "KeylessChatGPTAuthDO"
+      },
+      {
+        "name": "GITHUB",
+        "class_name": "GitHubAuthDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "WorkspaceDO",
+        "BotDO",
+        "ComputerDO",
+        "RealComputerDO",
+        "ChatGPTAuthDO",
+        "KeylessChatGPTAuthDO"
+      ]
+    },
+    {
+      "tag": "v3-github",
+      "new_sqlite_classes": [
+        "GitHubAuthDO"
+      ]
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "FILES",
+      "bucket_name": "botspace-test-files"
+    }
+  ]
 }

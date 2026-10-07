@@ -62,7 +62,7 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   digit string representing a positive safe integer. Invalid values return 400.
   Pass `nextCursor` unchanged as `before` for the next older page; null means no
   older page remains. New runs inserted between requests do not shift older pages.
-  `activeRuns` independently contains all admitted queued/running/waiting_approval
+  `activeRuns` independently contains all admitted queued/running/waiting_approval/waiting_connection
   runs (at most 16), newest-created first, even if absent from the requested page;
   it can overlap `runs`. Listing makes no new inference calls beyond the existing
   recovery of already accepted runs. Authentication and bot membership checks apply.
@@ -167,3 +167,67 @@ asynchronous task submission with source bot/run id,
 deduplicated operation id and depth cap. Bot identity preserved, all target ids checked
 in registry. Can be followup if other core loop critical paths aren't yet complete,
 but document explicitly instead of a fake tool.
+
+
+## Host tools and GitHub connection
+The host advertises a small catalog through runtime-independent `catalog` / `call`
+ports. Pi implements native `list_tools` and `call_tool`; neither engine nor skill
+owns provider credentials. Standard Agent Skills sources live in `skills/*/SKILL.md`
+and `load_skill` loads them on demand. Loading instructions grants no permissions.
+
+GitHubAuthDO stores one owner's encrypted private GitHub App registration and user
+OAuth credentials, separate from bot transcripts and workspace checkpoints. First
+connection creates a private personal App through GitHub's manifest flow, installs
+it on selected repositories and verifies the authorizing account and installation.
+The owner must complete GitHub consent. This registration flow currently targets
+personal accounts; organization-owned Apps require a separate registration policy.
+
+- GET /v1/connections/github returns safe account/App connection metadata.
+- DELETE /v1/connections/github revokes Timber grants/capabilities and removes local
+  credentials. Uninstall the App in GitHub to revoke the GitHub-side installation.
+- GET /v1/bots/:id/connections returns pending requests first plus recent history.
+- POST /v1/bots/:id/connections/:requestId/connect returns {url} for the browser's
+  provider consent flow. No token entry in chat.
+- Public /github/setup/{start,manifest,install,oauth} validates one-time expiring
+  state and a browser-bound secure HttpOnly cookie. No data API bypass.
+- Public /github/git/:owner/:repo.git/{info/refs,git-upload-pack,git-receive-pack}
+  is a narrow smart-HTTP proxy requiring a five-minute repository capability.
+  GitHub installation tokens never leave the host; the Linux process receives only
+  a transient scoped capability, which is revoked after the Git operation.
+
+A missing repository grant saves a ConnectionRequest and pauses the run as
+`waiting_connection`. Authorization persists the connected state and a new native
+continuation atomically; callback retries admit that exact continuation. Cancellation,
+bot deletion and newer native operations fence stale callbacks/tool calls. Authorizing
+access does not claim that the original tool ran: the resumed agent dispatches it.
+
+`github_connect` requests read or write scope. `github_clone` and `github_push` use
+native Git in the existing computer; `github_create_pull_request` and
+`github_list_pull_requests` use the fixed, host-validated remote GitHub MCP endpoint.
+PR writes are journaled and reconciled by marker before retrying an uncertain result.
+Git actions are stable credential-free ComputerAction values. Old running desktop
+images return `computer_upgrade_required` before any Git effect; an explicit suspend
+checkpoints the workspace, then the next start uses the new image. Never restart an
+active computer just to upgrade it.
+
+## Workspace apps
+Each bot workspace can expose multiple named apps, each with its own ID, port,
+readiness, base path and stable URL. See [workspace-apps.md](workspace-apps.md).
+`publish_app`, `list_apps` and `remove_app` are engine-independent host tools. The
+model explicitly probes readiness via list_apps; console polling reads stored state
+and does not wake or keep a machine alive.
+
+- GET /v1/bots/:id/apps returns {apps}.
+- POST /v1/bots/:id/apps/refresh explicitly probes existing apps without starting a VM.
+- POST /v1/bots/:id/apps {name,port,operationId} registers/probes {app} idempotently.
+- DELETE /v1/bots/:id/apps/:appId removes access, preserving source/server files.
+- POST /v1/bots/:id/apps/:appId/open issues a one-use 60-second POST ticket.
+
+A separate `timber-preview` Worker delegates through a service binding to the API's
+WorkspacePreviewGateway. App code never runs on the admin origin. The ticket becomes
+an HttpOnly, app-path-scoped browser session. App URLs contain no credentials;
+opening a copied URL on another browser requires access through Timber. HTML, assets,
+HTTP APIs and WebSockets share the app's prefix. The server must support that base
+path (e.g. Vite --base); no fragile HTML rewriting. Control port 8080 is blocked.
+Service workers are disabled on the preview origin. This is a private single-owner
+MVP: apps share a preview origin and are not separate browser security principals.

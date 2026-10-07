@@ -850,3 +850,112 @@ test('desktop and mobile panels remain within the viewport in light and dark the
     }
   });
 });
+
+test('GitHub repository connection stays inline and updates when access is connected', async () => {
+  await withPage(async ({page, context, login, state}) => {
+    const createdAt = new Date().toISOString();
+    const run = {id: 'github-run', botId: BOT_A, operationId: 'github-operation', status: 'waiting_connection', createdAt, updatedAt: createdAt};
+    const connection = {id: 'github-request', botId: BOT_A, runId: run.id, provider: 'github', repository: 'example/private-repo', permission: 'write', status: 'pending', createdAt};
+    state.runs.set(BOT_A, [run]); state.connections.set(BOT_A, [connection]);
+    state.messages.set(BOT_A, [{id: 'github-user', botId: BOT_A, runId: run.id, role: 'user', text: 'Clone my repository and open a pull request.', createdAt}]);
+    await login();
+    const card = page.locator('[data-connection-id="github-request"]');
+    await card.filter({hasText: 'Connect GitHub to continue'}).waitFor();
+    assert.equal(await card.evaluate(node => Boolean(node.closest('#messages'))), true, 'connection is in the conversation');
+    assert.equal(await card.evaluate(node => Boolean(document.querySelector('[data-message-id="github-user"]').compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING)), true, 'connection follows its request');
+    assert.match(await card.innerText(), /example\/private-repo/); assert.match(await card.innerText(), /push branches/);
+    await until(page, '.timber-work-status', 'Waiting for GitHub access');
+    const newTab = context.waitForEvent('page'); await card.getByRole('button', {name: 'Connect GitHub', exact: true}).click();
+    const consent = await newTab; await consent.waitForURL('**/github-connect');
+    assert.equal(await consent.evaluate(() => window.opener), null);
+    assert.equal(new URL(consent.url()).search, '', 'no owner credentials in the navigation');
+    assert.equal(state.calls.filter(call => call.method === 'POST' && call.path.endsWith('/connect')).length, 1);
+    await card.filter({hasText: 'Finish connecting in the new tab'}).waitFor();
+    connection.status = 'connected'; run.status = 'running'; run.updatedAt = new Date(Date.now() + 1000).toISOString();
+    state.emit(BOT_A, 'connection.updated', {connection}, run.id); state.emit(BOT_A, 'run.updated', {run}, run.id);
+    await card.filter({hasText: 'GitHub access connected'}).waitFor(); await until(page, '.timber-work-status', 'Ada is working');
+    assert.equal(await card.locator('button').count(), 0); assert.equal(sentMessages(state, BOT_A).length, 0, 'client does not duplicate the task when consent finishes');
+  });
+});
+
+test('workspace apps have independent protected links and open without sending the owner token', async () => {
+  for (const width of [1440, 390]) await withPage(async ({page, context, login, state, url}) => {
+    const createdAt = new Date().toISOString();
+    state.apps.set(BOT_A, [
+      {id: 'frontend', botId: BOT_A, name: 'Storefront', port: 3000, basePath: '/apps/frontend/', url: state.appURL(BOT_A, 'frontend'), state: 'ready', createdAt, updatedAt: createdAt},
+      {id: 'admin', botId: BOT_A, name: 'Admin', port: 3001, basePath: '/apps/admin/', url: state.appURL(BOT_A, 'admin'), state: 'unavailable', createdAt, updatedAt: createdAt},
+    ]);
+    await context.grantPermissions(['clipboard-read', 'clipboard-write'], {origin: new URL(url).origin});
+    await login(); await page.locator('#tab-apps').click();
+    assert.equal(await page.locator('[data-app-id]').count(), 2); assert.equal(await page.locator('#app-count').textContent(), '2');
+    assert.equal(await page.getByRole('button', {name: 'Open Admin', exact: true}).isDisabled(), true);
+    assert.match(await page.locator('[data-app-id="admin"]').innerText(), /not responding/);
+    if (process.env.CONSOLE_SCREENSHOT_DIR) {await mkdir(process.env.CONSOLE_SCREENSHOT_DIR, {recursive: true}); await page.screenshot({path: `${process.env.CONSOLE_SCREENSHOT_DIR}/workspace-apps-${width}.png`, animations: 'disabled', fullPage: true});}
+    const opened = context.waitForEvent('page'); await page.getByRole('button', {name: 'Open Storefront', exact: true}).click();
+    const app = await opened; await app.getByRole('heading', {name: 'Workspace app is available'}).waitFor();
+    assert.equal(app.url(), state.apps.get(BOT_A)[0].url); assert.equal(await app.evaluate(() => window.opener), null);
+    assert.equal(state.previewCalls[0].method, 'POST'); assert.equal(state.previewCalls[0].url, '/access');
+    assert.equal(new URLSearchParams(state.previewCalls[0].body).get('ticket'), 'fixture-ticket-frontend');
+    assert.equal(state.previewCalls.every(call => !call.authorization && !JSON.stringify(call).includes(TEST_TOKEN)), true, 'owner token never reaches the preview origin');
+    assert.equal(state.previewCalls.every(call => !call.url.includes('ticket')), true, 'ticket stays out of URLs');
+    await page.getByRole('button', {name: 'Copy Storefront link', exact: true}).click();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), state.apps.get(BOT_A)[0].url);
+    const admin = page.locator('[data-app-id="admin"]'); await admin.locator('summary').click(); await admin.getByRole('button', {name: 'Remove access', exact: true}).click();
+    await admin.waitFor({state: 'hidden'}); assert.equal(await page.locator('[data-app-id="frontend"]').count(), 1);
+    assert.equal(state.apps.get(BOT_A).length, 1); assert.equal(state.actions.length, 0, 'opening and removing access do not run computer commands');
+    assert.match(await page.locator('#apps-feedback').innerText(), /server and files were kept/);
+    await page.locator(`[data-bot-id="${BOT_B}"]`).click(); await page.locator('#workspace-app-empty').waitFor();
+    assert.equal(await page.locator('[data-app-id]').count(), 0, 'apps remain scoped to their bot');
+  }, {viewport: {width, height: 1000}});
+});
+
+test('disconnecting while app access is being prepared closes the tab without disclosing a ticket', async () => {
+  await withPage(async ({page, context, login, state}) => {
+    const createdAt = new Date().toISOString();
+    state.apps.set(BOT_A, [{id: 'slow-app', botId: BOT_A, name: 'Slow app', port: 3000, basePath: '/', url: state.appURL(BOT_A, 'slow-app'), state: 'ready', createdAt, updatedAt: createdAt}]);
+    let release; state.appOpenGate = new Promise(resolve => {release = resolve;});
+    try {
+      await login(); await page.locator('#tab-apps').click();
+      const opened = context.waitForEvent('page'); await page.getByRole('button', {name: 'Open Slow app', exact: true}).click(); const tab = await opened;
+      await page.locator('#disconnect').click(); release();
+      if (!tab.isClosed()) await tab.waitForEvent('close');
+      assert.equal(state.previewCalls.length, 0); assert.equal(await page.locator('#workspace-app-list').textContent(), '');
+    } finally {release();}
+  });
+});
+
+test('apps remain a named collection on mobile and unsafe addresses never become clickable', async () => {
+  await withPage(async ({page, login, state}) => {
+    const createdAt = new Date().toISOString();
+    state.apps.set(BOT_A, [{id: 'invalid', botId: BOT_A, name: 'Example application with a long name', port: 3000, basePath: '/', url: 'javascript:alert(1)', state: 'ready', createdAt, updatedAt: createdAt}]);
+    await login(); await page.locator('#tab-apps').click();
+    const card = page.locator('[data-app-id="invalid"]');
+    assert.equal(await card.getByRole('button', {name: /^Open /}).isDisabled(), true);
+    assert.equal(await card.getByRole('button', {name: /^Copy /}).isDisabled(), true);
+    assert.equal(await page.locator('#panel-apps').evaluate(node => node.scrollWidth <= node.clientWidth + 1), true);
+    assert.equal(await page.locator('#panel-apps input').count(), 0, 'user is not required to configure ports');
+  }, {viewport: {width: 390, height: 900}});
+});
+
+test('Refresh apps explicitly checks services while background lists remain passive', async () => {
+  await withPage(async ({page, login, state}) => {
+    const createdAt = new Date().toISOString(), appId = 'starting-web';
+    state.apps.set(BOT_A, [{id: appId, botId: BOT_A, name: 'Website', port: 3000, basePath: '/', url: state.appURL(BOT_A, appId), state: 'unavailable', createdAt, updatedAt: createdAt}]);
+    state.appRefreshStates.set(`${BOT_A}:${appId}`, 'ready');
+    await login(); await page.locator('#tab-apps').click();
+    const open = page.getByRole('button', {name: 'Open Website', exact: true});
+    assert.equal(await open.isDisabled(), true);
+    assert.equal(state.calls.some(call => call.path.endsWith('/apps/refresh')), false, 'selecting the bot and viewing its apps do not probe services');
+    let release; state.appRefreshGate = new Promise(resolve => {release = resolve;});
+    try {
+      await page.locator('#refresh-apps').click();
+      await page.getByRole('button', {name: 'Checking apps…', exact: true}).waitFor();
+      assert.equal(await page.locator('#refresh-apps').isDisabled(), true, 'an in-flight explicit check cannot be duplicated');
+      release();
+      await page.locator('[data-app-id="starting-web"]').filter({hasText: 'Ready to use'}).waitFor();
+      assert.equal(await open.isEnabled(), true);
+      assert.deepEqual(state.calls.filter(call => call.path.endsWith('/apps/refresh')).map(call => ({path: call.path, method: call.method})), [{path: `/v1/bots/${BOT_A}/apps/refresh`, method: 'POST'}]);
+      assert.equal(state.actions.length, 0);
+    } finally {release();}
+  });
+});

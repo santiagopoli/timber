@@ -3,6 +3,7 @@ import type { ComputerAction, ComputerResult } from "@botspace/contracts";
 import { ChatGPTAuthDO } from "../../apps/api/src/chatgpt";
 import type { Env } from "../../apps/api/src/env";
 export { ChatGPTAuthDO };
+export { GitHubAuthDO } from "../../apps/api/src/github";
 export class KeylessChatGPTAuthDO extends ChatGPTAuthDO {
   constructor(ctx: DurableObjectState, env: Env) {super(ctx, {...env, CHATGPT_CREDENTIAL_KEY: undefined});}
 }

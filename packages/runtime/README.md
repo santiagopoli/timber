@@ -27,6 +27,23 @@ pending approval terminates the native tool round and persists a pause marker;
 the provider boundary blocks further inference for that operation, including
 mixed tool rounds. The approved result resumes through a new durable input.
 
+Optional host `catalog()` and `call(request)` ports enable the native `list_tools`
+and `call_tool` functions. The catalog supplies names, descriptions and JSON input
+schemas. The host validates each call, owns MCP sessions, service credentials,
+repository grants and effect deduplication; Pi receives none of those secrets.
+Reusable instructions use the host's `load_skill` capability. Skills cannot grant
+tool access. App previews use the same host boundary, so another runtime can reuse
+these capabilities without importing Pi types.
+
+A `pending_connection` result carries a request ID, provider, repository and
+requested permission. It uses the same durable pause as approvals and stops all
+remaining dispatch and inference for that native operation. Connecting a service
+does not re-execute a tool inside Pi. The host submits a new durable continuation
+only after validating current run state and access. Historical pause records do
+not block fresh user submissions. Generic `call_tool` invocations are always
+unsafe and sequential for crash recovery, including when the selected host tool
+is a read; host operation IDs remain the authority for any effect reconciliation.
+
 Budgets are persistent and enforced before provider dispatch: 12 logical agent
 generations, 24 tool invocations, and up to two inference retries. Workers AI
 requests use at most 4096 output tokens. ChatGPT forbids `max_output_tokens`, so
@@ -47,7 +64,7 @@ These integration tests execute the real Pi harness, Cloudflare Lifecycle and
 SQLite in workerd. Only the external Workers AI / ChatGPT inference transport is
 a fixture. They cover named instructions and both streaming protocols, allowed
 subscription request fields, credential isolation, namespaced tool and screenshot
-roundtrips, input deduplication after a hard object restart, approval pauses,
+roundtrips, input deduplication after a hard object restart, approval and connection pauses,
 output limits, incomplete streams, usage failures, and model-loop budgets.
 
 Protocol references: [ChatGPT inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)

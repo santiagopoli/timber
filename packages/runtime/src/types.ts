@@ -7,7 +7,22 @@ export type PendingApproval = {
   approvalId: string;
   message?: string;
 };
-export type RuntimeToolResult = ComputerResult | PendingApproval;
+export type PendingConnection = {
+  status: 'pending_connection';
+  requestId: string;
+  provider: 'github';
+  repository: string;
+  permission: 'read' | 'write';
+  message?: string;
+};
+/** A host-owned durable wait. A later host submission resumes the conversation. */
+export type RuntimePause = PendingApproval | PendingConnection;
+export type RuntimeToolResult = ComputerResult | RuntimePause;
+export interface HostToolDefinition {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
 export interface RuntimeToolRequest {
   /** Stable identity for this tool invocation, preserved across Pi recovery. */
   operationId: string;
@@ -21,6 +36,17 @@ export interface RuntimeToolRequest {
 export interface RuntimeTools {
   execute(request: RuntimeToolRequest): Promise<RuntimeToolResult>;
   readImage?(artifactId: string): Promise<{ data: string; mimeType: string }>;
+  /** Metadata only. The host retains service credentials and capability policy. */
+  catalog?(): Promise<HostToolDefinition[]>;
+  call?(request: RuntimeHostToolRequest): Promise<RuntimeToolResult>;
+}
+export interface RuntimeHostToolRequest {
+  operationId: string;
+  runOperationId: string;
+  toolCallId?: string;
+  name: string;
+  arguments: Record<string, unknown>;
+  signal: AbortSignal;
 }
 export interface RuntimeEvent {
   type: string;

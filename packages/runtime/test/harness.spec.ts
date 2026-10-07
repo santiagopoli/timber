@@ -194,6 +194,51 @@ it('terminates native execution when a tool needs human approval', async () => {
   expect(state.messages.some(message => message.role === 'tool' && message.text.includes('pending_approval'))).toBe(true);
 });
 
+it('discovers host capabilities through native Pi without invoking the computer', async () => {
+  await request('/submit', { text: 'request-catalog', operationId: 'catalog-id', chatgpt: true });
+  expect(await (await request('/wait?id=catalog-id')).json()).toMatchObject({ status: 'done', kind: 'final' });
+  const state = await (await request('/inspect')).json<{ calls: { input: string }[]; toolCalls: unknown[]; hostCalls: unknown[]; messages: { role: string; text: string }[] }>();
+  expect(state.calls).toHaveLength(2);
+  expect(state.toolCalls).toHaveLength(0);
+  expect(state.hostCalls).toHaveLength(0);
+  expect(state.messages).toContainEqual(expect.objectContaining({ role: 'tool', text: expect.stringContaining('github_clone') }));
+  const wire = JSON.parse(state.calls[0]!.input);
+  const names = wire.tools.flatMap((namespace: { tools: { name: string }[] }) => namespace.tools.map(tool => tool.name));
+  expect(names).toContain('list_tools');
+  expect(names).toContain('call_tool');
+  expect(developerText(state.calls[0]!.input)).toContain('github-development');
+  expect(developerText(state.calls[0]!.input)).toContain('accessible URL rather than a localhost address');
+});
+
+it('persists a connection pause across eviction and resumes only through a new host input', async () => {
+  await request('/submit', { text: 'request-host', operationId: 'connect-id', chatgpt: true });
+  await request('/wait?id=connect-id');
+  const paused = await (await request('/inspect')).json<{ calls: unknown[]; toolCalls: unknown[]; hostCalls: { input: string }[]; events: { event: string }[] }>();
+  expect(paused.calls).toHaveLength(1);
+  expect(paused.toolCalls).toHaveLength(0);
+  expect(paused.hostCalls).toHaveLength(1);
+  expect(JSON.parse(paused.hostCalls[0]!.input)).toMatchObject({ name: 'github_clone', runOperationId: 'connect-id', arguments: { repository: 'owner/private', path: 'project' } });
+  expect(paused.events.map(row => JSON.parse(row.event))).toContainEqual(expect.objectContaining({ type: 'tool.completed', operationId: 'connect-id', data: expect.objectContaining({ status: 'pending_connection' }) }));
+  await abortAllDurableObjects();
+  expect(await (await request('/submit', { text: 'request-host', operationId: 'connect-id' })).json()).toMatchObject({ accepted: false });
+  const namespace = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE;
+  await runInDurableObject(namespace.getByName(probeId), (_instance, state) => {
+    const row = state.storage.sql.exec<{ approval: string }>('SELECT approval FROM botspace_runtime_pauses WHERE operation_id=?', 'connect-id').one();
+    expect(JSON.parse(row.approval)).toMatchObject({ status: 'pending_connection', requestId: 'connection-fixture' });
+    expect(state.storage.sql.exec('SELECT id FROM calls').toArray()).toHaveLength(1);
+  });
+  await request('/host-context', { githubConnected: true });
+  await request('/submit', { text: 'GitHub is connected. Continue the pending request-host task.', operationId: 'connection:connection-fixture' });
+  expect(await (await request('/wait?id=connection:connection-fixture')).json()).toMatchObject({ status: 'done', kind: 'final' });
+  const resumed = await (await request('/inspect')).json<{ calls: unknown[]; hostCalls: { input: string }[]; toolCalls: unknown[]; messages: { text: string; role: string }[] }>();
+  expect(resumed.calls).toHaveLength(3);
+  expect(resumed.hostCalls).toHaveLength(2);
+  expect(JSON.parse(resumed.hostCalls[1]!.input).runOperationId).toBe('connection:connection-fixture');
+  expect(JSON.parse(resumed.hostCalls[1]!.input).operationId).not.toBe(JSON.parse(resumed.hostCalls[0]!.input).operationId);
+  expect(resumed.toolCalls).toHaveLength(0);
+  expect(resumed.messages).toContainEqual(expect.objectContaining({ role: 'assistant', text: 'Hello from ChatGPT via the real Pi harness.' }));
+});
+
 it('pauses mixed tool rounds before another model request when one tool needs approval', async () => {
   await request('/submit', { text: 'request-exec-mixed', operationId: 'mixed-id' });
   const result = await (await request('/wait?id=mixed-id')).json<{ status: string }>();
