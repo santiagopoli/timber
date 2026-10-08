@@ -1480,3 +1480,64 @@ test('historical approvals and activity cannot precede their own request despite
     assert.equal(order[0],'causal-user');assert.ok(order.includes(approval.id));assert.ok(order.includes(approval.runId));
   });
 });
+
+for (const width of [390,820]) test(`focused composer follows the keyboard viewport when it pans at ${width}px`,async()=>{
+  await withPage(async({page,login,state})=>{
+    state.messages.get(BOT_A).push({id:'keyboard-history',botId:BOT_A,role:'assistant',text:'Earlier context.\n\n'.repeat(80),createdAt:new Date().toISOString()});
+    await page.addInitScript(()=>{
+      const viewport=window.visualViewport;
+      const initial={height:844,offsetTop:0,scale:1};
+      window.__keyboardViewport=initial;
+      for(const key of Object.keys(initial))Object.defineProperty(viewport,key,{configurable:true,get:()=>window.__keyboardViewport[key]});
+    });
+    await login();await page.locator('#message').fill('Volver a levantar');await page.locator('#message').focus();
+    // Keep the layout viewport full size. iOS can pan and shrink only the
+    // visual viewport, including scroll events with no corresponding resize.
+    for(const [height,offsetTop,event] of [[430,320,'resize'],[430,370,'scroll'],[430,285,'scroll'],[390,285,'resize'],[844,0,'resize']]){
+      await page.evaluate(({height,offsetTop,event})=>{Object.assign(window.__keyboardViewport,{height,offsetTop});visualViewport.dispatchEvent(new Event(event));},{height,offsetTop,event});
+      await page.waitForFunction(()=>{
+        const box=document.querySelector('#message-form').getBoundingClientRect();
+        const bottom=box.bottom-visualViewport.offsetTop;
+        return bottom<=visualViewport.height+1 && bottom>=visualViewport.height-24;
+      });
+      const geometry=await page.evaluate(()=>{
+        const offset=visualViewport.offsetTop,box=node=>{const r=node.getBoundingClientRect();return {top:r.top-offset,bottom:r.bottom-offset,height:r.height};};
+        return {prompt:box(document.querySelector('#message-form')),header:box(document.querySelector('.bot-header')),viewport:visualViewport.height,inputFocused:document.activeElement===document.querySelector('#message'),pageWidth:document.documentElement.scrollWidth,width:innerWidth};
+      });
+      assert.ok(geometry.header.top>=-1,'the header stays in view when the browser pans');
+      assert.ok(geometry.prompt.bottom<=geometry.viewport+1 && geometry.prompt.bottom>=geometry.viewport-24,'the prompt remains immediately above the keyboard, not merely somewhere on screen');
+      assert.equal(geometry.inputFocused,true,'viewport updates do not blur the composer');
+      assert.ok(geometry.pageWidth<=geometry.width+1);
+      if(process.env.CONSOLE_SCREENSHOT_DIR && offsetTop===320){
+        await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});
+        await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/keyboard-${width}.png`,clip:{x:0,y:offsetTop,width,height}});
+      }
+    }
+    await page.locator('#message').press('Shift+Enter');await page.locator('#message').pressSequentially('Conserva el borrador');
+    assert.equal(await page.locator('#message').inputValue(),'Volver a levantar\nConserva el borrador');
+    const draft=await page.locator('#message').inputValue(),input=page.locator('#message');
+    const small=(await input.boundingBox()).height;
+    await input.fill('Una línea de texto\n'.repeat(12));
+    const tall=(await input.boundingBox()).height;
+    assert.ok(tall>small && tall<=160,'the prompt grows for multiple lines without exceeding its height limit');
+    await input.fill(draft);
+    assert.equal((await input.boundingBox()).height,small,'deleting lines restores the prompt height');
+    const beforeZoom=await page.locator('#message-form').boundingBox();
+    await page.evaluate(()=>{Object.assign(window.__keyboardViewport,{height:400,offsetTop:120,scale:2});visualViewport.dispatchEvent(new Event('resize'));});
+    await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+    assert.deepEqual(await page.locator('#message-form').boundingBox(),beforeZoom,'pinch zoom does not reflow the chat around the zoomed viewport');
+    await page.evaluate(()=>{Object.assign(window.__keyboardViewport,{height:844,offsetTop:0,scale:1});visualViewport.dispatchEvent(new Event('resize'));});
+    const messages=page.locator('#messages');await messages.evaluate(node=>{node.scrollTop=120;});
+    await page.locator('#message').blur();
+    await page.evaluate(()=>{visualViewport.dispatchEvent(new Event('scroll'));});
+    assert.ok(Math.abs(await messages.evaluate(node=>node.scrollTop)-120)<2,'viewport synchronization does not reset a reviewed conversation');
+    await sendMessage(page);assert.equal(sentMessages(state,BOT_A).length,1);
+    await openBotEditor(page);await page.locator('#edit-name').focus();
+    await page.evaluate(()=>{Object.assign(window.__keyboardViewport,{height:430,offsetTop:320});visualViewport.dispatchEvent(new Event('resize'));});
+    await page.waitForFunction(()=>{
+      const box=document.querySelector('#edit-dialog').getBoundingClientRect(),offset=visualViewport.offsetTop;
+      return box.top>=offset && box.bottom<=offset+visualViewport.height;
+    });
+    assert.equal(await page.locator('#edit-name').evaluate(node=>document.activeElement===node),true,'a modal field stays focused and its dialog fits above the keyboard');
+  },{viewport:{width,height:844},isMobile:true,hasTouch:true,colorScheme:'dark'});
+});

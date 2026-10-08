@@ -40,7 +40,7 @@
 .timber-composer{border:1px solid var(--line);border-radius:26px;background:var(--soft);box-shadow:none;overflow:hidden}
 .timber-composer:focus-within{border-color:color-mix(in srgb,var(--ink) 35%,var(--line))}
 .timber-composer>[data-slot="input-group"]{display:flex;flex-direction:row;align-items:flex-end;gap:0;border:0;border-radius:0;box-shadow:none;outline:0;min-height:52px;height:auto;background:transparent;padding:0}
-.timber-composer textarea{flex:1;min-width:0;width:0;padding:14px 6px 14px 18px;min-height:52px;max-height:160px;resize:none;background:transparent;border:0;border-radius:0;box-shadow:none;font-size:16px;line-height:24px;field-sizing:fixed;outline:0;box-sizing:border-box}
+.timber-composer textarea{flex:1;min-width:0;width:0;padding:14px 6px 14px 18px;min-height:52px;max-height:160px;resize:none;background:transparent;border:0;border-radius:0;box-shadow:none;font-size:16px;line-height:24px;field-sizing:content;outline:0;box-sizing:border-box}
 .timber-composer textarea:focus{outline:0;box-shadow:none}
 .timber-composer textarea::placeholder{color:var(--muted);opacity:1}
 .timber-composer .timber-send{align-self:flex-end;flex:none;border:0;border-radius:50%;width:38px;height:38px;min-width:38px;min-height:38px;padding:9px;margin:7px;color:var(--surface);background:var(--ink);box-shadow:none;transition:opacity .15s}

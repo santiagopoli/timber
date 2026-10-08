@@ -387,6 +387,8 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
 function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallbacks }) {
   const textarea = useRef<HTMLTextAreaElement>(null);
   useLayoutEffect(() => {
+    // Native sizing avoids briefly collapsing a focused textarea on every key.
+    if (CSS.supports('field-sizing', 'content')) return;
     const input = textarea.current;
     if (!input) return;
     const resize = () => {

@@ -881,8 +881,21 @@ import './src/layout.css';
   document.addEventListener('visibilitychange', () => { desktop.setActive(!$('panel-computer').hidden && (!matchMedia('(max-width: 760px)').matches || document.body.dataset.mobileView === 'bot')); });
   window.addEventListener('pagehide', () => {stopComputerStatus(); streamController?.abort();});
   window.addEventListener('pageshow', event => {if (event.persisted && authenticated) {startStream(); void guarded(loadBots);}});
-  const updateViewport = () => {document.documentElement.style.setProperty('--app-height', `${Math.round(window.visualViewport?.height || innerHeight)}px`);};
-  window.visualViewport?.addEventListener('resize', updateViewport); window.addEventListener('resize', updateViewport); updateViewport();
+  let viewportFrame = 0;
+  const updateViewport = () => {
+    viewportFrame = 0;
+    const viewport = window.visualViewport;
+    // Pinch zoom must keep its native pan/scale, not resize the entire chat.
+    if (viewport && Math.abs(viewport.scale - 1) > 0.01) return;
+    const style = document.documentElement.style;
+    style.setProperty('--app-height', `${Math.round(viewport?.height || innerHeight)}px`);
+    style.setProperty('--app-top', `${Math.max(0, Math.round(viewport?.offsetTop || 0))}px`);
+  };
+  const scheduleViewport = () => {if (!viewportFrame) viewportFrame = requestAnimationFrame(updateViewport);};
+  for (const type of ['resize', 'scroll', 'scrollend']) window.visualViewport?.addEventListener(type, scheduleViewport, {passive:true});
+  window.addEventListener('resize', scheduleViewport); window.addEventListener('pageshow', scheduleViewport);
+  document.addEventListener('focusin', scheduleViewport); document.addEventListener('focusout', scheduleViewport);
+  updateViewport();
   document.body.dataset.mobileView = 'bots';
   void restoreSession();
 })();

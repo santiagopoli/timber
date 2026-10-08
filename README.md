@@ -90,6 +90,11 @@ preferences persist locally; switching inspector tabs preserves the selected fil
 and conversation. Expanded Computer and desktop fullscreen retain the same prompt
 and a compact live activity widget. Browsers without native fullscreen use an
 in-page fallback. Writing to the prompt never sends keys to the remote desktop.
+The conversation and fullscreen prompt follow the visible viewport's height and
+offset when a mobile keyboard opens or pans the page. The transcript keeps its
+own scroll position; pinch zoom keeps native browser behavior. Browser regression
+tests simulate keyboard resizing and panning on phone and iPad layouts, including
+multiline drafts and fullscreen. They do not replace a physical iOS device check.
 
 This is a single-owner development MVP. There is no multi-user login, native iOS
 client, inter-bot delegation, routine scheduling, Hermes adapter, local execution

@@ -14,7 +14,7 @@
 
 /* Keep native fullscreen and the iPad fallback on the same mounted framebuffer. */
 .desktop-viewer.desktop-fullscreen{display:flex;flex-direction:column;border:0;border-radius:0;background:var(--bg)}
-.desktop-viewer.desktop-fullscreen:not(:fullscreen){position:fixed;inset:0;z-index:100;width:100%;height:var(--app-height);padding-top:env(safe-area-inset-top)}
+.desktop-viewer.desktop-fullscreen:not(:fullscreen){position:fixed;inset:var(--app-top,0px) 0 auto;z-index:100;width:100%;height:var(--app-height);padding-top:env(safe-area-inset-top)}
 .desktop-viewer.desktop-fullscreen .desktop-screen{flex:1;min-height:0;aspect-ratio:auto}
 .desktop-viewer.desktop-fullscreen .desktop-toolbar{flex:none;max-width:none}
 .desktop-viewer.desktop-fullscreen .desktop-actions{width:auto;min-width:330px}
@@ -36,3 +36,6 @@
 .timber-mini-reply{font-size:12px;color:var(--muted);overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 @media(max-width:760px){.timber-focus-chat{padding-inline:8px}.desktop-viewer.desktop-fullscreen .desktop-actions{width:100%;min-width:0}}
 @media(prefers-color-scheme:light){.desktop-viewer[data-state="controlling"] .desktop-status{color:#856012}.desktop-viewer[data-state="viewing"] .desktop-status{color:#397b57}.desktop-viewer[data-state="error"] .desktop-status{color:var(--danger)}}
+
+/* Native fullscreen owns its outer dimensions. Inset its contents instead. */
+.desktop-viewer:fullscreen{padding-top:var(--app-top,0px);padding-bottom:max(0px,calc(100dvh - var(--app-top,0px) - var(--app-height)))}

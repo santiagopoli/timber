@@ -2,7 +2,10 @@
 *{box-sizing:border-box}
 html,body{min-width:320px;margin:0}
 body{color:var(--ink);background:var(--bg);font-size:14px;line-height:1.5;overscroll-behavior:none}
-body[data-authenticated="true"]{height:var(--app-height);overflow:hidden}
+html:has(>body[data-authenticated="true"]){height:100%;overflow:hidden}
+/* Safari may pan the visual viewport as well as shrinking it for the keyboard.
+   Anchor the shell to that visible area; only the panels own content scrolling. */
+body[data-authenticated="true"]{position:fixed;top:var(--app-top,0px);left:0;right:0;height:var(--app-height);overflow:hidden}
 button,input,textarea,select{font:inherit}
 button{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:40px;border:1px solid transparent;border-radius:10px;background:var(--accent);color:var(--bg);padding:9px 14px;cursor:pointer;font-weight:600;white-space:nowrap;touch-action:manipulation;-webkit-tap-highlight-color:transparent;transition:background .15s,border-color .15s}
 button:hover{filter:brightness(.94)}
@@ -179,7 +182,7 @@ p{line-height:1.6}
 .empty-state{padding:35px 20px;text-align:center;color:var(--muted);font-size:13px}
 .empty-state strong{display:block;color:var(--ink);font-size:15px;margin-bottom:8px;font-weight:550}
 .empty-state p{margin:0;font-size:12px}
-dialog{margin:auto;max-width:min(520px,calc(100vw - 32px));width:520px;max-height:calc(var(--app-height) - 48px);overflow:auto;overscroll-behavior:contain;padding:26px;border:1px solid var(--line);border-radius:20px;background:var(--surface);color:var(--ink);box-shadow:var(--shadow);scrollbar-width:thin}
+dialog{top:var(--app-top,0px);bottom:calc(100% - var(--app-top,0px) - var(--app-height));margin:auto;max-width:min(520px,calc(100vw - 32px));width:520px;max-height:calc(var(--app-height) - 48px);overflow:auto;overscroll-behavior:contain;padding:26px;border:1px solid var(--line);border-radius:20px;background:var(--surface);color:var(--ink);box-shadow:var(--shadow);scrollbar-width:thin}
 dialog::backdrop{background:#0008;backdrop-filter:blur(5px)}
 .dialog-heading{display:flex;justify-content:space-between;align-items:center;gap:15px;margin-bottom:20px;min-height:44px}
 .dialog-heading h2{font-size:22px;letter-spacing:-.5px;margin:0;font-weight:600}

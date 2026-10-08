@@ -341,6 +341,18 @@ for (const fallback of [false,true]) test(`fullscreen ${fallback?'fallback':'nat
   await page.locator('[data-mini-activity]').filter({hasText:'Completed'}).waitFor();
   await page.locator('#message').fill('Draft inside fullscreen');
   const bounds=await page.locator('#message').boundingBox();assert.ok(bounds.y+bounds.height<=page.viewportSize().height);
+  await page.evaluate(()=>{
+    window.__keyboardViewport={height:550,offsetTop:110,scale:1};
+    for(const key of Object.keys(window.__keyboardViewport))Object.defineProperty(visualViewport,key,{configurable:true,get:()=>window.__keyboardViewport[key]});
+    visualViewport.dispatchEvent(new Event('resize'));
+  });
+  await page.waitForFunction(()=>{
+    const bottom=document.querySelector('#message-form').getBoundingClientRect().bottom-visualViewport.offsetTop;
+    return bottom<=visualViewport.height && bottom>=visualViewport.height-24;
+  });
+  assert.equal(await page.locator('#message').inputValue(),'Draft inside fullscreen');
+  assert.equal(await page.locator('#message').evaluate(node=>document.activeElement===node),true);
+  await page.evaluate(()=>{Object.assign(window.__keyboardViewport,{height:1000,offsetTop:0});visualViewport.dispatchEvent(new Event('resize'));});
   assert.equal(state.sockets.length,1,'fullscreen keeps the original framebuffer transport');
   if(process.env.CONSOLE_SCREENSHOT_DIR){await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/fullscreen-${fallback?'ipad':'desktop'}.png`});}
   await page.locator('[data-mini-activity]').click();
