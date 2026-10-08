@@ -13,6 +13,9 @@ export type ComputerAction =
  | {type:"listFiles";path?:string}
  | {type:"screenshot"}
  | {type:"click";x:number;y:number;button?:"left"|"right"|"middle"}
+ | {type:"move";x:number;y:number}
+ | {type:"doubleClick";x:number;y:number;button?:"left"|"right"|"middle"}
+ | {type:"drag";fromX:number;fromY:number;toX:number;toY:number;button?:"left"|"right"|"middle";durationMs?:number}
  | {type:"type";text:string}
  | {type:"key";key:string}
  | {type:"scroll";direction:"up"|"down";amount?:number}

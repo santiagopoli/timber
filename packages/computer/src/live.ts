@@ -20,9 +20,13 @@ export class DesktopSessions {
     return live;
   }
   async controlled(){return (await this.sessions()).some(s=>s.mode==="control");}
-  async create(botId:string,mode:DesktopMode){
+  async create(botId:string,mode:DesktopMode,replaces?:string){
     const sessions=await this.sessions();
-    if(sessions.length>=4) throw new DesktopError("desktop_session_limit",429,"Disconnect another desktop viewer before connecting.");
+    const previous=replaces?sessions.find(s=>s.id===replaces && s.botId===botId && s.mode==="view"):undefined;
+    if(replaces && (mode!=="control" || !previous)) throw denied();
+    // A control transfer reserves its existing viewer slot while its old Watch
+    // socket stays live. It cannot bypass exclusive control or borrow another bot.
+    if(sessions.length-(previous?1:0)>=4) throw new DesktopError("desktop_session_limit",429,"Disconnect another desktop viewer before connecting.");
     if(mode==="control" && sessions.some(s=>s.mode==="control")) throw new DesktopError("computer_controlled",409,"Another session has control. Release it or wait for its lease to expire.");
     const ticket=crypto.randomUUID()+crypto.randomUUID(),id=crypto.randomUUID();
     const session:Session={id,botId,mode,ticketHash:await hash(ticket),used:false,expires:Date.now()+LEASE,deadline:Date.now()+3_600_000};

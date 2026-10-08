@@ -41,7 +41,7 @@ function rfbPeer(socket, record) {
 }
 async function withDesktop(work,{width=1440,height=1050}={}) {
  const fixture=await createConsoleFixture(),context=await browser.newContext({viewport:{width,height}}),page=await context.newPage();
- const state={calls:[],sockets:[],gates:[],gate:null,renewReplies:[]},errors=[],violations=[];
+ const state={calls:[],sockets:[],gates:[],gate:null,rfbGate:null,connectReplies:[],renewReplies:[]},errors=[],violations=[];
  page.on('pageerror',e=>errors.push(e.message));page.setDefaultTimeout(6000);
  await page.exposeFunction('__desktopCsp',v=>violations.push(v));
  await page.addInitScript(()=>document.addEventListener('securitypolicyviolation',e=>globalThis.__desktopCsp({directive:e.effectiveDirective,resource:e.blockedURI})));
@@ -51,6 +51,7 @@ async function withDesktop(work,{width=1440,height=1050}={}) {
   if(req.method()==='POST'&&url.pathname.endsWith('/live-session')){
    const id=`session-${state.calls.filter(c=>c.method==='POST'&&c.path.endsWith('/live-session')).length}`;
    if(state.gate){const gate=state.gate;state.gate=null;await gate;}
+   const reply=state.connectReplies.shift();if(reply)return route.fulfill(reply);
    return route.fulfill({json:{sessionId:id,protocols:['binary',`timber-fixture-ticket-${id}`],expiresAt:new Date(Date.now()+60000).toISOString()}});
   }
   if(url.pathname.endsWith('/renew')) {
@@ -63,7 +64,7 @@ async function withDesktop(work,{width=1440,height=1050}={}) {
  const proxy=createServer((req,res)=>{const upstream=forward(new URL(req.url,fixture.url),{method:req.method,headers:req.headers},reply=>{res.writeHead(reply.statusCode,reply.headers);reply.pipe(res);});upstream.on('error',()=>res.end());req.pipe(upstream);res.on('close',()=>upstream.destroy());});
  const websocket=new WebSocketServer({noServer:true,handleProtocols:protocols=>protocols.has('binary')?'binary':false});
  proxy.on('upgrade',(req,socket,head)=>{assert.match(req.url,/^\/v1\/bots\/[a-f0-9-]+\/computer\/live$/);assert.match(req.headers['sec-websocket-protocol'],/timber-fixture-ticket/);websocket.handleUpgrade(req,socket,head,client=>websocket.emit('connection',client,req));});
- websocket.on('connection',(client,req)=>{const record={url:req.url,inputs:[],unrecognized:[],connected:false,closed:false,drop:()=>client.terminate()};state.sockets.push(record);rfbPeer({send:bytes=>client.send(bytes),onMessage:callback=>client.on('message',callback),onClose:callback=>client.on('close',callback)},record);});
+ websocket.on('connection',async(client,req)=>{const record={url:req.url,inputs:[],unrecognized:[],connected:false,closed:false,drop:()=>client.terminate()};state.sockets.push(record);client.on('close',()=>{record.closed=true;});if(state.rfbGate){const gate=state.rfbGate;state.rfbGate=null;await gate;}if(client.readyState===1)rfbPeer({send:bytes=>client.send(bytes),onMessage:callback=>client.on('message',callback),onClose:callback=>client.on('close',callback)},record);});
  await new Promise(resolve=>proxy.listen(0,'127.0.0.1',resolve));
  const consoleURL=`http://127.0.0.1:${proxy.address().port}/console/`;
  const login=async()=>{await page.goto(consoleURL);await page.locator('#login').waitFor({state:'visible'});await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('#app').waitFor({state:'visible'});if(width<=760)await page.locator('.bot-item').first().click();await page.locator('#bot-workspace').waitFor({state:'visible'});};
@@ -259,5 +260,57 @@ test('a Suspend event cancels Watch rather than waking the computer during recov
   await until(()=>state.sockets[0].closed);
   await visibility(page,true);await visibility(page,false);
   assert.equal(creates(state).length,1);
+ });
+});
+
+test('Take control keeps Watch live until the control framebuffer is ready, with one direct click',async()=>{
+ await withDesktop(async({page,login,open,state})=>{
+  await login();await open('view');
+  let grant,frame;state.gate=new Promise(resolve=>grant=resolve);state.rfbGate=new Promise(resolve=>frame=resolve);state.gates.push(grant,frame);
+  await page.locator('[data-desktop="control"]').click();await until(()=>creates(state).length===2);
+  assert.equal(creates(state)[1].body.replaces,'session-1');
+  assert.equal(state.sockets[0].closed,false);assert.equal(deletes(state).length,0);
+  assert.equal(await page.locator('.desktop-empty').isVisible(),false);
+  grant();await until(()=>state.sockets.length===2);
+  assert.equal(state.sockets[0].closed,false,'Watch remains live throughout the replacement RFB handshake');
+  assert.equal(await page.locator('.desktop-screen canvas:visible').count(),1);
+  await page.locator('.desktop-screen canvas:visible').click({position:{x:70,y:70}});
+  assert.equal(state.sockets[0].inputs.length,0,'transfer never enables input on the view-only socket');
+  frame();await page.locator('.desktop-status').filter({hasText:'you have control'}).waitFor();
+  await until(()=>state.sockets[0].closed&&deletes(state).some(call=>call.path.endsWith('/session-1')));
+  await page.locator('.desktop-screen canvas').click({position:{x:75,y:75}});
+  await until(()=>state.sockets[1].inputs.some(input=>input.type===5));
+ },{width:390,height:844});
+});
+
+test('a refused or failed Take control keeps the same Watch connection and allows a direct retry',async()=>{
+ await withDesktop(async({page,login,open,state})=>{
+  await login();await open('view');
+  state.connectReplies.push({status:409,json:{error:{code:'computer_busy',message:'The agent is working. Stop it before taking control.'}}});
+  await page.locator('[data-desktop="control"]').click();
+  await page.locator('.desktop-hint').filter({hasText:'The agent is working'}).waitFor();await watching(page);
+  assert.equal(state.sockets.length,1);assert.equal(state.sockets[0].closed,false);assert.equal(deletes(state).length,0);
+  assert.equal(await page.locator('[data-desktop="control"]').isEnabled(),true);
+  let frame;state.rfbGate=new Promise(resolve=>frame=resolve);state.gates.push(frame);
+  await page.locator('[data-desktop="control"]').click();await until(()=>state.sockets.length===2);state.sockets[1].drop();
+  await page.locator('.desktop-hint').filter({hasText:'still watching'}).waitFor();
+  assert.equal(state.sockets[0].closed,false);assert.equal(await page.locator('.desktop-screen canvas:visible').count(),1);
+  await until(()=>deletes(state).some(call=>call.path.endsWith('/session-3')));
+  assert.equal(deletes(state).some(call=>call.path.endsWith('/session-1')),false);
+  frame();await page.locator('[data-desktop="control"]').click();
+  await page.locator('.desktop-status').filter({hasText:'you have control'}).waitFor();
+  assert.equal(creates(state).length,4);
+ });
+});
+
+test('hiding during a pending Take control releases its late grant and stays view-only',async()=>{
+ await withDesktop(async({page,login,open,state})=>{
+  await login();await open('view');let release;state.gate=new Promise(resolve=>release=resolve);state.gates.push(release);
+  await page.locator('[data-desktop="control"]').click();await until(()=>creates(state).length===2);
+  await visibility(page,true);release();await until(()=>deletes(state).some(call=>call.path.endsWith('/session-2')));
+  await visibility(page,false);await watching(page);
+  assert.equal(state.sockets.length,1);assert.equal(state.sockets[0].closed,false);
+  await page.locator('.desktop-screen canvas').click({position:{x:60,y:60}});
+  assert.equal(state.sockets[0].inputs.length,0);
  });
 });

@@ -140,9 +140,18 @@ normalization into BotEvent; do not expose raw engine-specific formats to UI.
 
 ComputerProvider exports exec(botId,operationId,action), status(botId), checkpoint(botId).
 ComputerAction is a discriminated union: exec, readFile, writeFile, listFiles,
-screenshot, click, type, key, scroll, navigate, checkpoint. Cloud provider and
-ComputerDO concrete implementation live under packages/computer. Container HTTP
+screenshot, click, move, doubleClick, drag, type, key, scroll, navigate, checkpoint.
+Cloud provider and ComputerDO concrete implementation live under packages/computer. Container HTTP
 server and image live in infra/computer. Agree export names with API agent.
+
+Mouse coordinates are integers in the 1280×800 desktop. `move` positions the pointer
+without clicking; `doubleClick` sends two clicks 100 ms apart. `drag` holds the chosen
+button from `{fromX,fromY}` to `{toX,toY}` over `durationMs` (100–2000, default 500),
+with a guaranteed release attempt on failure. Left, right and middle buttons are
+supported. New gestures require the corresponding image health capability; older
+images reject before journaling and never report a simulated result. They share
+the usual GUI approval policy and human-control exclusion. Pi exposes
+`desktop_move`, `desktop_double_click` and `desktop_drag`.
 
 Pi exec supplies a 120,000 ms default timeout and preserves an explicitly requested
 shorter timeout. The computer's existing HTTP exec default remains 30,000 ms for
@@ -300,8 +309,14 @@ MVP: apps share a preview origin and are not separate browser security principal
 Computer screenshots capture the complete X11 desktop. The console now separates
 live observation/control from model screenshots and from the Files explorer.
 
-- POST `/v1/bots/:id/computer/live-session` `{mode:"view"|"control"}` creates an
+- POST `/v1/bots/:id/computer/live-session` `{mode:"view"|"control",replaces?:sessionId}` creates an
   owner-authorized desktop grant and explicitly starts/restores the computer.
+  `replaces` is only valid for control transfer from a live Watch grant belonging
+  to the same bot. It reserves that viewer's slot while the old stream remains
+  open during the new RFB handshake. At most one additional transport exists
+  during transfer; exclusive control remains enforced. Failure releases only the
+  new grant. The console closes the previous Watch after the new connection is
+  ready, so Take control never requires manually disconnecting Watch first.
 - GET `/v1/bots/:id/computer/live` upgrades a same-origin WebSocket using the
   returned one-use ticket in `Sec-WebSocket-Protocol`, never a URL credential.
 - POST `/v1/bots/:id/computer/live-session/:sessionId/renew` renews a 60-second

@@ -121,6 +121,28 @@ describe("live desktop and workspace boundary",()=>{
       expect((await instance.fetch(internal(botId,"/desktop","POST",{mode:"view"}))).status).toBe(409);
     });
   });
+  it("reserves a Watch slot for direct control transfer without revoking the viewer first",async()=>{
+    const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
+    await runInDurableObject(stub,async(_instance,state)=>{
+      const sessions=new DesktopSessions(state.storage,p=>state.waitUntil(p));
+      const viewer=await sessions.create(botId,"view");
+      for(let i=0;i<3;i++)await sessions.create(botId,"view");
+      await expect(sessions.create(botId,"control")).rejects.toMatchObject({status:429});
+      await expect(sessions.create(crypto.randomUUID(),"control",viewer.sessionId)).rejects.toMatchObject({status:401});
+      await expect(sessions.create(botId,"view",viewer.sessionId)).rejects.toMatchObject({status:401});
+      const controller=await sessions.create(botId,"control",viewer.sessionId);
+      expect(await state.storage.get(`desktop:${viewer.sessionId}`)).toBeDefined();
+      expect(await sessions.controlled()).toBe(true);
+      await expect(sessions.create(botId,"control",viewer.sessionId)).rejects.toMatchObject({status:429});
+      await sessions.release(controller.sessionId);
+      expect(await sessions.controlled()).toBe(false);
+      expect(await state.storage.get(`desktop:${viewer.sessionId}`)).toBeDefined();
+      const retry=await sessions.create(botId,"control",viewer.sessionId);
+      await sessions.release(viewer.sessionId);
+      expect(await state.storage.get(`desktop:${retry.sessionId}`)).toBeDefined();
+      await sessions.closeAll();
+    });
+  });
   it("serves workspace downloads as attachments with isolation headers and never proxies desktop ports as apps",async()=>{
     const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
     await runInDurableObject(stub,async(instance,state)=>{

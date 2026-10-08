@@ -16,7 +16,7 @@ type AdmissionRetry = {attempts:number;next_at:number};
 type RuntimeProjection = {type:string;data:Record<string,unknown>;operationId?:string;eventKey?:string};
 const terminal = new Set<RunStatus>(["completed","failed","cancelled","interrupted"]);
 const automatic = new Set<ComputerAction["type"]>(["readFile","listFiles","screenshot","checkpoint"]);
-const gui = new Set<ComputerAction["type"]>(["navigate","click","type","key","scroll"]);
+const gui = new Set<ComputerAction["type"]>(["navigate","click","move","doubleClick","drag","type","key","scroll"]);
 const timestamp = ()=>new Date().toISOString();
 const legacyAdmissionFailure="The agent runtime could not accept this run.";
 const admissionPending="Message saved. Delivery to the agent is being retried.";
@@ -847,6 +847,7 @@ export class BotDO extends DurableObject<Env> {
       if(path==="/computer/live-session" && request.method==="POST") {
         const input=await body(request);
         if(input.mode!=="view" && input.mode!=="control") throw new ApiError(400,"invalid_mode","Choose view or control.");
+        if(input.replaces!==undefined && (input.mode!=="control" || typeof input.replaces!=="string" || !UUID.test(input.replaces))) throw new ApiError(400,"invalid_request","A control transfer must reference its current Watch session.");
         if(this.suspending || this.takingControl) throw new ApiError(409,"computer_busy","The computer is changing state. Try again shortly.");
         if(input.mode==="control") {
           const run=this.ctx.storage.sql.exec("SELECT id FROM runs WHERE json_extract(data,'$.status') IN ('queued','running') LIMIT 1").toArray()[0];
@@ -855,7 +856,7 @@ export class BotDO extends DurableObject<Env> {
           this.takingControl=true;
         }
         try {
-          const response=await this.computerView(new Request(request.url,{method:"POST",body:JSON.stringify({mode:input.mode})}),"/desktop");
+          const response=await this.computerView(new Request(request.url,{method:"POST",body:JSON.stringify({mode:input.mode,...(input.replaces?{replaces:input.replaces}:{})})}),"/desktop");
           if(response.ok && input.mode==="control") this.invalidatePendingGui();
           return response;
         } finally {this.takingControl=false;}

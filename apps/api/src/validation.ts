@@ -67,6 +67,14 @@ function finite(value:unknown,name:string,min:number,max:number):number {
   if(typeof value!=="number" || !Number.isFinite(value) || value<min || value>max) invalid(`${name} is out of range.`);
   return value as number;
 }
+function coordinate(value:unknown,name:string,max:number):number {
+  if(!Number.isInteger(value)) invalid("Mouse coordinates must be integers.");
+  return finite(value,name,0,max);
+}
+function mouseButton(value:unknown):"left"|"right"|"middle"|undefined {
+  if(value===undefined || value==="left" || value==="right" || value==="middle") return value;
+  invalid("Invalid mouse button.");
+}
 function path(value:unknown):string {
   const p=string(value,"path",1024);
   if(p.includes("\0") || p.startsWith("/") || p.split("/").some(x=>x==="..")) invalid("path must be relative to /workspace.");
@@ -94,11 +102,16 @@ export function parseAction(value:unknown):ComputerAction {
       return {type:"gitClone",repository,path:workspacePath,...(branch===undefined?{}:{branch})};
     }
     case "screenshot": return {type:"screenshot"};
-    case "click": {
-      if(!Number.isInteger(data.x) || !Number.isInteger(data.y)) invalid("Mouse coordinates must be integers.");
-      const button=data.button;
-      if(button!==undefined && !["left","right","middle"].includes(String(button))) invalid("Invalid mouse button.");
-      return {type:"click",x:finite(data.x,"x",0,1279),y:finite(data.y,"y",0,799),...(button?{button:button as "left"|"right"|"middle"}:{})};
+    case "move": return {type:"move",x:coordinate(data.x,"x",1279),y:coordinate(data.y,"y",799)};
+    case "click":
+    case "doubleClick": {
+      const button=mouseButton(data.button);
+      return {type:data.type,x:coordinate(data.x,"x",1279),y:coordinate(data.y,"y",799),...(button?{button}:{})};
+    }
+    case "drag": {
+      const button=mouseButton(data.button);
+      if(data.durationMs!==undefined && !Number.isInteger(data.durationMs)) invalid("durationMs must be an integer.");
+      return {type:"drag",fromX:coordinate(data.fromX,"fromX",1279),fromY:coordinate(data.fromY,"fromY",799),toX:coordinate(data.toX,"toX",1279),toY:coordinate(data.toY,"toY",799),...(button?{button}:{}),...(data.durationMs===undefined?{}:{durationMs:finite(data.durationMs,"durationMs",100,2000)})};
     }
     case "type": return {type:"type",text:string(data.text,"text",10_000,0)};
     case "key": return {type:"key",key:string(data.key,"key",100)};

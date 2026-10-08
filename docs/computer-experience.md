@@ -9,6 +9,8 @@ Select a bot and open **Computer → Watch desktop**. This explicitly starts the
 computer if necessary, then displays a continuous desktop stream and the remote
 mouse pointer. Watch does not send keyboard or mouse input. To interact, wait for
 the bot to finish (or explicitly stop its run), then choose **Take control**.
+Choose Take control directly while watching. The existing view stays live until
+the control connection is ready; a rejected or failed transfer preserves Watch.
 Click the desktop to focus it and use your keyboard/mouse. Switch back to Watch
 or Disconnect to release control. Watch survives brief panel/browser-tab switches;
 after 30 seconds away it pauses and automatically resumes when you return.
@@ -17,11 +19,11 @@ access without signing you out. Closing the Computer pane, Disconnect, changing
 bots, logout or Suspend stops watching. Manual control releases immediately when
 the page/pane is hidden and must always be taken again explicitly.
 
-The bot can click at desktop coordinates using the left, right or middle button,
-and scroll at the current pointer. Watching never blocks those tools. A human
+The bot can move the pointer to hover, click or double-click using the left, right
+or middle button, drag between coordinates, and scroll at the current pointer. Watching never blocks those tools. A human
 control lease temporarily blocks bot mutations to avoid competing input; releasing
-control restores bot access. Native hover/move-only and drag tools are not yet
-exposed by the agent tool set.
+control restores bot access. Drag duration is 100–2000 ms (default 500 ms); failed gestures attempt to release
+the button. Mouse actions and their coordinates appear in Activity.
 
 Full screen is available where the browser supports it. Screenshots, terminal and
 manual controls remain under **Snapshots, terminal & manual tools**. These are

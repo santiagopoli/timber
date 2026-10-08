@@ -101,10 +101,25 @@ describe('runtime computer bridge', () => {
   });
   it('marks side-effecting tools unsafe for crash recovery', () => {
     const tools = computerTools(bridge());
-    for (const name of ['exec', 'write_file', 'browser_navigate', 'desktop_click', 'desktop_type', 'desktop_key', 'desktop_scroll']) {
+    for (const name of ['exec', 'write_file', 'browser_navigate', 'desktop_click', 'desktop_move', 'desktop_double_click', 'desktop_drag', 'desktop_type', 'desktop_key', 'desktop_scroll']) {
       expect(tools.find(tool => tool.name === name)?.replay).toBe('unsafe');
     }
     expect(tools.find(tool => tool.name === 'read_file')?.replay).toBe('safe');
+  });
+  it('passes mouse gestures through the same sequential host approval and operation boundary', async () => {
+    const host = bridge();
+    const tools = computerTools(host);
+    const gestures = [
+      {name: 'desktop_move', input: {x: 200, y: 350}, action: {type: 'move', x: 200, y: 350}},
+      {name: 'desktop_double_click', input: {x: 90, y: 60, button: 'right'}, action: {type: 'doubleClick', x: 90, y: 60, button: 'right'}},
+      {name: 'desktop_drag', input: {fromX: 90, fromY: 60, toX: 500, toY: 400, durationMs: 750}, action: {type: 'drag', fromX: 90, fromY: 60, toX: 500, toY: 400, durationMs: 750}},
+    ];
+    for(const gesture of gestures) {
+      const tool = tools.find(tool => tool.name === gesture.name)!;
+      expect(tool.executionMode).toBe('sequential');
+      await tool.execute(gesture.input, api, context);
+      expect(host.tools.execute).toHaveBeenLastCalledWith(expect.objectContaining({action: gesture.action, toolCallId: api.callId, runOperationId: 'user-operation', signal: context.abortSignal}));
+    }
   });
   it('gives finite exec commands a 120-second default while retaining an explicit shorter bound', async () => {
     const host = bridge();

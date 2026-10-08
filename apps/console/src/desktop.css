@@ -6,6 +6,7 @@
 #panel-computer>.section-title>.row{flex-wrap:wrap;min-width:0;margin-left:auto}
 
 .desktop-footer[hidden]{display:none}.desktop-actions button,.desktop-keys button{min-height:40px}.desktop-toolbar{padding:12px;gap:10px}.desktop-hint{padding:0 12px 10px;font-size:12px}.desktop-heading strong{font-size:14px}.desktop-screen{min-height:0}.desktop-empty{font-size:13px;color:#999}.desktop-viewer{border-radius:12px}
+.desktop-screen>.desktop-transfer{visibility:hidden;pointer-events:none}
 @media(max-width:760px){.desktop-actions{display:grid;grid-template-columns:1fr 1fr;width:100%;gap:6px}.desktop-actions button,.desktop-keys button{min-height:44px}.desktop-screen{min-height:180px}.desktop-heading{width:100%;justify-content:space-between}}
 
 .desktop-actions{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) 40px 40px;gap:6px;width:100%}.desktop-actions [data-desktop="disconnect"],.desktop-actions [data-desktop="fullscreen"]{width:40px;padding:9px}.desktop-actions svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}.desktop-actions .quiet{background:transparent;color:var(--ink);border:1px solid var(--line)}

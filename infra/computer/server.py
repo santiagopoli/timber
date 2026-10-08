@@ -142,14 +142,39 @@ class Computer:
             target = self.state / (str(uuid.uuid4()) + ".png")
             self.run(["scrot", "--overwrite", str(target)])
             return {"status": "completed", "artifactName": target.name, "mimeType": "image/png"}
-        if kind == "click":
-            x, y = action.get("x"), action.get("y")
-            if type(x) is not int or type(y) is not int or not 0 <= x < 1280 or not 0 <= y < 800:
-                raise ValueError("Coordinates must be within the 1280x800 desktop")
-            button = {"left": "1", "middle": "2", "right": "3"}.get(action.get("button", "left"))
-            if not button:
-                raise ValueError("Unknown mouse button")
-            self.run(["xdotool", "mousemove", "--sync", str(x), str(y), "click", button])
+        if kind == "move":
+            x, y = self.mouse_point(action)
+            self.run(["xdotool", "mousemove", "--sync", str(x), str(y)])
+            return {"status": "completed", "output": f"Moved pointer to ({x}, {y})"}
+        elif kind in {"click", "doubleClick"}:
+            x, y = self.mouse_point(action)
+            button = self.mouse_button(action)
+            repeat = ["--repeat", "2", "--delay", "100"] if kind == "doubleClick" else []
+            self.run(["xdotool", "mousemove", "--sync", str(x), str(y), "click", *repeat, button])
+        elif kind == "drag":
+            from_x, from_y = self.mouse_point(action, "fromX", "fromY")
+            to_x, to_y = self.mouse_point(action, "toX", "toY")
+            button = self.mouse_button(action)
+            duration = action.get("durationMs", 500)
+            if type(duration) is not int or not 100 <= duration <= 2000:
+                raise ValueError("Drag duration must be 100 to 2000 milliseconds")
+            # Validate the entire gesture before touching input. Intermediate
+            # movement lets native controls observe dragging rather than a jump.
+            steps = max(2, duration // 50)
+            movement = ["xdotool"]
+            for step in range(1, steps + 1):
+                x = round(from_x + (to_x - from_x) * step / steps)
+                y = round(from_y + (to_y - from_y) * step / steps)
+                movement.extend(["sleep", str(duration / steps / 1000), "mousemove", str(x), str(y)])
+            self.run(["xdotool", "mousemove", "--sync", str(from_x), str(from_y)])
+            try:
+                # Even a failed/timeout press may have reached X11. Always try
+                # to release it, including when the movement subprocess fails.
+                self.run(["xdotool", "mousedown", button])
+                self.run(movement)
+            finally:
+                self.run(["xdotool", "mouseup", button])
+            return {"status": "completed", "output": f"Dragged from ({from_x}, {from_y}) to ({to_x}, {to_y})"}
         elif kind == "type":
             value = action.get("text")
             if not isinstance(value, str) or len(value) > 10000:
@@ -185,6 +210,20 @@ class Computer:
         else:
             raise ValueError(f"Unsupported action: {kind}")
         return {"status": "completed", "output": f"{kind} submitted to desktop"}
+
+    @staticmethod
+    def mouse_point(action: dict, x_name="x", y_name="y") -> tuple[int, int]:
+        x, y = action.get(x_name), action.get(y_name)
+        if type(x) is not int or type(y) is not int or not 0 <= x < 1280 or not 0 <= y < 800:
+            raise ValueError("Coordinates must be within the 1280x800 desktop")
+        return x, y
+
+    @staticmethod
+    def mouse_button(action: dict) -> str:
+        button = action.get("button", "left")
+        if not isinstance(button, str) or button not in {"left", "middle", "right"}:
+            raise ValueError("Unknown mouse button")
+        return {"left": "1", "middle": "2", "right": "3"}[button]
 
     def run(self, argv: list[str], **kwargs):
         # xclip forks an owner process which retains stderr. A PIPE here would
@@ -541,7 +580,7 @@ def create_handler(computer: Computer, token: str):
                 desktop = all(shutil.which(tool) for tool in ["scrot", "xdotool", "chromium", "xclip"])
                 if desktop:
                     desktop = subprocess.run(["xdotool", "getdisplaygeometry"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2).returncode == 0
-                return self.respond(200, {"ok": True, "bootId": computer.boot_id, "desktop": desktop, "capabilities": ["gitClone", "gitPush", "workspace"] + (["liveDesktop"] if desktop and desktop_ready() else [])})
+                return self.respond(200, {"ok": True, "bootId": computer.boot_id, "desktop": desktop, "capabilities": ["gitClone", "gitPush", "workspace"] + (["move", "doubleClick", "drag"] if desktop else []) + (["liveDesktop"] if desktop and desktop_ready() else [])})
             parsed = urlparse(self.path)
             if parsed.path.startswith("/workspace/"):
                 try:

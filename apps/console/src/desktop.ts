@@ -12,7 +12,7 @@ type Rfb = {
 };
 export interface DesktopViewerOptions {
   element: HTMLElement;
-  connect(mode: DesktopMode): Promise<DesktopSession>;
+  connect(mode: DesktopMode, replaces?: string): Promise<DesktopSession>;
   renew(sessionId: string): Promise<{expiresAt: string}>;
   release(sessionId: string): Promise<unknown>;
   onState?(state: ViewerState): void;
@@ -38,6 +38,10 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
   let destroyed = false;
   let generation = 0;
   let rfb: Rfb | undefined;
+  let surface: HTMLElement | undefined;
+  type Transfer = {session?: DesktopSession; client?: Rfb; surface?: HTMLElement; timer?: ReturnType<typeof setTimeout>};
+  let transfer: Transfer | undefined;
+  let controlError = '';
   let session: DesktopSession | undefined;
   let heartbeat: ReturnType<typeof setTimeout> | undefined;
   let handshakeTimeout: ReturnType<typeof setTimeout> | undefined;
@@ -52,9 +56,9 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
   const setState = (next: ViewerState, message?: string) => {
     state = next;
     root.dataset.state = next;
-    status.textContent = message || ({disconnected: 'Disconnected', connecting: 'Connecting…', reconnecting: 'Reconnecting…', paused: 'Paused', viewing: 'Live · watching', controlling: 'Live · you have control', error: 'Connection unavailable'}[next]);
-    observe.disabled = next === 'connecting' || next === 'viewing';
-    control.disabled = next === 'connecting' || next === 'controlling';
+    status.textContent = message || (transfer ? 'Taking control…' : ({disconnected: 'Disconnected', connecting: 'Connecting…', reconnecting: 'Reconnecting…', paused: 'Paused', viewing: 'Live · watching', controlling: 'Live · you have control', error: 'Connection unavailable'}[next]));
+    observe.disabled = Boolean(transfer) || next === 'connecting' || next === 'viewing';
+    control.disabled = Boolean(transfer) || next === 'connecting' || next === 'controlling';
     stop.disabled = !wanted;
     keys.hidden = next !== 'controlling';
     root.querySelector<HTMLElement>('.desktop-footer')!.hidden = next !== 'controlling';
@@ -63,7 +67,7 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
     hint.textContent = next === 'controlling'
       ? 'You have control. Switch to Watch desktop to release it.'
       : next === 'viewing'
-      ? 'View only'
+      ? controlError || 'View only'
       : next === 'paused' || next === 'reconnecting' ? 'Watch will resume automatically.' : 'Connect to view the desktop.';
     options.onState?.(next);
   };
@@ -72,7 +76,18 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
     if (current) releasing = Promise.all([releasing, options.release(current.sessionId).catch(() => {})]).then(() => {});
     return releasing;
   };
+  function cancelTransfer() {
+    const pending = transfer;
+    transfer = undefined;
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    pending.client?.disconnect();
+    pending.surface?.remove();
+    void release(pending.session);
+  }
   const clearConnection = () => {
+    cancelTransfer();
+    controlError = '';
     generation++;
     if (heartbeat) clearTimeout(heartbeat);
     if (handshakeTimeout) clearTimeout(handshakeTimeout);
@@ -85,6 +100,7 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
     const previous = rfb;
     rfb = undefined;
     previous?.disconnect();
+    surface?.remove(); surface = undefined;
     const released = release(session);
     session = undefined;
     renewPending = false;
@@ -152,7 +168,66 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
     if (destroyed || !active || !pageActive || document.hidden) return;
     wanted = true;
     retryAttempt = 0;
-    await start(nextMode);
+    if (nextMode === 'control' && mode === 'view' && rfb && session && connectedAt) await takeControl();
+    else await start(nextMode);
+  }
+  async function createClient(connection: DesktopSession, host: HTMLElement, nextMode: DesktopMode, valid: () => boolean): Promise<Rfb> {
+    // Credentials are one-use subprotocols, never a browser/history URL.
+    const target = new URL(connection.url, window.location.href);
+    if (target.protocol === 'https:') target.protocol = 'wss:';
+    if (target.protocol === 'http:') target.protocol = 'ws:';
+    if (!['ws:', 'wss:'].includes(target.protocol) || target.search || target.username || target.password) throw new Error('The desktop endpoint is invalid.');
+    const {default: RFB} = await import('@novnc/novnc');
+    if (!valid()) throw new DOMException('Desktop session changed.', 'AbortError');
+    const client = new RFB(host, target.href, {shared: true, wsProtocols: connection.protocols}) as Rfb;
+    client.viewOnly = nextMode === 'view'; client.focusOnClick = nextMode === 'control';
+    client.scaleViewport = true; client.resizeSession = false; client.showDotCursor = false;
+    client.qualityLevel = 7; client.compressionLevel = 2; client.background = '#111111';
+    return client;
+  }
+  function track(client: Rfb, nextMode: DesktopMode, current: number, connected = false) {
+    const ready = () => {
+      if (current !== generation) return;
+      clearTimeout(handshakeTimeout); handshakeTimeout = undefined;
+      connectedAt = Date.now(); setState(nextMode === 'control' ? 'controlling' : 'viewing');
+    };
+    client.addEventListener('connect', ready);
+    for (const event of ['disconnect', 'securityfailure']) client.addEventListener(event, () => {if (current === generation) recover();});
+    if (connected) ready();
+    else handshakeTimeout = setTimeout(() => {if (current === generation) recover();}, 30_000);
+    scheduleRenew(current);
+  }
+  async function takeControl() {
+    if (transfer || !session) return;
+    const previous = session, pending: Transfer = {};
+    transfer = pending; controlError = ''; setState('viewing');
+    const valid = () => transfer === pending && available() && wanted && !destroyed;
+    const failed = (error?: unknown) => {
+      if (transfer !== pending) return;
+      cancelTransfer();
+      controlError = error instanceof Error ? error.message : 'Could not take control. You are still watching.';
+      setState('viewing');
+    };
+    try {
+      const connection = await options.connect('control', previous.sessionId);
+      if (!valid()) {void release(connection); return;}
+      pending.session = connection;
+      const host = document.createElement('div');
+      host.className = 'desktop-surface desktop-transfer'; screen.append(host); pending.surface = host;
+      // The existing view stays live until the replacement has negotiated RFB.
+      const client = await createClient(connection, host, 'view', valid); pending.client = client;
+      client.addEventListener('connect', () => {
+        if (!valid()) {if (transfer === pending) cancelTransfer(); return;}
+        transfer = undefined; clearTimeout(pending.timer);
+        void clearConnection();
+        session = connection; rfb = client; surface = host; mode = 'control';
+        client.viewOnly = false; client.focusOnClick = true;
+        host.classList.remove('desktop-transfer');
+        track(client, 'control', generation, true);
+      });
+      for (const event of ['disconnect', 'securityfailure']) client.addEventListener(event, () => failed());
+      pending.timer = setTimeout(() => failed(new Error('Control did not connect. You are still watching.')), 30_000);
+    } catch (error) {failed(error);}
   }
   async function start(nextMode: DesktopMode) {
     if (destroyed || !wanted || !available()) {if (wanted) setState('paused', 'Waiting for connection…'); return;}
@@ -166,42 +241,9 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
       const connection = await options.connect(nextMode);
       if (current !== generation || destroyed || !available()) { void release(connection); return; }
       session = connection;
-      // Credentials are one-use subprotocols, never a browser/history URL.
-      const target = new URL(connection.url, window.location.href);
-      if (target.protocol === 'https:') target.protocol = 'wss:';
-      if (target.protocol === 'http:') target.protocol = 'ws:';
-      if (!['ws:', 'wss:'].includes(target.protocol) || target.search || target.username || target.password) throw new Error('The desktop endpoint is invalid.');
-      const {default: RFB} = await import('@novnc/novnc');
-      if (current !== generation || destroyed || !available()) return;
-      const client = new RFB(screen, target.href, {shared: true, wsProtocols: connection.protocols}) as Rfb;
-      rfb = client;
-      client.viewOnly = nextMode === 'view';
-      client.focusOnClick = nextMode === 'control';
-      client.scaleViewport = true;
-      client.resizeSession = false;
-      client.showDotCursor = false;
-      client.qualityLevel = 7;
-      client.compressionLevel = 2;
-      client.background = '#111111';
-      client.addEventListener('connect', () => {
-        if (current !== generation) return;
-        if (handshakeTimeout) clearTimeout(handshakeTimeout);
-        handshakeTimeout = undefined;
-        connectedAt = Date.now();
-        setState(nextMode === 'control' ? 'controlling' : 'viewing');
-      });
-      client.addEventListener('disconnect', () => {
-        if (current !== generation) return;
-        recover();
-      });
-      client.addEventListener('securityfailure', () => {
-        if (current !== generation) return;
-        recover();
-      });
-      handshakeTimeout = setTimeout(() => {
-        if (current === generation) recover();
-      }, 30_000);
-      scheduleRenew(current);
+      const host = document.createElement('div'); host.className = 'desktop-surface'; screen.append(host); surface = host;
+      const client = await createClient(connection, host, nextMode, () => current === generation && !destroyed && available());
+      rfb = client; track(client, nextMode, current);
     } catch (error) {
       if (current !== generation) return;
       recover(error);
@@ -227,6 +269,9 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
   function reconcile() {
     if (!wanted || destroyed) return;
     if (!available()) {
+      // A hidden pending controller must be released even while Watch remains
+      // in its short background grace period.
+      if (transfer) {cancelTransfer(); setState('viewing');}
       // Brief tab/panel switches keep Watch's existing socket. Background work
       // stops after a grace period; control is released immediately.
       if (!pageActive || !navigator.onLine || mode === 'control' || !connectedAt) pause();

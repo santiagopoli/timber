@@ -51,10 +51,11 @@ to that directory; absolute paths, parent traversal and escaping symlinks fail.
 Terminal commands intentionally have full control of this bot's computer, and must
 be approved by host policy before model invocation.
 
-The desktop is 1280×800. `navigate`, `screenshot`, `click`, `type`, `key` and `scroll`
-operate the real X11 desktop. Screenshots are private PNG artifacts in R2. This
-milestone provides screenshot-based observation and control; it does not claim a
-VNC/WebRTC live-video stream. Chromium starts lazily on first navigation. Clipboard
+The desktop is 1280×800. `navigate`, `screenshot`, `click`, `move`, `doubleClick`,
+`drag`, `type`, `key` and `scroll` operate the real X11 desktop. `move` does not
+click; `drag` releases its button even if an input subprocess fails. Screenshots
+are private PNG artifacts in R2. Live observation/control uses noVNC over an
+authenticated WebSocket with separate view-only and control x11vnc servers. Chromium starts lazily on first navigation. Clipboard
 paste permits Unicode text, then clears the clipboard.
 
 Shell commands run up to 120 seconds, return up to 128 KiB of merged stdout/stderr,

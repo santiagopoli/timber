@@ -4,12 +4,16 @@ No third-party test client is needed. This is only a bounded protocol smoke
 client, not an implementation used by the product (which uses noVNC).
 """
 import base64
+import ctypes as C
+import json
 import os
 from pathlib import Path
 import socket
 import struct
 import subprocess
 import time
+import urllib.request
+import uuid
 
 
 class Desktop:
@@ -89,10 +93,101 @@ class Desktop:
     def close(self): self.sock.close()
 
 
-def command(*args): return subprocess.check_output(args, text=True).strip()
+def command(*args): return subprocess.check_output(args, text=True, timeout=15).strip()
 def pointer():
     values = dict(line.split("=", 1) for line in command("xdotool", "getmouselocation", "--shell").splitlines())
     return int(values["X"]), int(values["Y"])
+
+
+def native_mouse_smoke(token):
+    """Observe real X11 events in a native window, not an xdotool exit code."""
+    def action(value, operation_id=None):
+        request = urllib.request.Request("http://127.0.0.1:8080/actions", data=json.dumps({"operationId": operation_id or str(uuid.uuid4()), "action": value}).encode(), headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=20) as response:
+            result = json.load(response)
+        assert result["status"] == "completed", result
+        return result
+
+    # XButtonEvent and XMotionEvent have the same fields through state. The
+    # complete XEvent union is 24 longs; ctypes uses the platform's native ABI.
+    class PointerEvent(C.Structure):
+        _fields_ = [("type", C.c_int), ("serial", C.c_ulong), ("send_event", C.c_int), ("display", C.c_void_p),
+                    ("window", C.c_ulong), ("root", C.c_ulong), ("subwindow", C.c_ulong), ("time", C.c_ulong),
+                    ("x", C.c_int), ("y", C.c_int), ("x_root", C.c_int), ("y_root", C.c_int), ("state", C.c_uint), ("button", C.c_uint)]
+    class Event(C.Union):
+        _fields_ = [("type", C.c_int), ("pointer", PointerEvent), ("pad", C.c_long * 24)]
+
+    x11 = C.CDLL("libX11.so.6")
+    def bind(name, result, *arguments):
+        fn = getattr(x11, name)
+        fn.restype, fn.argtypes = result, arguments
+        return fn
+    open_display = bind("XOpenDisplay", C.c_void_p, C.c_char_p)
+    root_window = bind("XDefaultRootWindow", C.c_ulong, C.c_void_p)
+    create = bind("XCreateSimpleWindow", C.c_ulong, C.c_void_p, C.c_ulong, C.c_int, C.c_int, C.c_uint, C.c_uint, C.c_uint, C.c_ulong, C.c_ulong)
+    store_name = bind("XStoreName", C.c_int, C.c_void_p, C.c_ulong, C.c_char_p)
+    select = bind("XSelectInput", C.c_int, C.c_void_p, C.c_ulong, C.c_long)
+    map_window = bind("XMapRaised", C.c_int, C.c_void_p, C.c_ulong)
+    sync = bind("XSync", C.c_int, C.c_void_p, C.c_int)
+    pending = bind("XPending", C.c_int, C.c_void_p)
+    next_event = bind("XNextEvent", C.c_int, C.c_void_p, C.POINTER(Event))
+    translate = bind("XTranslateCoordinates", C.c_int, C.c_void_p, C.c_ulong, C.c_ulong, C.c_int, C.c_int, C.POINTER(C.c_int), C.POINTER(C.c_int), C.POINTER(C.c_ulong))
+    query = bind("XQueryPointer", C.c_int, C.c_void_p, C.c_ulong, C.POINTER(C.c_ulong), C.POINTER(C.c_ulong), C.POINTER(C.c_int), C.POINTER(C.c_int), C.POINTER(C.c_int), C.POINTER(C.c_int), C.POINTER(C.c_uint))
+    destroy = bind("XDestroyWindow", C.c_int, C.c_void_p, C.c_ulong)
+    close = bind("XCloseDisplay", C.c_int, C.c_void_p)
+    display = open_display(None)
+    assert display, "Could not open the actual X11 desktop"
+    window = create(display, root_window(display), 100, 100, 600, 400, 0, 0, 0x334455)
+    try:
+        store_name(display, window, b"Timber native mouse smoke")
+        select(display, window, (1 << 2) | (1 << 3) | (1 << 6))  # press, release, motion
+        map_window(display, window)
+        sync(display, 0)
+        command("xdotool", "windowactivate", "--sync", str(window))
+        command("xdotool", "windowmove", "--sync", str(window), "100", "100")
+        x, y, child = C.c_int(), C.c_int(), C.c_ulong()
+        assert translate(display, window, root_window(display), 0, 0, C.byref(x), C.byref(y), C.byref(child))
+        start, end = (x.value + 80, y.value + 100), (x.value + 380, y.value + 260)
+        assert 0 <= start[0] < end[0] < 1280 and 0 <= start[1] < end[1] < 800
+        def events():
+            sync(display, 0)
+            observed = []
+            while pending(display):
+                event = Event()
+                next_event(display, C.byref(event))
+                if event.type in (4, 5, 6):
+                    point = event.pointer
+                    observed.append((event.type, point.x_root, point.y_root, point.state, point.time, point.button))
+            return observed
+        events()
+        action({"type": "move", "x": start[0], "y": start[1]})
+        moved = events()
+        assert pointer() == start, "Agent move did not position the native pointer"
+        assert any(item[:3] == (6, *start) for item in moved), "Native window did not receive hover movement"
+        assert not any(item[0] in (4, 5) for item in moved), "Hover unexpectedly pressed a button"
+
+        operation_id = str(uuid.uuid4())
+        double_click = {"type": "doubleClick", "x": start[0], "y": start[1]}
+        first = action(double_click, operation_id)
+        clicked = [item for item in events() if item[0] in (4, 5)]
+        assert [item[0] for item in clicked] == [4, 5, 4, 5], "Double-click must deliver two press/release pairs"
+        assert all(item[1:3] == start and item[5] == 1 for item in clicked)
+        assert 0 < clicked[2][4] - clicked[0][4] < 500, "Clicks were too far apart for a double-click"
+        assert action(double_click, operation_id) == first
+        assert not any(item[0] in (4, 5) for item in events()), "A repeated operation replayed the double-click"
+
+        action({"type": "drag", "fromX": start[0], "fromY": start[1], "toX": end[0], "toY": end[1], "durationMs": 500})
+        dragged = events()
+        assert [item[0] for item in dragged if item[0] in (4, 5)] == [4, 5]
+        assert len([item for item in dragged if item[0] == 6 and item[3] & (1 << 8)]) >= 2, "Native controls did not receive held-button movement"
+        assert any(item[:3] == (5, *end) for item in dragged), "Drag did not release at its destination"
+        root, child, rx, ry, wx, wy, mask = C.c_ulong(), C.c_ulong(), C.c_int(), C.c_int(), C.c_int(), C.c_int(), C.c_uint()
+        assert query(display, window, C.byref(root), C.byref(child), C.byref(rx), C.byref(ry), C.byref(wx), C.byref(wy), C.byref(mask))
+        assert not mask.value & (1 << 8), "Drag left the mouse button held"
+        assert pointer() == end
+    finally:
+        destroy(display, window)
+        close(display)
 
 
 def main():
@@ -149,7 +244,8 @@ def main():
         marker.unlink(missing_ok=True)
         view.close()
         control.close()
-    print("PASS desktop: authenticated live framebuffer, visible cursor, enforced observation, native pointer and keyboard")
+    native_mouse_smoke(token)
+    print("PASS desktop: authenticated live framebuffer, visible cursor, enforced observation, native pointer and keyboard, agent hover, double-click deduplication and drag/release")
 
 
 if __name__ == "__main__": main()

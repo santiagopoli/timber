@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path
 import sqlite3
+import subprocess
 import tarfile
 import tempfile
 import threading
@@ -63,6 +64,50 @@ class ComputerTests(unittest.TestCase):
         self.computer.db.close()
         self.computer = server.Computer(self.root / "workspace", self.root / "state")
         self.assertEqual(self.computer.boot_id, boot_id)
+
+    def test_invalid_mouse_gestures_produce_no_input(self):
+        invalid = [
+            {"type": "move", "x": 1280, "y": 0},
+            {"type": "move", "x": True, "y": 0},
+            {"type": "doubleClick", "x": 0, "y": 800},
+            {"type": "doubleClick", "x": 0, "y": 0, "button": {}},
+            {"type": "drag", "fromX": 10, "fromY": 20, "toX": -1, "toY": 30},
+            {"type": "drag", "fromX": 10, "fromY": 20, "toX": 30, "toY": 40, "durationMs": 99},
+            {"type": "drag", "fromX": 10, "fromY": 20, "toX": 30, "toY": 40, "durationMs": 2001},
+            {"type": "drag", "fromX": 10, "fromY": 20, "toX": 30, "toY": 40, "durationMs": 100.5},
+        ]
+        with patch.object(self.computer, "run") as dispatch:
+            for index, action in enumerate(invalid):
+                self.assertEqual(self.computer.execute(f"invalid-mouse-{index}", action)["status"], "failed")
+            dispatch.assert_not_called()
+
+    def test_drag_releases_the_button_after_failed_press_or_movement_and_never_replays(self):
+        for failure_stage in ("mousedown", "sleep"):
+            calls = []
+            def fail_during_gesture(argv):
+                calls.append(argv)
+                if argv[1] == failure_stage:
+                    raise subprocess.TimeoutExpired(argv, 15)
+            with self.subTest(stage=failure_stage), patch.object(self.computer, "run", side_effect=fail_during_gesture):
+                action = {"type": "drag", "fromX": 30, "fromY": 40, "toX": 200, "toY": 300, "button": "right"}
+                operation_id = f"drag-failure-{failure_stage}"
+                first = self.computer.execute(operation_id, action)
+                self.assertEqual(first["status"], "failed")
+                self.assertEqual(calls[-1], ["xdotool", "mouseup", "3"])
+                before_retry = len(calls)
+                self.assertEqual(self.computer.execute(operation_id, action), first)
+                self.assertEqual(len(calls), before_retry)
+
+    def test_double_click_deduplicates_and_move_never_presses_a_button(self):
+        with patch.object(self.computer, "run") as dispatch:
+            move = self.action("hover", type="move", x=300, y=200)
+            self.assertEqual(move["status"], "completed")
+            self.assertNotIn("click", dispatch.call_args.args[0])
+            self.assertNotIn("mousedown", dispatch.call_args.args[0])
+            first = self.action("double", type="doubleClick", x=300, y=200)
+            self.assertEqual(first["status"], "completed")
+            self.assertEqual(self.action("double", type="doubleClick", x=300, y=200), first)
+            self.assertEqual(dispatch.call_count, 2)
 
     def test_checkpoint_copies_hardlinked_files_as_regular_files(self):
         import os

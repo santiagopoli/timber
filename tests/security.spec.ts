@@ -61,6 +61,22 @@ describe("untrusted request validation", () => {
     expect(() => parseAction({type: "exec", command: "true", timeoutMs: -1})).toThrow();
   });
 
+  it("bounds every coordinate, button and duration before accepting a mouse gesture", () => {
+    for(const type of ["move", "doubleClick"]) {
+      expect(parseAction({type,x:1279,y:799,approved:true})).toEqual({type,x:1279,y:799});
+      for(const invalid of [{x:-1}, {x:1280}, {y:800}, {x:0.5}, {x:Infinity}, {x:true}, {y:"1"}]) {
+        expect(()=>parseAction({type,x:0,y:0,...invalid})).toThrow();
+      }
+    }
+    const drag={type:"drag",fromX:0,fromY:0,toX:1279,toY:799};
+    expect(parseAction({...drag,durationMs:100,button:"right",approved:true})).toEqual({...drag,durationMs:100,button:"right"});
+    expect(parseAction({...drag,durationMs:2000})).toEqual({...drag,durationMs:2000});
+    for(const invalid of [{fromX:-1}, {fromY:800}, {toX:1280}, {toY:0.5}, {durationMs:99}, {durationMs:2001}, {durationMs:100.5}, {durationMs:NaN}, {button:"4"}, {button:["left"]}]) {
+      expect(()=>parseAction({...drag,...invalid})).toThrow();
+    }
+    expect(()=>parseAction({type:"doubleClick",x:0,y:0,button:["left"]})).toThrow();
+  });
+
   it("rejects unusable bot identities and malformed messages", () => {
     expect(() => parseBotInput({name: "   "})).toThrow();
     expect(() => parseBotInput({name: "Ada", runtime: "invalid", model: "arbitrary-url"})).toThrow();

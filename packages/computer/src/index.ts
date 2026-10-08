@@ -25,6 +25,7 @@ const SAFETY_TIMEOUT_MS = 15 * 60_000;
 const PORT = 8080;
 const BASE_CAPABILITIES = ["exec", "readFile", "writeFile", "listFiles", "checkpoint"];
 const DESKTOP_CAPABILITIES = ["screenshot", "click", "type", "key", "scroll", "navigate"];
+const EXTENDED_MOUSE_CAPABILITIES = ["move", "doubleClick", "drag"];
 const encoder = new TextEncoder();
 
 function stableAction(action: ComputerAction): string {
@@ -57,7 +58,7 @@ const COMPUTER_ERRORS = {
   computer_method_not_allowed: {status:405, message:"The computer request method is not allowed."},
   computer_owner_mismatch: {status:403, message:"This computer belongs to another bot."},
   computer_deleted: {status:410, message:"This bot's computer has been permanently deleted."},
-  computer_upgrade_required: {status:409, message:"This computer is running an older image. Suspend it after its current work finishes to save its workspace, then retry on the updated image. No Git action was executed."},
+  computer_upgrade_required: {status:409, message:"This computer is running an older image. Suspend it after its current work finishes to save its workspace, then retry on the updated image. No action was executed."},
   computer_git_unavailable: {status:503, message:"The GitHub transport is unavailable. Reconnect GitHub and verify this bot's repository access."},
   computer_app_not_running: {status:503, message:"This app's computer is stopped. Ask the bot to start the app again."},
 } as const;
@@ -238,9 +239,11 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       return this.container.getTcpPort(port).fetch(new Request(`http://127.0.0.1:${port}/`,{headers:{Upgrade:"websocket",Authorization:`Bearer ${this.token}`,"Sec-WebSocket-Protocol":"binary"}}));
     },()=>this.touch());
     if(url.pathname==="/desktop" && request.method==="POST") {
-      const input=await request.json<{mode?:unknown}>();
+      const input=await request.json<{mode?:unknown;replaces?:unknown}>();
       if(input.mode!=="view" && input.mode!=="control") throw new ComputerProviderError("computer_invalid_request");
+      if(input.replaces!==undefined && (input.mode!=="control" || typeof input.replaces!=="string" || !/^[a-f0-9-]{36}$/.test(input.replaces))) throw new ComputerProviderError("computer_invalid_request");
       const mode=input.mode;
+      const replaces=input.replaces as string|undefined;
       const create=()=>this.withWorkspace(async()=>{
         let health=this.container?.running && this.workspaceHealth
           ? this.workspaceHealth : await this.initializeWorkspace(botId);
@@ -252,7 +255,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
           health=await this.health();
         }
         if(!health.capabilities?.includes("liveDesktop")) throw new DesktopError("desktop_unavailable",503,"The live desktop is still starting. Connect again shortly.");
-        await this.touch();return Response.json(await this.live.create(botId,mode));
+        await this.touch();return Response.json(await this.live.create(botId,mode,replaces));
       });
       return mode==="view" ? create() : this.serialize(create);
     }
@@ -302,7 +305,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     if (state !== "running") this.desktop = false;
     return {
       id:botId, provider:"cloudflare", state,
-      capabilities: container ? [...BASE_CAPABILITIES, ...(this.desktop ? DESKTOP_CAPABILITIES : []), ...this.capabilities.filter(value=>value==="gitClone" || value==="gitPush")] : [],
+      capabilities: container ? [...BASE_CAPABILITIES, ...(this.desktop ? [...DESKTOP_CAPABILITIES,...this.capabilities.filter(value=>EXTENDED_MOUSE_CAPABILITIES.includes(value))] : []), ...this.capabilities.filter(value=>value==="gitClone" || value==="gitPush")] : [],
       ...(checkpoint ? {lastCheckpointId:checkpoint.id} : {}),
       ...(error ? {error:{code:error.code,message:error.publicMessage}} : {}),
     };
@@ -328,6 +331,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       if(!["screenshot","readFile","listFiles"].includes(action.type) && await this.live.controlled()) return {operationId,status:"failed" as const,error:"A person has control of the desktop. No action was executed. Release desktop control before issuing a new action."};
       const health=await this.ensureReady(botId);
       if((action.type==="gitClone" || action.type==="gitPush") && !health.capabilities?.includes(action.type)) throw new ComputerProviderError("computer_upgrade_required");
+      if(EXTENDED_MOUSE_CAPABILITIES.includes(action.type) && (!health.desktop || !health.capabilities?.includes(action.type))) throw new ComputerProviderError("computer_upgrade_required");
       await this.touch();
       this.active();
       await this.ctx.storage.put<OperationRecord>(key, {digest});

@@ -7,7 +7,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   'use strict';
   const $ = (id) => document.getElementById(id);
   const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
-  const guiActions = new Set(['navigate', 'click', 'type', 'key', 'scroll']);
+  const guiActions = new Set(['navigate', 'click', 'move', 'doubleClick', 'drag', 'type', 'key', 'scroll']);
   const removedBots = new Set(), deletionPending = new Map();
   const drafts = new Map(), pendingMessages = new Map(), pendingActions = new Map(), computerPending = new Map(), stopping = new Set(), approvalWork = new Map(), approvalFeedback = new Map(), connectionWork = new Map(), appWork = new Map();
   let authenticated = false, bots = [], selected = null, currentRun = null, generation = 0, authSession = 0;
@@ -44,10 +44,10 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   const desktopSessions = new Map();
   const desktop = createDesktopViewer({
     element: $('desktop-root'),
-    async connect(mode) {
+    async connect(mode, replaces) {
       const id = selected?.id, version = generation;
       if (!id || !authenticated) throw new Error('Select a bot first.');
-      const session = await request(`${botPath(id)}/computer/live-session`, {method: 'POST', body: {mode}, signal: AbortSignal.timeout(90_000)});
+      const session = await request(`${botPath(id)}/computer/live-session`, {method: 'POST', body: {mode, ...(replaces ? {replaces} : {})}, signal: AbortSignal.timeout(90_000)});
       desktopSessions.set(session.sessionId, id);
       if (!validView(version) || selected?.id !== id) {
         await releaseDesktop(session.sessionId);

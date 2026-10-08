@@ -128,7 +128,7 @@ type TimelineEntry = { key: string; at: number; order: number; node: ReactNode }
 type ToolActivity = { key: string; runId?: string; at: number; name: string; aliases: Set<string>; returned: boolean; status?: string; result?: {status?: string; output?: string; error?: string; exitCode?: number; artifactId?: string}; data: Record<string, unknown> };
 type ActivityStep = {at: number; key: string; tool: ToolActivity};
 type ActivityModel = Pick<ChatModel, 'bot' | 'events' | 'runs' | 'approvals' | 'runFilter'>;
-const toolNames: Record<string, string> = {exec: 'Run command', read_file: 'Read file', readFile: 'Read file', write_file: 'Write file', writeFile: 'Write file', list_files: 'Browse files', listFiles: 'Browse files', desktop_screenshot: 'Capture desktop', screenshot: 'Capture desktop', browser_navigate: 'Open', navigate: 'Open', desktop_click: 'Click', click: 'Click', desktop_type: 'Type text', type: 'Type text', desktop_key: 'Press', key: 'Press', desktop_scroll: 'Scroll', scroll: 'Scroll', checkpoint: 'Save workspace', github_clone: 'Clone', gitClone: 'Clone', github_push: 'Push', gitPush: 'Push', github_connect: 'Connect GitHub', github_create_pull_request: 'Create pull request', github_list_pull_requests: 'List pull requests', github_list_repositories: 'List repositories', load_skill: 'Load skill', list_tools: 'Available tools', publish_app: 'Publish app', list_apps: 'List apps', remove_app: 'Remove app'};
+const toolNames: Record<string, string> = {exec: 'Run command', read_file: 'Read file', readFile: 'Read file', write_file: 'Write file', writeFile: 'Write file', list_files: 'Browse files', listFiles: 'Browse files', desktop_screenshot: 'Capture desktop', screenshot: 'Capture desktop', browser_navigate: 'Open', navigate: 'Open', desktop_click: 'Click', click: 'Click', desktop_move: 'Move pointer', move: 'Move pointer', desktop_double_click: 'Double click', doubleClick: 'Double click', desktop_drag: 'Drag', drag: 'Drag', desktop_type: 'Type text', type: 'Type text', desktop_key: 'Press', key: 'Press', desktop_scroll: 'Scroll', scroll: 'Scroll', checkpoint: 'Save workspace', github_clone: 'Clone', gitClone: 'Clone', github_push: 'Push', gitPush: 'Push', github_connect: 'Connect GitHub', github_create_pull_request: 'Create pull request', github_list_pull_requests: 'List pull requests', github_list_repositories: 'List repositories', load_skill: 'Load skill', list_tools: 'Available tools', publish_app: 'Publish app', list_apps: 'List apps', remove_app: 'Remove app'};
 const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 // The host publishes an allowlisted input summary. Historical events may have
 // no input at all; never invent the command from its result or operation ID.
@@ -194,9 +194,13 @@ function toolPresentation(tool: ToolActivity) {
     if (value('cwd')) parameters.push(value('cwd'));
   } else if (['read_file', 'readFile', 'write_file', 'writeFile', 'list_files', 'listFiles'].includes(tool.name)) {
     if (value('path')) title = `${tool.name === 'read_file' || tool.name === 'readFile' ? 'Read' : tool.name === 'write_file' || tool.name === 'writeFile' ? 'Write' : 'Browse'} ${value('path')}`;
-  } else if (['desktop_click', 'click'].includes(tool.name)) {
+  } else if (['desktop_click', 'click', 'desktop_double_click', 'doubleClick', 'desktop_move', 'move'].includes(tool.name)) {
     if (value('x') && value('y')) title += ` (${value('x')}, ${value('y')})`;
+    if (!['desktop_move', 'move'].includes(tool.name)) parameters.push(`${value('button') || 'left'} button`);
+  } else if (['desktop_drag', 'drag'].includes(tool.name)) {
+    if (['fromX', 'fromY', 'toX', 'toY'].every(key => value(key))) title += ` (${value('fromX')}, ${value('fromY')}) → (${value('toX')}, ${value('toY')})`;
     parameters.push(`${value('button') || 'left'} button`);
+    if (value('durationMs')) parameters.push(`${value('durationMs')}ms`);
   } else if (['desktop_scroll', 'scroll'].includes(tool.name)) {
     if (value('direction')) title += ` ${value('direction')}`;
     if (value('amount')) parameters.push(`${value('amount')} steps`);

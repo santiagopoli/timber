@@ -36,7 +36,10 @@ export function computerActivityInput(action: ComputerAction): DisplayInput {
     case 'readFile':
     case 'writeFile': return {path: bounded(action.path)};
     case 'listFiles': return {path: bounded(action.path ?? '/workspace')};
-    case 'click': return {x: action.x, y: action.y, button: action.button ?? 'left'};
+    case 'move': return {x: action.x, y: action.y};
+    case 'click':
+    case 'doubleClick': return {x: action.x, y: action.y, button: action.button ?? 'left'};
+    case 'drag': return {fromX: action.fromX, fromY: action.fromY, toX: action.toX, toY: action.toY, button: action.button ?? 'left', durationMs: action.durationMs ?? 500};
     case 'type': return {characters: Array.from(action.text).length};
     case 'key': return {key: bounded(action.key, 100)};
     case 'scroll': return {direction: action.direction, amount: action.amount ?? 3};
