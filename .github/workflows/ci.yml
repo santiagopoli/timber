@@ -1,4 +1,4 @@
-name: Verify backend
+name: Verify and deploy Timber
 on:
   push:
   pull_request:
@@ -52,3 +52,55 @@ jobs:
           docker run -d --name timber-image-smoke --shm-size=512m -p 127.0.0.1:8080:8080 -e BOTSPACE_COMPUTER_TOKEN="$COMPUTER_TEST_TOKEN" timber-computer:ci
           node scripts/smoke-computer.mjs
           docker exec -i timber-image-smoke python3 - < infra/computer/smoke_desktop.py
+  deploy:
+    name: Deploy production
+    needs: [verify, desktop-image]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    concurrency:
+      group: timber-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Skip superseded revision
+        id: revision
+        shell: bash
+        run: |
+          current="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [ "$current" = "$GITHUB_SHA" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "A newer commit is on main; this revision will not deploy."
+          fi
+      - name: Deploy API and preview gateway
+        if: steps.revision.outputs.current == 'true'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: '3acfff91febe1ba644c6358ae5612736'
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
+          CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
+        shell: bash
+        run: |
+          if [ -n "$CLOUDFLARE_API_TOKEN" ]; then
+            unset CLOUDFLARE_API_KEY CLOUDFLARE_EMAIL
+          elif [ -n "$CLOUDFLARE_API_KEY" ] && [ -n "$CLOUDFLARE_EMAIL" ]; then
+            unset CLOUDFLARE_API_TOKEN
+          else
+            echo "::error::Configure CLOUDFLARE_API_TOKEN or both CLOUDFLARE_API_KEY and CLOUDFLARE_EMAIL in GitHub Actions secrets."
+            exit 1
+          fi
+          npm run deploy
+      - name: Check production health
+        if: steps.revision.outputs.current == 'true'
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --retry 5 --retry-all-errors --retry-delay 3 --max-time 30 \
+            https://timber-api.santiagopoli.workers.dev/health | \
+            node --input-type=module -e 'let body=""; for await (const chunk of process.stdin) body+=chunk; const health=JSON.parse(body); if(health.ok!==true || health.service!=="botspace") process.exit(1); console.log("Production health passed");'

@@ -190,6 +190,29 @@ the runner's installed Chrome. CI retains screenshots as `console-screenshots`.
 
 ## Deploy to Cloudflare
 
+### Continuous deployment
+
+The `Verify and deploy Timber` GitHub Actions workflow runs the full checks and
+desktop image smoke tests on pushes and pull requests. Only successful runs on
+`main` deploy production, including manually dispatched runs on `main`.
+Deployment uses the `production` environment and is serialized without cancelling
+an in-progress deploy. Superseded revisions are skipped before deployment.
+The API and preview gateway are deployed with `npm run deploy`, followed by a
+public API health check. Existing Worker secrets are preserved.
+
+Configure GitHub Actions secrets at repository or `production` environment scope:
+
+- `CLOUDFLARE_API_TOKEN`: deployment token (preferred).
+- Alternatively, `CLOUDFLARE_API_KEY` and `CLOUDFLARE_EMAIL`: global API key and
+  its account email. These are used only when no API token is configured.
+
+To rotate credentials, replace the secret value in GitHub. To switch from a global
+key to a deployment token, add `CLOUDFLARE_API_TOKEN`, then remove the old key/email
+secrets. No workflow edit is needed. Re-run the workflow on `main` after initial
+secret setup. Pull requests never receive the deployment credentials.
+The desktop image remains pinned to the digest in the production configuration;
+publishing an image archive alone does not roll it out.
+
 Full computer use requires a Cloudflare account with **Workers Paid and Containers
 enabled**, plus R2. The default model is `gpt-6.1-sol`, using the owner's authorized
 ChatGPT plan allowance. ChatGPT plan sharing must be available to that account and
