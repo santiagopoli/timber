@@ -1404,3 +1404,79 @@ for (const viewport of [{width:1440,height:1000},{width:1024,height:768},{width:
     assert.equal(await page.locator('#panel-conversation').isVisible(),true);
   },{viewport,colorScheme:'dark'});
 });
+
+test('live activity follows its accepted request before transcript sync even when the device clock is ahead',async()=>{
+  await withPage(async({page,login,state})=>{
+    await login();await page.clock.setFixedTime(new Date('2035-01-01T12:00:00Z'));
+    let run;
+    await page.route(`**/v1/bots/${BOT_A}/messages`,async route=>{
+      if(route.request().method()!=='POST')return route.continue();
+      const input=route.request().postDataJSON();
+      const now=new Date().toISOString();
+      run={id:'order-pending-run',botId:BOT_A,operationId:input.operationId,status:'running',createdAt:now,updatedAt:now};
+      state.runs.get(BOT_A).unshift(run);
+      await route.fulfill({status:202,json:{run}});
+    });
+    await page.locator('#message').fill('Build the app after this message');await sendMessage(page);
+    await page.locator('.timber-delivery-status').filter({hasText:'Running'}).waitFor();
+    state.emit(BOT_A,'tool.started',{toolCallId:'order-pending-tool',toolName:'exec',input:{command:'npm run build'}},run.id);
+    await page.locator('[data-run-activity="order-pending-run"]').waitFor();
+    const ordered=await page.locator('#messages').evaluate(node=>[...node.querySelectorAll('[data-operation-id], [data-run-activity]')].map(item=>item.dataset.operationId || item.dataset.runActivity));
+    assert.deepEqual(ordered,[run.operationId,run.id],'the accepted bubble anchors its activity even before its stored message exists');
+    const message={id:'order-stored-user',botId:BOT_A,runId:run.id,role:'user',text:'Build the app after this message',createdAt:run.createdAt};
+    state.messages.get(BOT_A).push(message);
+    state.emit(BOT_A,'message.created',{message},run.id);
+    await page.locator('[data-message-id="order-stored-user"]').waitFor();
+    assert.equal(await page.locator(`[data-operation-id="${run.operationId}"]`).count(),0,'reconciliation leaves one request bubble');
+    const finalOrder=await page.locator('#messages').evaluate(node=>[...node.querySelectorAll('[data-message-id="order-stored-user"], [data-run-activity]')].map(item=>item.dataset.messageId || item.dataset.runActivity));
+    assert.deepEqual(finalOrder,['order-stored-user',run.id]);
+  });
+});
+
+test('streamed requests and answers render immediately and survive an older in-flight transcript snapshot',async()=>{
+  await withPage(async({page,login,state})=>{
+    await login();const snapshot=structuredClone(state.messages.get(BOT_A));
+    let release,started;const gate=new Promise(resolve=>release=resolve),readStarted=new Promise(resolve=>started=resolve);
+    let held=false;
+    await page.route(`**/v1/bots/${BOT_A}/messages`,async route=>{
+      if(route.request().method()!=='GET')return route.continue();
+      if(!held){held=true;started();await gate;}
+      await route.fulfill({json:{messages:snapshot}});
+    });
+    const now=new Date().toISOString(),run={id:'order-stream-run',botId:BOT_A,operationId:'order-stream-op',status:'running',createdAt:now,updatedAt:now};
+    state.runs.get(BOT_A).unshift(run);state.emit(BOT_A,'run.updated',{run},run.id);
+    await readStarted;
+    const message={id:'order-stream-user',botId:BOT_A,runId:run.id,role:'user',text:'This request arrived in the live stream',createdAt:now};
+    const reply={id:'order-stream-answer',botId:BOT_A,runId:run.id,role:'assistant',text:'The live answer is ready',createdAt:new Date().toISOString()};
+    try{
+      state.emit(BOT_A,'message.created',{message},run.id);
+      state.emit(BOT_A,'tool.started',{toolCallId:'order-stream-tool',toolName:'exec',input:{command:'pwd'}},run.id);
+      state.emit(BOT_A,'message.created',{message:reply},run.id);
+      await page.locator('[data-message-id="order-stream-answer"]').waitFor();
+      const order=await page.locator('#messages').evaluate(node=>[...node.querySelectorAll('[data-message-id^="order-stream"], [data-run-activity]')].map(item=>item.dataset.messageId||item.dataset.runActivity));
+      assert.ok(order.indexOf(message.id)<order.indexOf(run.id));
+      assert.ok(order.indexOf(message.id)<order.indexOf(reply.id));
+      const read=page.waitForResponse(response=>response.url().endsWith('/messages'));release();await read;
+      assert.equal(await page.locator('[data-message-id="order-stream-user"]').count(),1);
+      assert.equal(await page.locator('[data-message-id="order-stream-answer"]').count(),1);
+      state.emit(BOT_A,'message.created',{message:{...message,id:'foreign-stream-user',botId:BOT_B}},run.id);
+      await openPanel(page,'activity');await page.locator('#refresh-history').click();await openPanel(page,'conversation');
+      assert.equal(await page.locator('[data-message-id="foreign-stream-user"]').count(),0);
+      assert.equal(await page.locator('[data-message-id="order-stream-user"]').count(),1,'stale refresh cannot remove the request anchor');
+      await selectBot(page,BOT_B);await until(page,'#selected-name','Linus');
+      assert.equal(await page.locator('[data-message-id="order-stream-user"]').count(),0,'stream cache is isolated to its bot');
+    }finally{release();}
+  });
+});
+
+test('historical approvals and activity cannot precede their own request despite earlier timestamps',async()=>{
+  await withPage(async({page,login,state})=>{
+    const approval=pendingApproval(),later='2035-01-01T12:00:00Z';
+    state.approvals.set(BOT_A,[approval]);
+    state.messages.set(BOT_A,[{id:'causal-user',botId:BOT_A,runId:approval.runId,role:'user',text:'Inspect the workspace',createdAt:later}]);
+    state.emit(BOT_A,'tool.started',{toolCallId:'causal-tool',toolName:'list_files',input:{path:'.'}},approval.runId);
+    await login();await page.locator('[data-run-activity]').waitFor();
+    const order=await page.locator('#messages').evaluate(node=>[...node.querySelectorAll('[data-message-id], [data-timeline-approval], [data-run-activity]')].map(item=>item.dataset.messageId||item.dataset.timelineApproval||item.dataset.runActivity));
+    assert.equal(order[0],'causal-user');assert.ok(order.includes(approval.id));assert.ok(order.includes(approval.runId));
+  });
+});

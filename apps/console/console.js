@@ -21,6 +21,7 @@ import './src/layout.css';
   let botsCollapsed = typeof preferences.botsCollapsed === 'boolean' ? preferences.botsCollapsed : tabletLayout.matches;
   let lastWorkspacePanel = panelNames.includes(preferences.workspacePanel) && preferences.workspacePanel !== 'conversation' ? preferences.workspacePanel : 'computer';
   const saveLayout = () => {preferences = {botsCollapsed, workspacePanel: lastWorkspacePanel, workspaceOpen: currentPanel !== 'conversation'}; try {localStorage.setItem('timber.layout', JSON.stringify(preferences));} catch {}};
+  const streamedMessages = new Map();
   let messages = [], approvals = [], connections = [], workspaceApps = [], connectionsRequest = 0, appsRequest = 0, runs = new Map(), activeRunIds = new Set(), nextCursor = null, olderPagesLoaded = false, loadingOlderRuns = false, runFilter = null, runRevision = 0, runsRequest = 0, messagesRequest = 0, approvalsRequest = 0;
   let cursor = 0, boundary = '', events = [], streamDrafts = new Map(), chatLoading = false, focusApproval = 0, screenUrl = null, artifact = null, directoryPath = '.';
   let chatGPTConnected = false, chatGPTBusy = false, chatGPTAccount = null, editBotId = null, deleteTarget = null, deleteBusy = false, sendBusy = new Set();
@@ -114,7 +115,7 @@ import './src/layout.css';
   function disconnect(message = '') {
     desktop.disconnect(); workspace.clear();
     stopComputerStatus(); generation++; authSession++; authenticated = false; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
-    selected = null; currentRun = null; bots = []; messages = []; approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
+    selected = null; currentRun = null; bots = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
     removedBots.clear(); deletionPending.clear(); deleteTarget = null; deleteBusy = false; editBotId = null; drafts.clear(); pendingMessages.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); connectionWork.clear(); appWork.clear(); closeDialogs(); clearScreen();
     chatGPTConnected = false; chatGPTAccount = null; chatGPTBusy = false;
     chat.clear(); activity.clear(); $('toggle-bots').hidden = true;
@@ -160,7 +161,7 @@ import './src/layout.css';
     desktop.disconnect(); workspace.clear();
     if (!$('panel-files').hidden) workspace.setBot(bot.id);
     stopComputerStatus(); generation++; const version = generation; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
-    selected = bot; chatLoading = true; currentRun = null; cursor = 0; boundary = ''; events = []; messages = []; approvals = []; connections = []; workspaceApps = []; runs = new Map(); activeRunIds = new Set(); streamDrafts = new Map(); nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; runFilter = null; runRevision = 0;
+    selected = bot; chatLoading = true; currentRun = null; cursor = 0; boundary = ''; events = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs = new Map(); activeRunIds = new Set(); streamDrafts = new Map(); nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; runFilter = null; runRevision = 0;
     $('refresh-apps').disabled = false; $('refresh-apps').textContent = 'Refresh';
     history[replace ? 'replaceState' : 'pushState'](null, '', `${location.pathname}${location.search}#bot=${encodeURIComponent(bot.id)}`);
     $('empty').hidden = true; $('bot-workspace').hidden = false; updateBotHeader(); renderBots(); renderApps();
@@ -232,7 +233,16 @@ import './src/layout.css';
     } catch (error) { if (session === authSession && selected?.id === botId && error.name !== 'AbortError') showError(error); }
     finally {if (session === authSession) {sendBusy.delete(botId); if (selected?.id === botId) renderMessages();}}
   }
-  async function loadMessages(version = generation) { const id = selected?.id, sequence = ++messagesRequest; if (!id) return; const result = await request(`${botPath(id)}/messages`); if (!validView(version) || sequence !== messagesRequest) return; messages = result.messages; reconcileDeliveries(); renderMessages(); }
+  async function loadMessages(version = generation) {
+    const id = selected?.id, sequence = ++messagesRequest; if (!id) return;
+    const result = await request(`${botPath(id)}/messages`);
+    if (!validView(version) || sequence !== messagesRequest) return;
+    // A REST snapshot may have started before a newer message arrived by SSE.
+    // Keep that message until a snapshot actually contains it.
+    for (const message of result.messages) streamedMessages.delete(message.id);
+    messages = [...result.messages, ...streamedMessages.values()];
+    reconcileDeliveries(); renderMessages();
+  }
   function mergeRun(run, source = 'snapshot') {
     if (!run?.id || run.botId !== selected?.id) return false;
     const prior = runs.get(run.id);
@@ -501,9 +511,19 @@ import './src/layout.css';
     const row = el('article', 'event'), title = el('div', 'event-title'); title.append(el('span', '', event.type.replaceAll('.', ' · ')), el('span', 'muted', `#${event.id} · ${time(event.createdAt)}`));
     const detail = el('details'); detail.append(el('summary', '', 'Event details')); const serialized = JSON.stringify(redact(event.data), null, 2); detail.append(el('pre', '', serialized.length > 8000 ? `${serialized.slice(0, 8000)}\n…` : serialized)); row.append(title, detail); $('activity-list').prepend(row); while ($('activity-list').children.length > 200) $('activity-list').lastElementChild.remove();
     $('event-count').textContent = String($('activity-list').children.length);
+    if (event.type === 'message.created') {
+      const message = event.data.message;
+      if (message?.botId === selected?.id && typeof message.id === 'string' && message.id && typeof message.text === 'string' &&
+          ['user', 'assistant', 'tool', 'system'].includes(message.role) && Number.isFinite(Date.parse(message.createdAt)) &&
+          (!message.runId || message.runId === event.runId)) {
+        if (!messages.some(item => item.id === message.id)) {streamedMessages.set(message.id, message); messages.push(message);}
+        if (message.role === 'assistant') streamDrafts.delete(event.runId);
+        reconcileDeliveries([...runs.values()]); renderMessages();
+      }
+    }
     if (event.type === 'run.updated' && event.data.run) {
       const run = event.data.run;
-      if ((runs.has(run.id) || !boundary || run.createdAt >= boundary) && mergeRun(run, 'event')) { runRevision++; if (!terminal.has(run.status)) activeRunIds.add(run.id); renderRuns(); }
+      if ((runs.has(run.id) || !boundary || run.createdAt >= boundary) && mergeRun(run, 'event')) { runRevision++; if (!terminal.has(run.status)) activeRunIds.add(run.id); reconcileDeliveries([run]); renderRuns(); }
     }
     if (event.type === 'runtime.snapshot' && typeof event.data.partialText === 'string' && activeRunIds.has(event.runId) && !terminal.has(runs.get(event.runId)?.status)) {
       // Recovery snapshots replace the whole partial; only later deltas append.
@@ -654,7 +674,7 @@ import './src/layout.css';
     if (wasSelected) {
       stopComputerStatus(); generation++; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
       for (const runId of runs.keys()) stopping.delete(runId);
-      selected = null; currentRun = null; messages = []; approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
+      selected = null; currentRun = null; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
       cursor = 0; boundary = ''; runFilter = null; nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; chatLoading = false; chat.clear(); activity.clear();
       for (const element of ['activity-list', 'run-list', 'file-list', 'workspace-app-list']) $(element).replaceChildren();
       for (const element of ['file-content', 'type-text', 'exec-command', 'navigate-url', 'key-name']) $(element).value = '';

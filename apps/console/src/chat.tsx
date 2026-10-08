@@ -299,33 +299,45 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks): TimelineEntry[] {
   const messages = model.messages.filter(message => !model.runFilter || message.runId === model.runFilter);
   const approvals = model.approvals.filter(approval => !model.runFilter || approval.runId === model.runFilter);
   const current = [...approvals].filter(approval => ['pending', 'executing', 'approved'].includes(approval.status)).sort((a, b) => timestamp(b.createdAt) - timestamp(a.createdAt))[0];
+  // The server run identifies a request even before its transcript row loads.
+  // Device clock skew and equal timestamps must never put an effect before it.
+  const deliveries = model.deliveries.map(delivery => {
+    const run = model.runs.find(run => run.operationId === delivery.operationId);
+    return {...delivery, runId: delivery.runId || run?.id, createdAt: run?.createdAt || delivery.createdAt};
+  }).filter(delivery => (!model.runFilter || delivery.runId === model.runFilter) &&
+    !messages.some(message => message.role === 'user' && message.runId && message.runId === delivery.runId));
+  const requests = new Map<string, {at: number; order: number}>();
+  messages.forEach((message, index) => {if (message.role === 'user' && message.runId) requests.set(message.runId, {at: timestamp(message.createdAt), order: index * 2});});
+  deliveries.forEach((delivery, index) => {if (delivery.runId) requests.set(delivery.runId, {at: timestamp(delivery.createdAt), order: (messages.length + index) * 2});});
+  const afterRequest = (runId: string | undefined, createdAt: number) => {
+    const request = runId ? requests.get(runId) : undefined;
+    const at = Math.max(createdAt, request?.at || 0);
+    return {at, order: request && request.at === at ? request.order + 1 : (messages.length + deliveries.length) * 2 + 1};
+  };
   const entries: TimelineEntry[] = [], groups = new Map<string, {runId?: string; steps: ActivityStep[]}>();
   const addActivity = (runId: string | undefined, step: ActivityStep) => {const key = runId || step.key, group = groups.get(key) || {runId, steps: []}; group.steps.push(step); groups.set(key, group);};
   messages.forEach((message, index) => {
     // Progress is public assistant text accompanying a tool call. It belongs in
     // the transcript just like a final answer, never in a reasoning disclosure.
-    const request = message.role === 'assistant' && message.runId ? messages.find(item => item.role === 'user' && item.runId === message.runId) : undefined;
-    const at = Math.max(timestamp(message.createdAt), timestamp(request?.createdAt));
-    entries.push({key: `message:${message.id}`, at, order: index * 2, node: <Message from={message.role === 'user' ? 'user' : 'assistant'} data-message-id={message.id} data-message-kind={message.kind} data-progress-message-id={message.kind === 'progress' ? message.id : undefined} data-run-id={message.runId} className={`timber-message timber-message-${message.role}`}>
+    const request = message.role === 'assistant' && message.runId ? requests.get(message.runId) : undefined;
+    const at = Math.max(timestamp(message.createdAt), request?.at || 0);
+    entries.push({key: `message:${message.id}`, at, order: Math.max(index * 2, request && request.at === at ? request.order + 2 : 0), node: <Message from={message.role === 'user' ? 'user' : 'assistant'} data-message-id={message.id} data-message-kind={message.kind} data-progress-message-id={message.kind === 'progress' ? message.id : undefined} data-run-id={message.runId} className={`timber-message timber-message-${message.role}`}>
       {message.role !== 'user' && <div className="timber-message-meta"><span>{message.role === 'assistant' ? model.bot.name : label(message.role)}</span></div>}
       <MessageContent className="timber-message-content"><Response text={message.text} /></MessageContent>
       {['user', 'assistant'].includes(message.role) && <CopyMessage text={message.text} createdAt={message.createdAt} />}
       {message.role === 'user' && <MessageRunStatus model={model} runId={message.runId} callbacks={callbacks} />}
     </Message>});
   });
-  const afterRequest = (runId: string | undefined, at: number) => {const index = messages.findIndex(message => message.role === 'user' && message.runId === runId && timestamp(message.createdAt) === at); return index < 0 ? messages.length * 2 + 1 : index * 2 + 1;};
-  for (const approval of approvals) entries.push({key: `approval:${approval.id}`, at: timestamp(approval.createdAt), order: afterRequest(approval.runId, timestamp(approval.createdAt)), node: <ApprovalEntry approval={approval} current={approval.id === current?.id} automatic={model.bot.computerApprovalMode === 'automatic'} callbacks={callbacks} />});
+  for (const approval of approvals) entries.push({key: `approval:${approval.id}`, ...afterRequest(approval.runId, timestamp(approval.createdAt)), node: <ApprovalEntry approval={approval} current={approval.id === current?.id} automatic={model.bot.computerApprovalMode === 'automatic'} callbacks={callbacks} />});
   for (const connection of model.connections.filter(item => !model.runFilter || item.runId === model.runFilter)) {
-    const request = messages.find(message => message.role === 'user' && message.runId === connection.runId);
-    const at = Math.max(timestamp(connection.createdAt), timestamp(request?.createdAt));
-    entries.push({key: `connection:${connection.id}`, at, order: afterRequest(connection.runId, at), node: <ConnectionEntry connection={connection} callbacks={callbacks} />});
+    entries.push({key: `connection:${connection.id}`, ...afterRequest(connection.runId, timestamp(connection.createdAt)), node: <ConnectionEntry connection={connection} callbacks={callbacks} />});
   }
-  for (const delivery of model.deliveries.filter(item => !model.runFilter || item.runId === model.runFilter)) entries.push({key: `delivery:${delivery.operationId}`, at: timestamp(delivery.createdAt), order: messages.length * 2 + 3, node: <DeliveryEntry delivery={delivery} busy={model.sending} callbacks={callbacks} />});
+  deliveries.forEach((delivery, index) => entries.push({key: `delivery:${delivery.operationId}`, at: timestamp(delivery.createdAt), order: (messages.length + index) * 2, node: <DeliveryEntry delivery={delivery} busy={model.sending} callbacks={callbacks} />}));
   for (const tool of collectTools(model)) addActivity(tool.runId, {tool, key: tool.key, at: tool.at});
-  for (const [key, group] of groups) {const request = messages.find(message => message.role === 'user' && message.runId === group.runId); const at = Math.max(Math.min(...group.steps.map(step => step.at)), timestamp(request?.createdAt)); entries.push({key: `activity:${key}`, at, order: afterRequest(group.runId, at), node: <ActivityGroup model={model} runId={group.runId} steps={group.steps} />});}
+  for (const [key, group] of groups) entries.push({key: `activity:${key}`, ...afterRequest(group.runId, Math.min(...group.steps.map(step => step.at))), node: <ActivityGroup model={model} runId={group.runId} steps={group.steps} />});
   for (const run of model.runs.filter(run=>['failed','interrupted','cancelled'].includes(run.status) && (!model.runFilter || model.runFilter===run.id))) {
-    const at = Math.max(timestamp(run.updatedAt), ...messages.filter(message=>message.runId===run.id).map(message=>timestamp(message.createdAt)), ...model.events.filter(event=>event.runId===run.id).map(event=>timestamp(event.createdAt)));
-    entries.push({key:`outcome:${run.id}`,at,order:messages.length*2+4,node:<TaskOutcome model={model} run={run} callbacks={callbacks}/>});
+    const at = Math.max(requests.get(run.id)?.at || 0, timestamp(run.updatedAt), ...messages.filter(message=>message.runId===run.id).map(message=>timestamp(message.createdAt)), ...model.events.filter(event=>event.runId===run.id).map(event=>timestamp(event.createdAt)));
+    entries.push({key:`outcome:${run.id}`,at,order:(messages.length + deliveries.length)*2+4,node:<TaskOutcome model={model} run={run} callbacks={callbacks}/>});
   }
   return entries.sort((a, b) => a.at - b.at || a.order - b.order);
 }
