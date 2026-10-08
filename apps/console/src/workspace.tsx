@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { createHighlighter, type BundledLanguage, type Highlighter, type ThemedToken } from 'shiki';
-import { createJavaScriptRegexEngine } from 'shiki/engine/javascript';
+import type { BundledLanguage, ThemedToken } from 'shiki';
+import { syntaxHighlighter } from './lib/syntax';
 import { ArrowLeftIcon, ChevronRightIcon, DownloadIcon, FileIcon, FolderIcon, GitBranchIcon, RefreshCwIcon, LoaderCircleIcon, XIcon } from 'lucide-react';
 import './workspace.css';
 
@@ -22,17 +22,12 @@ const join = (root:string,path:string) => root === '.' ? path : `${root}/${path}
 type LoadState = 'loading'|'ready'|'error';
 const safeImages = new Set(['image/png','image/jpeg','image/gif','image/webp','image/avif','image/bmp','image/x-icon']);
 
-let highlighter:Promise<Highlighter>|null=null;
 function SourceCode({code,language='text'}:{code:string;language?:string}) {
   const [highlight,setHighlight]=useState<{code:string;language:string;tokens:ThemedToken[][]}|null>(null);
   useEffect(()=>{
     let active=true;
-    highlighter ??= createHighlighter({themes:['github-dark'],langs:[],engine:createJavaScriptRegexEngine()});
-    void highlighter.then(async engine=>{
-      let selected=language;
-      if(!['text','plaintext'].includes(selected) && !engine.getLoadedLanguages().includes(selected)) {
-        try {await engine.loadLanguage(selected as BundledLanguage);} catch {selected='text';}
-      }
+    void syntaxHighlighter(language).then(engine=>{
+      const selected=engine.getLoadedLanguages().includes(language)?language:'text';
       const tokens=engine.codeToTokens(code,{lang:selected as BundledLanguage,theme:'github-dark'}).tokens;
       if(active)setHighlight({code,language,tokens});
     }).catch(()=>{ /* Unknown syntaxes retain their exact escaped source. */ });

@@ -126,10 +126,10 @@ test('public progress stays visible beside readable tool activity and the final 
     await activity.locator('.timber-activity-count').filter({hasText: '1 action'}).waitFor();
     assert.equal(await activity.locator('[data-tool-operation-id]').count(), 1);
     const tool = activity.locator(`[data-tool-operation-id="${operationId}"]`);
-    assert.equal(await tool.locator('[data-tool-result-preview]').innerText(), '/workspace', 'the actual result is visible before details are opened');
+    assert.equal((await tool.locator('[data-tool-result-preview]').innerText()).trim(), '/workspace', 'the actual result is visible before details are opened');
     await tool.locator('summary').click();
-    assert.equal(await tool.locator('pre').first().textContent(), '/workspace\n');
-    assert.match(await tool.innerText(), /Completed.*exit 0/);
+    assert.equal(await tool.locator('.timber-tool-output pre').textContent(), '/workspace\n');
+    assert.equal(await tool.locator('.timber-tool-status').getAttribute('aria-label'), 'Completed · exit 0');
     assert.match(await page.locator('#run-status').innerText(), /running/, 'a completed command does not claim the whole task finished');
     const final = {id: 'activity-final-answer', botId: BOT_A, runId: run.id, role: 'assistant', kind: 'final', text: '**Workspace verified.** The command succeeded in `/workspace`.', createdAt: new Date(Date.now() + 1000).toISOString()};
     state.messages.set(BOT_A, [user, legacy, progress, final]); run.status = 'completed'; run.updatedAt = final.createdAt;
@@ -139,7 +139,7 @@ test('public progress stays visible beside readable tool activity and the final 
     assert.equal(await answer.evaluate(node => node.closest('[data-run-activity]') === null), true, 'final text remains outside activity');
     assert.equal(await answer.getByRole('button', {name: 'Copy message', exact: true}).isVisible(), true);
     assert.equal(await activity.locator('[data-tool-operation-id]').count(), 1);
-    assert.equal(await tool.locator('pre').first().textContent(), '/workspace\n', 'the native completion callback preserves the host result');
+    assert.equal(await tool.locator('.timber-tool-output pre').textContent(), '/workspace\n', 'the native completion callback preserves the host result');
     assert.equal(await activity.locator(`[data-progress-message-id="${progress.id}"]`).count(), 0);
     assert.equal(await page.locator(`[data-progress-message-id="${progress.id}"]`).count(), 1);
     assert.equal(await activity.locator(`[data-message-id="${final.id}"]`).count(), 0);
@@ -148,7 +148,7 @@ test('public progress stays visible beside readable tool activity and the final 
     await page.locator(`[data-progress-message-id="${progress.id}"]`).waitFor({state: 'visible'});
     await page.locator(`[data-message-id="${final.id}"]`).waitFor({state: 'visible'});
     assert.equal(await page.locator(`[data-run-activity="${run.id}"] details[open]`).count(), 0, 'reload keeps diagnostics optional');
-    assert.equal(await page.locator(`[data-run-activity="${run.id}"] [data-tool-result-preview]`).innerText(), '/workspace', 'reloaded actions still expose their result');
+    assert.equal((await page.locator(`[data-run-activity="${run.id}"] [data-tool-result-preview]`).innerText()).trim(), '/workspace', 'reloaded actions still expose their result');
     assert.equal(state.calls.some(call => call.method !== 'GET'), false); assert.equal(state.actions.length, 0);
   }, {viewport: {width, height: 1000}});
 });
@@ -213,8 +213,10 @@ test('action rows expose commands, parameters and results without nested disclos
     assert.equal(await group.locator('[data-tool-operation-id]').count(), 3, 'native and host start events describe one write');
     assert.equal(await group.locator('details[open]').count(), 0);
     assert.equal(await group.locator('details details').count(), 0, 'each action has one optional disclosure');
-    assert.match(await write.locator('summary').innerText(), /Write blender\/animar_escena.py[\s\S]*Completed[\s\S]*Wrote blender\/animar_escena.py/);
-    assert.match(await exec.locator('summary').innerText(), /python blender\/animar_escena.py --frames 24 --output renders\/scene.mp4[\s\S]*Completed · exit 0[\s\S]*timeout 120s[\s\S]*Rendered 24 frames/);
+    assert.match(await write.locator('summary').innerText(), /Write blender\/animar_escena.py[\s\S]*Wrote blender\/animar_escena.py/);
+    assert.equal(await write.locator('.timber-tool-status').getAttribute('aria-label'), 'Completed');
+    assert.match(await exec.locator('summary').innerText(), /python blender\/animar_escena.py --frames 24 --output renders\/scene.mp4[\s\S]*timeout 120s[\s\S]*Rendered 24 frames/);
+    assert.equal(await exec.locator('.timber-tool-status').getAttribute('aria-label'), 'Completed · exit 0');
     assert.match(await click.locator('summary').innerText(), /Click \(460, 310\)[\s\S]*Running[\s\S]*right button/);
     assert.equal(await group.evaluate(node => node.scrollWidth <= node.clientWidth + 1), true, 'action rows fit the viewport');
     if (process.env.CONSOLE_SCREENSHOT_DIR) {await mkdir(process.env.CONSOLE_SCREENSHOT_DIR, {recursive: true}); await click.scrollIntoViewIfNeeded(); await page.screenshot({path: `${process.env.CONSOLE_SCREENSHOT_DIR}/activity-flat-${width}.png`, animations: 'disabled'});}
@@ -279,12 +281,94 @@ test('activity preserves resolved host tools, hides private inputs, and does not
     assert.match(await typed.locator('summary').innerText(), /24 characters · input hidden/);
     await typed.locator('summary').click();
     assert.doesNotMatch(await typed.innerText(), /fixture-private-typed-input/);
+    await typed.getByRole('button', {name: 'Details', exact: true}).click();
     assert.match(await typed.locator('.timber-tool-data').innerText(), /\[hidden\]/);
     assert.equal(await historical.locator('.timber-tool-command').innerText(), 'Write file');
     assert.equal(await historical.locator('[data-tool-result-preview]').innerText(), 'Wrote notes.txt');
     assert.equal(await group.locator('[data-tool-operation-id]').count(), 3);
     assert.equal(state.actions.length, 0);
   });
+});
+
+test('formatted activity contains long commands, copies exact source and updates corner status in both views', async () => {
+  for (const width of [390, 1440]) await withPage(async ({page, context, login, state, url}) => {
+    const createdAt = new Date().toISOString(), run = {id: 'formatted-activity', botId: BOT_A, operationId: 'formatted-request', status: 'running', createdAt, updatedAt: createdAt};
+    const command = 'npm install -g bun@1.3.11 > /tmp/bun-install.log 2>&1 && npm install --prefix /tmp/spacetime-node node@22 > /tmp/node-install.log 2>&1 && cd /workspace/spacetime && PATH=/tmp/spacetime-node/node_modules/.bin:$PATH SESSIONCTL_SKIP_BROWSER_POSTINSTALL=1 PUPPETEER_SKIP_DOWNLOAD=1 bun install --frozen-lockfile > /tmp/spacetime-install.log 2>&1; tail -10 /tmp/spacetime-install.log';
+    state.runs.set(BOT_A, [run]); state.messages.set(BOT_A, [{id: 'format-user', botId: BOT_A, runId: run.id, role: 'user', text: 'Instalá las dependencias y verificá la app.', createdAt}]);
+    state.emit(BOT_A, 'tool.completed', {operationId: 'format-git', toolName: 'exec', input: {command: 'git -C /workspace/spacetime status --short', timeoutMs: 10000}, result: {status: 'completed', output: ' M client/index.html\n M client/src/main.tsx\n M client/vite.config.ts\n', exitCode: 0}}, run.id);
+    state.emit(BOT_A, 'tool.started', {operationId: 'format-install', toolName: 'exec', input: {command, timeoutMs: 120000}}, run.id);
+    await context.grantPermissions(['clipboard-read', 'clipboard-write'], {origin: new URL(url).origin});
+    await login();
+    const row = page.locator('[data-tool-operation-id="format-install"]'), git = page.locator('[data-tool-operation-id="format-git"]');
+    await row.waitFor();
+    assert.equal(await row.locator('.timber-tool-kind').getAttribute('aria-label'), 'Packages');
+    assert.equal(await git.locator('.timber-tool-kind').getAttribute('aria-label'), 'Git');
+    assert.equal(await git.locator('.timber-tool-status').getAttribute('aria-label'), 'Completed · exit 0');
+    assert.equal(await git.locator('.timber-tool-status').innerText(), '', 'completion is an accessible corner icon, without repetitive visible text');
+    assert.equal(await row.locator('.timber-tool-corner .timber-spinner').count(), 1);
+    await page.waitForFunction(() => [...document.querySelectorAll('[data-tool-operation-id="format-install"] .timber-code pre span[style]')].some(node => node.style.color !== 'inherit'));
+    const dimensions = await row.locator('.timber-code [data-code-content]').evaluate(node => ({height: node.getBoundingClientRect().height, scroll: node.scrollWidth, width: node.clientWidth}));
+    assert.ok(dimensions.height <= 75, 'long shell commands stay compact');
+    if (width === 390) assert.ok(dimensions.scroll > dimensions.width, 'long commands scroll inside their own block');
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    if (process.env.CONSOLE_SCREENSHOT_DIR) {await mkdir(process.env.CONSOLE_SCREENSHOT_DIR, {recursive: true}); await page.screenshot({path: `${process.env.CONSOLE_SCREENSHOT_DIR}/activity-formatted-${width}.png`, animations: 'disabled'});}
+    await row.locator('summary').click();
+    await row.getByRole('button', {name: 'Command', exact: true}).click();
+    await row.getByRole('button', {name: 'Copy code', exact: true}).click();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), command);
+    await row.getByRole('button', {name: 'Wrap lines', exact: true}).click();
+    assert.equal(await row.getByRole('button', {name: 'Wrap lines', exact: true}).getAttribute('aria-pressed'), 'true');
+    assert.equal(await row.locator('.timber-tool-expanded').evaluate(node => node.scrollWidth <= node.clientWidth + 1), true);
+    state.emit(BOT_A, 'tool.completed', {operationId: 'format-install', toolName: 'exec', result: {status: 'failed', output: 'Dependency unavailable\n', error: 'Could not resolve the package version.', exitCode: 1}}, run.id);
+    await row.locator('summary').filter({hasText: 'Could not resolve the package version.'}).waitFor();
+    assert.equal(await row.locator('.timber-tool-status').getAttribute('aria-label'), 'Failed · exit 1');
+    assert.equal(await row.locator('.timber-tool-corner .timber-spinner').count(), 0);
+    assert.equal(await row.locator('.timber-tool-exit').innerText(), 'exit 1');
+    await row.locator('summary').click();
+    await openPanel(page, 'activity');
+    const panelRow = page.locator('[data-activity-tool-operation-id="format-install"]');
+    assert.equal(await panelRow.locator('.timber-tool-kind').getAttribute('aria-label'), 'Packages');
+    assert.equal(await panelRow.locator('.timber-tool-status').getAttribute('aria-label'), 'Failed · exit 1');
+    assert.match(await panelRow.locator('summary').innerText(), /Could not resolve the package version/);
+    assert.equal(await panelRow.locator('details').count(), 0);
+  }, {viewport: {width, height: 920}, colorScheme: width === 390 ? 'dark' : 'light'});
+});
+
+test('activity highlights files and diffs, renders skill Markdown safely and preserves JSON literals when copying', async () => {
+  await withPage(async ({page, context, login, state, url}) => {
+    const createdAt = new Date().toISOString(), run = {id: 'formatted-output', botId: BOT_A, operationId: 'output-request', status: 'completed', createdAt, updatedAt: createdAt};
+    state.runs.set(BOT_A, [run]); state.messages.set(BOT_A, [{id: 'output-user', botId: BOT_A, runId: run.id, role: 'user', text: 'Revisá el código, los cambios y la guía.', createdAt}]);
+    const python = 'def greet(name: str):\n    return f"Hello, {name}"\n';
+    const diff = 'diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-old\n+new\n';
+    const json = '{"ok":true,"files":["app.py","package.json"]}', precise = '{"id":9007199254740993,"value":1.00,"a":1,"a":2}';
+    for (const [operationId, toolName, input, output] of [
+      ['format-python', 'readFile', {path: 'app.py'}, python], ['format-diff', 'exec', {command: 'git diff'}, diff],
+      ['format-json', 'exec', {command: 'curl localhost:3000/api/status'}, json], ['format-precise', 'exec', {command: 'cat data.json'}, precise],
+      ['format-skill', 'load_skill', {name: 'workspace-apps'}, '---\nname: workspace-apps\ndescription: Hidden frontmatter\n---\n# Publish the app\n\nUse **named apps**.\n\n```sh\nnpm run dev -- --host 0.0.0.0\n```\n\n<script>globalThis.__unsafeActivity = true</script>\n<img src=x onerror="globalThis.__unsafeActivity = true">\n[Unsafe](javascript:alert(1))'],
+    ]) state.emit(BOT_A, 'tool.completed', {operationId, toolName, input, result: {status: 'completed', output}}, run.id);
+    await context.grantPermissions(['clipboard-read', 'clipboard-write'], {origin: new URL(url).origin});
+    await login();
+    for (const [id, language, original] of [['format-python','python',python],['format-diff','diff',diff],['format-json','json',json],['format-precise','json',precise]]) {
+      const row = page.locator(`[data-tool-operation-id="${id}"]`);
+      await row.locator('summary').click();
+      await row.locator(`.timber-tool-output [data-language="${language}"]`).waitFor();
+      await page.waitForFunction(id => [...document.querySelectorAll(`[data-tool-operation-id="${id}"] .timber-tool-output pre span[style]`)].some(node => node.style.color !== 'inherit'), id);
+      await row.getByRole('button', {name: 'Copy code', exact: true}).click();
+      assert.equal(await page.evaluate(() => navigator.clipboard.readText()), original, 'copy retains original whitespace, numbers and keys');
+      if (id === 'format-json') assert.match(await row.locator('.timber-tool-output pre').innerText(), /\n\s+"ok": true/);
+      if (id === 'format-precise') assert.match(await row.locator('.timber-tool-output pre').innerText(), /9007199254740993/);
+      await row.locator('summary').click();
+    }
+    const skill = page.locator('[data-tool-operation-id="format-skill"]');
+    assert.doesNotMatch(await skill.locator('summary').innerText(), /Hidden frontmatter|description:/);
+    await skill.locator('summary').click();
+    assert.equal(await skill.locator('.timber-tool-output [data-streamdown="strong"]').innerText(), 'named apps');
+    await skill.locator('.timber-tool-output [data-language="bash"]').waitFor();
+    assert.equal(await skill.locator('script,img,a[href^="javascript:"]').count(), 0);
+    assert.equal(await page.evaluate(() => globalThis.__unsafeActivity), undefined);
+    if (process.env.CONSOLE_SCREENSHOT_DIR) {await mkdir(process.env.CONSOLE_SCREENSHOT_DIR, {recursive: true}); await page.screenshot({path: `${process.env.CONSOLE_SCREENSHOT_DIR}/activity-markdown-mobile.png`, animations: 'disabled'});}
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  }, {viewport: {width: 390, height: 920}, colorScheme: 'dark'});
 });
 
 test('copying either message role preserves the exact source Markdown', async () => {

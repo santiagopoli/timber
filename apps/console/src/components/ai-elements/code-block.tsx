@@ -23,11 +23,10 @@ import {
 } from "react";
 import type {
   BundledLanguage,
-  BundledTheme,
-  HighlighterGeneric,
   ThemedToken,
 } from "shiki";
-import { createHighlighter } from "shiki";
+import { syntaxHighlighter } from "@/lib/syntax";
+type CodeLanguage = BundledLanguage | "text" | "plaintext";
 
 // Shiki uses bitflags for font styles: 1=italic, 2=bold, 4=underline
 // oxlint-disable-next-line eslint(no-bitwise)
@@ -78,7 +77,7 @@ const TokenSpan = ({ token }: { token: ThemedToken }) => (
 
 // Line number styles using CSS counters
 const LINE_NUMBER_CLASSES = cn(
-  "block",
+  "inline",
   "before:content-[counter(line)]",
   "before:inline-block",
   "before:[counter-increment:line]",
@@ -94,23 +93,25 @@ const LINE_NUMBER_CLASSES = cn(
 const LineSpan = ({
   keyedLine,
   showLineNumbers,
+  trailingNewline,
 }: {
   keyedLine: KeyedLine;
   showLineNumbers: boolean;
+  trailingNewline: boolean;
 }) => (
-  <span className={showLineNumbers ? LINE_NUMBER_CLASSES : "block"}>
-    {keyedLine.tokens.length === 0
-      ? "\n"
-      : keyedLine.tokens.map(({ token, key }) => (
+  <span className={showLineNumbers ? LINE_NUMBER_CLASSES : undefined}>
+    {keyedLine.tokens.map(({ token, key }) => (
           <TokenSpan key={key} token={token} />
         ))}
+    {trailingNewline ? "\n" : ""}
   </span>
 );
 
 // Types
 type CodeBlockProps = HTMLAttributes<HTMLDivElement> & {
   code: string;
-  language: BundledLanguage;
+  copyText?: string;
+  language: CodeLanguage;
   showLineNumbers?: boolean;
 };
 
@@ -129,39 +130,16 @@ const CodeBlockContext = createContext<CodeBlockContextType>({
   code: "",
 });
 
-// Highlighter cache (singleton per language)
-const highlighterCache = new Map<
-  string,
-  Promise<HighlighterGeneric<BundledLanguage, BundledTheme>>
->();
-
 // Token cache
 const tokensCache = new Map<string, TokenizedCode>();
 
 // Subscribers for async token updates
 const subscribers = new Map<string, Set<(result: TokenizedCode) => void>>();
 
-const getTokensCacheKey = (code: string, language: BundledLanguage) => {
+const getTokensCacheKey = (code: string, language: CodeLanguage) => {
   // Different files may share their length, prefix and suffix. The complete
   // source prevents a cache hit from rendering another file’s middle lines.
   return `${language}:${code}`;
-};
-
-const getHighlighter = (
-  language: BundledLanguage
-): Promise<HighlighterGeneric<BundledLanguage, BundledTheme>> => {
-  const cached = highlighterCache.get(language);
-  if (cached) {
-    return cached;
-  }
-
-  const highlighterPromise = createHighlighter({
-    langs: [language],
-    themes: ["github-light", "github-dark"],
-  });
-
-  highlighterCache.set(language, highlighterPromise);
-  return highlighterPromise;
 };
 
 // Create raw tokens for immediate display while highlighting loads
@@ -183,10 +161,11 @@ const createRawTokens = (code: string): TokenizedCode => ({
 // Synchronous highlight with callback for async results
 export const highlightCode = (
   code: string,
-  language: BundledLanguage,
+  language: CodeLanguage,
   // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-callbacks)
   callback?: (result: TokenizedCode) => void
 ): TokenizedCode | null => {
+  if (["text", "plaintext"].includes(language)) return createRawTokens(code);
   const tokensCacheKey = getTokensCacheKey(code, language);
 
   // Return cached result if available
@@ -204,7 +183,7 @@ export const highlightCode = (
   }
 
   // Start highlighting in background - fire-and-forget async pattern
-  getHighlighter(language)
+  syntaxHighlighter(language)
     // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-then)
     .then((highlighter) => {
       const availableLangs = highlighter.getLoadedLanguages();
@@ -225,6 +204,7 @@ export const highlightCode = (
       };
 
       // Cache the result
+      if (tokensCache.size >= 64) tokensCache.delete(tokensCache.keys().next().value!);
       tokensCache.set(tokensCacheKey, tokenized);
 
       // Notify all subscribers
@@ -282,11 +262,12 @@ const CodeBlockBody = memo(
             showLineNumbers && "[counter-increment:line_0] [counter-reset:line]"
           )}
         >
-          {keyedLines.map((keyedLine) => (
+          {keyedLines.map((keyedLine, index) => (
             <LineSpan
               key={keyedLine.key}
               keyedLine={keyedLine}
               showLineNumbers={showLineNumbers}
+              trailingNewline={index < keyedLines.length - 1}
             />
           ))}
         </code>
@@ -328,6 +309,7 @@ export const CodeBlockHeader = ({
   ...props
 }: HTMLAttributes<HTMLDivElement>) => (
   <div
+    data-code-header
     className={cn(
       "flex items-center justify-between border-b bg-muted/80 px-3 py-2 text-muted-foreground text-xs",
       className
@@ -377,7 +359,7 @@ export const CodeBlockContent = ({
   showLineNumbers = false,
 }: {
   code: string;
-  language: BundledLanguage;
+  language: CodeLanguage;
   showLineNumbers?: boolean;
 }) => {
   // Memoized raw tokens for immediate display
@@ -419,7 +401,7 @@ export const CodeBlockContent = ({
   const tokenized = asyncTokens ?? syncTokens;
 
   return (
-    <div className="relative overflow-auto">
+    <div className="relative overflow-auto" data-code-content>
       <CodeBlockBody showLineNumbers={showLineNumbers} tokenized={tokenized} />
     </div>
   );
@@ -427,13 +409,14 @@ export const CodeBlockContent = ({
 
 export const CodeBlock = ({
   code,
+  copyText,
   language,
   showLineNumbers = false,
   className,
   children,
   ...props
 }: CodeBlockProps) => {
-  const contextValue = useMemo(() => ({ code }), [code]);
+  const contextValue = useMemo(() => ({ code: copyText ?? code }), [code, copyText]);
 
   return (
     <CodeBlockContext.Provider value={contextValue}>

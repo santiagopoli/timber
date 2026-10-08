@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { ArrowUpIcon, CheckIcon, ChevronDownIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon } from 'lucide-react';
 import { useStickToBottomContext } from 'use-stick-to-bottom';
@@ -10,6 +10,7 @@ import { Tool, ToolContent } from '@/components/ai-elements/tool';
 import { Confirmation, ConfirmationAction, ConfirmationActions } from '@/components/ai-elements/confirmation';
 import { Button } from '@/components/ui/button';
 import type { ChatApproval, ChatCallbacks, ChatModel, ChatConnection, MessageDelivery } from './chat-types';
+import {ActivityCode, ActivityOutput, activityIdentity, outputFormat} from './activity-content';
 import './chat.css';
 
 const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
@@ -231,28 +232,37 @@ function toolState(tool: ToolActivity, model: ActivityModel) {
 }
 
 function ToolActivityRow({tool, model, panel = false}: {tool: ToolActivity; model: ActivityModel; panel?: boolean}) {
-  const state = toolState(tool, model), presentation = toolPresentation(tool);
-  const Icon = state.running ? LoaderCircleIcon : state.failed ? CircleAlertIcon : state.pending ? ShieldCheckIcon : CheckIcon;
-  const output = typeof tool.result?.output === 'string' ? tool.result.output.trim() : '';
+  const [expanded, setExpanded] = useState(false), [detail, setDetail] = useState<'output'|'command'|'details'|null>(null);
+  const state = toolState(tool, model), presentation = toolPresentation(tool), input = toolInput(tool);
+  const command = presentation.command ? displayText(input.command) : '';
+  const identity = activityIdentity(tool.name, command), Icon = identity.Icon;
+  const StatusIcon = state.running ? LoaderCircleIcon : state.failed ? CircleAlertIcon : state.pending ? ShieldCheckIcon : CheckIcon;
+  const output = typeof tool.result?.output === 'string' ? tool.result.output : '';
   const error = tool.result?.error;
-  const preview = error || output || (tool.result?.artifactId ? 'Image captured' : tool.name === 'exec' && state.status === 'completed' ? 'No output' : '');
+  const format = useMemo(()=>outputFormat(output, tool.name, {path: input.path}), [output, tool.name, input.path]);
+  const preview = error || (tool.result?.artifactId ? 'Image captured' : tool.name === 'exec' && state.status === 'completed' && !output.trim() ? 'No output' : '');
   const operation = String(tool.data.operationId || tool.data.toolCallId || tool.key);
   const attributes = panel ? {'data-activity-tool-operation-id': operation} : {'data-tool-operation-id': operation};
-  return <details className={`timber-tool-row${state.failed ? ' timber-tool-error' : ''}`} {...attributes} data-tool-status={state.status}>
+  const statusLabel = `${state.text}${tool.result?.exitCode !== undefined ? ` · exit ${tool.result.exitCode}` : ''}`;
+  const tabs = [...(output ? ['output' as const] : []), ...(command ? ['command' as const] : []), 'details' as const];
+  const selected = detail && tabs.includes(detail) ? detail : tabs[0];
+  return <details className={`timber-tool-row${state.failed ? ' timber-tool-error' : ''}`} {...attributes} data-tool-status={state.status} onToggle={event=>setExpanded(event.currentTarget.open)}>
     <summary className="timber-tool-summary" title="Show full output and details">
-      <Icon className={`timber-tool-icon${state.running ? ' timber-spinner' : ''}`} aria-hidden="true" />
+      <span className="timber-tool-kind" title={identity.label} aria-label={identity.label}><Icon aria-hidden="true"/></span>
       <div className="timber-tool-overview">
-        <div className="timber-tool-heading"><span className={`timber-tool-command${presentation.command ? ' is-command' : ''}`}>{presentation.title}</span><span className="timber-tool-status" role="status">{state.text}{tool.result?.exitCode !== undefined ? ` · exit ${tool.result.exitCode}` : ''}</span></div>
-        {presentation.parameters && <div className="timber-tool-parameters">{presentation.parameters}</div>}
-        {preview && <div className={`timber-tool-preview${error ? tool.result?.status === 'completed' ? ' timber-save-warning' : ' timber-inline-error' : ''}`} data-tool-result-preview>{bounded(preview, 420)}</div>}
+        <div className={`timber-tool-command${presentation.command ? ' is-command' : ''}`}>{command ? <ActivityCode code={command} language="bash" compact/> : presentation.title}</div>
+        <div className="timber-tool-meta"><span className={state.pending || state.status === 'unconfirmed' ? 'timber-tool-parameters' : 'timber-sr-only'}>{statusLabel}</span>{tool.result?.exitCode !== undefined && tool.result.exitCode !== 0 && <span className="timber-tool-exit">exit {tool.result.exitCode}</span>}{presentation.parameters && <span className="timber-tool-parameters">{presentation.parameters}</span>}</div>
+        {preview ? <div className={`timber-tool-preview${error ? tool.result?.status === 'completed' ? ' timber-save-warning' : ' timber-inline-error' : ''}`} data-tool-result-preview>{bounded(preview,420)}</div> : output.trim() && <div className="timber-tool-preview" data-tool-result-preview><ActivityOutput format={format} compact/></div>}
       </div>
-      <ChevronDownIcon className="timber-tool-chevron" aria-hidden="true" />
+      <span className="timber-tool-corner"><span className="timber-tool-status" role="status" aria-label={statusLabel} title={statusLabel}><StatusIcon className={state.running ? 'timber-spinner' : ''} aria-hidden="true"/></span><ChevronDownIcon className="timber-tool-chevron" aria-hidden="true"/></span>
     </summary>
-    <div className="timber-tool-expanded">
-      {output && <div className="timber-tool-output"><span className="timber-tool-detail-label">Output</span><pre className="timber-action"><code>{tool.result?.output}</code></pre></div>}
+    {expanded && <div className="timber-tool-expanded">
+      <div className="timber-tool-tabs" role="group" aria-label="Action detail">{tabs.map(tab=><button type="button" key={tab} aria-pressed={selected===tab} onClick={()=>setDetail(tab)}>{tab==='details' ? 'Details' : tab==='command' ? 'Command' : 'Output'}</button>)}</div>
+      {selected === 'output' && <div className="timber-tool-output"><ActivityOutput format={format} source={output}/></div>}
+      {selected === 'command' && <ActivityCode code={command} language="bash"/>}
+      {selected === 'details' && <div className="timber-tool-data"><ActivityCode code={safeJSON(publicToolData(tool))} language="json"/></div>}
       {error && <p className={tool.result?.status === 'completed' ? 'timber-save-warning' : 'timber-inline-error'}>{error}</p>}
-      <span className="timber-tool-detail-label">Details</span><pre className="timber-action timber-tool-data"><code>{safeJSON(publicToolData(tool))}</code></pre>
-    </div>
+    </div>}
   </details>;
 }
 
