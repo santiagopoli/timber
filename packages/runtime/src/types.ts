@@ -86,8 +86,10 @@ export interface PiRuntimeOptions<Env extends object> {
   /** Wake the host's durable input outbox; attempts and backoff remain host-owned. */
   onAdmissionRetry?(operationId: string): Promise<void>;
   defaultModel?: string;
-  maxGenerations?: number;
-  maxToolCalls?: number;
+  /** Optional per-task cap; omitted, null or 0 means unlimited. Recovery does not reset it. */
+  maxGenerations?: number | null;
+  /** Optional independent tool cap; omitted, null or 0 means unlimited. */
+  maxToolCalls?: number | null;
 }
 
 /** Host-facing protocol. No Pi session IDs, native transcript or lifecycle types. */

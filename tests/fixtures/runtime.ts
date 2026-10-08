@@ -1,6 +1,7 @@
 /** Deterministic test adapter. Production never imports this file. */
 import type { PiRuntimeOptions, RuntimeMessage } from "../../packages/runtime/src/types";
 export const DEFAULT_MODEL = "@cf/test/mock";
+export { parseRuntimeLimit } from "../../packages/runtime/src/budget";
 export type { RuntimeEvent, RuntimeToolRequest } from "../../packages/runtime/src/types";
 
 type Result = {operationId: string; session: "1"; status: "done" | "unanswered"; text?: string; reason?: string};

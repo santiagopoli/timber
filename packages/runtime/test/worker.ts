@@ -10,6 +10,7 @@ export class HarnessProbe extends DurableObject {
   heldTool?: Promise<void>;
   releaseHeldTool?: () => void;
   heldInference?: Promise<void>;
+  releaseHeldInference?: () => void;
   holdInferenceAfterToolCount?: number;
   toolDelayMs?: number;
   toolFailure?: boolean;
@@ -23,10 +24,22 @@ export class HarnessProbe extends DurableObject {
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY,value TEXT)');
     this.runtime = createPiRuntime({
       owner: this, storage: ctx.storage, defaultModel: CF_MODEL,
+      maxGenerations: JSON.parse(this.setting('maxGenerations') ?? 'null'),
+      maxToolCalls: JSON.parse(this.setting('maxToolCalls') ?? 'null'),
       chatgpt: { fetch: async request => {
         const input = await request.json<{ input: Record<string, unknown>[] }>();
         const call = ctx.storage.sql.exec<{id:number}>('INSERT INTO calls(input) VALUES(?) RETURNING id', JSON.stringify({ ...input, fixtureUrl: request.url, fixtureHeaders: Object.fromEntries(request.headers) })).one();
-        if (input.input.filter(item => item.type === 'function_call_output').length === this.holdInferenceAfterToolCount) await this.heldInference;
+        if (input.input.filter(item => item.type === 'function_call_output').length === this.holdInferenceAfterToolCount) {
+          // Match a real fetch: cancellation must release a held provider request.
+          const signal = request.signal;
+          let rejectAbort!: (reason: unknown) => void;
+          const aborted = new Promise<never>((_resolve, reject) => {rejectAbort = reject;});
+          const onAbort = () => rejectAbort(signal.reason);
+          signal.addEventListener('abort', onAbort, {once:true});
+          if(signal.aborted)onAbort();
+          try {await Promise.race([this.heldInference, aborted]);}
+          finally {signal.removeEventListener('abort', onAbort);}
+        }
         return responsesFixture(input,call.id);
       } },
       ai: { run: async (_model: string, input: { messages: { role: string; content: unknown }[] }) => {

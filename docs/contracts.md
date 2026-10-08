@@ -21,6 +21,13 @@ that conversation. v1 is cloud-only; no iOS implementation in this milestone.
   token for an HttpOnly session cookie, then discards the token from JavaScript.
 - Cross-tenant design: deterministic owner identity "owner" after auth. Bot ids are
   server-generated UUIDs. Registry membership checked before any access.
+- Model/tool task-count budgets are opt-in Worker variables
+  `BOTSPACE_MAX_GENERATIONS` and `BOTSPACE_MAX_TOOL_CALLS`. Unset, empty or `0`
+  means uncapped; positive safe integers impose independent per-task caps.
+  Invalid values are rejected. Logical operation accounting persists across
+  recovery, even while uncapped; duplicate dispatch identities are counted once.
+  Timeouts, inference retries, response-size limits and cancellation remain
+  independent. Changing budgets neither resumes terminal runs nor replays tools.
 
 ## HTTP surface
 JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.

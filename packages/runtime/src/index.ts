@@ -10,32 +10,14 @@ import { createAI } from 'agents/models/pi-ai';
 import { classifyFailure, normalizeEntries, textContent, toolCompletion } from './normalize.js';
 import { computerToolOperationId, computerTools, hostTools, type ToolBridge } from './tools.js';
 import { CHATGPT_MODEL, chatgptModel, createChatGPTProvider } from './chatgpt.js';
+import { createBudget } from './budget.js';
 import type { AgentRuntime, RuntimePause, PiRuntimeOptions, RuntimeApprovalSummary, RuntimeEvent, RuntimeMessage, RuntimeOperation, RuntimeOperationResult, RuntimeReceipt } from './types.js';
 
 export type { AgentRuntime, RuntimeOperation, RuntimeOperationResult, RuntimeReceipt, RuntimePendingOperation, PendingApproval, PendingConnection, RuntimePause, HostToolDefinition, RuntimeHostToolRequest, PiRuntimeOptions, RuntimeEvent, RuntimeMessage, RuntimeToolRequest, RuntimeToolResult, RuntimeTools, RuntimeApprovalSummary, RuntimeApprovalContext } from './types.js';
 export { normalizeEntries, textContent } from './normalize.js';
+export { createBudget, parseRuntimeLimit } from './budget.js';
 export const DEFAULT_MODEL = CHATGPT_MODEL;
 const MODEL_RETRIES = 2;
-
-/** Durable budgets count logical tasks once, including after object eviction. */
-export function createBudget(storage: Pick<DurableObjectStorage, 'sql'>, limits: { generation: number; tool: number }) {
-  storage.sql.exec(`CREATE TABLE IF NOT EXISTS botspace_runtime_budget (
-    operation_id TEXT NOT NULL, kind TEXT NOT NULL, item_id TEXT NOT NULL,
-    PRIMARY KEY(operation_id, kind, item_id)
-  )`);
-  return (operationId: string, kind: 'generation' | 'tool', itemId: string): void => {
-    // These synchronous SQLite calls cannot interleave with a second invocation.
-    const existing = storage.sql.exec<{ found: number }>(
-      'SELECT 1 AS found FROM botspace_runtime_budget WHERE operation_id=? AND kind=? AND item_id=?', operationId, kind, itemId,
-    ).toArray().length > 0;
-    if (existing) return;
-    const count = storage.sql.exec<{ total: number }>(
-      'SELECT COUNT(*) AS total FROM botspace_runtime_budget WHERE operation_id=? AND kind=?', operationId, kind,
-    ).one().total;
-    if (count >= limits[kind]) throw new Error(`Run ${kind} budget exhausted`);
-    storage.sql.exec('INSERT INTO botspace_runtime_budget(operation_id,kind,item_id) VALUES(?,?,?)', operationId, kind, itemId);
-  };
-}
 
 export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<Env>): AgentRuntime {
   const ai = createAI({ binding: options.ai });
@@ -46,8 +28,8 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
     throw new Error('Unknown model: choose gpt-6.1-sol or an explicit @cf/ model');
   };
   const consume = createBudget(options.storage, {
-    generation: Math.min(Math.max(options.maxGenerations ?? 12, 1), 100),
-    tool: Math.min(Math.max(options.maxToolCalls ?? 24, 1), 200),
+    generation: options.maxGenerations,
+    tool: options.maxToolCalls,
   });
   options.storage.sql.exec('CREATE TABLE IF NOT EXISTS botspace_runtime_pauses (operation_id TEXT PRIMARY KEY, approval TEXT NOT NULL)');
   const paused = (operationId: string): RuntimePause | undefined => {

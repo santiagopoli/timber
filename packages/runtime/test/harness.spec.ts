@@ -2,10 +2,18 @@ import { env, exports } from 'cloudflare:workers';
 import { abortAllDurableObjects, reset, runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import type { HarnessProbe } from './worker.js';
+import { createBudget } from '../src/budget.js';
 let probeId: string;
 beforeEach(() => { probeId = crypto.randomUUID(); });
 const request = (path: string, input?: unknown) => exports.default.fetch(`https://test${path}`, { headers: { 'content-type': 'application/json', 'x-probe-id': probeId }, ...(input ? { method: 'POST', body: JSON.stringify(input) } : {}) });
 afterEach(async () => { await reset(); });
+async function configureLimits(limits: { maxGenerations?: number; maxToolCalls?: number }) {
+  const stub = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE.getByName(probeId);
+  await runInDurableObject(stub, (_instance, state) => {
+    for (const [key, value] of Object.entries(limits)) state.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)', key, JSON.stringify(value));
+  });
+  await abortAllDurableObjects();
+}
 it('retries a transient shutdown failure without reopening admission', async () => {
   const stub = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE.getByName(probeId);
   await request('/submit', { text: 'hello', operationId: 'before-deletion' });
@@ -64,6 +72,7 @@ it.each(['recover-empty-once','recover-incomplete-once','recover-stream-once'])(
   expect(events).toContainEqual(expect.objectContaining({type:'run.completed',operationId:'recover-result'}));
 });
 it('lets the model explain a reached tool budget instead of silently terminating on prior commentary',async()=>{
+  await configureLimits({maxToolCalls:24});
   await request('/submit',{text:'request-tool-budget',operationId:'tool-budget-answer',chatgpt:true});
   expect(await (await request('/wait?id=tool-budget-answer')).json()).toMatchObject({status:'done',kind:'final',text:'I reached the tool limit; 24 reads completed. Continue to inspect more files.'});
   const state=await (await request('/inspect')).json<{calls:{input:string}[];toolCalls:unknown[]}>();
@@ -274,11 +283,12 @@ it('pauses mixed tool rounds before another model request when one tool needs ap
   expect(state.messages.some(message => message.text.includes('pending_approval'))).toBe(true);
 });
 it('enforces a durable generation budget on an endlessly tool-calling model', async () => {
+  await configureLimits({maxGenerations:3});
   await request('/submit', { text: 'request-loop', operationId: 'loop-id' });
   const result = await (await request('/wait?id=loop-id')).json<{ status: string }>();
   expect(result.status).toBe('unanswered');
   const state = await (await request('/inspect')).json<{ calls: unknown[] }>();
-  expect(state.calls).toHaveLength(12);
+  expect(state.calls).toHaveLength(3);
 });
 
 it('projects a safe billing failure from a real provider error response', async () => {
@@ -365,11 +375,75 @@ it.each(['truncated-stream', 'incomplete-response', 'bad-namespace', 'output-lim
   expect(state.events.some(row => JSON.parse(row.event).type === 'tool.started')).toBe(false);
 });
 
-it('retains the 12-generation limit with ChatGPT subscription inference', async () => {
+it('honors an explicitly configured generation limit with ChatGPT subscription inference', async () => {
+  await configureLimits({maxGenerations:5});
   await request('/submit', { text: 'request-loop', operationId: 'chatgpt-loop', chatgpt: true });
   expect(await (await request('/wait?id=chatgpt-loop')).json()).toMatchObject({ status: 'unanswered' });
   const state = await (await request('/inspect')).json<{ calls: unknown[] }>();
-  expect(state.calls).toHaveLength(12);
+  expect(state.calls).toHaveLength(5);
+});
+
+it('finishes a long task beyond the old round/tool caps, including after a hard restart', async () => {
+  const namespace = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE;
+  const stub = namespace.getByName(probeId);
+  await runInDurableObject(stub, instance => {
+    instance.holdInferenceAfterToolCount = 26;
+    instance.heldInference = new Promise(() => {});
+  });
+  await request('/submit', {text: 'request-long-task', operationId: 'long-task', chatgpt: true});
+  await expect.poll(() => runInDurableObject(stub, (_instance, state) =>
+    state.storage.sql.exec('SELECT id FROM tool_calls').toArray().length,
+  ), {timeout: 10_000}).toBe(26);
+  await abortAllDurableObjects();
+  expect(await (await request('/wait?id=long-task')).json()).toMatchObject({status:'done',kind:'final',text:'Completed 60 file reads over 30 tool rounds.'});
+  const result = await (await request('/inspect')).json<{toolCalls:{input:string}[];messages:{role:string;kind?:string}[]}>();
+  expect(result.toolCalls).toHaveLength(60);
+  expect(new Set(result.toolCalls.map(row=>JSON.parse(row.input).operationId)).size).toBe(60);
+  expect(result.messages.filter(message=>message.role==='assistant' && message.kind==='final')).toHaveLength(1);
+  await runInDurableObject(namespace.getByName(probeId), (_instance, state) => {
+    expect(state.storage.sql.exec("SELECT item_id FROM botspace_runtime_budget WHERE operation_id='long-task' AND kind='generation'").toArray()).toHaveLength(31);
+  });
+});
+
+it('still cancels an uncapped task after it has passed the former limits', async () => {
+  const stub = (env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+  await runInDurableObject(stub, instance => {
+    instance.holdInferenceAfterToolCount = 26;
+    instance.heldInference = new Promise(resolve => {instance.releaseHeldInference = resolve;});
+  });
+  await request('/submit',{text:'request-loop',operationId:'cancel-uncapped',chatgpt:true});
+  await expect.poll(()=>runInDurableObject(stub,(_instance,state)=>
+    state.storage.sql.exec('SELECT id FROM calls').toArray().length,
+  ),{timeout:10_000}).toBe(27);
+  await runInDurableObject(stub,async instance=>{
+    try {expect(await instance.runtime.cancel('cancel-uncapped')).toBe(true);}
+    finally {instance.releaseHeldInference?.();}
+  });
+  expect(await (await request('/wait?id=cancel-uncapped')).json()).toMatchObject({status:'unanswered'});
+  const result=await (await request('/inspect')).json<{toolCalls:unknown[];calls:unknown[]}>();
+  expect(result.toolCalls).toHaveLength(26);
+  expect(result.calls).toHaveLength(27);
+});
+
+it('preserves accounting without caps and enforces later explicit caps after restart', async () => {
+  const namespace = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE;
+  await runInDurableObject(namespace.getByName(probeId), (_instance, state) => {
+    const consume = createBudget(state.storage);
+    for(let i=0;i<130;i++)consume('accounted-task','generation',`generation-${i}`);
+    for(let i=0;i<260;i++)consume('accounted-task','tool',`tool-${i}`);
+  });
+  await abortAllDurableObjects();
+  await runInDurableObject(namespace.getByName(probeId), (_instance, state) => {
+    const consume = createBudget(state.storage,{generation:130,tool:260});
+    expect(()=>consume('accounted-task','generation','generation-129')).not.toThrow();
+    expect(()=>consume('accounted-task','tool','tool-259')).not.toThrow();
+    expect(()=>consume('accounted-task','generation','generation-130')).toThrow('generation budget exhausted');
+    expect(()=>consume('accounted-task','tool','tool-260')).toThrow('tool budget exhausted');
+    expect(()=>consume('another-task','generation','generation-130')).not.toThrow();
+    const uncappedTools = createBudget(state.storage,{generation:130,tool:0});
+    expect(()=>uncappedTools('accounted-task','tool','tool-260')).not.toThrow();
+    expect(()=>uncappedTools('accounted-task','generation','generation-130')).toThrow('generation budget exhausted');
+  });
 });
 
 function developerText(wire: string): string {

@@ -44,14 +44,21 @@ not block fresh user submissions. Generic `call_tool` invocations are always
 unsafe and sequential for crash recovery, including when the selected host tool
 is a read; host operation IDs remain the authority for any effect reconciliation.
 
-Budgets are persistent and enforced before provider dispatch: 12 logical agent
-generations, 24 tool invocations, and up to two inference retries. Workers AI
-requests use at most 4096 output tokens. ChatGPT forbids `max_output_tokens`, so
+Task-count budgets are optional: `maxGenerations` and `maxToolCalls` default to
+uncapped, and `null`/`0` also disable them. Positive safe integers configure an
+independent cap without a hidden clamp. The API exposes them as Worker variables
+`BOTSPACE_MAX_GENERATIONS` and `BOTSPACE_MAX_TOOL_CALLS`; malformed settings fail
+explicitly. Accounting stays persistent even while uncapped, and enforcement
+happens before provider/tool dispatch. Recovery reuses each logical task identity,
+so an object restart or inference retry cannot reset or double-charge its budget.
+These are host policy controls, not limits required by Pi Durable.
+
+Individual operations retain up to two inference retries and bounded time/output.
+Workers AI requests use at most 4096 output tokens. ChatGPT forbids `max_output_tokens`, so
 its adapter aborts locally at 65,536 generated characters and the harness applies
 a 120-second stream timeout. This is a local safety cap, not an exact token or
 cost ceiling. Incomplete and truncated responses are failures, including usage
-errors arriving after text has streamed. Retries/recovery of one logical task
-retain its budget identity. Text-only models receive an explicit error before a
+errors arriving after text has streamed. Text-only models receive an explicit error before a
 model-initiated screenshot dispatch; direct human screenshot access is separate.
 
 ## Verification
@@ -65,7 +72,8 @@ SQLite in workerd. Only the external Workers AI / ChatGPT inference transport is
 a fixture. They cover named instructions and both streaming protocols, allowed
 subscription request fields, credential isolation, namespaced tool and screenshot
 roundtrips, input deduplication after a hard object restart, approval and connection pauses,
-output limits, incomplete streams, usage failures, and model-loop budgets.
+output limits, incomplete streams, usage failures, optional model-loop budgets,
+and tasks exceeding the former count caps across a hard restart.
 
 Protocol references: [ChatGPT inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)
 and [preview requirements](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations).

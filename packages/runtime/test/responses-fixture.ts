@@ -6,7 +6,8 @@ export function responsesFixture(payload: { input: Record<string, unknown>[] }, 
   const user = payload.input[userIndex];
   const text = JSON.stringify(user);
   if (text.includes('request-multistep-recovery')) return multistepResponse(payload.input.slice(userIndex + 1));
-  if (text.includes('request-tool-budget')) return multistepResponse(payload.input.slice(userIndex + 1),true);
+  if (text.includes('request-tool-budget')) return multistepResponse(payload.input.slice(userIndex + 1),'budget');
+  if (text.includes('request-long-task')) return multistepResponse(payload.input.slice(userIndex + 1),'long');
   const hasToolOutput = payload.input.slice(userIndex + 1).some(item => item.type === 'function_call_output');
   if (hasToolOutput && (text.includes('empty-final-after-exec') || text.includes('recover-empty-once') && requestNumber === 2)) {
     const item = { type: 'reasoning', id: 'rs_empty_final', summary: [{ type: 'summary_text', text: 'Private fixture reasoning must remain hidden.' }], encrypted_content: 'synthetic-fixture-ciphertext' };
@@ -48,16 +49,17 @@ export function responsesFixture(payload: { input: Record<string, unknown>[] }, 
 }
 
 /** Several tool rounds with commentary/reasoning and distinct composite call IDs. */
-function multistepResponse(history: Record<string, unknown>[], budget = false): Response {
+function multistepResponse(history: Record<string, unknown>[], mode: 'recovery' | 'budget' | 'long' = 'recovery'): Response {
   const completed = history.filter(item => item.type === 'function_call_output').length;
-  const round = completed === 0 ? 0 : completed === 2 ? 1 : completed === 3 ? 2 : 3;
-  const calls = budget ? completed ? [] : Array.from({length:25},(_,index)=>({name:'read_file',args:{path:`file-${index}.txt`}})) : round === 0
+  const round = mode === 'long' ? completed / 2 : completed === 0 ? 0 : completed === 2 ? 1 : completed === 3 ? 2 : 3;
+  const calls = mode === 'long' ? completed < 60 ? [0,1].map(index=>({name:'read_file',args:{path:`file-${completed+index}.txt`}})) : []
+    : mode === 'budget' ? completed ? [] : Array.from({length:25},(_,index)=>({name:'read_file',args:{path:`file-${index}.txt`}})) : round === 0
     ? [{ name: 'exec', args: { command: 'printf fixture-one' } }, { name: 'exec', args: { command: 'printf fixture-two' } }]
     : round === 1 ? [{ name: 'browser_navigate', args: { url: 'https://example.test/fixture' } }]
     : round === 2 ? [{ name: 'desktop_screenshot', args: {} }] : [];
   const items: Record<string, unknown>[] = [
     { type: 'reasoning', id: `rs_multistep_${round}`, summary: [], encrypted_content: 'synthetic-fixture-ciphertext' },
-    { type: 'message', id: `msg_multistep_${round}`, role: 'assistant', status: 'completed', phase: calls.length ? 'commentary' : 'final_answer', content: [{ type: 'output_text', text: calls.length ? `Working on fixture round ${round + 1}.` : budget ? 'I reached the tool limit; 24 reads completed. Continue to inspect more files.' : 'Completed both commands, opened the page, and checked the screenshot.', annotations: [] }] },
+    { type: 'message', id: `msg_multistep_${round}`, role: 'assistant', status: 'completed', phase: calls.length ? 'commentary' : 'final_answer', content: [{ type: 'output_text', text: calls.length ? `Working on fixture round ${round + 1}.` : mode === 'long' ? 'Completed 60 file reads over 30 tool rounds.' : mode === 'budget' ? 'I reached the tool limit; 24 reads completed. Continue to inspect more files.' : 'Completed both commands, opened the page, and checked the screenshot.', annotations: [] }] },
     ...calls.map((call, index) => ({ type: 'function_call', id: `fc_multistep_${round}_${index}`, call_id: `call_multistep_${round}_${index}`, name: call.name, namespace: TOOL_NAMESPACE, arguments: JSON.stringify(call.args), status: 'completed' })),
   ];
   const response = { id: `resp_multistep_${round}`, object: 'response', status: 'completed', output: items, usage: { input_tokens: 20, output_tokens: 15, total_tokens: 35, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 4 } } };

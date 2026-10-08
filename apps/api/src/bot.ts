@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Approval, Bot, BotEvent, ComputerAction, ComputerResult, ComputerStatus, ConnectionRequest, Message, Run, RunPage, RunStatus } from "@botspace/contracts";
 import { createCloudComputerProvider, touchCloudComputer, suspendCloudComputer, deleteCloudComputer, ComputerProviderError } from "@botspace/computer";
-import { createPiRuntime, type AgentRuntime, type RuntimeApprovalContext, type RuntimeApprovalSummary, type RuntimeToolResult, type RuntimeHostToolRequest } from "@botspace/runtime";
+import { createPiRuntime, parseRuntimeLimit, type AgentRuntime, type RuntimeApprovalContext, type RuntimeApprovalSummary, type RuntimeToolResult, type RuntimeHostToolRequest } from "@botspace/runtime";
 import { hostTools, validateHostArguments, githubDevelopmentSkill, workspaceAppsSkill } from "./host-tools";
 import { WorkspaceApps } from "./workspace-apps";
 import { computerActivityInput, hostActivityInput } from "./tool-activity";
@@ -64,6 +64,8 @@ export class BotDO extends DurableObject<Env> {
       owner:this,
       storage:ctx.storage,
       ai:env.AI,
+      maxGenerations:parseRuntimeLimit(env.BOTSPACE_MAX_GENERATIONS,"BOTSPACE_MAX_GENERATIONS"),
+      maxToolCalls:parseRuntimeLimit(env.BOTSPACE_MAX_TOOL_CALLS,"BOTSPACE_MAX_TOOL_CALLS"),
       ...(env.CHATGPT?{chatgpt:{fetch:async(request:Request)=>{
         const url=new URL(request.url);
         if(url.href!=="https://api.openai.com/v1/responses" || request.method!=="POST") throw new Error("Unsupported ChatGPT inference route");

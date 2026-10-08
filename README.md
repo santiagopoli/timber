@@ -33,7 +33,7 @@ other engines can implement these boundaries without changing bot identity.
   explicit verification and disconnection. No automatic paid-model fallback.
 - One lazy cloud computer per bot, reused across tool calls: terminal, files,
   Chromium, screenshots, mouse, keyboard and scrolling.
-- Persisted approvals for model-initiated effects, bounded loops and operation IDs
+- Persisted approvals for model-initiated effects, optional task budgets and operation IDs
   that prevent a repeated request from executing a completed action twice.
 - Workspace checkpoints in R2, restore on cold start, explicit suspend and idle stop.
 - Protected API, developer console and CLI smoke tests.
@@ -113,6 +113,37 @@ yet. Live desktop viewing/control and a Files/Git explorer are available in the
 browser console. It is a test client, not the intended
 product interface. Packages and environment variables retain the internal
 `@botspace/*` and `BOTSPACE_*` names.
+
+## Task execution limits
+
+By default, a task has no fixed model-round or tool-call count limit. It can
+continue until the agent answers, the user stops it, a host approval/connection
+is needed, or an actual operation/provider failure ends the run. The old 12-round
+and 24-tool MVP caps were Timber policy, not a Pi Durable requirement.
+
+An operator can opt into independent per-task limits using Worker variables:
+
+| Variable | Default | Optional value |
+| --- | --- | --- |
+| `BOTSPACE_MAX_GENERATIONS` | Unset: no count cap | Positive integer model-generation count; `0` disables |
+| `BOTSPACE_MAX_TOOL_CALLS` | Unset: no count cap | Positive integer tool-call count; `0` disables |
+
+These are deployment settings, not per-bot console controls. Invalid values are
+rejected instead of silently changing the budget. Accounting survives object
+restarts, including when a cap is enabled later; replaying an already recorded
+logical operation does not count it again. There is no hidden 100/200 clamp.
+Budget exhaustion does not automatically restart or replay the task.
+
+Individual operations remain bounded: two retries for transient inference
+failures, a 120-second model stream timeout, the existing response-size cap, and
+a 120-second maximum for a finite `exec`. Provider allowance limits still apply.
+The console's Stop action remains available while the task is running.
+
+This policy follows the opt-in task-count limits documented by
+[OpenCode](https://opencode.ai/docs/agents/#max-steps),
+[Claude Code](https://code.claude.com/docs/en/cli-reference), and
+[Hermes](https://hermes-agent.nousresearch.com/docs/user-guide/configuration)
+(checked 2026-10-08), while preserving Pi's operation-level controls.
 
 ## Run the tests
 

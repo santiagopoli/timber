@@ -12,4 +12,7 @@ export interface Env {
   ASSETS?: Fetcher;
   BOTSPACE_API_TOKEN?: string;
   BOTSPACE_DEFAULT_MODEL?: string;
+  /** Optional per-task budgets. Unset or 0 leaves the task count uncapped. */
+  BOTSPACE_MAX_GENERATIONS?: string;
+  BOTSPACE_MAX_TOOL_CALLS?: string;
 }
