@@ -2,6 +2,7 @@ import './src/styles.css';
 import { mountChat, mountToolActivity } from './src/chat.tsx';
 import { createDesktopViewer } from './src/desktop.ts';
 import { mountWorkspaceExplorer } from './src/workspace.tsx';
+import './src/layout.css';
 
 (() => {
   'use strict';
@@ -12,7 +13,14 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   const drafts = new Map(), pendingMessages = new Map(), pendingActions = new Map(), computerPending = new Map(), stopping = new Set(), approvalWork = new Map(), approvalFeedback = new Map(), connectionWork = new Map(), appWork = new Map();
   let authenticated = false, bots = [], selected = null, currentRun = null, generation = 0, authSession = 0;
   let sessionController = new AbortController(), streamController, refreshTimer, progressTimer, computerStatusTimer;
-  let computerStatusRequest = 0, currentPanel = 'conversation', computerExpanded = false;
+  let computerStatusRequest = 0, currentPanel = 'conversation', workspaceExpanded = false, desktopFullscreen = false;
+  const wideLayout = matchMedia('(min-width: 761px)'), tabletLayout = matchMedia('(max-width: 1099px)');
+  const panelNames = ['conversation', 'computer', 'files', 'apps', 'runs', 'activity'];
+  let preferences = {};
+  try {preferences = JSON.parse(localStorage.getItem('timber.layout') || '{}') || {};} catch {}
+  let botsCollapsed = typeof preferences.botsCollapsed === 'boolean' ? preferences.botsCollapsed : tabletLayout.matches;
+  let lastWorkspacePanel = panelNames.includes(preferences.workspacePanel) && preferences.workspacePanel !== 'conversation' ? preferences.workspacePanel : 'computer';
+  const saveLayout = () => {preferences = {botsCollapsed, workspacePanel: lastWorkspacePanel, workspaceOpen: currentPanel !== 'conversation'}; try {localStorage.setItem('timber.layout', JSON.stringify(preferences));} catch {}};
   let messages = [], approvals = [], connections = [], workspaceApps = [], connectionsRequest = 0, appsRequest = 0, runs = new Map(), activeRunIds = new Set(), nextCursor = null, olderPagesLoaded = false, loadingOlderRuns = false, runFilter = null, runRevision = 0, runsRequest = 0, messagesRequest = 0, approvalsRequest = 0;
   let cursor = 0, boundary = '', events = [], streamDrafts = new Map(), chatLoading = false, focusApproval = 0, screenUrl = null, artifact = null, directoryPath = '.';
   let chatGPTConnected = false, chatGPTBusy = false, chatGPTAccount = null, editBotId = null, deleteTarget = null, deleteBusy = false, sendBusy = new Set();
@@ -39,11 +47,12 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
     onClearFilter: () => { runFilter = null; renderMessages(); },
     onStop: (botId, runId) => { if (selected?.id === botId) void guarded(() => cancelRun(runId)); },
     onConnect: (botId, requestId) => { if (selected?.id === botId) void connectGitHub(botId, requestId); },
-  });
+  }, () => {void desktop.exitFullscreen().then(() => {workspaceExpanded = false; showPanel('conversation');});});
   const activity = mountToolActivity($('activity-tools'));
   const desktopSessions = new Map();
   const desktop = createDesktopViewer({
     element: $('desktop-root'),
+    onFullscreen(value) {desktopFullscreen = value; syncChatDock();},
     async connect(mode, replaces) {
       const id = selected?.id, version = generation;
       if (!id || !authenticated) throw new Error('Select a bot first.');
@@ -108,7 +117,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
     selected = null; currentRun = null; bots = []; messages = []; approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
     removedBots.clear(); deletionPending.clear(); deleteTarget = null; deleteBusy = false; editBotId = null; drafts.clear(); pendingMessages.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); connectionWork.clear(); appWork.clear(); closeDialogs(); clearScreen();
     chatGPTConnected = false; chatGPTAccount = null; chatGPTBusy = false;
-    chat.clear(); activity.clear();
+    chat.clear(); activity.clear(); $('toggle-bots').hidden = true;
     for (const id of ['activity-list', 'bot-list', 'run-list', 'file-list', 'workspace-app-list']) $(id).replaceChildren();
     for (const id of ['token', 'type-text', 'exec-command', 'navigate-url', 'key-name', 'file-content', 'bot-search']) $(id).value = '';
     $('create-form').reset(); $('edit-form').reset(); $('delete-error').textContent = ''; $('delete-form').reset(); renderDeleteControls(); $('file-path').value = '.'; $('computer-result').textContent = 'No actions yet.';
@@ -142,6 +151,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   async function selectBot(bot, {replace = false} = {}) {
     if (removedBots.has(bot.id)) return;
     document.body.dataset.mobileView = 'bot';
+    if (wideLayout.matches && tabletLayout.matches) {botsCollapsed = true; renderLayout();}
     if (selected?.id === bot.id) {
       history[replace ? 'replaceState' : 'pushState'](null, '', `${location.pathname}${location.search}#bot=${encodeURIComponent(bot.id)}`);
       if (!$('panel-computer').hidden) {desktop.setActive(true); void guarded(computerStatus);}
@@ -675,22 +685,58 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
       } else $('delete-error').textContent = `${errorText(error)} Deletion was not confirmed. Nothing was retried automatically.`;
     } finally {if (session === authSession) {deleteBusy = false; renderDeleteControls();}}
   }
-  function showPanel(name, focus = false) {
-    currentPanel = name;
-    const docked = name === 'computer' && matchMedia('(min-width: 1024px)').matches && !computerExpanded;
-    if ($('workspace-panels')) $('workspace-panels').dataset.computerDocked = String(docked);
-    if ($('expand-computer')) {$('expand-computer').setAttribute('aria-label', computerExpanded ? 'Dock computer' : 'Expand computer'); $('expand-computer').title = computerExpanded ? 'Dock computer' : 'Expand computer'; $('expand-computer').dataset.expanded = String(computerExpanded);}
-    if ($('panel-menu')) {$('panel-menu').open = false; $('panel-menu').dataset.active = String(['runs', 'activity'].includes(name));}
-    for (const button of document.querySelectorAll('[data-panel]')) { const active = button.dataset.panel === name; button.classList.toggle('active', active); if (active) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current'); button.tabIndex = 0; $(`panel-${button.dataset.panel}`).hidden = !(active || (docked && button.dataset.panel === 'conversation')); }
-    if ($('current-panel')) {$('current-panel').textContent = ({computer: 'Computer', files: 'Files', apps: 'Apps', runs: 'Runs', activity: 'Activity'})[name] || ''; $('current-panel').hidden = name === 'conversation' || docked;}
-    if ($('back-to-chat')) $('back-to-chat').hidden = name === 'conversation' || docked;
-    if (focus) $('more-panels')?.focus();
-    desktop.setActive(name === 'computer');
-    if (name === 'files' && selected) workspace.setBot(selected.id);
-    else workspace.clear();
-    if (name !== 'computer') stopComputerStatus();
-    if (name === 'computer' && selected) void guarded(computerStatus); if (name === 'runs' && selected) void guarded(() => loadRuns()); if (name === 'apps' && selected) void guarded(() => loadApps());
+  function syncChatDock() {
+    const docked = desktopFullscreen || (workspaceExpanded && currentPanel === 'computer');
+    $('desktop-root').dataset.expanded = String(docked);
+    chat.setDock(docked ? $('desktop-chat-dock') : null);
   }
+  function renderLayout() {
+    $('app').dataset.botsCollapsed = String(botsCollapsed);
+    $('toggle-bots').setAttribute('aria-expanded', String(!botsCollapsed));
+    $('toggle-bots').setAttribute('aria-label', botsCollapsed ? 'Show conversations' : 'Hide conversations');
+    $('sidebar-scrim').hidden = botsCollapsed || !wideLayout.matches || !tabletLayout.matches;
+    $('bot-sidebar').inert = wideLayout.matches && botsCollapsed;
+    const open = currentPanel !== 'conversation', docked = open && wideLayout.matches && !workspaceExpanded;
+    $('workspace-panels').dataset.workspaceDocked = String(docked);
+    $('workspace-panels').dataset.computerDocked = String(docked && currentPanel === 'computer');
+    $('workspace-sidebar').hidden = !open;
+    $('workspace-sidebar').dataset.expanded = String(workspaceExpanded);
+    $('toggle-workspace').setAttribute('aria-expanded', String(open));
+    $('toggle-workspace').setAttribute('aria-label', open ? 'Hide workspace' : 'Show workspace');
+    $('toggle-workspace').title = open ? 'Hide workspace' : 'Show workspace';
+    $('expand-workspace').setAttribute('aria-label', workspaceExpanded ? 'Dock workspace' : 'Expand workspace');
+    $('expand-workspace').title = workspaceExpanded ? 'Dock workspace' : 'Expand workspace';
+    $('expand-workspace').setAttribute('aria-pressed', String(workspaceExpanded));
+    for (const name of panelNames) $(`panel-${name}`).hidden = name === 'conversation' ? open && !docked : name !== currentPanel;
+    for (const button of document.querySelectorAll('[data-panel]')) {
+      const active = button.dataset.panel === currentPanel;
+      button.classList.toggle('active', active);
+      if (active) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current');
+    }
+    $('more-panels').setAttribute('aria-label', wideLayout.matches ? 'More options' : 'Open workspace');
+    $('more-panels').title = wideLayout.matches ? 'More options' : 'Open workspace';
+    $('current-panel').textContent = ({computer:'Computer',files:'Files',apps:'Apps',runs:'Runs',activity:'Activity'})[currentPanel] || '';
+    $('current-panel').hidden = !open || docked;
+    $('back-to-chat').hidden = !open || docked;
+    desktop.setActive(currentPanel === 'computer');
+    syncChatDock();
+  }
+  function showPanel(name, focus = false) {
+    if (!panelNames.includes(name)) return;
+    currentPanel = name;
+    if (name !== 'conversation') lastWorkspacePanel = name;
+    else workspaceExpanded = false;
+    $('panel-menu').open = false;
+    $('panel-menu').dataset.active = String(['runs', 'activity'].includes(name));
+    renderLayout(); saveLayout();
+    if (focus) $('more-panels').focus();
+    if (name === 'files' && selected) workspace.setBot(selected.id);
+    if (name !== 'computer') stopComputerStatus();
+    if (name === 'computer' && selected) void guarded(computerStatus);
+    if (name === 'runs' && selected) void guarded(() => loadRuns());
+    if (name === 'apps' && selected) void guarded(() => loadApps());
+  }
+  function toggleBots() {botsCollapsed = !botsCollapsed; renderLayout(); saveLayout();}
   function bindForm(id, fn) { $(id).addEventListener('submit', (event) => { event.preventDefault(); void guarded(fn); }); }
   function openCreate() { $('create-error').textContent = ''; $('bot-dialog').showModal(); $('bot-name').focus(); }
   for (const id of ['new-bot', 'empty-new-bot']) $(id).addEventListener('click', openCreate);
@@ -707,13 +753,15 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   async function openSession() {
     authenticated = true; sessionController = new AbortController();
     await loadBots();
+    $('toggle-bots').hidden = false;
     $('token').value = ''; $('login').hidden = true; $('app').hidden = false; $('disconnect').hidden = false; $('settings-button').hidden = false;
     document.body.dataset.authenticated = 'true';
     $('connection').textContent = 'Connected'; $('empty').hidden = false; $('bot-workspace').hidden = true;
     void chatGPTTask(loadChatGPT);
     const bot = bots.find(item => item.id === chosenHash()) || (!matchMedia('(max-width: 760px)').matches ? bots[0] : null);
     if (bot) await guarded(() => selectBot(bot, {replace: true}));
-    else showBotList(false);
+    else {botsCollapsed = false; showBotList(false);}
+    showPanel(preferences.workspaceOpen === true && wideLayout.matches ? lastWorkspacePanel : 'conversation');
   }
   function showBotList(updateHistory = true) {
     document.body.dataset.mobileView = 'bots';
@@ -751,11 +799,19 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   $('mobile-back')?.addEventListener('click', () => showBotList());
   $('mobile-account')?.addEventListener('click', () => $('settings-button').click());
   $('back-to-chat')?.addEventListener('click', () => showPanel('conversation'));
-  $('close-computer')?.addEventListener('click', () => {desktop.disconnect(); computerExpanded = false; showPanel('conversation');});
-  $('expand-computer')?.addEventListener('click', () => {computerExpanded = !computerExpanded; showPanel('computer');});
-  matchMedia('(min-width: 1024px)').addEventListener('change', () => {if (currentPanel === 'computer') showPanel('computer');});
+  $('toggle-bots').addEventListener('click', toggleBots);
+  $('sidebar-scrim').addEventListener('click', toggleBots);
+  $('toggle-workspace').addEventListener('click', () => showPanel(currentPanel === 'conversation' ? lastWorkspacePanel : 'conversation'));
+  $('close-workspace').addEventListener('click', () => {showPanel('conversation'); $('toggle-workspace').focus();});
+  $('expand-workspace').addEventListener('click', () => {workspaceExpanded = !workspaceExpanded; renderLayout();});
+  wideLayout.addEventListener('change', () => {workspaceExpanded = false; renderLayout();});
+  tabletLayout.addEventListener('change', renderLayout);
   document.addEventListener('click', event => {const menu = $('panel-menu'); if (menu?.open && !menu.contains(event.target)) menu.open = false;});
-  document.addEventListener('keydown', event => {if (event.key === 'Escape' && $('panel-menu')?.open) {$('panel-menu').open = false; $('more-panels').focus();}});
+  document.addEventListener('keydown', event => {
+    if (event.key !== 'Escape') return;
+    if ($('panel-menu').open) {$('panel-menu').open = false; $('more-panels').focus();}
+    else if (wideLayout.matches && tabletLayout.matches && !botsCollapsed && !document.querySelector('dialog[open]')) {toggleBots(); $('toggle-bots').focus();}
+  });
   $('create-form').addEventListener('submit', async (event) => {
     event.preventDefault(); const button = event.submitter || event.currentTarget.querySelector('[type=submit]'); button.disabled = true; $('create-error').textContent = '';
     try { const { bot } = await request('/v1/bots', { method: 'POST', body: { name: $('bot-name').value.trim(), instructions: $('bot-instructions').value.trim(), model: $('bot-model').value, computerApprovalMode: $('bot-computer-approval-mode').value } }); $('create-form').reset(); $('bot-dialog').close(); $('bot-search').value = ''; bots = [bot, ...bots.filter((item) => item.id !== bot.id)]; renderBots(); await guarded(() => selectBot(bot)); }
@@ -775,7 +831,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   $('refresh-runs').addEventListener('click', () => guarded(() => loadRuns())); $('load-more-runs').addEventListener('click', () => guarded(() => loadRuns(generation, true)));
   $('approval-shortcut').addEventListener('click', () => { runFilter = null; focusApproval++; showPanel('conversation'); renderMessages(); });
   const tabs = [...document.querySelectorAll('[data-panel]')];
-  tabs.forEach((button, index) => {button.addEventListener('click', () => showPanel(button.dataset.panel)); button.addEventListener('keydown', event => {let next; if (event.key === 'ArrowDown') next = (index + 1) % tabs.length; if (event.key === 'ArrowUp') next = (index + tabs.length - 1) % tabs.length; if (event.key === 'Home') next = 0; if (event.key === 'End') next = tabs.length - 1; if (next !== undefined) {event.preventDefault(); tabs[next].focus();}});});
+  tabs.forEach((button, index) => {button.addEventListener('click', () => showPanel(button.dataset.panel)); button.addEventListener('keydown', event => {if (!button.closest('#panel-menu')) return; const menuTabs = tabs.filter(tab => tab.closest('#panel-menu')); index = menuTabs.indexOf(button); let next; if (event.key === 'ArrowDown') next = (index + 1) % menuTabs.length; if (event.key === 'ArrowUp') next = (index + menuTabs.length - 1) % menuTabs.length; if (event.key === 'Home') next = 0; if (event.key === 'End') next = menuTabs.length - 1; if (next !== undefined) {event.preventDefault(); menuTabs[next].focus();}});});
   $('refresh-history').addEventListener('click', () => guarded(() => Promise.all([loadMessages(), loadRuns(), loadApprovals(), loadConnections(), loadApps()]))); $('reconnect-stream').addEventListener('click', startStream);
   $('refresh-computer').addEventListener('click', () => guarded(computerStatus)); $('take-screenshot').addEventListener('click', () => guarded(() => computerAction({ type: 'screenshot' })));
   $('checkpoint').addEventListener('click', () => guarded(() => computerAction({ type: 'checkpoint' }))); $('suspend-computer').addEventListener('click', () => guarded(suspendComputer));

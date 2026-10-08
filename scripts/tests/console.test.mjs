@@ -832,7 +832,7 @@ test('restores older active runs, ignores stale SSE and retains pagination throu
 test('approval navigation works across panels and hides secure typing text', async () => {
   await withPage(async ({page, login, state}) => {
     const approval = {id: '30000000-0000-4000-8000-000000000001', botId: BOT_A, runId: 'pending', status: 'pending', action: {type: 'type', text: 'test-only-sensitive-input'}, expiresAt: new Date(Date.now() + 3600000).toISOString()};
-    state.approvals.set(BOT_A, [approval]); await login(); await openPanel(page, 'computer'); await page.locator('#close-computer').click();
+    state.approvals.set(BOT_A, [approval]); await login(); await openPanel(page, 'computer'); await page.locator('#close-workspace').click();
     assert.equal(await page.locator('#panel-conversation').isVisible(), true); assert.equal((await page.locator('#messages').innerText()).includes(approval.action.text), false);
     await page.locator('#messages').getByRole('button', {name: 'Deny', exact: true}).click(); await page.locator('#approval-shortcut').waitFor({state: 'hidden'}); assert.equal(approval.status, 'denied');
   });
@@ -916,7 +916,7 @@ test('timeline ties preserve user request, approval, then answer and retain a re
     state.emit(BOT_A, 'approval.updated', {approval}, approval.runId);
     await page.waitForResponse(response => response.url().endsWith('/approvals'));
     await page.waitForFunction(expected => document.querySelector('#messages').scrollTop === expected, before);
-    await openPanel(page, 'computer'); await page.locator('#close-computer').click();
+    await openPanel(page, 'computer'); await page.locator('#close-workspace').click();
     await page.waitForFunction(expected => document.querySelector('#messages').scrollTop === expected, before);
   });
 });
@@ -1371,4 +1371,36 @@ test('mobile composer remains visible with a short keyboard-sized viewport and l
     await sendMessage(page);
     assert.equal(sentMessages(state, BOT_A).length, 1);
   }, {viewport: {width: 390, height: 844}, isMobile: true, hasTouch: true, colorScheme: 'dark'});
+});
+
+for (const viewport of [{width:1440,height:1000},{width:1024,height:768},{width:820,height:1180},{width:768,height:1024}]) test(`conversation and workspace remain usable together at ${viewport.width}px`, async()=>{
+  await withPage(async({page,login})=>{
+    await login();
+    await page.locator('#message').fill('Keep this draft while browsing');
+    await page.locator('#toggle-workspace').click();
+    await page.locator('#panel-computer').waitFor({state:'visible'});
+    const chat=await page.locator('#panel-conversation').boundingBox(),right=await page.locator('#workspace-sidebar').boundingBox();
+    assert.ok(chat.width>=360 && right.width>=320 && chat.x+chat.width<=right.x+1,'chat and workspace fit side by side');
+    await page.locator('.inspector-tabs [data-panel="apps"]').click();
+    assert.equal(await page.locator('#panel-conversation').isVisible(),true);
+    assert.equal(await page.locator('#panel-apps').isVisible(),true);
+    assert.equal(await page.locator('#message').inputValue(),'Keep this draft while browsing');
+    if(await page.locator('#bot-sidebar').isVisible()) await page.locator('#toggle-bots').click();
+    assert.equal(await page.locator('#bot-sidebar').isVisible(),false);
+    await page.locator('#toggle-bots').click();
+    assert.equal(await page.locator('#bot-sidebar').isVisible(),true);
+    if(viewport.width<1100){await page.locator('#sidebar-scrim').click({position:{x:viewport.width-50,y:70}});}
+    else await page.locator('#toggle-bots').click();
+    assert.equal(await page.locator('#panel-apps').isVisible(),true);
+    await page.locator('#close-workspace').click();
+    assert.equal(await page.locator('#workspace-sidebar').isVisible(),false);
+    await page.locator('#toggle-workspace').click();
+    assert.equal(await page.locator('#panel-apps').isVisible(),true,'reopening restores the selected workspace tab');
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+    const prompt=await page.locator('#message').boundingBox();assert.ok(prompt.y+prompt.height<=viewport.height,'composer stays on screen');
+    if(process.env.CONSOLE_SCREENSHOT_DIR){await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/panels-${viewport.width}.png`});}
+    await page.reload();await page.locator('#app').waitFor({state:'visible'});await page.locator('#panel-apps').waitFor({state:'visible'});
+    assert.equal(await page.locator('#bot-sidebar').isVisible(),false,'sidebar preference survives a reload');
+    assert.equal(await page.locator('#panel-conversation').isVisible(),true);
+  },{viewport,colorScheme:'dark'});
 });

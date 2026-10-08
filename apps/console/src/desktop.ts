@@ -16,6 +16,7 @@ export interface DesktopViewerOptions {
   renew(sessionId: string): Promise<{expiresAt: string}>;
   release(sessionId: string): Promise<unknown>;
   onState?(state: ViewerState): void;
+  onFullscreen?(active: boolean): void;
 }
 
 /** Watch intent outlives its transport. Automatic recovery is always view-only. */
@@ -23,6 +24,28 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
   const root = options.element;
   root.classList.add('desktop-viewer');
   root.innerHTML = `<div class="desktop-toolbar"><div class="desktop-heading"><strong>Live desktop</strong><span class="desktop-status" role="status" aria-live="polite">Disconnected</span></div><div class="desktop-actions"><button type="button" data-desktop="observe">Watch desktop</button><button type="button" class="quiet" data-desktop="control">Take control</button><button type="button" class="quiet" data-desktop="disconnect" disabled aria-label="Disconnect desktop" title="Disconnect desktop"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v9M6.5 5.5a8 8 0 1 0 11 0"/></svg></button><button type="button" class="quiet" data-desktop="fullscreen" aria-label="Show desktop fullscreen" title="Fullscreen"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/></svg></button></div></div><p class="desktop-hint">Connect to view the desktop.</p><div class="desktop-screen" tabindex="-1" aria-label="Remote Linux desktop"><div class="desktop-empty">Desktop offline</div></div><div class="desktop-footer"><div class="desktop-keys" hidden><span>Send key</span><button type="button" data-key="Escape">Esc</button><button type="button" data-key="Tab">Tab</button><button type="button" data-key="Return">Enter</button></div></div>`;
+  const dock = document.createElement('div'); dock.id = 'desktop-chat-dock'; root.append(dock);
+  let fallbackFullscreen = false;
+  const notifyFullscreen = () => {
+    const expanded = document.fullscreenElement === root || fallbackFullscreen;
+    root.classList.toggle('desktop-fullscreen', expanded);
+    fullscreen.setAttribute('aria-label', expanded ? 'Exit desktop fullscreen' : 'Show desktop fullscreen');
+    fullscreen.title = expanded ? 'Exit fullscreen' : 'Fullscreen';
+    fullscreen.setAttribute('aria-pressed', String(expanded));
+    options.onFullscreen?.(expanded);
+  };
+  async function exitFullscreen() {
+    if (document.fullscreenElement === root) await document.exitFullscreen().catch(() => {});
+    fallbackFullscreen = false; notifyFullscreen();
+  }
+  async function toggleFullscreen() {
+    if (document.fullscreenElement === root || fallbackFullscreen) {await exitFullscreen(); return;}
+    try {if (root.requestFullscreen) {await root.requestFullscreen(); return;}} catch {}
+    fallbackFullscreen = true; notifyFullscreen();
+  }
+  const escapeFullscreen = (event: KeyboardEvent) => {
+    if (event.key === 'Escape' && fallbackFullscreen) {event.preventDefault(); void exitFullscreen();}
+  };
   const screen = root.querySelector<HTMLElement>('.desktop-screen')!;
   const empty = root.querySelector<HTMLElement>('.desktop-empty')!;
   const status = root.querySelector<HTMLElement>('.desktop-status')!;
@@ -108,6 +131,7 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
     return released;
   };
   function disconnect() {
+    if (document.fullscreenElement === root || fallbackFullscreen) void exitFullscreen();
     wanted = false;
     retryAttempt = 0;
     const released = clearConnection();
@@ -257,8 +281,7 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
       case 'control': void connect('control'); break;
       case 'disconnect': disconnect(); break;
       case 'fullscreen':
-        if (document.fullscreenElement === root) void document.exitFullscreen();
-        else void root.requestFullscreen?.().catch(() => {});
+        void toggleFullscreen();
         break;
     }
     if (target.dataset.key && state === 'controlling' && mode === 'control') {
@@ -294,15 +317,19 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
   window.addEventListener('pageshow', onReturn);
   window.addEventListener('online', reconcile);
   window.addEventListener('offline', reconcile);
-  fullscreen.hidden = !root.requestFullscreen;
+  document.addEventListener('fullscreenchange', notifyFullscreen);
+  document.addEventListener('keydown', escapeFullscreen);
   return {
-    connect, disconnect,
+    connect, disconnect, exitFullscreen,
     setActive(value: boolean) {if (active === value) return; active = value; reconcile();},
     destroy() {
       if (destroyed) return;
       destroyed = true;
       wanted = false;
       clearConnection();
+      void exitFullscreen();
+      document.removeEventListener('fullscreenchange', notifyFullscreen);
+      document.removeEventListener('keydown', escapeFullscreen);
       root.removeEventListener('click', onClick);
       document.removeEventListener('visibilitychange', reconcile);
       window.removeEventListener('pagehide', onLeave);

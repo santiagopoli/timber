@@ -35,7 +35,7 @@ async function withWorkspace(work,{width=1440,height=1050,largeFiles=false,color
 test('workspace browser opens highlighted code, safely displays HTML and downloads binary files',async()=>{
  await withWorkspace(async({page,login,calls})=>{
   await login();assert.equal(calls.length,0,'hidden Files does not wake the computer');
-  await openPanel(page,'files');await page.locator('.workspace-project').filter({hasText:'feature/preview'}).waitFor();
+  await openPanel(page,'files');await page.locator('#expand-workspace').click();await page.locator('.workspace-project').filter({hasText:'feature/preview'}).waitFor();
   assert.equal(await page.locator('.workspace-project').count(),2);
   assert.equal(await page.getByRole('button',{name:'outside ↗'}).isDisabled(),true);
   await page.locator('.workspace-entry').filter({hasText:'frontend'}).click();
@@ -108,4 +108,25 @@ for(const width of [375,390])test(`mobile Files uses the full viewport and retur
   assert.ok(Math.abs(await page.locator('.workspace-file-list').evaluate(element=>element.scrollTop)-before)<2,'returning preserves list scroll');
   if(process.env.CONSOLE_SCREENSHOT_DIR){await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/workspace-browser-${width}.png`,fullPage:true});}
  },{width,height:844,largeFiles:true,colorScheme:width===375?'dark':'light'});
+});
+
+for (const width of [1440,820]) test(`docked Files preserves source while switching workspace panels at ${width}px`,async()=>{
+ await withWorkspace(async({page,login,calls})=>{
+  await login();await page.locator('#message').fill('Review this file');await openPanel(page,'files');
+  await page.locator('.workspace-entry').filter({hasText:'frontend'}).click();
+  await page.locator('.workspace-entry').filter({hasText:'app.ts'}).click();
+  await page.locator('.workspace-source').filter({hasText:'const message'}).waitFor();
+  assert.equal(await page.locator('#panel-conversation').isVisible(),true);
+  assert.equal(await page.locator('.workspace-sidebar').isVisible(),false,'the compact pane dedicates its width to the open source');
+  const fileCalls=calls.filter(path=>path.includes('/file?')).length;
+  await page.locator('.inspector-tabs [data-panel="computer"]').click();
+  await page.locator('.inspector-tabs [data-panel="files"]').click();
+  await page.locator('.workspace-source').filter({hasText:'const message'}).waitFor();
+  assert.equal(calls.filter(path=>path.includes('/file?')).length,fileCalls,'switching panels retains the selected file');
+  assert.equal(await page.locator('#message').inputValue(),'Review this file');
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+  if(process.env.CONSOLE_SCREENSHOT_DIR){await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/files-docked-${width}.png`});}
+  await page.getByRole('button',{name:'Back to files',exact:true}).click();
+  await page.locator('.workspace-entry').filter({hasText:'unsafe.html'}).waitFor();
+ },{width,colorScheme:'dark'});
 });

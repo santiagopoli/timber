@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
+import { createPortal } from 'react-dom';
 import { ArrowUpIcon, CheckIcon, ChevronDownIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon } from 'lucide-react';
 import { useStickToBottomContext } from 'use-stick-to-bottom';
 import { defaultUrlTransform, type UrlTransform } from 'streamdown';
@@ -371,7 +372,7 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
   </>;
 }
 
-function Chat({ model, callbacks }: { model: ChatModel; callbacks: ChatCallbacks }) {
+function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallbacks }) {
   const textarea = useRef<HTMLTextAreaElement>(null);
   useLayoutEffect(() => {
     const input = textarea.current;
@@ -391,22 +392,53 @@ function Chat({ model, callbacks }: { model: ChatModel; callbacks: ChatCallbacks
     observer.observe(input);
     return () => observer.disconnect();
   }, [model.draft]);
-  return <div className="timber-chat-layout">
-    {model.runFilter && <div id="run-filter" className="timber-filter"><span>Filtered by task</span><Button id="clear-run-filter" variant="ghost" size="sm" onClick={callbacks.onClearFilter}>Show all messages</Button></div>}
-    <Conversation className="timber-conversation" initial="instant" resize="instant"><ConversationBody model={model} callbacks={callbacks} /></Conversation>
-    <div className="timber-composer-wrap">
+  return <div className="timber-composer-wrap">
       <PromptInput id="message-form" className="timber-composer" maxFiles={0} onReset={event => event.preventDefault()} onSubmit={({text}) => {if (!model.sending && text.trim()) callbacks.onSend(model.bot.id, text);}}>
         <PromptInputBody><PromptInputTextarea ref={textarea} id="message" rows={1} aria-label={`Message ${model.bot.name}`} placeholder={`Message ${model.bot.name}…`} value={model.draft} onChange={event => callbacks.onDraft(model.bot.id, event.currentTarget.value)} />
           <PromptInputSubmit className="timber-send" aria-label="Send message" title="Send message" disabled={model.sending || !model.draft.trim()}>{model.sending ? <LoaderCircleIcon className="timber-spinner" /> : <ArrowUpIcon />}</PromptInputSubmit>
         </PromptInputBody>
       </PromptInput>
-    </div>
+    </div>;
+}
+
+function MiniActivity({model, onConversation}: {model: ChatModel; onConversation(): void}) {
+  const tools = collectTools({...model, runFilter: null}, true).sort((a,b) => b.at - a.at);
+  const active = tools.filter(tool => toolState(tool, model).running);
+  const visible = active.length ? active.slice(0, 3) : tools.slice(0, 1);
+  const run = model.currentRun, latestRun = [...model.runs].sort((a,b) => timestamp(b.updatedAt) - timestamp(a.updatedAt))[0];
+  const waiting = run?.status === 'waiting_approval' || run?.status === 'waiting_connection';
+  const failed = !run && latestRun && ['failed','interrupted'].includes(latestRun.status);
+  const reply = model.stream?.text || [...model.messages].reverse().find(message => message.role === 'assistant' && message.kind !== 'progress')?.text;
+  const delivery = model.deliveries.find(item => ['unknown','rejected'].includes(item.state));
+  const heading = delivery ? 'Message not confirmed' : waiting ? 'Needs your attention' : failed ? 'Response interrupted' : run ? responseRetry(model,run.id) || (model.stream ? 'Responding' : 'Working') : reply ? 'Reply ready' : 'Activity';
+  return <button className="timber-mini-activity" type="button" onClick={onConversation} aria-label="Open conversation" data-mini-activity>
+    <span className="timber-mini-heading"><strong>{model.bot.name}</strong><span role="status">{heading}</span><ExternalLinkIcon aria-hidden="true"/></span>
+    {visible.map(tool => {const state = toolState(tool,model), presentation = toolPresentation(tool); const StatusIcon = state.running ? LoaderCircleIcon : state.failed ? CircleAlertIcon : state.pending ? ShieldCheckIcon : CheckIcon;
+      return <span className="timber-mini-step" key={tool.key} title={`${presentation.title} · ${state.text}`}><StatusIcon className={state.running ? 'timber-spinner' : ''} aria-hidden="true"/><span>{presentation.title}</span><small>{state.text}</small></span>;
+    })}
+    {(delivery || waiting || failed || model.stream || (!run && reply)) && <span className="timber-mini-reply">{delivery?.error || (waiting ? 'Open conversation to continue' : failed ? latestRun?.error : reply)}</span>}
+  </button>;
+}
+
+function Chat({ model, callbacks, dockTarget, onConversation }: { model: ChatModel; callbacks: ChatCallbacks; dockTarget: HTMLElement | null; onConversation(): void }) {
+  const composer = <Composer model={model} callbacks={callbacks}/>;
+  return <div className="timber-chat-layout">
+    {model.runFilter && <div id="run-filter" className="timber-filter"><span>Filtered by task</span><Button id="clear-run-filter" variant="ghost" size="sm" onClick={callbacks.onClearFilter}>Show all messages</Button></div>}
+    <Conversation className="timber-conversation" initial="instant" resize="instant"><ConversationBody model={model} callbacks={callbacks} /></Conversation>
+    {dockTarget ? createPortal(<div className="timber-focus-chat"><MiniActivity model={model} onConversation={onConversation}/>{composer}</div>, dockTarget) : composer}
   </div>;
 }
 
-export function mountChat(element: HTMLElement, callbacks: ChatCallbacks) {
+
+export function mountChat(element: HTMLElement, callbacks: ChatCallbacks, onConversation: () => void) {
   const root = createRoot(element);
-  return { update(model: ChatModel) {root.render(<Chat key={model.bot.id} model={model} callbacks={callbacks} />);}, clear() {root.render(null);} };
+  let model: ChatModel | null = null, dockTarget: HTMLElement | null = null;
+  const render = () => root.render(model ? <Chat key={model.bot.id} model={model} callbacks={callbacks} dockTarget={dockTarget} onConversation={onConversation}/> : null);
+  return {
+    update(value: ChatModel) {model = value; render();},
+    setDock(target: HTMLElement | null) {if (dockTarget !== target) {dockTarget = target; render();}},
+    clear() {model = null; render();},
+  };
 }
 
 export function mountToolActivity(element: HTMLElement) {

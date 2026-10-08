@@ -15,8 +15,9 @@ Click the desktop to focus it and use your keyboard/mouse. Switch back to Watch
 or Disconnect to release control. Watch survives brief panel/browser-tab switches;
 after 30 seconds away it pauses and automatically resumes when you return.
 Network interruption or an expired desktop grant reconnects with fresh view-only
-access without signing you out. Closing the Computer pane, Disconnect, changing
-bots, logout or Suspend stops watching. Manual control releases immediately when
+access without signing you out. Collapsing the workspace uses the same 30-second
+Watch grace period as switching panels. Disconnect, changing bots, logout or
+Suspend stops watching. Manual control releases immediately when
 the page/pane is hidden and must always be taken again explicitly.
 
 The bot can move the pointer to hover, click or double-click using the left, right
@@ -26,8 +27,19 @@ mutations to avoid competing input; releasing control restores bot access. Drag
 duration is 100–2000 ms (default 500 ms); failed gestures attempt to release the
 button. Mouse actions and their coordinates appear in Activity.
 
-Full screen is available where the browser supports it. Screenshots, terminal and
-manual controls remain under **Snapshots, terminal & manual tools**. These are
+Desktop and iPad have a collapsible bot list on the left, conversation in the
+center and a collapsible workspace on the right. On narrower iPads the bot list
+opens over the conversation so both the chat and workspace remain usable. The
+workspace toolbar switches between Computer, Files, Apps, Activity and Runs.
+Expanding the workspace preserves its current view without reconnecting noVNC.
+
+Computer expansion and full screen keep the same conversation prompt and draft,
+with a compact activity widget updated from the live event stream. Follow-up
+messages use the normal bot inbox, without cancelling the current task. Select
+the widget to return to the conversation and review answers, approvals or errors.
+Keyboard focus in the prompt never sends input to the remote desktop. Native
+fullscreen is used when available, with an in-page fallback otherwise.
+Screenshots, terminal and manual controls remain under **Manual tools**. These are
 explicit actions; the live viewer does not repeatedly invoke the screenshot tool.
 Save checkpoint saves portable workspace files; Suspend saves and stops processes.
 A live connection keeps the computer running until it disconnects.
@@ -46,7 +58,10 @@ Each discovered Git repository gets a project card showing its path, branch or
 detached HEAD, and staged/modified/untracked counts. Select a project, then a
 changed file, to switch between source, working changes and staged changes.
 Refresh explicitly to pick up ongoing agent edits. This explorer is read-only;
-use the bot or the explicit quick file editor for changes.
+use the bot or the explicit quick file editor for changes. In a narrow inspector,
+opening a file dedicates that pane to its contents; Back restores the file list.
+Expand the inspector for side-by-side files and source. Switching inspector tabs
+or collapsing the workspace keeps the selected file; changing bots clears it.
 
 ## Implementation
 
@@ -79,3 +94,8 @@ human control, and lease renewal proceeds during a blocked workspace inspection.
 
 CI for `de80c8758fac8d6742f2a7d25fa15838aba6da00` passed backend/typechecks,
 48 console browser cases, both real desktop image checks, and Worker bundling.
+
+Console layout verification covers 768, 820, 1024 and 1440 px widths in Chromium,
+sidebar preferences after reload, retained file previews, native fullscreen and
+its fallback with real noVNC/RFB transport, live action updates, and prompt/input
+isolation. iPad hardware and Safari fullscreen were not exercised by these tests.

@@ -1,0 +1,58 @@
+/* The conversation stays mounted; the inspector changes only its visible panel. */
+.layout-toggle{flex:none}
+.inspector-toolbar{display:flex;align-items:center;gap:2px;flex:none;padding:6px 8px;border-bottom:1px solid var(--line);min-width:0;background:var(--surface)}
+.inspector-tabs{display:flex;flex:1;gap:2px;min-width:0;overflow:auto;scrollbar-width:none}
+.inspector-tabs button{flex:0 0 40px;min-width:40px;min-height:40px;padding:10px;color:var(--muted);background:transparent;border:0;border-radius:8px}
+.inspector-tabs button.active{background:var(--soft);color:var(--ink)}
+.inspector-tabs svg{width:18px;height:18px}
+.inspector-tabs button span{display:none}
+.inspector-toolbar>.icon-button{width:36px;min-width:36px;min-height:40px;padding:9px;color:var(--muted)}
+.workspace-inspector{display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden;flex:1;background:var(--surface);container-type:inline-size;container-name:inspector}
+.workspace-inspector>.panel{flex:1;min-width:0;min-height:0;padding:16px}
+.workspace-inspector .computer-panel-header{margin-bottom:12px}
+.workspace-inspector .computer-panel-header h2{font-size:15px}
+.workspace-inspector .computer-grid,.workspace-inspector .computer-side{grid-template-columns:minmax(0,1fr)}
+.workspace-inspector .computer-utilities .row{flex-wrap:wrap}
+.workspace-inspector #panel-files{padding:0}
+.sidebar-scrim{display:none}
+@media(min-width:761px){
+  :root{--sidebar-width:248px}
+  .app[data-bots-collapsed=true]{grid-template-columns:minmax(0,1fr)}
+  .app[data-bots-collapsed=true]>.sidebar{display:none}
+  .bot-header{padding:10px 18px;min-height:65px}
+  #workspace-panels[data-workspace-docked=true]{display:grid;grid-template-columns:minmax(0,1fr) clamp(340px,38%,540px);grid-template-rows:minmax(0,1fr)}
+  #workspace-panels[data-workspace-docked=true]>#panel-conversation{grid-column:1;grid-row:1}
+  #workspace-panels[data-workspace-docked=true]>.workspace-inspector{grid-column:2;grid-row:1;border-left:1px solid var(--line)}
+  .workspace-inspector[data-expanded=true]>.inspector-toolbar{padding-inline:16px}
+  .workspace-inspector[data-expanded=true] .inspector-tabs button{flex-basis:auto;gap:6px;padding:8px 12px;font-size:12px}
+  .workspace-inspector[data-expanded=true] .inspector-tabs button span{display:inline}
+  #workspace-panels[data-workspace-docked=true] .timber-conversation-content{padding-inline:22px}
+  #workspace-panels[data-workspace-docked=true] .timber-composer-wrap{padding-inline:18px}
+  .workspace-inspector[data-expanded=true] #panel-computer{display:flex;flex-direction:column;overflow:hidden}
+  .workspace-inspector[data-expanded=true] #desktop-root{flex:1;min-height:0;display:flex;flex-direction:column}
+  .workspace-inspector[data-expanded=true] .desktop-screen{flex:1;min-height:0;aspect-ratio:auto}
+  .workspace-inspector[data-expanded=true] #computer-tools,.workspace-inspector[data-expanded=true] .computer-utilities{display:none}
+}
+@media(min-width:761px) and (max-width:1099px){
+  /* At iPad widths the bot list is a drawer so opening it never crushes the chat. */
+  .app{position:relative;grid-template-columns:minmax(0,1fr)}
+  .app>.sidebar{position:absolute;inset:0 auto 0 0;width:280px;z-index:21;box-shadow:12px 0 40px #0003}
+  .sidebar-scrim{display:block;position:absolute;inset:0;z-index:20;background:#0005;border:0;border-radius:0}
+  #workspace-panels[data-workspace-docked=true]{grid-template-columns:minmax(0,1fr) minmax(320px,43%)}
+  .bot-header{min-height:62px;padding-inline:14px}
+}
+@media(max-width:760px){
+  .layout-toggle{display:none!important}
+  #expand-workspace{display:none}
+  .inspector-toolbar{padding-inline:10px}
+  .inspector-tabs button{min-height:44px;flex-basis:44px}
+  .inspector-toolbar>.icon-button{min-width:44px;min-height:44px}
+  .workspace-inspector>.panel{padding:16px}
+  .workspace-inspector #panel-files{padding:0}
+}
+.panel-menu>summary>.panel-more-icon{display:none}
+@media(min-width:761px){
+  .panel-menu>summary{width:40px;min-width:40px;padding:0;background:transparent;border-color:transparent}
+  .panel-menu>summary>svg,.panel-menu>summary>span{display:none}
+  .panel-menu>summary>.panel-more-icon{display:block}
+}

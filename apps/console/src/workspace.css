@@ -66,7 +66,8 @@
 .workspace-loading{display:flex;align-items:center;gap:8px;padding:12px 9px;color:var(--muted);font-size:12px}
 .workspace-loading-icon{width:16px;height:16px;animation:workspace-spin 1s linear infinite}
 @keyframes workspace-spin{to{transform:rotate(360deg)}}
-@media(max-width:760px){
+/* Adapt to the available pane width, not the browser window. */
+@container inspector (max-width:760px){
   #panel-files{padding:0 0 env(safe-area-inset-bottom)}
   .workspace-heading{margin:0;padding:0 12px;min-height:44px}
   .workspace-heading h2{font-size:12px;color:var(--muted);font-weight:450}

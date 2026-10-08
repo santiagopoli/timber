@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {after,before,test} from 'node:test';
 import {chromium} from 'playwright';
+import {mkdir} from 'node:fs/promises';
 import {createServer,request as forward} from 'node:http';
 import {WebSocketServer} from 'ws';
 import {createConsoleFixture,TEST_TOKEN,BOT_A,BOT_B} from './console-fixture.mjs';
@@ -134,7 +135,7 @@ test('disconnecting the console closes the active desktop socket and releases th
 });
 
 
-test('Computer docks beside the conversation on desktop, expands explicitly and closes its live session',async()=>{
+test('Computer expands with the shared composer and collapses without dropping Watch',async()=>{
  await withDesktop(async({page,login,open,state})=>{
   await login();await openPanel(page,'computer');
   assert.equal(await page.locator('#workspace-panels').getAttribute('data-computer-docked'),'true');
@@ -145,18 +146,19 @@ test('Computer docks beside the conversation on desktop, expands explicitly and 
   assert.ok(chat.width>=300 && computer.width>=360 && chat.x+chat.width<=computer.x+1,'both panes have usable widths');
   await page.locator('#message').fill('Keep my next instruction in the composer');
   await open('view');
-  await page.locator('#expand-computer').click();
+  await page.locator('#expand-workspace').click();
   assert.equal(await page.locator('#panel-conversation').isVisible(),false);
-  assert.equal(await page.locator('#expand-computer').getAttribute('aria-label'),'Dock computer');
+  assert.equal(await page.locator('#desktop-chat-dock #message').inputValue(),'Keep my next instruction in the composer');
+  assert.equal(await page.locator('#expand-workspace').getAttribute('aria-label'),'Dock workspace');
   assert.equal(state.sockets.length,1,'expanding does not create a new desktop connection');
-  await page.locator('#expand-computer').click();
+  await page.locator('#expand-workspace').click();
   assert.equal(await page.locator('#panel-conversation').isVisible(),true);
   assert.equal(await page.locator('#message').inputValue(),'Keep my next instruction in the composer');
-  await page.locator('#close-computer').click();
+  await page.locator('#close-workspace').click();
   await page.locator('#panel-computer').waitFor({state:'hidden'});
   assert.equal(await page.locator('#panel-conversation').isVisible(),true);
-  await until(()=>state.sockets[0].closed);
-  await until(()=>deletes(state).some(call=>call.path===`/v1/bots/${BOT_A}/computer/live-session/session-1`));
+  assert.equal(state.sockets[0].closed,false,'collapsing preserves the warm Watch connection');
+  await page.locator('#toggle-workspace').click(); await watching(page);
   assert.equal(state.sockets.length,1);
  });
 });
@@ -168,11 +170,11 @@ test('mobile Computer uses the full screen and returns to the preserved conversa
   assert.equal(await page.locator('#workspace-panels').getAttribute('data-computer-docked'),'false');
   assert.equal(await page.locator('#panel-conversation').isVisible(),false);
   assert.equal(await page.locator('#panel-computer').isVisible(),true);
-  assert.equal(await page.locator('#expand-computer').isVisible(),false);
+  assert.equal(await page.locator('#expand-workspace').isVisible(),false);
   await open('view');
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
-  await page.locator('#close-computer').click();
-  await until(()=>state.sockets[0].closed);
+  await page.locator('#close-workspace').click();
+  assert.equal(state.sockets[0].closed,false);
   assert.equal(await page.locator('#panel-conversation').isVisible(),true);
   assert.equal(await page.locator('#message').inputValue(),'Mobile draft stays with Ada');
  },{width:390,height:844});
@@ -313,4 +315,38 @@ test('hiding during a pending Take control releases its late grant and stays vie
   await page.locator('.desktop-screen canvas').click({position:{x:60,y:60}});
   assert.equal(state.sockets[0].inputs.length,0);
  });
+});
+
+for (const fallback of [false,true]) test(`fullscreen ${fallback?'fallback':'native'} keeps messaging, live activity and desktop input isolated`,async()=>{
+ await withDesktop(async({page,login,open,state,fixture})=>{
+  const run={id:'focus-run',botId:BOT_A,operationId:'focus-request',status:'running',createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};
+  fixture.runs.set(BOT_A,[run]);
+  await login();await page.locator('#message').fill('Draft before fullscreen');await open('control');
+  await page.locator('.desktop-screen canvas').click({position:{x:100,y:100}});
+  if(fallback)await page.evaluate(()=>{document.querySelector('#desktop-root').requestFullscreen=undefined;});
+  await page.locator('[data-desktop="fullscreen"]').click();
+  await page.locator('#desktop-root.desktop-fullscreen').waitFor();
+  await page.locator('#desktop-chat-dock #message').waitFor({state:'visible'});
+  assert.equal(await page.locator('#message').count(),1,'there is only one composer');
+  assert.equal(await page.locator('#message').inputValue(),'Draft before fullscreen');
+  const before=state.sockets[0].inputs.filter(input=>input.type===4).length;
+  await page.locator('#message').fill('Continue with this instruction');await page.locator('#message').press('Enter');
+  await until(()=>fixture.calls.some(call=>call.path===`/v1/bots/${BOT_A}/messages`&&call.body?.text==='Continue with this instruction'));
+  assert.equal(fixture.calls.filter(call=>call.path.endsWith('/cancel')).length,0);
+  assert.equal(state.sockets[0].inputs.filter(input=>input.type===4).length,before,'typing into Timber never types into the remote desktop');
+  fixture.emit(BOT_A,'tool.started',{operationId:'focus-tool',toolName:'exec',input:{command:'npm run build'}},run.id);
+  await page.locator('[data-mini-activity]').filter({hasText:'npm run build'}).waitFor();
+  await page.locator('[data-mini-activity]').filter({hasText:'Running'}).waitFor();
+  fixture.emit(BOT_A,'tool.completed',{operationId:'focus-tool',toolName:'exec',result:{status:'completed',exitCode:0,output:'Built successfully'}},run.id);
+  await page.locator('[data-mini-activity]').filter({hasText:'Completed'}).waitFor();
+  await page.locator('#message').fill('Draft inside fullscreen');
+  const bounds=await page.locator('#message').boundingBox();assert.ok(bounds.y+bounds.height<=page.viewportSize().height);
+  assert.equal(state.sockets.length,1,'fullscreen keeps the original framebuffer transport');
+  if(process.env.CONSOLE_SCREENSHOT_DIR){await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/fullscreen-${fallback?'ipad':'desktop'}.png`});}
+  await page.locator('[data-mini-activity]').click();
+  await page.locator('#panel-conversation').waitFor({state:'visible'});
+  assert.equal(await page.locator('#message').inputValue(),'Draft inside fullscreen');
+  assert.equal(await page.locator('#desktop-root').evaluate(node=>node.classList.contains('desktop-fullscreen')),false);
+  assert.equal(await page.evaluate(()=>document.fullscreenElement),null);
+ },{width:fallback?820:1440,height:1000});
 });

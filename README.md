@@ -84,6 +84,12 @@ cookie valid for 30 days. The token is then discarded. Reloading or reopening
 Timber preserves the session; Sign out clears it. Drafts stay in memory per bot;
 the selected bot ID is kept in the URL fragment. On mobile, the bot list opens
 into a full-screen conversation; Workspace contains Computer, Files and Apps.
+Desktop and iPad keep the conversation next to a collapsible workspace inspector.
+The left bot list also collapses, opening as a drawer on narrower iPads. Layout
+preferences persist locally; switching inspector tabs preserves the selected file
+and conversation. Expanded Computer and desktop fullscreen retain the same prompt
+and a compact live activity widget. Browsers without native fullscreen use an
+in-page fallback. Writing to the prompt never sends keys to the remote desktop.
 
 This is a single-owner development MVP. There is no multi-user login, native iOS
 client, inter-bot delegation, routine scheduling, Hermes adapter, local execution
