@@ -15,6 +15,7 @@ import type { AgentRuntime, RuntimePause, PiRuntimeOptions, RuntimeApprovalSumma
 export type { AgentRuntime, RuntimeOperation, RuntimeOperationResult, RuntimeReceipt, RuntimePendingOperation, PendingApproval, PendingConnection, RuntimePause, HostToolDefinition, RuntimeHostToolRequest, PiRuntimeOptions, RuntimeEvent, RuntimeMessage, RuntimeToolRequest, RuntimeToolResult, RuntimeTools, RuntimeApprovalSummary, RuntimeApprovalContext } from './types.js';
 export { normalizeEntries, textContent } from './normalize.js';
 export const DEFAULT_MODEL = CHATGPT_MODEL;
+const MODEL_RETRIES = 2;
 
 /** Durable budgets count logical tasks once, including after object eviction. */
 export function createBudget(storage: Pick<DurableObjectStorage, 'sql'>, limits: { generation: number; tool: number }) {
@@ -112,7 +113,9 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
               let emptyAnswer: AssistantMessage | undefined;
               for await (const event of upstream) {
                 if (event.type === 'done' && ['stop', 'length', 'toolUse'].includes(event.message.stopReason) && !event.message.content.some(part => part.type === 'toolCall') && !textContent(event.message.content).trim()) {
-                  emptyAnswer = { ...event.message, stopReason: 'error', errorMessage: 'model_empty_response' };
+                  // Pi's durable generation retry resumes with the saved tool
+                  // results. The transient marker uses its native retry policy.
+                  emptyAnswer = { ...event.message, stopReason: 'error', errorMessage: 'model_empty_response: stream ended without a visible answer' };
                   output.push({ type: 'error', reason: 'error', error: emptyAnswer });
                 } else output.push(event);
               }
@@ -164,6 +167,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
             'You own one ongoing conversation. Preserve useful context across tasks.',
             'Your computer is a reusable cloud Linux desktop. Files belong under /workspace.',
             'Use only the provided tools. Never invent tool results or claim an action succeeded without its result.',
+            'After a tool result, continue the task: inspect failures, make a safe corrective attempt when appropriate, and provide a visible final answer describing the outcome. A successful tool call alone is not a final answer. Never leave the user waiting for a follow-up prompt to hear what happened.',
             bot.computerApprovalMode === 'automatic'
               ? 'Current computer approval mode: automatic. The host authorizes new computer actions under this mode without per-action approval. Use the tools without inventing a manual approval requirement.'
               : 'Current computer approval mode: ask. Actions requiring approval must wait for a host approval decision; a user request to retry is not itself approval to execute.',
@@ -192,7 +196,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
       native = await Harness.open(context.storage, {
         models, registry,
         settings: {
-          retry: { enabled: true, maxRetries: 2, baseDelayMs: 500 },
+          retry: { enabled: true, maxRetries: MODEL_RETRIES, baseDelayMs: 500 },
           stream: { timeoutMs: 120_000, maxRetries: 0 },
           // Background compaction has no active operation to charge; compact at active boundaries instead.
           compaction: { backgroundTokens: 0 },
@@ -216,6 +220,12 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
     const answer = await storage.entry(record.answer, background);
     return answer ? normalizeEntries([answer.entry]).find(message => message.role === 'assistant')?.kind : undefined;
   };
+  const publishRetry = async (attempt: number, at: number, error: string) => {
+    await emit({ type: 'run.retrying', operationId: activeOperationId,
+      eventKey: `retry:${activeOperationId}:${at}:${attempt}`,
+      data: { attempt, maxRetries: MODEL_RETRIES, retryAt: new Date(at).toISOString(), errorCode: classifyFailure('model_error', error).errorCode },
+    });
+  };
   const processEvent = async (event: AgentEvent): Promise<void> => {
     if (destroyed) return;
     switch (event.type) {
@@ -226,6 +236,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
         await emit({ type: 'runtime.snapshot', operationId: activeOperationId, data: {
           busy: Boolean(event.run), partialText: textContent(event.generation?.message?.content),
         } });
+        if (event.generation?.retry) await publishRetry(event.generation.attempt, event.generation.retry.at, event.generation.retry.error);
         break;
       }
       case 'run_start':
@@ -240,6 +251,9 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
         for (const change of event.changes) {
           if (change.type === 'text_delta') await emit({ type: 'message.delta', operationId: activeOperationId, data: { delta: change.delta } });
         }
+        break;
+      case 'auto_retry_start':
+        await publishRetry(event.attempt, event.at, event.errorMessage);
         break;
       case 'message_end':
         await publishEntry([event.entry], activeOperationId);

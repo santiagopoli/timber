@@ -83,7 +83,7 @@ test('explicitly stopping a run reports cancellation in the conversation without
     state.emit(BOT_A, 'runtime.snapshot', {busy: true, partialText: 'Working on the request'}, run.id);
     await login(); await until(page, '#streaming-text', 'Working on the request');
     await page.locator('#cancel-run').click();
-    await until(page, '[data-message-id="explicit-stop-request"]', /cancelled/i);
+    await until(page, '[data-run-outcome="explicit-stop-run"]', 'Task stopped');
     await page.locator('#streaming-message').waitFor({state: 'hidden'});
     assert.equal(run.status, 'cancelled');
     assert.deepEqual(state.calls.filter(call => call.path.endsWith('/cancel')).map(call => ({path: call.path, method: call.method})), [{path: `/v1/bots/${BOT_A}/runs/${run.id}/cancel`, method: 'POST'}]);
@@ -164,14 +164,67 @@ test('a successful command followed by an empty model answer exposes the failure
     await login();
     run.status = 'failed'; run.error = 'The model ended its turn without a visible answer. The completed tools were not repeated.'; run.updatedAt = new Date(Date.now() + 1000).toISOString();
     state.emit(BOT_A, 'run.updated', {run}, run.id);
-    await until(page, '[data-message-id="empty-answer-request"]', 'without a visible answer');
-    assert.match(await page.locator('[data-message-id="empty-answer-request"]').innerText(), /Failed/);
+    await until(page, '[data-run-outcome="empty-answer-run"]', 'without a visible answer');
+    assert.equal(await page.locator('#run-status').isVisible(), false, 'a failed task does not label the bot');
+    assert.equal(await page.locator('#run-error').isVisible(), false, 'no duplicate global failure banner');
     const activity = page.locator(`[data-run-activity="${run.id}"]`);
     assert.equal(await activity.locator(`[data-tool-operation-id="${operationId}"][data-tool-status="completed"]`).count(), 1);
     assert.equal(await page.locator('#streaming-message').isVisible(), false); assert.equal(state.messages.get(BOT_A).length, 1, 'no fabricated final response is introduced');
     assert.equal(sentMessages(state, BOT_A).length, 0); assert.equal(state.actions.length, 0);
     assert.equal(await page.getByRole('button', {name: 'Retry sending', exact: true}).count(), 0);
   });
+});
+
+test('response recovery is visible and exhausted failure belongs to its task instead of the conversation header', async () => {
+  for(const width of [390,1440]) await withPage(async({page,login,state})=>{
+    const createdAt=new Date().toISOString(),run={id:'recover-ui-run',botId:BOT_A,operationId:'recover-ui-input',status:'running',createdAt,updatedAt:createdAt};
+    state.runs.set(BOT_A,[run]);state.messages.set(BOT_A,[{id:'recover-ui-message',botId:BOT_A,runId:run.id,role:'user',text:'Revisá la app y explicame el resultado.',createdAt}]);
+    state.emit(BOT_A,'tool.completed',{operationId:'recover-ui-exec',toolName:'exec',input:{command:'npm test',timeoutMs:120000},result:{status:'completed',exitCode:0,output:'42 tests passed'}},run.id);
+    await login();
+    const activity=page.locator('[data-run-activity="recover-ui-run"]');
+    state.emit(BOT_A,'message.delta',{delta:'Incomplete response from a lost attempt'},run.id);
+    await page.locator('#streaming-text').filter({hasText:'Incomplete response'}).waitFor();
+    state.emit(BOT_A,'run.retrying',{attempt:1,maxRetries:2,retryAt:new Date(Date.now()+500).toISOString(),errorCode:'model_connection_interrupted'},run.id);
+    await activity.getByRole('status').filter({hasText:'Retrying response · 1/2'}).waitFor();
+    assert.equal(await page.locator('#streaming-message').isVisible(),false,'a failed partial cannot concatenate with the next response');
+    const error='The model connection was interrupted and could not recover. Your recorded tool results are preserved.';
+    run.status='failed';run.error=error;run.updatedAt=new Date(Date.now()+1000).toISOString();state.emit(BOT_A,'run.updated',{run},run.id);
+    const notice=page.locator('[data-run-outcome="recover-ui-run"]');
+    await notice.filter({hasText:error}).waitFor();
+    assert.equal(await page.locator('#run-status').isVisible(),false);
+    assert.equal(await page.locator('#run-error').isVisible(),false);
+    assert.equal(await page.locator('#messages').getByText(error,{exact:true}).count(),1);
+    assert.equal(await notice.evaluate(node=>Boolean(document.querySelector('[data-run-activity="recover-ui-run"]').compareDocumentPosition(node)&Node.DOCUMENT_POSITION_FOLLOWING)),true,'the outcome follows the task activity');
+    assert.equal(await activity.locator('[data-tool-operation-id="recover-ui-exec"]').getAttribute('data-tool-status'),'completed','a model failure does not rewrite the command outcome');
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+    if(process.env.CONSOLE_SCREENSHOT_DIR){await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});await notice.scrollIntoViewIfNeeded();await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/task-outcome-${width}.png`,animations:'disabled'});}
+    await page.reload();await notice.waitFor();
+    assert.equal(await page.locator('#run-status').isVisible(),false,'historical failure stays out of the header after reload');
+    await notice.getByRole('button',{name:'Continue',exact:true}).click();
+    await page.locator('[data-message-id]').filter({hasText:'Continue this task:'}).waitFor();
+    const sent=sentMessages(state,BOT_A);assert.equal(sent.length,1);assert.notEqual(sent[0].body.operationId,run.operationId);
+    assert.match(sent[0].body.text,/Revisá la app/);assert.match(sent[0].body.text,/do not repeat completed work/);
+    assert.equal(state.actions.length,0,'Continue submits intent, never dispatches an old computer action');
+  },{viewport:{width,height:920},colorScheme:'dark'});
+});
+
+test('a recovered response finishes the task and leaves the persistent conversation ready',async()=>{
+  await withPage(async({page,login,state})=>{
+    const createdAt=new Date().toISOString(),run={id:'recover-success',botId:BOT_A,operationId:'recover-success-input',status:'running',createdAt,updatedAt:createdAt};
+    state.runs.set(BOT_A,[run]);state.messages.set(BOT_A,[{id:'recover-success-message',botId:BOT_A,runId:run.id,role:'user',text:'Check the result.',createdAt}]);
+    await login();state.emit(BOT_A,'run.retrying',{attempt:1,maxRetries:2,retryAt:createdAt,errorCode:'model_empty_response'},run.id);
+    await page.locator('.timber-work-status').filter({hasText:'Retrying response'}).waitFor();
+    state.emit(BOT_A,'message.delta',{delta:'The saved result confirms success.'},run.id);
+    await page.locator('#streaming-text').filter({hasText:'The saved result confirms success.'}).waitFor();
+    const answer={id:'recovered-final',botId:BOT_A,runId:run.id,role:'assistant',kind:'final',text:'The saved result confirms success.',createdAt:new Date(Date.now()+1000).toISOString()};
+    state.messages.get(BOT_A).push(answer);state.emit(BOT_A,'message.created',{message:answer},run.id);
+    run.status='completed';run.updatedAt=answer.createdAt;state.emit(BOT_A,'run.updated',{run},run.id);
+    await page.locator('[data-message-id="recovered-final"]').waitFor();
+    assert.equal(await page.locator('#run-status').isVisible(),false);
+    assert.equal(await page.locator('[data-run-outcome]').count(),0);
+    assert.equal(await page.locator('.timber-work-status').count(),0);
+    assert.equal(sentMessages(state,BOT_A).length,0);
+  },{viewport:{width:390,height:920},colorScheme:'dark'});
 });
 
 test('a historical approval-request tool callback never claims the action completed or is still awaiting a decision', async () => {

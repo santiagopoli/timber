@@ -82,7 +82,7 @@ describe('runtime computer bridge', () => {
     host.consume = () => { throw new Error('budget exceeded'); };
     const result = await executeComputerTool(host, { type: 'screenshot' }, api, context);
     expect(host.tools.execute).not.toHaveBeenCalled();
-    expect(result.control).toEqual({ terminate: true });
+    expect(result.control).toBeUndefined(); // The model must be able to explain the limit.
     expect(result.isError).toBe(true);
   });
   it('returns screenshot pixels to the model, not just an artifact identifier', async () => {
@@ -173,7 +173,7 @@ describe('runtime host tool bridge', () => {
     abort.abort();
     await expect(executeHostTool(host, { name: 'github_push', arguments: {} }, api, { ...context, abortSignal: abort.signal })).rejects.toThrow();
     host.consume = () => { throw new Error('exhausted'); };
-    expect((await executeHostTool(host, { name: 'github_push', arguments: {} }, api, context)).control).toEqual({ terminate: true });
+    expect(await executeHostTool(host, { name: 'github_push', arguments: {} }, api, context)).toMatchObject({isError:true});
     expect(host.tools.call).not.toHaveBeenCalled();
   });
 });
@@ -183,9 +183,10 @@ describe('public transcript projection', () => {
     const entries = [{ id: '12', conversationId: '1', kind: 'assistant', model: [
       { role: 'assistant', content: [{ type: 'text', text: 'Same words' }, { type: 'toolCall', id: 'call-1', name: 'exec', arguments: { command: 'private command' } }], stopReason: 'toolUse' },
       { role: 'assistant', content: [{ type: 'text', text: 'Same words' }], stopReason: 'stop' },
-      { role: 'assistant', content: [{ type: 'text', text: 'Same words' }], stopReason: 'error' },
+      { role: 'assistant', content: [{ type: 'text', text: 'Unfinished attempt' }], stopReason: 'error' },
     ] }] as unknown as EntryRecord[];
-    expect(normalizeEntries(entries).map(message => message.kind)).toEqual(['progress', 'final', undefined]);
+    expect(normalizeEntries(entries).map(message => message.kind)).toEqual(['progress', 'final']);
+    expect(JSON.stringify(normalizeEntries(entries))).not.toContain('Unfinished attempt');
     expect(JSON.stringify(normalizeEntries(entries))).not.toContain('private command');
   });
   it('projects honest tool status and correlation without tool output or arguments', () => {

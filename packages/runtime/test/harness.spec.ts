@@ -38,12 +38,38 @@ it('reports a reasoning-only final response as a failure without repeating compl
   await request('/submit', { text: 'request-exec empty-final-after-exec', operationId: 'empty-final', chatgpt: true });
   expect(await (await request('/wait?id=empty-final')).json()).toMatchObject({ status: 'unanswered', reason: 'model_error' });
   const state = await (await request('/inspect')).json<{ calls: unknown[]; toolCalls: unknown[]; messages: unknown[]; events: { event: string }[] }>();
-  expect(state.calls).toHaveLength(2);
+  expect(state.calls).toHaveLength(4);
   expect(state.toolCalls).toHaveLength(1);
   const events = state.events.map(row => JSON.parse(row.event));
   expect(events).toContainEqual(expect.objectContaining({ type: 'run.failed', data: expect.objectContaining({ errorCode: 'model_empty_response' }) }));
   expect(events.some(event => event.type === 'run.completed')).toBe(false);
   expect(JSON.stringify({ messages: state.messages, events })).not.toContain('Private fixture reasoning');
+});
+it.each(['recover-empty-once','recover-incomplete-once','recover-stream-once'])('recovers %s after a saved tool result without another user message or tool execution',async failure=>{
+  await request('/host-context',{mode:'automatic'});
+  const stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+  if(failure==='recover-empty-once') await runInDurableObject(stub,instance=>{instance.toolFailure=true;});
+  await request('/submit',{text:`request-exec ${failure}`,operationId:'recover-result',chatgpt:true});
+  const result=await (await request('/wait?id=recover-result')).json<{status:string;text:string}>();
+  expect(result.status).toBe('done');
+  expect(result.text).toContain(failure==='recover-empty-once'?'command failed with exit 1':'Hello from ChatGPT');
+  const state=await (await request('/inspect')).json<{calls:{input:string}[];toolCalls:unknown[];messages:{role:string;kind?:string;text:string}[];events:{event:string}[]}>();
+  expect(state.calls).toHaveLength(3);expect(state.toolCalls).toHaveLength(1);
+  for(const call of state.calls.slice(1)) expect(JSON.parse(call.input).input.filter((item:{type:string})=>item.type==='function_call_output')).toHaveLength(1);
+  expect(state.messages.filter(message=>message.role==='user')).toHaveLength(1);
+  expect(state.messages.filter(message=>message.kind==='final')).toHaveLength(1);
+  const events=state.events.map(row=>JSON.parse(row.event));
+  expect(events).toContainEqual(expect.objectContaining({type:'run.retrying',operationId:'recover-result',data:expect.objectContaining({attempt:1,maxRetries:2})}));
+  expect(events.some(event=>event.type==='run.failed')).toBe(false);
+  expect(events).toContainEqual(expect.objectContaining({type:'run.completed',operationId:'recover-result'}));
+});
+it('lets the model explain a reached tool budget instead of silently terminating on prior commentary',async()=>{
+  await request('/submit',{text:'request-tool-budget',operationId:'tool-budget-answer',chatgpt:true});
+  expect(await (await request('/wait?id=tool-budget-answer')).json()).toMatchObject({status:'done',kind:'final',text:'I reached the tool limit; 24 reads completed. Continue to inspect more files.'});
+  const state=await (await request('/inspect')).json<{calls:{input:string}[];toolCalls:unknown[]}>();
+  expect(state.calls).toHaveLength(2);expect(state.toolCalls).toHaveLength(24);
+  const results=JSON.parse(state.calls[1]!.input).input.filter((item:{type:string})=>item.type==='function_call_output');
+  expect(results).toHaveLength(25);expect(results.at(-1).output).toContain('reached its tool budget');
 });
 it('continues multiple delayed tool rounds after a hard restart without another user message', async () => {
   const namespace = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE;

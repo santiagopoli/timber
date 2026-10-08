@@ -13,6 +13,7 @@ export function normalizeEntries(entries: readonly EntryRecord[]): RuntimeMessag
   return entries.flatMap(entry => (entry.model ?? []).flatMap((message, index) => {
     const role = message.role === 'toolResult' ? 'tool' : message.role;
     if (!['user', 'assistant', 'tool', 'system'].includes(role)) return [];
+    if (message.role === 'assistant' && ['error', 'aborted'].includes(message.stopReason)) return [];
     const text = textContent(message.content);
     if (!text) return [];
     const timestamp = 'timestamp' in message ? message.timestamp : undefined;
@@ -48,8 +49,10 @@ export function toolCompletion(entry: EntryRecord | undefined): { operationId?: 
 export function classifyFailure(reason: string, detail: unknown): { errorCode: string; publicMessage: string } {
   const text = typeof detail === 'string' ? detail : '';
   if (/model_empty_response/.test(text)) {
-    return { errorCode: 'model_empty_response', publicMessage: 'The model ended its turn without a visible answer. The completed tools were not repeated.' };
+    return { errorCode: 'model_empty_response', publicMessage: 'The model returned no answer after automatic retries. Your recorded tool results are preserved.' };
   }
+  if (/Run (?:generation|tool) budget exhausted/.test(text)) return { errorCode: 'runtime_budget_exceeded', publicMessage: 'This task reached its execution limit. Continue from the recorded results.' };
+  if (/chatgpt_response_filtered/.test(text)) return { errorCode: 'model_response_filtered', publicMessage: 'The model provider could not return a response to this request.' };
   if (/chatgpt_not_connected|chatgpt_reauthorization_required|chatgpt_reauthentication_required|chatgpt_connection_expired|subscription_sharing_invalid_user/.test(text)) {
     return { errorCode: 'chatgpt_not_connected', publicMessage: 'Connect ChatGPT before running this bot.' };
   }
@@ -77,5 +80,6 @@ export function classifyFailure(reason: string, detail: unknown): { errorCode: s
   if (/timeout|timed out|deadline/i.test(text)) {
     return { errorCode: 'model_timeout', publicMessage: 'The model request exceeded its time limit.' };
   }
+  if (reason !== 'aborted' && /chatgpt_incomplete_response|ended without|stream ended before|connection.?lost|socket hang up|fetch failed|terminated/i.test(text)) return { errorCode: 'model_connection_interrupted', publicMessage: 'The model connection was interrupted and could not recover. Your recorded tool results are preserved.' };
   return { errorCode: reason === 'aborted' ? 'run_aborted' : 'model_request_failed', publicMessage: reason === 'aborted' ? 'The run was stopped before an answer completed.' : 'The model request failed before an answer completed.' };
 }

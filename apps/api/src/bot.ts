@@ -293,7 +293,8 @@ export class BotDO extends DurableObject<Env> {
     if(this.hasPendingApproval(run.id)) {this.updateStatus(run.id,"waiting_approval");return;}
     // The provider checkpoints file mutations before returning their results.
     // Read-only/GUI turns must not stop a warm browser just to copy its profile.
-    if(status==="done") this.updateStatus(run.id,"completed");
+    if(status==="done" && (kind==="progress" || !text?.trim())) this.updateStatus(run.id,"failed","The task stopped before a final answer. Its recorded actions remain available.");
+    else if(status==="done") this.updateStatus(run.id,"completed");
     else {const failure=this.operationFailure(reason);this.updateStatus(run.id,failure.status,failure.error);}
   }
 

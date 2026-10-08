@@ -81,8 +81,14 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   Tool completion events can include both `operationId` (stable computer effect
   identity) and `toolCallId` (native call identity). Clients merge these explicit
   aliases for display; neither identical command text nor event names prove
-  execution success. A successful inference with no tool call or public answer
-  fails explicitly as `model_empty_response`; completed effects are not replayed.
+  execution success. Transient model failures, incomplete transport responses and
+  responses with neither tools nor public text use Pi's durable generation retry
+  (two retries, 500/1000 ms backoff). They retain the same input and recorded tool
+  results; completed effects are not replayed. Limits, access denial, filtering
+  and invalid protocol remain terminal. `run.retrying` exposes only the attempt,
+  maximum retries, retry time and safe error category. Exhausted empty responses
+  fail as `model_empty_response`. A native completion containing only progress
+  without a pending host decision does not claim task completion.
   Host-dispatched actions persist `tool.started` before execution and include an
   allowlisted `input` display summary (command, path, coordinates or other public
   parameters). Completion repeats that summary with the result, using the same
@@ -93,6 +99,10 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   and Activity, independent of transcript refresh. Command/parameters, status
   and a bounded output/error preview remain visible with details closed. Streaming
   text does not evict tool records from the separate bounded activity history.
+  The conversation header represents active work only. Terminal failures and
+  cancellation appear once after that task's activity; they do not label the bot
+  or the entire conversation. Continue submits a new explicit request using the
+  recorded context, rather than replaying an old computer operation.
 - GET /v1/bots/:id/computer -> {computer:ComputerStatus}. `starting` means an
   initialization is currently in flight. A failed control-server probe or saved
   startup failure is `unavailable`, with optional fixed `error:{code,message}`.
@@ -208,6 +218,15 @@ configuration timestamps prevent an older in-flight request from restoring an
 obsolete permission; already accepted effects are not cancelled by a policy edit.
 
 ## Storage / lifecycle
+The normal idle window is five minutes. Tool activity, active runtime events,
+explicit workspace reads, live-desktop lease renewals and successful app requests
+renew it. Passive status polling and an open chat do not. A detached server alone
+does not keep the machine awake. Idle shutdown first checkpoints, then destroys
+the container; checkpoint failures defer shutdown and retry after one minute.
+A separate fifteen-minute infrastructure inactivity timeout is the fallback.
+Restoration brings back the checkpointed /workspace files, not process memory,
+running services, desktop windows, /tmp or packages installed elsewhere.
+
 Workspace path /workspace, one writer via ComputerDO. Root package/tool image version
 pinned. Backend stores artifacts and directory archive in R2, metadata in DO. Unsafe
 in-progress operations after restart are interrupted; completed results deduplicated.

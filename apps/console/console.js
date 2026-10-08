@@ -187,7 +187,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
     const visibleApprovals = effectiveApprovals(), pending = visibleApprovals.filter(approval => approval.status === 'pending');
     $('approval-count').textContent = String(pending.length); $('approval-shortcut').hidden = !pending.length;
     const stream = [...streamDrafts.entries()].find(([id, text]) => text && activeRunIds.has(id) && !terminal.has(runs.get(id)?.status) && (!runFilter || id === runFilter));
-    const model = { bot: selected, messages, runs: [...runs.values()], approvals: visibleApprovals, connections: connections.map(item => ({...item, ...connectionWork.get(`${selected.id}:${item.id}`)})), events: events.filter(event => ['tool.started', 'tool.completed'].includes(event.type)).map(event => ({...event, data: redact(event.data)})),
+    const model = { bot: selected, messages, runs: [...runs.values()], approvals: visibleApprovals, connections: connections.map(item => ({...item, ...connectionWork.get(`${selected.id}:${item.id}`)})), events: events.map(event => ({...event, data: redact(event.data)})),
       deliveries: [...pendingMessages.values()].filter(delivery => delivery.botId === selected.id).map(delivery => ({...delivery})), draft: drafts.get(selected.id) || '', sending: sendBusy.has(selected.id), loading: chatLoading,
       currentRun, runFilter, focusApproval, stream: stream ? {runId: stream[0], text: stream[1]} : null, feedback: approvalFeedback.get(selected.id) };
     chat.update(model); activity.update({...model, runFilter: null});
@@ -236,11 +236,13 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
   const sortedRuns = () => [...runs.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   function renderCurrentRun() {
     const active = sortedRuns().filter((run) => activeRunIds.has(run.id) && !terminal.has(run.status));
-    currentRun = active.find((run) => run.status === 'running') || active.find((run) => ['waiting_approval', 'waiting_connection'].includes(run.status)) || active[0] || sortedRuns()[0] || null;
+    currentRun = active.find((run) => run.status === 'running') || active.find((run) => ['waiting_approval', 'waiting_connection'].includes(run.status)) || active[0] || null;
     $('run-status').textContent = currentRun ? statusLabel(currentRun.status) : 'Ready'; $('run-status').dataset.status = currentRun?.status || 'ready';
+    $('run-status').hidden = !currentRun;
     $('cancel-run').hidden = !currentRun || terminal.has(currentRun.status); $('cancel-run').disabled = currentRun ? stopping.has(currentRun.id) : false;
     $('active-run-count').hidden = !active.length; $('active-run-count').textContent = String(active.length);
-    $('run-error').textContent = currentRun?.error || ''; $('run-error').hidden = !currentRun?.error; renderStreamDraft();
+    // Outcomes belong to their task in the transcript, never to the bot header.
+    $('run-error').textContent = ''; $('run-error').hidden = true; renderStreamDraft();
   }
   function renderRuns() {
     $('run-list').replaceChildren(); const ordered = sortedRuns();
@@ -485,7 +487,7 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
     cursor = event.id;
     // Text deltas must not evict an in-flight tool from the activity model.
     // Keep the bounded tool history separate from the diagnostic event log.
-    if (event.type === 'tool.started' || event.type === 'tool.completed') {events.push(event); if (events.length > 200) events.shift();}
+    if (['tool.started', 'tool.completed', 'run.retrying'].includes(event.type)) {events.push(event); if (events.length > 200) events.shift();}
     const row = el('article', 'event'), title = el('div', 'event-title'); title.append(el('span', '', event.type.replaceAll('.', ' · ')), el('span', 'muted', `#${event.id} · ${time(event.createdAt)}`));
     const detail = el('details'); detail.append(el('summary', '', 'Event details')); const serialized = JSON.stringify(redact(event.data), null, 2); detail.append(el('pre', '', serialized.length > 8000 ? `${serialized.slice(0, 8000)}\n…` : serialized)); row.append(title, detail); $('activity-list').prepend(row); while ($('activity-list').children.length > 200) $('activity-list').lastElementChild.remove();
     $('event-count').textContent = String($('activity-list').children.length);
@@ -502,10 +504,11 @@ import { mountWorkspaceExplorer } from './src/workspace.tsx';
       if (activeRunIds.has(event.runId) && !terminal.has(runs.get(event.runId)?.status)) { streamDrafts.set(event.runId, (streamDrafts.get(event.runId) || '') + event.data.delta); renderStreamDraft(); }
       return;
     }
+    if (event.type === 'run.retrying') {streamDrafts.delete(event.runId); renderStreamDraft();}
     if ((event.type === 'message.created' && event.data.message?.role === 'assistant') || (event.type === 'message' && event.data.role === 'assistant')) { streamDrafts.delete(event.runId); renderStreamDraft(); }
     // Tool progress is already in the stream. Rendering it must not wait for
     // transcript/runs REST refreshes (which may be delayed by ongoing work).
-    if (event.type === 'tool.started' || event.type === 'tool.completed') renderMessages();
+    if (['tool.started', 'tool.completed', 'run.retrying'].includes(event.type)) renderMessages();
     scheduleRefresh(version);
   }
   const pause = (ms, signal) => new Promise((resolve) => { if (signal.aborted) return resolve(); const done = () => { clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); }; const timer = setTimeout(done, ms); signal.addEventListener('abort', done, { once: true }); });

@@ -88,6 +88,11 @@
 .timber-delivery-error{padding:12px;border-radius:10px;background:var(--soft);border:0;font-size:12px;line-height:1.6}
 .timber-delivery-error p{color:var(--danger);margin:0 0 8px}.timber-delivery-error p:last-child{margin-bottom:0}
 .timber-message-run{display:flex;flex-direction:column;gap:5px}
+.timber-task-outcome{font-size:13px;line-height:1.6;padding:14px 0;border-top:1px solid var(--line);min-width:0}
+.timber-task-outcome-heading{display:flex;align-items:center;gap:8px;color:var(--muted);font-weight:500}
+.timber-task-outcome-heading svg{width:16px;height:16px;color:var(--danger);flex-shrink:0}
+.timber-task-outcome p{margin:8px 0 12px;color:var(--muted);overflow-wrap:anywhere}
+.timber-task-outcome button{min-height:40px}
 
 .timber-chat button[data-variant="outline"]{color:var(--ink);background:var(--surface);border-color:var(--line)}
 .timber-chat button[data-variant="ghost"]{color:var(--ink);background:transparent}

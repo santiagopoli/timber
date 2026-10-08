@@ -71,7 +71,13 @@ export function createChatGPTProvider(transport: PiRuntimeOptions<object>['chatg
       },
       onProviderStreamEvent(value) {
         const event = object(value);
-        if (event.type === 'response.incomplete') throw new Error('chatgpt_incomplete_response');
+        if (event.type === 'response.incomplete') {
+          const response = event.response ? object(event.response) : undefined;
+          const details = response?.incomplete_details ? object(response.incomplete_details) : undefined;
+          if (details?.reason === 'max_output_tokens') throw new Error('chatgpt_output_limit');
+          if (details?.reason === 'content_filter') throw new Error('chatgpt_response_filtered');
+          throw new Error('chatgpt_incomplete_response: stream ended without a terminal response');
+        }
         const item = event.item ? object(event.item) : undefined;
         if (item?.type === 'function_call' && item.namespace !== TOOL_NAMESPACE) throw new Error('chatgpt_invalid_tool_namespace');
         if (item?.type === 'custom_tool_call') throw new Error('chatgpt_unsupported_tool');

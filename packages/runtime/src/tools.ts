@@ -41,7 +41,8 @@ async function executeBridgeTool(
     return {
       content: [{ type: 'text', text: 'This run reached its tool budget. Ask the user to continue.' }],
       isError: true,
-      control: { terminate: true },
+      // Let the model explain this result; terminating here would settle on its
+      // previous tool-call commentary without ever producing a final answer.
     };
   }
   const signal = context.abortSignal ?? new AbortController().signal;

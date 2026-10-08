@@ -90,12 +90,21 @@ function MessageRunStatus({ model, runId, callbacks }: { model: ChatModel; runId
   const run = model.runs.find(item => item.id === runId);
   // The inline request or activity already explains an active task. Keep the
   // receipt only when it adds delivery, failure or cancellation information.
-  if (!run || (!['queued', 'cancelled', 'interrupted'].includes(run.status) && !run.error)) return null;
+  if (!run || run.status !== 'queued') return null;
   return <div className="timber-message-run" data-message-run-status={run.status}>
-    <span className="timber-delivery-status">{['cancelled', 'interrupted'].includes(run.status) ? <CircleAlertIcon /> : run.status === 'queued' ? <ClockIcon /> : run.status === 'waiting_approval' ? <ShieldCheckIcon /> : <CheckIcon />}{label(run.status).replace(/^./, character => character.toUpperCase())}</span>
-    {run.status === 'interrupted' && <p className="timber-receipt-help">Review completed actions before retrying.</p>}
+    <span className="timber-delivery-status"><ClockIcon />Queued</span>
     {run.error && <div className="timber-delivery-error"><p>{run.error}</p>{run.status === 'queued' && run.error.includes('Retry this message') && <Button variant="outline" size="sm" disabled={model.sending} onClick={() => callbacks.onRetry(model.bot.id, run.operationId)}>Retry sending</Button>}</div>}
   </div>;
+}
+
+function TaskOutcome({model, run, callbacks}: {model:ChatModel;run:ChatModel['runs'][number];callbacks:ChatCallbacks}) {
+  const request = model.messages.find(message=>message.runId===run.id && message.role==='user');
+  const canContinue = request && run.status !== 'cancelled';
+  return <article className="timber-task-outcome" data-run-outcome={run.id} role="status">
+    <div className="timber-task-outcome-heading"><CircleAlertIcon aria-hidden="true"/><span>{run.status==='cancelled' ? 'Task stopped' : 'Response interrupted'}</span></div>
+    {run.error && <p>{run.error}</p>}
+    {canContinue && <Button type="button" variant="outline" size="sm" disabled={model.sending || model.runs.some(item=>!terminal.has(item.status))} onClick={()=>callbacks.onSend(model.bot.id, `Continue this task:\n\n${bounded(request.text,6000)}\n\nUse the results already recorded in this conversation. Check the last outcome before taking another action; do not repeat completed work. Explain the result or any remaining blocker.`)}>Continue</Button>}
+  </article>;
 }
 
 function ConnectionEntry({ connection, callbacks }: { connection: ChatConnection; callbacks: ChatCallbacks }) {
@@ -266,10 +275,16 @@ function ToolActivityRow({tool, model, panel = false}: {tool: ToolActivity; mode
   </details>;
 }
 
+function responseRetry(model: ActivityModel, runId?: string) {
+  const events = model.events.filter(event=>event.runId===runId && ['run.retrying','tool.started'].includes(event.type));
+  const last = events.at(-1);
+  return last?.type==='run.retrying' ? `Retrying response · ${last.data.attempt}/${last.data.maxRetries}` : null;
+}
+
 function ActivityGroup({model, runId, steps}: {model: ActivityModel; runId?: string; steps: ActivityStep[]}) {
   const run = model.runs.find(item => item.id === runId), working = run?.status === 'running';
   return <section className="timber-activity-group" data-run-activity={runId || 'unassigned'} aria-label="Activity">
-    <div className="timber-activity-header"><ActivityIcon aria-hidden="true" /><span>Activity</span><span className="timber-activity-count">{steps.length} {steps.length === 1 ? 'action' : 'actions'}</span>{working && <span className="timber-activity-status"><LoaderCircleIcon className="timber-spinner" aria-hidden="true" />Working</span>}</div>
+    <div className="timber-activity-header"><ActivityIcon aria-hidden="true" /><span>Activity</span><span className="timber-activity-count">{steps.length} {steps.length === 1 ? 'action' : 'actions'}</span>{working && <span className="timber-activity-status" role="status"><LoaderCircleIcon className="timber-spinner" aria-hidden="true" />{responseRetry(model,runId) || 'Working'}</span>}</div>
     <div className="timber-activity-content">{[...steps].sort((a, b) => a.at - b.at).map(step => <ToolActivityRow key={step.key} tool={step.tool} model={model} />)}</div>
   </section>;
 }
@@ -307,6 +322,10 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks): TimelineEntry[] {
   for (const delivery of model.deliveries.filter(item => !model.runFilter || item.runId === model.runFilter)) entries.push({key: `delivery:${delivery.operationId}`, at: timestamp(delivery.createdAt), order: messages.length * 2 + 3, node: <DeliveryEntry delivery={delivery} busy={model.sending} callbacks={callbacks} />});
   for (const tool of collectTools(model)) addActivity(tool.runId, {tool, key: tool.key, at: tool.at});
   for (const [key, group] of groups) {const request = messages.find(message => message.role === 'user' && message.runId === group.runId); const at = Math.max(Math.min(...group.steps.map(step => step.at)), timestamp(request?.createdAt)); entries.push({key: `activity:${key}`, at, order: afterRequest(group.runId, at), node: <ActivityGroup model={model} runId={group.runId} steps={group.steps} />});}
+  for (const run of model.runs.filter(run=>['failed','interrupted','cancelled'].includes(run.status) && (!model.runFilter || model.runFilter===run.id))) {
+    const at = Math.max(timestamp(run.updatedAt), ...messages.filter(message=>message.runId===run.id).map(message=>timestamp(message.createdAt)), ...model.events.filter(event=>event.runId===run.id).map(event=>timestamp(event.createdAt)));
+    entries.push({key:`outcome:${run.id}`,at,order:messages.length*2+4,node:<TaskOutcome model={model} run={run} callbacks={callbacks}/>});
+  }
   return entries.sort((a, b) => a.at - b.at || a.order - b.order);
 }
 
@@ -344,7 +363,7 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
       </Message>}
       {!model.stream && visibleRun && !terminal.has(visibleRun.status) && !hasInlineStatus && <div className="timber-work-status" role="status">
         {visibleRun.status === 'waiting_connection' ? <GitBranchIcon /> : visibleRun.status === 'waiting_approval' ? <ShieldCheckIcon /> : visibleRun.status === 'queued' ? <ClockIcon /> : <LoaderCircleIcon className="timber-spinner" />}
-        <span>{visibleRun.status === 'waiting_connection' ? 'Waiting for GitHub access' : visibleRun.status === 'waiting_approval' ? 'Waiting for your approval' : visibleRun.status === 'queued' ? 'Queued' : `${model.bot.name} is working`}</span>
+        <span>{visibleRun.status === 'waiting_connection' ? 'Waiting for GitHub access' : visibleRun.status === 'waiting_approval' ? 'Waiting for your approval' : visibleRun.status === 'queued' ? 'Queued' : responseRetry(model,visibleRun.id) || `${model.bot.name} is working`}</span>
       </div>}
       {visibleRun?.error && !model.messages.some(message => message.role === 'user' && message.runId === visibleRun.id) && <div className="timber-delivery-error" role="status"><p>{visibleRun.error}</p>{visibleRun.status === 'queued' && visibleRun.error.includes('Retry this message') && <Button variant="outline" size="sm" disabled={model.sending} onClick={() => callbacks.onRetry(model.bot.id, visibleRun.operationId)}>Retry sending</Button>}</div>}
     </ConversationContent>
