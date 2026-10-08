@@ -1547,6 +1547,118 @@ for(const delay of [0,1000]) test(`a progress reply precedes activity and its sa
   });
 });
 
+for(const width of [390,1440]) test(`screenshot actions show authenticated expandable thumbnails at ${width}px`,async()=>{
+  await withPage(async({page,login,state})=>{
+    const artifactId='10000000-0000-4000-8000-000000000099';
+    state.messages.set(BOT_A,[]);
+    state.emit(BOT_A,'tool.completed',{operationId:'screenshot-action',toolName:'desktop_screenshot',result:{status:'completed',artifactId,mimeType:'image/png'}},'screenshot-run');
+    await login();
+    const thumb=page.getByRole('button',{name:'Expand screenshot',exact:true});
+    await thumb.waitFor();await page.waitForFunction(()=>document.querySelector('[data-artifact-id] img')?.naturalWidth===1280);
+    assert.equal(await page.locator('[data-tool-operation-id="screenshot-action"]').evaluate(node=>node.open),false,'a thumbnail needs no action disclosure');
+    assert.equal(state.actions.length,0,'preview reads the saved artifact without taking another screenshot');
+    assert.equal(state.calls.filter(call=>call.path===`/v1/bots/${BOT_A}/artifacts/${artifactId}`).length,1);
+    await thumb.click();const dialog=page.getByRole('dialog',{name:'Screenshot',exact:true});await dialog.waitFor();
+    assert.equal(await page.locator('[data-tool-operation-id="screenshot-action"]').evaluate(node=>node.open),false,'opening an image does not also toggle action details');
+    assert.equal(await dialog.locator('img').evaluate(img=>img.naturalWidth),1280);
+    await dialog.getByRole('button',{name:'View actual size',exact:true}).click();
+    assert.equal(await dialog.locator('.is-zoomed img').evaluate(img=>img.getBoundingClientRect().width),1280);
+    await dialog.getByRole('button',{name:'Fit image',exact:true}).click();
+    assert.ok((await dialog.locator('img').boundingBox()).width<=width);
+    const download=page.waitForEvent('download');await dialog.getByRole('link',{name:'Download screenshot',exact:true}).click();
+    assert.equal((await download).suggestedFilename(),`screenshot-${artifactId}.png`);
+    if(process.env.CONSOLE_SCREENSHOT_DIR){await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/screenshot-dialog-${width}.png`});}
+    await page.keyboard.press('Escape');await dialog.waitFor({state:'hidden'});
+    assert.equal(await thumb.evaluate(node=>node===document.activeElement),true,'closing restores focus to the thumbnail');
+    await openPanel(page,'activity');await page.locator('#activity-tools').getByRole('button',{name:'Expand screenshot',exact:true}).waitFor();
+    assert.equal(state.actions.length,0);
+  },{viewport:{width,height:900},colorScheme:'dark'});
+});
+
+test('screenshot previews discard late reads on bot changes and release image URLs on sign-out',async()=>{
+  await withPage(async({page,login,state})=>{
+    const artifactId='10000000-0000-4000-8000-000000000099';
+    await page.addInitScript(()=>{
+      window.__artifactURLs={created:[],revoked:[]};
+      const create=URL.createObjectURL.bind(URL),revoke=URL.revokeObjectURL.bind(URL);
+      URL.createObjectURL=blob=>{const url=create(blob);window.__artifactURLs.created.push(url);return url;};
+      URL.revokeObjectURL=url=>{window.__artifactURLs.revoked.push(url);revoke(url);};
+    });
+    state.messages.set(BOT_A,[]);
+    state.emit(BOT_A,'tool.completed',{operationId:'private-image',toolName:'desktop_screenshot',result:{status:'completed',artifactId}},'image-run');
+    let release,finish;
+    const gate=new Promise(resolve=>release=resolve),finished=new Promise(resolve=>finish=resolve);
+    const routePattern=`**/artifacts/${artifactId}`;
+    await page.route(routePattern,async route=>{await gate;try{await route.continue();}finally{finish();}});
+    try {
+      const requested=page.waitForRequest(request=>request.url().endsWith(`/artifacts/${artifactId}`));
+      await login();await requested;
+      await selectBot(page,BOT_B);await until(page,'#selected-name','Linus');
+      release();await finished;await page.unroute(routePattern);
+      assert.equal(await page.locator('[data-artifact-id]').count(),0);
+      assert.deepEqual(await page.evaluate(()=>window.__artifactURLs.created),[],'a late response cannot create an image in another bot');
+      await selectBot(page,BOT_A);await page.getByRole('button',{name:'Expand screenshot',exact:true}).waitFor();
+      assert.ok(await page.evaluate(()=>window.__artifactURLs.created.length)>0);
+      await signOut(page);await page.locator('#login').waitFor({state:'visible'});
+      await page.waitForFunction(()=>window.__artifactURLs.created.every(url=>window.__artifactURLs.revoked.includes(url)));
+      assert.equal(await page.locator('[data-artifact-id]').count(),0);
+      assert.equal(state.actions.length,0);
+    } finally {release();}
+  });
+});
+
+test('completed activity survives a long conversation, later actions and reload',async()=>{
+  await withPage(async({page,login,state})=>{
+    const createdAt=new Date().toISOString();
+    const run={id:'retained-activity-run',botId:BOT_A,operationId:'retained-request',status:'running',createdAt,updatedAt:createdAt};
+    state.runs.set(BOT_A,[run]);
+    state.messages.set(BOT_A,[{id:'retained-user',botId:BOT_A,runId:run.id,role:'user',text:'Inspect the workspace.',createdAt}]);
+    state.emit(BOT_A,'tool.started',{operationId:'retained-command',toolName:'exec',input:{command:'pwd'}},run.id);
+    state.emit(BOT_A,'tool.completed',{operationId:'retained-command',toolName:'exec',result:{status:'completed',output:'/workspace',exitCode:0}},run.id);
+    await login();await page.locator('[data-tool-operation-id="retained-command"]').waitFor();
+    // Host and native events can exceed the diagnostic log's 200 entries in
+    // ordinary long conversations. That cap must never trim transcript actions.
+    for(let i=0;i<105;i++){
+      state.emit(BOT_A,'tool.started',{operationId:`later-key-${i}`,toolName:'desktop_key',input:{key:'Escape'}},run.id);
+      state.emit(BOT_A,'tool.completed',{operationId:`later-key-${i}`,toolName:'desktop_key',result:{status:'completed',output:'key submitted to desktop'}},run.id);
+    }
+    const answer={id:'retained-answer',botId:BOT_A,runId:run.id,role:'assistant',kind:'final',text:'Workspace inspection complete.',createdAt:new Date().toISOString()};
+    state.messages.get(BOT_A).push(answer);state.emit(BOT_A,'message.created',{message:answer},run.id);
+    run.status='completed';run.updatedAt=answer.createdAt;state.emit(BOT_A,'run.updated',{run},run.id);
+    await page.locator('[data-tool-operation-id="later-key-104"][data-tool-status="completed"]').waitFor();
+    await page.locator('[data-message-id="retained-answer"]').waitFor();
+    assert.equal(await page.locator('[data-tool-operation-id="retained-command"]').count(),1,'finishing newer actions must not remove completed history');
+    assert.equal((await page.locator('[data-tool-operation-id="retained-command"] [data-tool-result-preview]').innerText()).trim(),'/workspace');
+    await page.reload();await page.locator('[data-tool-operation-id="later-key-104"]').waitFor();
+    assert.equal(await page.locator('[data-tool-operation-id="retained-command"]').count(),1,'SSE replay restores the complete activity history');
+    assert.equal(await page.locator('[data-tool-operation-id]').count(),106,'replay does not duplicate actions');
+    assert.equal(await page.locator('#activity-list > article').count(),200,'the separate diagnostic log stays bounded');
+  });
+});
+
+test('an unavailable screenshot offers a read-only retry and never hides meaningful tool output',async()=>{
+  await withPage(async({page,login,state})=>{
+    const artifactId='10000000-0000-4000-8000-000000000099';let reads=0;
+    await page.route(`**/artifacts/${artifactId}`,route=>++reads===1?route.fulfill({status:503,json:{error:{message:'Image temporarily unavailable'}}}):route.continue());
+    state.messages.set(BOT_A,[]);
+    for(const [id,toolName,output,status] of [['quiet-key','desktop_key','key submitted to desktop','completed'],['quiet-click','desktop_click','click submitted to desktop','completed'],['useful-exec','exec','key submitted to desktop','completed'],['failed-key','desktop_key','key submitted to desktop','failed']]){
+      state.emit(BOT_A,'tool.completed',{operationId:id,toolName,input:{key:'Escape',command:'npm run build',x:20,y:30},result:{status,output}},'image-run');
+    }
+    state.emit(BOT_A,'tool.completed',{operationId:'retry-image',toolName:'desktop_screenshot',result:{status:'completed',artifactId}},'image-run');
+    await login();await page.getByRole('button',{name:'Retry screenshot preview',exact:true}).waitFor();
+    assert.equal(await page.locator('[data-tool-operation-id="quiet-key"] [data-tool-result-preview]').count(),0);
+    assert.equal(await page.locator('[data-tool-operation-id="quiet-click"] [data-tool-result-preview]').count(),0);
+    assert.match(await page.locator('[data-tool-operation-id="useful-exec"] [data-tool-result-preview]').innerText(),/key submitted to desktop/);
+    assert.match(await page.locator('[data-tool-operation-id="failed-key"] [data-tool-result-preview]').innerText(),/key submitted/);
+    await page.getByRole('button',{name:'Retry screenshot preview',exact:true}).click();
+    await page.getByRole('button',{name:'Expand screenshot',exact:true}).waitFor();
+    assert.equal(reads,2);assert.equal(state.actions.length,0);
+    assert.equal(await page.getByRole('dialog',{name:'Screenshot',exact:true}).count(),0,'retrying an image does not open an empty viewer');
+    await page.locator('[data-tool-operation-id="quiet-key"] > summary').click();
+    assert.match(await page.locator('[data-tool-operation-id="quiet-key"] .timber-tool-output').innerText(),/key submitted to desktop/,'raw output remains inspectable');
+  });
+});
+
 for (const width of [390,820]) test(`focused composer follows the keyboard viewport when it pans at ${width}px`,async()=>{
   await withPage(async({page,login,state})=>{
     state.messages.get(BOT_A).push({id:'keyboard-history',botId:BOT_A,role:'assistant',text:'Earlier context.\n\n'.repeat(80),createdAt:new Date().toISOString()});

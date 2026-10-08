@@ -41,7 +41,7 @@ function rfbPeer(socket, record) {
  send(Buffer.from('RFB 003.008\n'));
 }
 async function withDesktop(work,{width=1440,height=1050}={}) {
- const fixture=await createConsoleFixture(),context=await browser.newContext({viewport:{width,height}}),page=await context.newPage();
+ const fixture=await createConsoleFixture(),context=await browser.newContext({viewport:{width,height},colorScheme:'dark'}),page=await context.newPage();
  const state={calls:[],sockets:[],gates:[],gate:null,rfbGate:null,connectReplies:[],renewReplies:[]},errors=[],violations=[];
  page.on('pageerror',e=>errors.push(e.message));page.setDefaultTimeout(6000);
  await page.exposeFunction('__desktopCsp',v=>violations.push(v));
@@ -321,6 +321,7 @@ for (const fallback of [false,true]) test(`fullscreen ${fallback?'fallback':'nat
  await withDesktop(async({page,login,open,state,fixture})=>{
   const run={id:'focus-run',botId:BOT_A,operationId:'focus-request',status:'running',createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};
   fixture.runs.set(BOT_A,[run]);
+  fixture.messages.get(BOT_A).unshift({id:'focus-older-context',botId:BOT_A,role:'user',text:'Earlier conversation context. '.repeat(80),createdAt:'2026-01-01T00:00:00Z'});
   await login();await page.locator('#message').fill('Draft before fullscreen');await open('control');
   await page.locator('.desktop-screen canvas').click({position:{x:100,y:100}});
   if(fallback)await page.evaluate(()=>{document.querySelector('#desktop-root').requestFullscreen=undefined;});
@@ -339,6 +340,18 @@ for (const fallback of [false,true]) test(`fullscreen ${fallback?'fallback':'nat
   await page.locator('[data-mini-activity]').filter({hasText:'Running'}).waitFor();
   fixture.emit(BOT_A,'tool.completed',{operationId:'focus-tool',toolName:'exec',result:{status:'completed',exitCode:0,output:'Built successfully'}},run.id);
   await page.locator('[data-mini-activity]').filter({hasText:'Completed'}).waitFor();
+  const reply={id:'focus-formatted-reply',botId:BOT_A,runId:run.id,role:'assistant',kind:'progress',text:'Switched to **Map view**. The app shows `Map unavailable`; I am checking the configuration.',createdAt:new Date().toISOString()};
+  fixture.messages.get(BOT_A).push(reply);fixture.emit(BOT_A,'message.created',{message:reply},run.id);
+  await page.locator('[data-mini-reply] [data-streamdown="strong"]').filter({hasText:'Map view'}).waitFor();
+  assert.equal(await page.locator('[data-mini-reply] code').innerText(),'Map unavailable');
+  assert.equal((await page.locator('[data-mini-reply]').innerText()).includes('**'),false,'the preview renders Markdown rather than raw delimiters');
+  const artifactId='10000000-0000-4000-8000-000000000099';
+  fixture.emit(BOT_A,'tool.completed',{operationId:'focus-image',toolName:'desktop_screenshot',result:{status:'completed',artifactId,mimeType:'image/png'}},run.id);
+  const imageButton=page.locator('[data-mini-activity]').getByRole('button',{name:'Expand screenshot',exact:true});await imageButton.waitFor();
+  await imageButton.click();await page.getByRole('dialog',{name:'Screenshot',exact:true}).waitFor();
+  assert.equal(await page.locator('#desktop-root [data-screenshot-dialog]').count(),fallback?0:1,'native fullscreen contains its image viewer; the fallback uses the document modal layer');
+  await page.keyboard.press('Escape');await page.getByRole('dialog',{name:'Screenshot',exact:true}).waitFor({state:'hidden'});
+  assert.equal(await page.locator('#desktop-root.desktop-fullscreen').count(),1,'closing a screenshot preserves fullscreen');
   await page.locator('#message').fill('Draft inside fullscreen');
   const bounds=await page.locator('#message').boundingBox();assert.ok(bounds.y+bounds.height<=page.viewportSize().height);
   await page.evaluate(()=>{
@@ -355,9 +368,30 @@ for (const fallback of [false,true]) test(`fullscreen ${fallback?'fallback':'nat
   await page.evaluate(()=>{Object.assign(window.__keyboardViewport,{height:1000,offsetTop:0});visualViewport.dispatchEvent(new Event('resize'));});
   assert.equal(state.sockets.length,1,'fullscreen keeps the original framebuffer transport');
   if(process.env.CONSOLE_SCREENSHOT_DIR){await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/fullscreen-${fallback?'ipad':'desktop'}.png`});}
-  await page.locator('[data-mini-activity]').click();
+  await page.getByRole('button',{name:'Open conversation history',exact:true}).click();
+  await page.locator('.timber-focus-history #messages').waitFor({state:'visible'});
+  await page.locator('.timber-focus-history').getByRole('button',{name:'Expand screenshot',exact:true}).waitFor();
+  await page.waitForFunction(()=>{const n=document.querySelector('.timber-focus-history #messages');return n.scrollTop+n.clientHeight>=n.scrollHeight-2;});
+  await page.locator('.timber-focus-history #messages').hover();await page.mouse.wheel(0,-10000);
+  // Headless Chromium does not scroll native fullscreen with wheel input,
+  // including a plain overflow element. Still verify its scroll retention.
+  if(!fallback)await page.locator('.timber-focus-history #messages').evaluate(node=>{node.scrollTop=0;});
+  await page.waitForFunction(()=>document.querySelector('.timber-focus-history #messages').scrollTop<2);
+  const update={...reply,id:'focus-history-live-reply',text:'The configuration is ready.',createdAt:new Date().toISOString()};
+  fixture.messages.get(BOT_A).push(update);fixture.emit(BOT_A,'message.created',{message:update},run.id);
+  await page.locator('.timber-focus-history [data-message-id="focus-history-live-reply"]').waitFor({state:'attached'});
+  assert.ok(await page.locator('.timber-focus-history #messages').evaluate(node=>node.scrollTop<2),'a new reply does not interrupt reading older messages');
+  assert.equal(await page.locator('#messages').count(),1,'history reuses the conversation instead of duplicating message IDs');
+  assert.equal(await page.locator('#desktop-root.desktop-fullscreen').count(),1,'reading history stays in fullscreen');
+  assert.equal(state.sockets.length,1);assert.equal(state.sockets[0].closed,false);
+  assert.equal(await page.locator('#message').inputValue(),'Draft inside fullscreen');
+  if(process.env.CONSOLE_SCREENSHOT_DIR){await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/fullscreen-history-${fallback?'ipad':'desktop'}.png`});}
+  await page.getByRole('button',{name:'Close conversation history',exact:true}).click();
+  await page.getByRole('button',{name:'Collapse chat preview',exact:true}).click();
+  assert.equal(await page.locator('.timber-mini-body').count(),0);assert.equal(await page.locator('#message').isVisible(),true);
+  await page.getByRole('button',{name:'Expand chat preview',exact:true}).click();
+  await page.getByRole('button',{name:'Exit desktop fullscreen',exact:true}).click();
   await page.waitForFunction(()=>!document.fullscreenElement && !document.querySelector('#desktop-root').classList.contains('desktop-fullscreen'));
-  await page.locator('#panel-conversation').waitFor({state:'visible'});
   assert.equal(await page.locator('#message').inputValue(),'Draft inside fullscreen');
   assert.equal(await page.locator('#desktop-root').evaluate(node=>node.classList.contains('desktop-fullscreen')),false);
   assert.equal(await page.evaluate(()=>document.fullscreenElement),null);

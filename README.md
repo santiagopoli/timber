@@ -51,6 +51,13 @@ computer operations share an **Activity** block in chronological order; a new
 message separates that block from later actions, even within the same task.
 Native and host events for the same tool call produce one row. The final answer
 follows its actions. Private model reasoning is never shown.
+Completed actions remain in the conversation as newer tasks run and after reload;
+only the separate diagnostic event log is limited to its latest 200 entries.
+Successful desktop actions use a status icon; redundant acknowledgements remain
+available only in raw details. Screenshot results show authenticated thumbnails
+that expand into a fit/actual-size viewer with download. These previews read
+saved artifacts, never run another computer action, and are released on bot
+switch or sign-out.
 Cancellation, interrupted work and empty model responses have explicit
 inline states rather than silently appearing complete.
 
@@ -90,7 +97,9 @@ Desktop and iPad keep the conversation next to a collapsible workspace inspector
 The left bot list also collapses, opening as a drawer on narrower iPads. Layout
 preferences persist locally; switching inspector tabs preserves the selected file
 and conversation. Expanded Computer and desktop fullscreen retain the same prompt
-and a compact live activity widget. Browsers without native fullscreen use an
+and a collapsible preview with formatted replies and live actions. **History**
+opens the conversation inside fullscreen, preserving the desktop connection and
+message draft. Browsers without native fullscreen use an
 in-page fallback. Writing to the prompt never sends keys to the remote desktop.
 The conversation and fullscreen prompt follow the visible viewport's height and
 offset when a mobile keyboard opens or pans the page. The transcript keeps its

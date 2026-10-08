@@ -48,8 +48,16 @@ import './src/layout.css';
     onClearFilter: () => { runFilter = null; renderMessages(); },
     onStop: (botId, runId) => { if (selected?.id === botId) void guarded(() => cancelRun(runId)); },
     onConnect: (botId, requestId) => { if (selected?.id === botId) void connectGitHub(botId, requestId); },
-  }, () => {void desktop.exitFullscreen().then(() => {workspaceExpanded = false; showPanel('conversation');});});
-  const activity = mountToolActivity($('activity-tools'));
+  }, loadArtifact);
+  const activity = mountToolActivity($('activity-tools'), loadArtifact);
+  async function loadArtifact(botId, artifactId, signal) {
+    if (!authenticated || selected?.id !== botId) throw new DOMException('The bot changed.', 'AbortError');
+    const version = generation;
+    const response = await request(`${botPath(botId)}/artifacts/${encodeURIComponent(artifactId)}`, {raw:true,signal});
+    const blob = await response.blob();
+    if (!validView(version)) throw new DOMException('The bot changed.', 'AbortError');
+    return blob;
+  }
   const desktopSessions = new Map();
   const desktop = createDesktopViewer({
     element: $('desktop-root'),
@@ -505,9 +513,9 @@ import './src/layout.css';
     if (event.type === 'computer.suspended') desktop.disconnect();
     if (['computer.action', 'computer.suspended', 'tool.started', 'tool.completed', 'approval.updated'].includes(event.type)) queueComputerStatus();
     cursor = event.id;
-    // Text deltas must not evict an in-flight tool from the activity model.
-    // Keep the bounded tool history separate from the diagnostic event log.
-    if (['tool.started', 'tool.completed', 'run.retrying'].includes(event.type)) {events.push(event); if (events.length > 200) events.shift();}
+    // Actions belong to the conversation, including after a task completes.
+    // Only the separate diagnostic log is capped; SSE replay restores history.
+    if (['tool.started', 'tool.completed', 'run.retrying'].includes(event.type)) events.push(event);
     const row = el('article', 'event'), title = el('div', 'event-title'); title.append(el('span', '', event.type.replaceAll('.', ' · ')), el('span', 'muted', `#${event.id} · ${time(event.createdAt)}`));
     const detail = el('details'); detail.append(el('summary', '', 'Event details')); const serialized = JSON.stringify(redact(event.data), null, 2); detail.append(el('pre', '', serialized.length > 8000 ? `${serialized.slice(0, 8000)}\n…` : serialized)); row.append(title, detail); $('activity-list').prepend(row); while ($('activity-list').children.length > 200) $('activity-list').lastElementChild.remove();
     $('event-count').textContent = String($('activity-list').children.length);

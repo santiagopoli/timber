@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
-import { ArrowUpIcon, CheckIcon, ChevronDownIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon } from 'lucide-react';
+import { ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon, HistoryIcon } from 'lucide-react';
 import { useStickToBottomContext } from 'use-stick-to-bottom';
 import { defaultUrlTransform, type UrlTransform } from 'streamdown';
 import { Conversation, ConversationContent, ConversationEmptyState, ConversationScrollButton } from '@/components/ai-elements/conversation';
@@ -12,6 +12,7 @@ import { Confirmation, ConfirmationAction, ConfirmationActions } from '@/compone
 import { Button } from '@/components/ui/button';
 import type { ChatApproval, ChatCallbacks, ChatModel, ChatConnection, MessageDelivery } from './chat-types';
 import {ActivityCode, ActivityOutput, activityIdentity, outputFormat} from './activity-content';
+import {ArtifactPreview, ArtifactProvider, type ArtifactLoader} from './artifact-preview';
 import './chat.css';
 
 const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
@@ -249,8 +250,10 @@ function ToolActivityRow({tool, model, panel = false}: {tool: ToolActivity; mode
   const StatusIcon = state.running ? LoaderCircleIcon : state.failed ? CircleAlertIcon : state.pending ? ShieldCheckIcon : CheckIcon;
   const output = typeof tool.result?.output === 'string' ? tool.result.output : '';
   const error = tool.result?.error;
+  const gui = /^(?:desktop_)?(?:click|move|double_click|doubleClick|drag|type|key|scroll|navigate)$/.test(tool.name) || tool.name === 'browser_navigate';
+  const redundant = gui && tool.result?.status === 'completed' && /^(?:click|move|doubleClick|drag|type|key|scroll|navigate) submitted to desktop\.?$/i.test(output.trim());
   const format = useMemo(()=>outputFormat(output, tool.name, {path: input.path}), [output, tool.name, input.path]);
-  const preview = error || (tool.result?.artifactId ? 'Image captured' : tool.name === 'exec' && state.status === 'completed' && !output.trim() ? 'No output' : '');
+  const preview = error || (tool.name === 'exec' && state.status === 'completed' && !output.trim() ? 'No output' : '');
   const operation = String(tool.data.operationId || tool.data.toolCallId || tool.key);
   const attributes = panel ? {'data-activity-tool-operation-id': operation} : {'data-tool-operation-id': operation};
   const statusLabel = `${state.text}${tool.result?.exitCode !== undefined ? ` · exit ${tool.result.exitCode}` : ''}`;
@@ -262,7 +265,8 @@ function ToolActivityRow({tool, model, panel = false}: {tool: ToolActivity; mode
       <div className="timber-tool-overview">
         <div className={`timber-tool-command${presentation.command ? ' is-command' : ''}`}>{command ? <ActivityCode code={command} language="bash" compact/> : presentation.title}</div>
         <div className="timber-tool-meta"><span className={state.pending || state.status === 'unconfirmed' ? 'timber-tool-parameters' : 'timber-sr-only'}>{statusLabel}</span>{tool.result?.exitCode !== undefined && tool.result.exitCode !== 0 && <span className="timber-tool-exit">exit {tool.result.exitCode}</span>}{presentation.parameters && <span className="timber-tool-parameters">{presentation.parameters}</span>}</div>
-        {preview ? <div className={`timber-tool-preview${error ? tool.result?.status === 'completed' ? ' timber-save-warning' : ' timber-inline-error' : ''}`} data-tool-result-preview>{bounded(preview,420)}</div> : output.trim() && <div className="timber-tool-preview" data-tool-result-preview><ActivityOutput format={format} compact/></div>}
+        {preview ? <div className={`timber-tool-preview${error ? tool.result?.status === 'completed' ? ' timber-save-warning' : ' timber-inline-error' : ''}`} data-tool-result-preview>{bounded(preview,420)}</div> : output.trim() && !redundant && <div className="timber-tool-preview" data-tool-result-preview><ActivityOutput format={format} compact/></div>}
+        {tool.result?.artifactId && <ArtifactPreview key={`${model.bot.id}:${tool.result.artifactId}`} botId={model.bot.id} artifactId={tool.result.artifactId}/>}
       </div>
       <span className="timber-tool-corner"><span className="timber-tool-status" role="status" aria-label={statusLabel} title={statusLabel}><StatusIcon className={state.running ? 'timber-spinner' : ''} aria-hidden="true"/></span><ChevronDownIcon className="timber-tool-chevron" aria-hidden="true"/></span>
     </summary>
@@ -446,39 +450,59 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
     </div>;
 }
 
-function MiniActivity({model, onConversation}: {model: ChatModel; onConversation(): void}) {
+function MiniActivity({model, historyOpen, onHistory}: {model: ChatModel; historyOpen: boolean; onHistory(value:boolean): void}) {
+  const [collapsed,setCollapsed] = useState(false);
   const tools = collectTools({...model, runFilter: null}, true).sort((a,b) => b.at - a.at);
   const active = tools.filter(tool => toolState(tool, model).running);
-  const visible = active.length ? active.slice(0, 3) : tools.slice(0, 1);
   const run = model.currentRun, latestRun = [...model.runs].sort((a,b) => timestamp(b.updatedAt) - timestamp(a.updatedAt))[0];
+  const visible = active.length ? active.slice(0,2) : tools.filter(tool=>!run || tool.runId===run.id).slice(0,1);
   const waiting = run?.status === 'waiting_approval' || run?.status === 'waiting_connection';
   const failed = !run && latestRun && ['failed','interrupted'].includes(latestRun.status);
-  const reply = model.stream?.text || [...model.messages].reverse().find(message => message.role === 'assistant' && message.kind !== 'progress')?.text;
+  const lastReply = [...model.messages].reverse().find(message => message.role === 'assistant' && (!run || message.runId === run.id));
+  const reply = model.stream?.text || lastReply?.text;
   const delivery = model.deliveries.find(item => ['unknown','rejected'].includes(item.state));
-  const heading = delivery ? 'Message not confirmed' : waiting ? 'Needs your attention' : failed ? 'Response interrupted' : run ? responseRetry(model,run.id) || (model.stream ? 'Responding' : 'Working') : reply ? 'Reply ready' : 'Activity';
-  return <button className="timber-mini-activity" type="button" onClick={onConversation} aria-label="Open conversation" data-mini-activity>
-    <span className="timber-mini-heading"><strong>{model.bot.name}</strong><span role="status">{heading}</span><ExternalLinkIcon aria-hidden="true"/></span>
-    {visible.map(tool => {const state = toolState(tool,model), presentation = toolPresentation(tool); const StatusIcon = state.running ? LoaderCircleIcon : state.failed ? CircleAlertIcon : state.pending ? ShieldCheckIcon : CheckIcon;
-      return <span className="timber-mini-step" key={tool.key} title={`${presentation.title} · ${state.text}`}><StatusIcon className={state.running ? 'timber-spinner' : ''} aria-hidden="true"/><span>{presentation.title}</span><small>{state.text}</small></span>;
-    })}
-    {(delivery || waiting || failed || model.stream || (!run && reply)) && <span className="timber-mini-reply">{delivery?.error || (waiting ? 'Open conversation to continue' : failed ? latestRun?.error : reply)}</span>}
-  </button>;
+  const heading = delivery ? 'Not delivered' : waiting ? 'Needs attention' : failed ? 'Interrupted' : run ? responseRetry(model,run.id) || (model.stream ? 'Responding' : 'Working') : '';
+  const warning = delivery?.error || (failed ? latestRun?.error : '');
+  const screenshot = visible.find(tool=>tool.result?.artifactId)?.result?.artifactId;
+  return <section className="timber-mini-activity" data-mini-activity aria-label={`${model.bot.name} conversation preview`}>
+    <div className="timber-mini-heading">
+      <span className="timber-mini-avatar" aria-hidden="true">{model.bot.name.slice(0,1)}</span><strong>{model.bot.name}</strong>
+      {heading && <span className={`timber-mini-status${waiting || failed || delivery?' needs-attention':''}`} role="status">{run && !waiting ? <LoaderCircleIcon className="timber-spinner"/> : waiting || failed || delivery ? <CircleAlertIcon/> : null}{heading}</span>}
+      <div className="timber-mini-controls">
+        <button type="button" data-open-history onClick={()=>{setCollapsed(false);onHistory(!historyOpen);}} aria-expanded={historyOpen} aria-label={historyOpen?'Close conversation history':'Open conversation history'} title={historyOpen?'Close history':'Conversation history'}><HistoryIcon/><span>History</span></button>
+        <button type="button" onClick={()=>{if(historyOpen)onHistory(false);setCollapsed(value=>!value);}} aria-expanded={!collapsed} aria-label={collapsed?'Expand chat preview':'Collapse chat preview'} title={collapsed?'Expand preview':'Collapse preview'}>{collapsed?<ChevronUpIcon/>:<ChevronDownIcon/>}</button>
+      </div>
+    </div>
+    {!collapsed && !historyOpen && <div className="timber-mini-body">
+      {(reply || warning || screenshot) && <div className="timber-mini-reply-row">
+        <div className={`timber-mini-reply${warning?' timber-inline-error':''}`} data-mini-reply>{warning?<p>{warning}</p>:reply?<Response text={reply} streaming={Boolean(model.stream)}/>:null}</div>
+        {screenshot && <ArtifactPreview key={`${model.bot.id}:${screenshot}`} botId={model.bot.id} artifactId={screenshot} compact/>}
+      </div>}
+      {visible.map(tool=>{
+        const state=toolState(tool,model),presentation=toolPresentation(tool),identity=activityIdentity(tool.name,presentation.command?displayText(toolInput(tool).command):'');
+        const Icon=identity.Icon,StatusIcon=state.running?LoaderCircleIcon:state.failed?CircleAlertIcon:state.pending?ShieldCheckIcon:CheckIcon;
+        return <div className="timber-mini-step" key={tool.key} title={`${presentation.title} · ${state.text}`}><Icon aria-hidden="true"/><span className={presentation.command?'is-command':''}>{presentation.title}</span><span className="timber-mini-step-status" role="status" aria-label={state.text}><StatusIcon className={state.running?'timber-spinner':''}/><span className="timber-sr-only">{state.text}</span></span></div>;
+      })}
+    </div>}
+  </section>;
 }
 
-function Chat({ model, callbacks, dockTarget, onConversation }: { model: ChatModel; callbacks: ChatCallbacks; dockTarget: HTMLElement | null; onConversation(): void }) {
+function Chat({ model, callbacks, dockTarget }: { model: ChatModel; callbacks: ChatCallbacks; dockTarget: HTMLElement | null }) {
+  const [historyOpen,setHistoryOpen] = useState(false);
+  useEffect(()=>{if(!dockTarget)setHistoryOpen(false);},[dockTarget]);
   const composer = <Composer model={model} callbacks={callbacks}/>;
+  const conversation = <Conversation className="timber-conversation" initial="instant" resize="instant"><ConversationBody model={model} callbacks={callbacks}/></Conversation>;
   return <div className="timber-chat-layout">
     {model.runFilter && <div id="run-filter" className="timber-filter"><span>Filtered by task</span><Button id="clear-run-filter" variant="ghost" size="sm" onClick={callbacks.onClearFilter}>Show all messages</Button></div>}
-    <Conversation className="timber-conversation" initial="instant" resize="instant"><ConversationBody model={model} callbacks={callbacks} /></Conversation>
-    {dockTarget ? createPortal(<div className="timber-focus-chat"><MiniActivity model={model} onConversation={onConversation}/>{composer}</div>, dockTarget) : composer}
+    {!(dockTarget && historyOpen) && conversation}
+    {dockTarget ? createPortal(<div className="timber-focus-chat"><MiniActivity model={model} historyOpen={historyOpen} onHistory={setHistoryOpen}/>{historyOpen && <div className="timber-focus-history" aria-label="Conversation history">{conversation}</div>}{composer}</div>,dockTarget) : composer}
   </div>;
 }
 
-
-export function mountChat(element: HTMLElement, callbacks: ChatCallbacks, onConversation: () => void) {
+export function mountChat(element: HTMLElement, callbacks: ChatCallbacks, loadArtifact: ArtifactLoader) {
   const root = createRoot(element);
   let model: ChatModel | null = null, dockTarget: HTMLElement | null = null;
-  const render = () => root.render(model ? <Chat key={model.bot.id} model={model} callbacks={callbacks} dockTarget={dockTarget} onConversation={onConversation}/> : null);
+  const render = () => root.render(model ? <ArtifactProvider load={loadArtifact}><Chat key={model.bot.id} model={model} callbacks={callbacks} dockTarget={dockTarget}/></ArtifactProvider> : null);
   return {
     update(value: ChatModel) {model = value; render();},
     setDock(target: HTMLElement | null) {if (dockTarget !== target) {dockTarget = target; render();}},
@@ -486,7 +510,7 @@ export function mountChat(element: HTMLElement, callbacks: ChatCallbacks, onConv
   };
 }
 
-export function mountToolActivity(element: HTMLElement) {
+export function mountToolActivity(element: HTMLElement, loadArtifact: ArtifactLoader) {
   const root = createRoot(element);
-  return { update(model: ActivityModel) {root.render(<ActivityPanel key={model.bot.id} model={model} />);}, clear() {root.render(null);} };
+  return { update(model: ActivityModel) {root.render(<ArtifactProvider load={loadArtifact}><ActivityPanel key={model.bot.id} model={model} /></ArtifactProvider>);}, clear() {root.render(null);} };
 }

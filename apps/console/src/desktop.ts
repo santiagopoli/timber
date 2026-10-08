@@ -44,7 +44,7 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
     fallbackFullscreen = true; notifyFullscreen();
   }
   const escapeFullscreen = (event: KeyboardEvent) => {
-    if (event.key === 'Escape' && fallbackFullscreen) {event.preventDefault(); void exitFullscreen();}
+    if (event.key === 'Escape' && fallbackFullscreen && !event.defaultPrevented && !document.querySelector('[data-screenshot-dialog]')) {event.preventDefault(); void exitFullscreen();}
   };
   const screen = root.querySelector<HTMLElement>('.desktop-screen')!;
   const empty = root.querySelector<HTMLElement>('.desktop-empty')!;
