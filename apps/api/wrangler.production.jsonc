@@ -82,7 +82,7 @@
       "scheduling_policy": "durable_object",
       "images": {
         "base": {
-          "image": "registry.cloudflare.com/3acfff91febe1ba644c6358ae5612736/timber-computer@sha256:7b91540a16843705a3854f864338a9824ba3324e35d4192289c30039b8aeaff3"
+          "image": "registry.cloudflare.com/3acfff91febe1ba644c6358ae5612736/timber-computer@sha256:fcf42d49f3834836ad8a2476b8ea2cf23c8a5f721dba966e350eb49897ffea1c"
         }
       }
     }
