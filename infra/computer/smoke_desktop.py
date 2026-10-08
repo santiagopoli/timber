@@ -165,6 +165,11 @@ def native_mouse_smoke(token):
         assert pointer() == start, "Agent move did not position the native pointer"
         assert any(item[:3] == (6, *start) for item in moved), "Native window did not receive hover movement"
         assert not any(item[0] in (4, 5) for item in moved), "Hover unexpectedly pressed a button"
+        # Keep the pointer at exactly the same pixel. Older xdotool --sync
+        # waits for an actual movement here and deadlocks the following input.
+        action({"type": "move", "x": start[0], "y": start[1]})
+        assert pointer() == start, "Repeated hover changed the pointer position"
+        assert not any(item[0] in (4, 5) for item in events())
 
         operation_id = str(uuid.uuid4())
         double_click = {"type": "doubleClick", "x": start[0], "y": start[1]}
@@ -175,6 +180,12 @@ def native_mouse_smoke(token):
         assert 0 < clicked[2][4] - clicked[0][4] < 500, "Clicks were too far apart for a double-click"
         assert action(double_click, operation_id) == first
         assert not any(item[0] in (4, 5) for item in events()), "A repeated operation replayed the double-click"
+
+        for _ in range(2):
+            action({"type": "click", "x": start[0], "y": start[1]})
+            clicked = [item for item in events() if item[0] in (4, 5)]
+            assert [item[0] for item in clicked] == [4, 5], "Same-coordinate click must deliver exactly one press/release pair"
+            assert all(item[1:3] == start and item[5] == 1 for item in clicked)
 
         action({"type": "drag", "fromX": start[0], "fromY": start[1], "toX": end[0], "toY": end[1], "durationMs": 500})
         dragged = events()

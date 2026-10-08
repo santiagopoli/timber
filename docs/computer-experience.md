@@ -20,10 +20,11 @@ bots, logout or Suspend stops watching. Manual control releases immediately when
 the page/pane is hidden and must always be taken again explicitly.
 
 The bot can move the pointer to hover, click or double-click using the left, right
-or middle button, drag between coordinates, and scroll at the current pointer. Watching never blocks those tools. A human
-control lease temporarily blocks bot mutations to avoid competing input; releasing
-control restores bot access. Drag duration is 100–2000 ms (default 500 ms); failed gestures attempt to release
-the button. Mouse actions and their coordinates appear in Activity.
+or middle button, drag between coordinates, and scroll at the current pointer.
+Watching never blocks those tools. A human control lease temporarily blocks bot
+mutations to avoid competing input; releasing control restores bot access. Drag
+duration is 100–2000 ms (default 500 ms); failed gestures attempt to release the
+button. Mouse actions and their coordinates appear in Activity.
 
 Full screen is available where the browser supports it. Screenshots, terminal and
 manual controls remain under **Snapshots, terminal & manual tools**. These are

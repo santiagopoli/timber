@@ -93,7 +93,7 @@ class ComputerTests(unittest.TestCase):
                 operation_id = f"drag-failure-{failure_stage}"
                 first = self.computer.execute(operation_id, action)
                 self.assertEqual(first["status"], "failed")
-                self.assertEqual(calls[-1], ["xdotool", "mouseup", "3"])
+                self.assertEqual(calls[-1][1:3], ["mouseup", "3"])
                 before_retry = len(calls)
                 self.assertEqual(self.computer.execute(operation_id, action), first)
                 self.assertEqual(len(calls), before_retry)

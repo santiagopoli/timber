@@ -144,13 +144,16 @@ class Computer:
             return {"status": "completed", "artifactName": target.name, "mimeType": "image/png"}
         if kind == "move":
             x, y = self.mouse_point(action)
-            self.run(["xdotool", "mousemove", "--sync", str(x), str(y)])
+            # --sync waits for motion on older xdotool builds and can hang if
+            # already at this pixel. Querying the pointer completes an X11
+            # round-trip without requiring movement, also ordering later input.
+            self.run(["xdotool", "mousemove", str(x), str(y), "getmouselocation"])
             return {"status": "completed", "output": f"Moved pointer to ({x}, {y})"}
         elif kind in {"click", "doubleClick"}:
             x, y = self.mouse_point(action)
             button = self.mouse_button(action)
             repeat = ["--repeat", "2", "--delay", "100"] if kind == "doubleClick" else []
-            self.run(["xdotool", "mousemove", "--sync", str(x), str(y), "click", *repeat, button])
+            self.run(["xdotool", "mousemove", str(x), str(y), "click", *repeat, button, "getmouselocation"])
         elif kind == "drag":
             from_x, from_y = self.mouse_point(action, "fromX", "fromY")
             to_x, to_y = self.mouse_point(action, "toX", "toY")
@@ -166,14 +169,15 @@ class Computer:
                 x = round(from_x + (to_x - from_x) * step / steps)
                 y = round(from_y + (to_y - from_y) * step / steps)
                 movement.extend(["sleep", str(duration / steps / 1000), "mousemove", str(x), str(y)])
-            self.run(["xdotool", "mousemove", "--sync", str(from_x), str(from_y)])
+            movement.append("getmouselocation")
+            self.run(["xdotool", "mousemove", str(from_x), str(from_y), "getmouselocation"])
             try:
                 # Even a failed/timeout press may have reached X11. Always try
                 # to release it, including when the movement subprocess fails.
-                self.run(["xdotool", "mousedown", button])
+                self.run(["xdotool", "mousedown", button, "getmouselocation"])
                 self.run(movement)
             finally:
-                self.run(["xdotool", "mouseup", button])
+                self.run(["xdotool", "mouseup", button, "getmouselocation"])
             return {"status": "completed", "output": f"Dragged from ({from_x}, {from_y}) to ({to_x}, {to_y})"}
         elif kind == "type":
             value = action.get("text")
