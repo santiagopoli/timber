@@ -1481,6 +1481,72 @@ test('historical approvals and activity cannot precede their own request despite
   });
 });
 
+for (const width of [390,1440]) test(`assistant replies separate successive activity blocks in live and saved history at ${width}px`,async()=>{
+  await withPage(async({page,login,state})=>{
+    const at=second=>new Date(Date.parse('2026-10-08T12:00:00Z')+second*1000).toISOString();
+    const run={id:'interleaved-run',botId:BOT_A,operationId:'interleaved-op',status:'running',createdAt:at(0),updatedAt:at(0)};
+    const user={id:'interleaved-user',botId:BOT_A,runId:run.id,role:'user',text:'Volver a levantar Spacetime',createdAt:at(0)};
+    state.runs.set(BOT_A,[run]);state.messages.set(BOT_A,[user]);
+    const emit=(type,data,second)=>{
+      const event={id:++state.nextEventId,botId:BOT_A,runId:run.id,type,data,createdAt:at(second)};
+      state.events.push(event);state.deliver(event);
+    };
+    const message=(id,text,second,kind='progress')=>{
+      const value={id,botId:BOT_A,runId:run.id,role:'assistant',kind,text,createdAt:at(second)};
+      state.messages.get(BOT_A).push(value);emit('message.created',{message:value},second);return value;
+    };
+    const start=(id,command,second)=>emit('tool.started',{toolCallId:id,toolName:'exec',input:{command}},second);
+    const finish=(id,second)=>emit('tool.completed',{toolCallId:id,toolName:'exec',result:{status:'completed',output:'ok',exitCode:0}},second);
+    const order=()=>page.locator('#messages').evaluate(node=>[...node.querySelectorAll('[data-message-id], [data-tool-operation-id]')].map(item=>item.dataset.messageId||item.dataset.toolOperationId));
+    start('interleaved-inspect','command -v bun',1);finish('interleaved-inspect',2);
+    await login();await page.locator('[data-tool-operation-id="interleaved-inspect"]').waitFor();
+    message('interleaved-reply','Sí, estoy restaurando las dependencias y volviendo a arrancar Spacetime.',3);
+    await page.locator('[data-message-id="interleaved-reply"]').waitFor();
+    start('interleaved-install','npm install',4);
+    await page.locator('[data-tool-operation-id="interleaved-install"]').waitFor();
+    assert.deepEqual(await order(),[user.id,'interleaved-inspect','interleaved-reply','interleaved-install'],'new activity follows the public assistant reply');
+    assert.equal(await page.locator('[data-message-id="interleaved-reply"]').evaluate(node=>node.closest('[data-run-activity]')),null,'the reply remains a normal assistant message');
+    assert.equal(await page.locator('[data-run-activity]').count(),2);
+    await page.locator('[data-tool-operation-id="interleaved-install"] > summary').click();
+    finish('interleaved-install',5);
+    message('interleaved-launch-reply','Las dependencias están listas. Ahora arranco la app.',6);
+    start('interleaved-launch','npm run dev',7);start('interleaved-check','curl -I http://localhost:3000',8);
+    await page.locator('[data-tool-operation-id="interleaved-check"]').waitFor();
+    assert.equal(await page.locator('[data-tool-operation-id="interleaved-install"]').evaluate(node=>node.open),true,'later replies do not remount previously opened action details');
+    assert.equal(await page.locator('[data-run-activity]').count(),3,'consecutive actions share a block until another message');
+    assert.equal(await page.locator('[data-run-activity]').first().locator('.timber-activity-status').count(),0,'finished earlier blocks do not claim to be working');
+    finish('interleaved-launch',9);finish('interleaved-check',10);
+    message('interleaved-final','Spacetime está disponible.',11,'final');
+    run.status='completed';run.updatedAt=at(11);emit('run.updated',{run},11);
+    await page.locator('[data-message-id="interleaved-final"]').waitFor();
+    const expected=[user.id,'interleaved-inspect','interleaved-reply','interleaved-install','interleaved-launch-reply','interleaved-launch','interleaved-check','interleaved-final'];
+    assert.deepEqual(await order(),expected);
+    if(process.env.CONSOLE_SCREENSHOT_DIR){await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});await page.locator('[data-message-id="interleaved-reply"]').scrollIntoViewIfNeeded();await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/interleaved-${width}.png`});}
+    await page.reload();await page.locator('[data-tool-operation-id="interleaved-check"]').waitFor();
+    assert.deepEqual(await order(),expected,'reloading restores the same interleaved conversation');
+    assert.equal(await page.locator('[data-run-activity]').count(),3);
+    assert.equal(state.calls.some(call=>call.method!=='GET'),false,'rendering history does not replay actions');
+  },{viewport:{width,height:1000},colorScheme:'dark'});
+});
+
+for(const delay of [0,1000]) test(`a progress reply precedes activity and its same-time final answer with ${delay}ms delay`,async()=>{
+  await withPage(async({page,login,state})=>{
+    const at='2026-10-08T12:00:00Z',runId='tie-progress-run';
+    const toolAt=new Date(Date.parse(at)+delay).toISOString();
+    state.runs.set(BOT_A,[{id:runId,botId:BOT_A,operationId:'tie-progress-op',status:'completed',createdAt:at,updatedAt:at}]);
+    state.messages.set(BOT_A,[
+      {id:'tie-progress-user',botId:BOT_A,runId,role:'user',text:'Arrancá la app.',createdAt:at},
+      {id:'tie-progress-reply',botId:BOT_A,runId,role:'assistant',kind:'progress',text:'Sí, estoy arrancando la app.',createdAt:at},
+      {id:'tie-progress-final',botId:BOT_A,runId,role:'assistant',kind:'final',text:'La app está disponible.',createdAt:toolAt},
+    ]);
+    state.emit(BOT_A,'tool.started',{toolCallId:'tie-progress-tool',toolName:'exec',input:{command:'npm run dev'}},runId).createdAt=toolAt;
+    state.emit(BOT_A,'tool.completed',{toolCallId:'tie-progress-tool',toolName:'exec',result:{status:'completed',output:'Ready',exitCode:0}},runId).createdAt=toolAt;
+    await login();await page.locator('[data-tool-operation-id="tie-progress-tool"]').waitFor();
+    const order=await page.locator('#messages').evaluate(node=>[...node.querySelectorAll('[data-message-id], [data-tool-operation-id]')].map(item=>item.dataset.messageId||item.dataset.toolOperationId));
+    assert.deepEqual(order,['tie-progress-user','tie-progress-reply','tie-progress-tool','tie-progress-final']);
+  });
+});
+
 for (const width of [390,820]) test(`focused composer follows the keyboard viewport when it pans at ${width}px`,async()=>{
   await withPage(async({page,login,state})=>{
     state.messages.get(BOT_A).push({id:'keyboard-history',botId:BOT_A,role:'assistant',text:'Earlier context.\n\n'.repeat(80),createdAt:new Date().toISOString()});

@@ -356,6 +356,7 @@ for (const fallback of [false,true]) test(`fullscreen ${fallback?'fallback':'nat
   assert.equal(state.sockets.length,1,'fullscreen keeps the original framebuffer transport');
   if(process.env.CONSOLE_SCREENSHOT_DIR){await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/fullscreen-${fallback?'ipad':'desktop'}.png`});}
   await page.locator('[data-mini-activity]').click();
+  await page.waitForFunction(()=>!document.fullscreenElement && !document.querySelector('#desktop-root').classList.contains('desktop-fullscreen'));
   await page.locator('#panel-conversation').waitFor({state:'visible'});
   assert.equal(await page.locator('#message').inputValue(),'Draft inside fullscreen');
   assert.equal(await page.locator('#desktop-root').evaluate(node=>node.classList.contains('desktop-fullscreen')),false);

@@ -135,7 +135,7 @@ function DeliveryEntry({ delivery, busy, callbacks }: { delivery: MessageDeliver
   </Message>;
 }
 
-type TimelineEntry = { key: string; at: number; order: number; node: ReactNode };
+type TimelineEntry = { key: string; at: number; order: number; node: ReactNode; tool?: ToolActivity };
 type ToolActivity = { key: string; runId?: string; at: number; name: string; aliases: Set<string>; returned: boolean; status?: string; result?: {status?: string; output?: string; error?: string; exitCode?: number; artifactId?: string}; data: Record<string, unknown> };
 type ActivityStep = {at: number; key: string; tool: ToolActivity};
 type ActivityModel = Pick<ChatModel, 'bot' | 'events' | 'runs' | 'approvals' | 'runFilter'>;
@@ -282,8 +282,9 @@ function responseRetry(model: ActivityModel, runId?: string) {
   return last?.type==='run.retrying' ? `Retrying response · ${last.data.attempt}/${last.data.maxRetries}` : null;
 }
 
-function ActivityGroup({model, runId, steps}: {model: ActivityModel; runId?: string; steps: ActivityStep[]}) {
-  const run = model.runs.find(item => item.id === runId), working = run?.status === 'running';
+function ActivityGroup({model, runId, steps, latest}: {model: ActivityModel; runId?: string; steps: ActivityStep[]; latest: boolean}) {
+  const run = model.runs.find(item => item.id === runId);
+  const working = steps.some(step => toolState(step.tool, model).running) || latest && run?.status === 'running';
   return <section className="timber-activity-group" data-run-activity={runId || 'unassigned'} aria-label="Activity">
     <div className="timber-activity-header"><ActivityIcon aria-hidden="true" /><span>Activity</span><span className="timber-activity-count">{steps.length} {steps.length === 1 ? 'action' : 'actions'}</span>{working && <span className="timber-activity-status" role="status"><LoaderCircleIcon className="timber-spinner" aria-hidden="true" />{responseRetry(model,runId) || 'Working'}</span>}</div>
     <div className="timber-activity-content">{[...steps].sort((a, b) => a.at - b.at).map(step => <ToolActivityRow key={step.key} tool={step.tool} model={model} />)}</div>
@@ -309,19 +310,30 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks): TimelineEntry[] {
   const requests = new Map<string, {at: number; order: number}>();
   messages.forEach((message, index) => {if (message.role === 'user' && message.runId) requests.set(message.runId, {at: timestamp(message.createdAt), order: index * 2});});
   deliveries.forEach((delivery, index) => {if (delivery.runId) requests.set(delivery.runId, {at: timestamp(delivery.createdAt), order: (messages.length + index) * 2});});
+  const messagePosition = (message: ChatModel['messages'][number], index: number) => {
+    const request = message.role === 'assistant' && message.runId ? requests.get(message.runId) : undefined;
+    const at = Math.max(timestamp(message.createdAt), request?.at || 0);
+    return {at, order: Math.max(index * 2, request && request.at === at ? request.order + 2 : 0)};
+  };
+  const assistantPositions = messages.flatMap((message,index) => message.role === 'assistant'
+    ? [{runId:message.runId,kind:message.kind,...messagePosition(message,index)}] : []);
   const afterRequest = (runId: string | undefined, createdAt: number) => {
     const request = runId ? requests.get(runId) : undefined;
     const at = Math.max(createdAt, request?.at || 0);
-    return {at, order: request && request.at === at ? request.order + 1 : (messages.length + deliveries.length) * 2 + 1};
+    // Tool-calling commentary introduces its actions, even if the clocks tie.
+    // Final answers keep their transcript position after those actions.
+    const tied = assistantPositions.filter(message => runId && message.runId === runId && message.at === at);
+    const introductions = tied.filter(message=>message.kind === 'progress'), answers = tied.filter(message=>message.kind !== 'progress');
+    const order = introductions.length ? Math.max(...introductions.map(message=>message.order)) + 1
+      : answers.length ? Math.min(...answers.map(message=>message.order)) - 1
+      : request && request.at === at ? request.order + 1 : (messages.length + deliveries.length) * 2 + 1;
+    return {at, order};
   };
-  const entries: TimelineEntry[] = [], groups = new Map<string, {runId?: string; steps: ActivityStep[]}>();
-  const addActivity = (runId: string | undefined, step: ActivityStep) => {const key = runId || step.key, group = groups.get(key) || {runId, steps: []}; group.steps.push(step); groups.set(key, group);};
+  const entries: TimelineEntry[] = [];
   messages.forEach((message, index) => {
     // Progress is public assistant text accompanying a tool call. It belongs in
     // the transcript just like a final answer, never in a reasoning disclosure.
-    const request = message.role === 'assistant' && message.runId ? requests.get(message.runId) : undefined;
-    const at = Math.max(timestamp(message.createdAt), request?.at || 0);
-    entries.push({key: `message:${message.id}`, at, order: Math.max(index * 2, request && request.at === at ? request.order + 2 : 0), node: <Message from={message.role === 'user' ? 'user' : 'assistant'} data-message-id={message.id} data-message-kind={message.kind} data-progress-message-id={message.kind === 'progress' ? message.id : undefined} data-run-id={message.runId} className={`timber-message timber-message-${message.role}`}>
+    entries.push({key: `message:${message.id}`, ...messagePosition(message,index), node: <Message from={message.role === 'user' ? 'user' : 'assistant'} data-message-id={message.id} data-message-kind={message.kind} data-progress-message-id={message.kind === 'progress' ? message.id : undefined} data-run-id={message.runId} className={`timber-message timber-message-${message.role}`}>
       {message.role !== 'user' && <div className="timber-message-meta"><span>{message.role === 'assistant' ? model.bot.name : label(message.role)}</span></div>}
       <MessageContent className="timber-message-content"><Response text={message.text} /></MessageContent>
       {['user', 'assistant'].includes(message.role) && <CopyMessage text={message.text} createdAt={message.createdAt} />}
@@ -333,13 +345,32 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks): TimelineEntry[] {
     entries.push({key: `connection:${connection.id}`, ...afterRequest(connection.runId, timestamp(connection.createdAt)), node: <ConnectionEntry connection={connection} callbacks={callbacks} />});
   }
   deliveries.forEach((delivery, index) => entries.push({key: `delivery:${delivery.operationId}`, at: timestamp(delivery.createdAt), order: (messages.length + index) * 2, node: <DeliveryEntry delivery={delivery} busy={model.sending} callbacks={callbacks} />}));
-  for (const tool of collectTools(model)) addActivity(tool.runId, {tool, key: tool.key, at: tool.at});
-  for (const [key, group] of groups) entries.push({key: `activity:${key}`, ...afterRequest(group.runId, Math.min(...group.steps.map(step => step.at))), node: <ActivityGroup model={model} runId={group.runId} steps={group.steps} />});
+  for (const tool of collectTools(model)) entries.push({key:`activity:${tool.key}`, ...afterRequest(tool.runId,tool.at), node:null, tool});
   for (const run of model.runs.filter(run=>['failed','interrupted','cancelled'].includes(run.status) && (!model.runFilter || model.runFilter===run.id))) {
     const at = Math.max(requests.get(run.id)?.at || 0, timestamp(run.updatedAt), ...messages.filter(message=>message.runId===run.id).map(message=>timestamp(message.createdAt)), ...model.events.filter(event=>event.runId===run.id).map(event=>timestamp(event.createdAt)));
     entries.push({key:`outcome:${run.id}`,at,order:(messages.length + deliveries.length)*2+4,node:<TaskOutcome model={model} run={run} callbacks={callbacks}/>});
   }
-  return entries.sort((a, b) => a.at - b.at || a.order - b.order);
+  // Group only adjacent actions after ordering the complete conversation.
+  // A single run can contain several replies; later actions must not be moved
+  // into an earlier block above the reply that introduced them.
+  const sorted = entries.sort((a,b)=>a.at-b.at || a.order-b.order);
+  const lastTool = new Map(sorted.flatMap(entry=>entry.tool ? [[entry.tool.runId,entry.tool.key] as const] : []));
+  const ordered: TimelineEntry[] = [];
+  let group: {entry: TimelineEntry; runId?: string; steps: ActivityStep[]} | undefined;
+  const flush = () => {
+    if (!group) return;
+    const {entry,runId,steps} = group;
+    ordered.push({...entry,node:<ActivityGroup model={model} runId={runId} steps={steps} latest={steps.some(step=>step.key===lastTool.get(runId))}/>});
+    group = undefined;
+  };
+  for (const entry of sorted) {
+    if (!entry.tool) {flush();ordered.push(entry);continue;}
+    if (group && group.runId !== entry.tool.runId) flush();
+    group ||= {entry,runId:entry.tool.runId,steps:[]};
+    group.steps.push({tool:entry.tool,key:entry.tool.key,at:entry.at});
+  }
+  flush();
+  return ordered;
 }
 
 function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: ChatCallbacks }) {

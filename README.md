@@ -46,10 +46,12 @@ completed run back to running.
 Streaming replies use the same safe Markdown formatting as saved messages;
 recovery snapshots replace the partial reply before later deltas are appended.
 Each user or assistant message has a copy action that preserves its original
-Markdown. Public progress updates and computer operations share an expandable
-**Activity** block, separate from the final answer. Native and host events for the
-same tool call produce one row. This displays public progress, not private model
-reasoning. Cancellation, interrupted work and empty model responses have explicit
+Markdown. Public progress updates appear as normal assistant messages. Consecutive
+computer operations share an **Activity** block in chronological order; a new
+message separates that block from later actions, even within the same task.
+Native and host events for the same tool call produce one row. The final answer
+follows its actions. Private model reasoning is never shown.
+Cancellation, interrupted work and empty model responses have explicit
 inline states rather than silently appearing complete.
 
 **Edit bot → Delete bot** asks for confirmation naming the bot. Deletion disables
