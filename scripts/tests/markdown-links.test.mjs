@@ -133,11 +133,17 @@ test('a conversation cannot mint access for another bot or a lookalike app path'
       await message.getByRole('link', {name, exact: true}).click();
       const app = await opened;
       await app.getByText('Open this app from Timber', {exact: true}).waitFor();
+      // Also exercise the favicon request made by full Chrome after navigation.
+      await app.evaluate(async () => {await fetch('/favicon.ico', {cache: 'no-store'});});
       await app.close();
     }
     assert.equal(state.calls.filter(call => call.path.endsWith('/open')).length, 0);
-    assert.equal(state.previewCalls.length, 2);
-    assert.equal(state.previewCalls.every(call => call.method === 'GET' && !call.authorization && !call.body), true, 'unregistered links receive no app ticket');
+    const appNavigations = state.previewCalls.filter(call => new URL(call.url, state.previewOrigin).pathname.startsWith('/apps/'));
+    assert.deepEqual(appNavigations.map(call => call.url), [
+      new URL(state.appURL(BOT_B, 'spacetime')).pathname,
+      new URL(state.appURL(BOT_A, 'spacetime').replace(/\/$/, '') + '-other/').pathname,
+    ], 'each unregistered app destination is navigated to exactly once');
+    assert.equal(state.previewCalls.every(call => call.method === 'GET' && !call.authorization && !call.body && !call.url.includes('ticket') && !JSON.stringify(call).includes(TEST_TOKEN)), true, 'unregistered links and browser resources receive no app ticket or owner credentials');
   }, state => {registerApp(state); registerApp(state, BOT_B);});
 });
 

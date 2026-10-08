@@ -68,6 +68,8 @@ path containment, safe Git inspection, actual noVNC/RFB negotiation in Chromium,
 rendered framebuffer pixels, keyboard/mouse, navigation cleanup, code highlighting,
 diffs and responsive layouts. The image workflow tests a real X11 desktop,
 including cursor movement and a native xterm window, after checkpoint restoration.
+Mouse regressions observe X11 events for hover, repeated moves/clicks at the same
+pixel, double-click deduplication, and held-button dragging followed by release.
 
 Recovery regressions exercise real noVNC sockets through tab/panel changes,
 mobile background return, socket loss, network return, transient heartbeat errors,

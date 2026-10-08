@@ -1020,15 +1020,24 @@ test('workspace apps have independent protected links and open without sending t
     const opened = context.waitForEvent('page'); await page.getByRole('button', {name: 'Open Storefront', exact: true}).click();
     const app = await opened; await app.getByRole('heading', {name: 'Workspace app is available'}).waitFor();
     assert.equal(app.url(), state.apps.get(BOT_A)[0].url); assert.equal(await app.evaluate(() => window.opener), null);
-    assert.equal(state.previewCalls[0].method, 'POST'); assert.equal(state.previewCalls[0].url, '/access');
-    assert.equal(state.previewCalls[0].origin, new URL(url).origin, 'browser sends the real console origin for the ticket exchange');
-    assert.ok([undefined, `${new URL(url).origin}/`].includes(state.previewCalls[0].referer), 'referrers cannot expose console paths or queries');
-    assert.equal(new URLSearchParams(state.previewCalls[0].body).get('ticket'), 'fixture-ticket-frontend');
-    assert.equal(state.previewCalls.every(call => !call.authorization && !JSON.stringify(call).includes(TEST_TOKEN)), true, 'owner token never reaches the preview origin');
-    assert.equal(state.previewCalls.every(call => !call.url.includes('ticket')), true, 'ticket stays out of URLs');
+    const exchanges = state.previewCalls.filter(call => call.method === 'POST' && call.url === '/access');
+    assert.equal(exchanges.length, 1, 'opening the app exchanges exactly one ticket');
+    assert.equal(exchanges[0].origin, new URL(url).origin, 'browser sends the real console origin for the ticket exchange');
+    assert.ok([undefined, `${new URL(url).origin}/`].includes(exchanges[0].referer), 'referrers cannot expose console paths or queries');
+    assert.equal(new URLSearchParams(exchanges[0].body).get('ticket'), 'fixture-ticket-frontend');
     await app.getByRole('button', {name: 'Save draft', exact: true}).click();
     await app.getByText('Draft saved', {exact: true}).waitFor();
-    assert.equal(state.previewCalls.at(-1).origin, state.previewOrigin, 'forms inside the app retain their same-origin provenance');
+    // Full Chrome may request a favicon after the navigation, unlike the local
+    // headless shell. Exercise that extra browser request deterministically.
+    await app.evaluate(async () => {await fetch('/favicon.ico', {cache: 'no-store'});});
+    const appPath = new URL(state.apps.get(BOT_A)[0].url).pathname;
+    const submissions = state.previewCalls.filter(call => call.method === 'POST' && call.url === appPath);
+    assert.equal(submissions.length, 1, 'the form submits once to its own app');
+    assert.equal(submissions[0].origin, state.previewOrigin, 'forms inside the app retain their same-origin provenance');
+    assert.equal(new URLSearchParams(submissions[0].body).get('draft'), 'example');
+    assert.equal(state.previewCalls.filter(call => call.method === 'POST').length, 2, 'only the ticket exchange and explicit form submission mutate preview state');
+    assert.equal(state.previewCalls.every(call => !call.authorization && !JSON.stringify(call).includes(TEST_TOKEN)), true, 'owner token never reaches any preview request, including browser resources');
+    assert.equal(state.previewCalls.every(call => !call.url.includes('ticket')), true, 'ticket stays out of all preview URLs');
     await page.getByRole('button', {name: 'Copy Storefront link', exact: true}).click();
     assert.equal(await page.evaluate(() => navigator.clipboard.readText()), state.apps.get(BOT_A)[0].url);
     const admin = page.locator('[data-app-id="admin"]'); await admin.locator('summary').click(); await admin.getByRole('button', {name: 'Remove access', exact: true}).click();
@@ -1142,8 +1151,14 @@ test('console session survives reload and another tab while keeping the API toke
       await anotherTab.goto(url + '#bot=' + BOT_B); await anotherTab.locator('#bot-workspace').waitFor({state: 'visible'});
       await until(anotherTab, '#selected-name', 'Linus');
       assert.equal(await anotherTab.locator('#login').isVisible(), false);
+      // Browser resources do not use the authenticated API fetch wrapper.
+      await anotherTab.evaluate(async () => {await fetch('/favicon.ico', {cache: 'no-store'});});
       assert.equal(state.sessionCalls.filter(call => call.method === 'POST').length, 1, 'reload and a new tab reuse the same session');
-      assert.equal(state.requestAuth.every(call => !call.hasBearer && call.hasCookie && call.client === 'console'), true, 'only the login exchange receives the API token');
+      assert.deepEqual(state.sessionCalls.filter(call => call.hasBearer).map(call => call.method), ['POST'], 'only the login exchange receives the API token');
+      assert.equal(state.requestAuth.every(call => !call.hasBearer), true, 'no API or browser-resource request receives the API token');
+      const apiRequests = state.requestAuth.filter(call => new URL(call.path, url).pathname.startsWith('/v1/'));
+      assert.ok(apiRequests.length > 0, 'the restored tabs make authenticated API requests');
+      assert.equal(apiRequests.every(call => call.hasCookie && call.client === 'console'), true, 'all API requests reuse the cookie through the console client');
       await signOut(page); await page.locator('#login').waitFor({state: 'visible'});
       assert.equal((await context.cookies()).some(cookie => cookie.name === 'timber_fixture_session'), false);
       await anotherTab.reload(); await anotherTab.locator('#login').waitFor({state: 'visible'});
