@@ -1767,12 +1767,22 @@ test('bot mention keyboard selection and unknown-delivery retry retain identical
       if(!rejected){rejected=true;return route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:{code:'unavailable',message:'Temporary connection issue.'}})});}
       return route.continue();
     });
-    await page.locator('#message').fill('@Lin');await page.locator('#message').press('Enter');
+    await page.locator('#message').fill('@Lin');
+    // Typing can arrive before the next animation frame on a busy device. Hold
+    // that frame so inserting a mention cannot later rewind the user's cursor.
+    await page.evaluate(()=>{
+      const original=window.requestAnimationFrame,pending=[];
+      window.requestAnimationFrame=callback=>{pending.push(callback);return -pending.length;};
+      window.__releaseMentionFrame=()=>{window.requestAnimationFrame=original;for(const callback of pending)callback(performance.now());delete window.__releaseMentionFrame;};
+    });
+    await page.locator('#message').press('Enter');
     assert.equal(await page.locator('#message').inputValue(),'@Linus ');
-    await page.locator('#message').pressSequentially('check this');await sendMessage(page);
+    await page.locator('#message').pressSequentially('c');
+    await page.evaluate(()=>window.__releaseMentionFrame());
+    await page.locator('#message').pressSequentially('heck this');await sendMessage(page);
     await page.getByRole('button',{name:'Retry sending',exact:true}).click();
     await page.waitForFunction(()=>!document.querySelector('#message').value);
-    assert.equal(submissions.length,2);assert.deepEqual(submissions[0],submissions[1]);assert.deepEqual(submissions[1].mentions,[BOT_B]);
+    assert.equal(submissions.length,2);assert.equal(submissions[0].text,'@Linus check this');assert.deepEqual(submissions[0],submissions[1]);assert.deepEqual(submissions[1].mentions,[BOT_B]);
     assert.equal(state.messages.get(BOT_A).filter(message=>message.text==='@Linus check this').length,1);
   });
 });

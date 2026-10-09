@@ -422,6 +422,7 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
 
 function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallbacks }) {
   const textarea = useRef<HTMLTextAreaElement>(null);
+  const pendingCaret = useRef<{text:string;position:number} | null>(null);
   const [caret, setCaret] = useState(model.draft.length), [mentionIndex, setMentionIndex] = useState(0), [dismissed, setDismissed] = useState(false);
   const mentionMatch = /(?:^|\s)@([^\n@]{0,80})$/.exec(model.draft.slice(0, caret));
   const mentionStart = mentionMatch ? caret - mentionMatch[1].length - 1 : -1;
@@ -431,10 +432,19 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
   const chooseMention = (bot: ChatModel['bot']) => {
     const insertion = `@${bot.name} `, text = model.draft.slice(0, mentionStart) + insertion + model.draft.slice(caret);
     const nextCaret = mentionStart + insertion.length;
+    pendingCaret.current = {text,position:nextCaret};
     callbacks.onDraft(model.bot.id, text, [...new Set([...model.draftMentions, bot.id])]);
     setDismissed(true); setCaret(nextCaret);
-    requestAnimationFrame(() => {textarea.current?.focus(); textarea.current?.setSelectionRange(nextCaret, nextCaret);});
   };
+  useLayoutEffect(() => {
+    const pending = pendingCaret.current;
+    if (!pending || pending.text !== model.draft) return;
+    pendingCaret.current = null;
+    // Set the cursor in the same commit as the inserted mention. A deferred
+    // frame can arrive after more typing and move the cursor into that text.
+    textarea.current?.focus({preventScroll:true});
+    textarea.current?.setSelectionRange(pending.position,pending.position);
+  },[model.draft]);
   useLayoutEffect(() => {
     // Native sizing avoids briefly collapsing a focused textarea on every key.
     if (CSS.supports('field-sizing', 'content')) return;
@@ -464,7 +474,7 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
       <PromptInput id="message-form" className="timber-composer" maxFiles={0} onReset={event => event.preventDefault()} onSubmit={({text}) => {if (!model.sending && text.trim()) callbacks.onSend(model.bot.id, text, selectedMentions.map(bot => bot.id));}}>
         <PromptInputBody><PromptInputTextarea ref={textarea} id="message" rows={1} aria-label={`Message ${model.bot.name}`} placeholder={`Message ${model.bot.name} · @ to mention a bot`} value={model.draft}
           aria-autocomplete="list" aria-controls={choices.length ? 'bot-mentions' : undefined} aria-expanded={choices.length > 0} aria-activedescendant={choices.length ? `mention-${choices[Math.min(mentionIndex, choices.length - 1)].id}` : undefined}
-          onChange={event => {setCaret(event.currentTarget.selectionStart);setMentionIndex(0);setDismissed(false);callbacks.onDraft(model.bot.id, event.currentTarget.value);}}
+          onChange={event => {pendingCaret.current=null;setCaret(event.currentTarget.selectionStart);setMentionIndex(0);setDismissed(false);callbacks.onDraft(model.bot.id, event.currentTarget.value);}}
           onSelect={event => setCaret(event.currentTarget.selectionStart)}
           onKeyDown={event => {
             if (!choices.length || event.nativeEvent.isComposing) return;
