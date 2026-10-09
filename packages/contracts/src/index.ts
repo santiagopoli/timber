@@ -32,7 +32,7 @@ export type ComputerAction =
  | {type:"gitPush";repository:string;path:string;branch:string}
  | {type:"checkpoint"};
 /** An exec receipt may still be running; processId remains stable across polls and cancellation. */
-export interface ComputerResult { operationId:string;status:"running"|"completed"|"failed"|"interrupted"|"cancelled";processId?:string;output?:string;exitCode?:number;artifactId?:string;mimeType?:string;checkpointId?:string;error?:string; }
+export interface ComputerResult { operationId:string;status:"running"|"completed"|"failed"|"interrupted"|"cancelled";processId?:string;processKnown?:boolean;output?:string;exitCode?:number;artifactId?:string;mimeType?:string;checkpointId?:string;checkpointStatus?:"pending"|"saved"|"failed";error?:string; }
 export interface ComputerStatus { id:string;provider:"cloudflare";state:"stopped"|"starting"|"running"|"unavailable";capabilities:string[];lastCheckpointId?:string;error?:{code:string;message:string}; }
 export interface Approval {id:string;botId:string;runId:string;operationId:string;toolCallId?:string;action:ComputerAction;status:"pending"|"approved"|"denied"|"executing"|"completed"|"failed"|"interrupted";createdAt:string;expiresAt:string;result?:ComputerResult;}
 export interface ComputerProvider {exec(botId:string,operationId:string,action:ComputerAction):Promise<ComputerResult>;cancel(botId:string,processId:string):Promise<ComputerResult>;status(botId:string):Promise<ComputerStatus>;checkpoint(botId:string):Promise<ComputerResult>;}

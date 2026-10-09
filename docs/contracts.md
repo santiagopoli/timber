@@ -193,6 +193,11 @@ settle with one answer. Runtime completion includes `answerId` and
 `answerOperationId`, recovered from durable generation attribution, so the host
 settles every input, displays the shared answer once and assigns it to the input
 that generated it. Sending a message never invokes cancellation.
+Stopping an older input that has already been joined by a newer input withdraws
+only the older submission and cancels its descendants; the newer root work and
+its children continue. Stopping the latest input aborts the active native run.
+An input still queued in the native inbox is withdrawn without aborting the
+active work.
 
 ComputerProvider exports exec(botId,operationId,action), status(botId), checkpoint(botId).
 ComputerAction is a discriminated union: exec, execPoll, execCancel, readFile, writeFile, listFiles,
@@ -229,7 +234,15 @@ their bot. Child cancellation is restricted to its own processes or descendants.
 BotDO also observes confirmed running processes through a durable ten-second
 read-only job, including after their task's final answer. `process.updated` keeps
 the conversation and sidebar current without additional model calls. Transport
-retries reuse the same observation identity; terminal states end observation.
+retries reuse the same observation identity; fully settled terminal states end observation.
+Terminal commands with `checkpointStatus:"pending"` remain under observation
+until their files are saved or checkpointing fails. Unchanged snapshots do not
+emit duplicate output. A durable dispatch marker also recovers an exec whose
+initial receipt was lost: observation starts after transport failure or recovery,
+not during ordinary startup. If the provider confirms `processKnown:false`, the
+host first obtains an acknowledged cancellation fence for that process ID before
+reporting a terminal outcome, preventing a delayed start. Historical runtime tool
+receipts remain immutable; recovery never relaunches exec or requests a model turn.
 
 Pi marks exec and cancellation unsafe for native replay; polling is safe. A saved
 running result survives runtime recovery and directs the next call to the same
@@ -249,9 +262,9 @@ Checkpoint errors preserve the completed, failed or cancelled command outcome. K
 background-write conflicts, archive limits and nonportable files are classified
 into fixed safe diagnostics; arbitrary server responses and paths are not
 forwarded. Explicit checkpoint failure reports failed with the same safe cause.
-Retrying the original operation ID never reruns its command or its checkpoint;
-after fixing the persistence cause, a new checkpoint operation saves the existing
-files without repeating the command.
+Reusing the original operation ID never reruns its command. Persistence recovery
+retries only the save; an explicit checkpoint can also save the existing files
+after fixing an actionable archive problem, without repeating the command.
 
 Computer operation IDs accept 1–160 ASCII letters, digits, dots, colons, hyphens
 or underscores. Runtime adapters must map opaque model call IDs into this space
@@ -302,6 +315,21 @@ batch finishes; one checkpoint can cover the completed batch. Passive status
 polling and an open chat do not keep the machine awake. A detached server outside
 managed execution alone does not keep it awake. Idle shutdown first checkpoints, then destroys
 the container; checkpoint failures defer shutdown and retry after one minute.
+Checkpoint persistence has its own durable retry intent, separate from execution.
+Uploads enforce the declared byte length with a streaming transfer and verify SHA-256.
+The upload candidate is recorded before R2 admission; recovery checks its size and
+checksum and atomically publishes its pointer and affected operation receipts.
+A lost pointer write can therefore recover an existing upload without rerunning a
+command. A fresh explicit checkpoint or suspend always captures current files,
+including desktop changes made after any recovered upload.
+Transient persistence failures get one immediate retry, then durable retries with
+exponential delay capped at one minute. User activity cannot postpone this deadline.
+`checkpointStatus` is `pending`, `saved`, or `failed`; routine saving is not an action
+error. Continued persistence failure becomes visible after three failed attempts;
+successful publication removes only the checkpoint warning and preserves command
+errors. Snapshot validation failures remain actionable immediately. If the original
+computer was lost before upload, recovery reports unsaved files instead of starting
+a new computer or claiming that the old effects were saved.
 A separate fifteen-minute infrastructure inactivity timeout is the fallback.
 Restoration brings back the checkpointed /workspace files, not process memory,
 running services, desktop windows, /tmp or packages installed elsewhere.

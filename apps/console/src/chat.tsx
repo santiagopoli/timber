@@ -60,7 +60,8 @@ function CopyMessage({ text, kind = 'message', createdAt }: { text: string; kind
 
 function ApprovalEntry({ approval, current, automatic, callbacks, agentName, events = [] }: { approval: ChatApproval; current: boolean; automatic: boolean; callbacks: ChatCallbacks; agentName?:string; events?: ChatModel['events'] }) {
   const process = processUpdate(events, approval.result?.processId || approval.operationId);
-  if (process) approval = {...approval, result: {...approval.result, ...record(process.data.result)} as ChatApproval['result']};
+  if (process) approval = {...approval, result: process.data.result as ChatApproval['result']};
+  const saving = approval.result?.checkpointStatus === 'pending';
   const pending = approval.status === 'pending';
   const executing = approval.status === 'executing' || approval.status === 'approved' || approval.result?.status === 'running';
   const processStatus = approval.result?.processId ? approval.result.status : undefined;
@@ -79,6 +80,7 @@ function ApprovalEntry({ approval, current, automatic, callbacks, agentName, eve
         {!automatic && <p className="timber-approval-help">“Approve and allow” includes future commands, file changes and desktop actions for this bot.</p>}
       </Confirmation>}
       {executing && <p className="timber-approval-help"><LoaderCircleIcon className="timber-spinner" aria-hidden="true" /> {process?.data.cancellationRequested ? 'Stopping command…' : 'Approved action is executing'}</p>}
+      {current && saving && <p className="timber-approval-help" data-checkpoint-status="pending">Saving files…</p>}
       {approval.status === 'expired' && <p className="timber-approval-help">This request expired.</p>}
       {approval.result?.error && <p className={approval.result.status === "completed" ? "timber-save-warning" : "timber-inline-error"}>{approval.result.error}</p>}
       {['failed', 'interrupted'].includes(approval.status) && <p className="timber-approval-help">Inspect its effects before retrying. This action will not be replayed automatically.</p>}
@@ -89,7 +91,7 @@ function ApprovalEntry({ approval, current, automatic, callbacks, agentName, eve
   const attributes = {'data-approval-id': approval.id, 'data-approval-status': approval.status, 'data-process-status': processStatus};
   return <article className="timber-approval-entry" data-timeline-approval={approval.id} data-run-id={approval.runId}>
     {current ? <div id="current-approval" {...attributes}>{content}</div> : <details className="timber-approval-history" data-approval-history-id={approval.id}>
-      <summary><WrenchIcon aria-hidden="true" /><span>{title}</span><time>{time(approval.createdAt)}</time></summary>
+      <summary><WrenchIcon aria-hidden="true" /><span>{title}</span>{saving && <span className="timber-tool-parameters" data-checkpoint-status="pending">Saving files…</span>}<time>{time(approval.createdAt)}</time></summary>
       <div {...attributes}>{content}</div>
     </details>}
   </article>;
@@ -144,7 +146,7 @@ function DeliveryEntry({ delivery, busy, callbacks }: { delivery: MessageDeliver
 }
 
 type TimelineEntry = { key: string; at: number; order: number; node: ReactNode; tool?: ToolActivity };
-type ToolActivity = { key: string; runId?: string; at: number; name: string; aliases: Set<string>; returned: boolean; status?: string; result?: {status?: string; processId?: string; output?: string; error?: string; exitCode?: number; artifactId?: string}; process?: ChatModel['events'][number]; data: Record<string, unknown> };
+type ToolActivity = { key: string; runId?: string; at: number; name: string; aliases: Set<string>; returned: boolean; status?: string; result?: {status?: string; processId?: string; checkpointStatus?: 'pending'|'saved'|'failed'; output?: string; error?: string; exitCode?: number; artifactId?: string}; process?: ChatModel['events'][number]; data: Record<string, unknown> };
 type ActivityStep = {at: number; key: string; tool: ToolActivity};
 type ActivityModel = Pick<ChatModel, 'bot' | 'events' | 'runs' | 'approvals' | 'runFilter'> & Partial<Pick<ChatModel,'collaborationEvents'>>;
 const toolNames: Record<string, string> = {exec: 'Run command', read_file: 'Read file', readFile: 'Read file', write_file: 'Write file', writeFile: 'Write file', list_files: 'Browse files', listFiles: 'Browse files', desktop_screenshot: 'Capture desktop', screenshot: 'Capture desktop', browser_navigate: 'Open', navigate: 'Open', desktop_click: 'Click', click: 'Click', desktop_move: 'Move pointer', move: 'Move pointer', desktop_double_click: 'Double click', doubleClick: 'Double click', desktop_drag: 'Drag', drag: 'Drag', desktop_type: 'Type text', type: 'Type text', desktop_key: 'Press', key: 'Press', desktop_scroll: 'Scroll', scroll: 'Scroll', checkpoint: 'Save workspace', github_clone: 'Clone', gitClone: 'Clone', github_push: 'Push', gitPush: 'Push', github_connect: 'Connect GitHub', github_create_pull_request: 'Create pull request', github_list_pull_requests: 'List pull requests', github_list_repositories: 'List repositories', load_skill: 'Load skill', list_tools: 'Available tools', publish_app: 'Publish app', list_apps: 'List apps', remove_app: 'Remove app', spawn_subagent:'Create subagent', list_subagents:'View subagents', send_subagent_message:'Message subagent', wait_subagent:'Wait for subagent', cancel_subagent:'Stop subagent', send_to_bot:'Message bot', create_bot:'Create named bot', list_bots:'View bots'};
@@ -189,7 +191,7 @@ function collectTools(model: ActivityModel, includeApprovals = false): ToolActiv
     else if (typeof data.toolName === 'string' && (data.toolName !== 'call_tool' || tool.name === 'Computer tool')) tool.name = data.toolName;
     tool.returned ||= event.type === 'tool.completed';
     if (typeof data.status === 'string') tool.status = data.status;
-    if (data.result && typeof data.result === 'object') tool.result = {...tool.result, ...data.result as ToolActivity['result']};
+    if (data.result && typeof data.result === 'object') tool.result = event.type==='process.updated' ? data.result as ToolActivity['result'] : {...tool.result, ...data.result as ToolActivity['result']};
     tool.data = {...tool.data, ...data};
   }
   for (const approval of model.approvals) {
@@ -212,7 +214,7 @@ function collectTools(model: ActivityModel, includeApprovals = false): ToolActiv
     // Process observations outlive the original tool/approval receipt. Keep the
     // original operation and timeline position while applying the latest state.
     const originalExec = tool.name === 'exec' || Boolean(tool.process);
-    return {...tool, process, name: originalExec ? 'exec' : tool.name, result: {...tool.result, ...record(process.data.result)}, data: originalExec ? {...tool.data, ...process.data, input: {...toolInput(tool), ...record(process.data.input)}} : {...tool.data, cancellationRequested: process.data.cancellationRequested}};
+    return {...tool, process, name: originalExec ? 'exec' : tool.name, result: record(process.data.result), data: originalExec ? {...tool.data, ...process.data, input: {...toolInput(tool), ...record(process.data.input)}} : {...tool.data, result:process.data.result, cancellationRequested: process.data.cancellationRequested}};
   });
 }
 
@@ -283,7 +285,7 @@ function ToolActivityRow({tool, model, panel = false}: {tool: ToolActivity; mode
       <span className="timber-tool-kind" title={identity.label} aria-label={identity.label}><Icon aria-hidden="true"/></span>
       <div className="timber-tool-overview">
         <div className={`timber-tool-command${presentation.command ? ' is-command' : ''}`}>{command ? <ActivityCode code={command} language="bash" compact/> : presentation.title}</div>
-        <div className="timber-tool-meta"><span className={state.pending || state.status === 'unconfirmed' ? 'timber-tool-parameters' : 'timber-sr-only'}>{statusLabel}</span>{tool.result?.exitCode !== undefined && tool.result.exitCode !== 0 && <span className="timber-tool-exit">exit {tool.result.exitCode}</span>}{presentation.parameters && <span className="timber-tool-parameters">{presentation.parameters}</span>}</div>
+        <div className="timber-tool-meta"><span className={state.pending || state.status === 'unconfirmed' ? 'timber-tool-parameters' : 'timber-sr-only'}>{statusLabel}</span>{tool.result?.exitCode !== undefined && tool.result.exitCode !== 0 && <span className="timber-tool-exit">exit {tool.result.exitCode}</span>}{presentation.parameters && <span className="timber-tool-parameters">{presentation.parameters}</span>}{tool.result?.checkpointStatus==='pending' && <span className="timber-tool-parameters" data-checkpoint-status="pending">Saving files…</span>}</div>
         {preview ? <div className={`timber-tool-preview${error ? tool.result?.status === 'completed' ? ' timber-save-warning' : ' timber-inline-error' : ''}`} data-tool-result-preview>{bounded(preview,420)}</div> : output.trim() && !redundant && <div className="timber-tool-preview" data-tool-result-preview><ActivityOutput format={format} compact/></div>}
         {tool.result?.artifactId && <ArtifactPreview key={`${model.bot.id}:${tool.result.artifactId}`} botId={model.bot.id} artifactId={tool.result.artifactId}/>}
       </div>

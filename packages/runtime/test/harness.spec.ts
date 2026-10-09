@@ -134,6 +134,34 @@ it('attends a new root request and spawns its own child while an earlier child i
     });
   } finally { await runInDurableObject(stub, instance => instance.releaseHeldTool?.()); }
 });
+it('stops an older joined task without aborting the newer root input or its child', async () => {
+  const stub = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE.getByName(probeId);
+  await runInDurableObject(stub, instance => { instance.abortHeldTool = true; instance.heldTool = new Promise(resolve => { instance.releaseHeldTool = resolve; }); });
+  try {
+    await request('/submit', {text: 'request-subagent-wait', operationId: 'older-joined-task'});
+    const waits = () => runInDurableObject(stub, (_instance, state) => state.storage.sql.exec<{event:string}>('SELECT event FROM projected').toArray().map(row => JSON.parse(row.event)).filter(event => event.type === 'tool.started' && event.data.toolName === 'wait_subagent'));
+    await expect.poll(async () => (await waits()).length).toBe(1);
+    await request('/submit', {text: 'request-subagent-wait second-task', operationId: 'newer-joined-task'});
+    // Fixture call IDs are reusable across turns; inspect native pending state
+    // and the latest child to establish that the second input has been placed.
+    await expect.poll(() => runInDurableObject(stub, async instance => {
+      const children = await instance.runtime.subagents();
+      return children.length === 2 && children.every(child => child.status === 'running');
+    })).toBe(true);
+    await runInDurableObject(stub, async instance => {
+      expect(await instance.runtime.cancel('older-joined-task')).toBe(true);
+      expect(await instance.runtime.operation('older-joined-task')).toMatchObject({status:'unanswered',reason:'aborted'});
+      expect(await instance.runtime.operation('newer-joined-task')).toMatchObject({status:'running'});
+      const children = await instance.runtime.subagents();
+      expect(children.find(child => child.parentOperationId === 'older-joined-task')?.status).toBe('cancelled');
+      expect(children.find(child => child.parentOperationId === 'newer-joined-task')?.status).toBe('running');
+      instance.releaseHeldTool?.();
+    });
+    expect(await (await request('/wait?id=newer-joined-task')).json()).toMatchObject({status:'done',answerOperationId:'newer-joined-task'});
+    expect(await (await request('/wait?id=older-joined-task')).json()).toMatchObject({status:'unanswered',reason:'aborted'});
+    await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents()).find(child => child.parentOperationId === 'newer-joined-task')?.status)).toBe('completed');
+  } finally { await runInDurableObject(stub, instance => instance.releaseHeldTool?.()); }
+});
 it('recovers an in-flight child without repeating an unsafe computer action', async () => {
   const namespace = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE;
   let stub = namespace.getByName(probeId);

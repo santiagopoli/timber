@@ -429,7 +429,26 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
       return { operationId, status, ...(text === undefined ? {} : { text }), ...answer, ...(reason === undefined ? {} : { reason }) };
     },
     async pending() { assertActive(); return (await harness.pending({ session: '1' })).map(({ operationId, status }) => ({ operationId, status })); },
-    async cancel(operationId?: string) { assertActive(); await subagents.cancelParent(operationId); return harness.abort({ operationId }); },
+    async cancel(operationId?: string) {
+      assertActive();
+      await harness.pi();
+      await subagents.cancelParent(operationId);
+      if (operationId) {
+        // A steering input can share the native run with an older host task.
+        // Withdraw only that older input atomically: aborting its conversation
+        // would also kill the newer independent work that now owns the run.
+        const detached = await native.commit(async tx => {
+          const submission = await tx.submissionByRequest(ROOT_CONVERSATION_ID, operationId);
+          const live = await tx.doc(LiveDoc, ROOT_CONVERSATION_ID);
+          const inputs = live.run?.inputs;
+          if (submission?.type !== 'input' || submission.status !== 'placed' || !inputs?.includes(submission.id) || inputs.at(-1) === submission.id) return false;
+          tx.settleSubmission(submission.id, { status: 'unanswered', reason: 'aborted' });
+          return true;
+        }, background);
+        if (detached) return true;
+      }
+      return harness.abort({ operationId });
+    },
     async operation(operationId: string): Promise<RuntimeOperation> {
       assertActive();
       const pending = (await harness.pending({ session: '1' })).find(item => item.operationId === operationId);

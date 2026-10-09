@@ -14,7 +14,7 @@ export interface ComputerEnv {
   COMPUTER_BOOTSTRAP?: string;
 }
 
-interface OperationRecord { digest: string; result?: ComputerResult; processId?: string; conflict?:boolean; }
+interface OperationRecord { digest: string; result?: ComputerResult; processId?: string; conflict?:boolean; checkpoint?:{bootId:string;revision:number;warning?:string}; }
 interface ExecCancellation {operationId:string;journal:boolean;}
 interface ExecSession {
   digest: string;
@@ -24,7 +24,8 @@ interface ExecSession {
   checkpoint: 'pending' | 'attempting' | 'done';
   checkpointAttemptId?: string;
 }
-interface Checkpoint { id: string; key: string; size: number; sha256: string; createdAt: string; }
+interface Checkpoint { id: string; key: string; size: number; sha256: string; createdAt: string; bootId?:string; revision?:number; }
+interface CheckpointRetry {bootId:string;revision:number;attempts:number;nextAttemptAt:number;blocked?:boolean;candidate?:Checkpoint;errorCode?:ComputerErrorCode;}
 interface Health { ok: boolean; bootId: string; desktop: boolean; capabilities?:string[]; }
 interface ContainerResult extends ComputerResult { artifactName?: string; }
 interface GitTransport { id:string; url:string; token:string; }
@@ -64,6 +65,7 @@ const COMPUTER_ERRORS = {
   computer_checkpoint_nonportable: {status:409, message:"The workspace contains an external symlink or a special file that cannot be checkpointed. Use regular files and relative symlinks within /workspace, then retry checkpoint."},
   computer_checkpoint_integrity_failed: {status:503, message:"The workspace checkpoint failed size or checksum validation."},
   computer_checkpoint_persist_failed: {status:503, message:"The workspace checkpoint could not be saved durably. Retry the checkpoint, not the previous action."},
+  computer_checkpoint_lost: {status:409, message:"The computer restarted before its latest files were checkpointed. Only the last saved workspace can be restored; do not repeat the previous action automatically."},
   computer_invalid_request: {status:400, message:"The computer request is invalid."},
   computer_method_not_allowed: {status:405, message:"The computer request method is not allowed."},
   computer_owner_mismatch: {status:403, message:"This computer belongs to another bot."},
@@ -154,14 +156,16 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         }
       }
       const sessions=await ctx.storage.list<ExecSession>({prefix:"exec-session:"});
+      const retry=await ctx.storage.get<CheckpointRetry>('checkpointRetry');
       for(const [key,session] of sessions) if(session.checkpoint==='attempting') {
         const checkpoint=await ctx.storage.get<Checkpoint>('lastCheckpoint');
         if(checkpoint && checkpoint.id===session.checkpointAttemptId) session.result.checkpointId=checkpoint.id;
+        else if(retry) session.result.checkpointStatus='pending';
         else session.result.error=`${session.result.error?session.result.error+' ':''}The checkpoint outcome could not be confirmed after recovery. Retry checkpoint; do not repeat the command.`;
         session.checkpoint='done';
         await this.storeExecution(key.slice('exec-session:'.length),session);
       }
-      if([...sessions.values()].some(session=>session.result.status==='running' || session.checkpoint==='pending')) await ctx.storage.setAlarm(Date.now()+1_000);
+      if([...sessions.values()].some(session=>session.result.status==='running' || session.checkpoint==='pending') || (retry && !retry.blocked)) await ctx.storage.setAlarm(Date.now()+1_000);
       if (this.container?.running) await stage("computer_lifecycle_failed", () => this.container!.setInactivityTimeout(SAFETY_TIMEOUT_MS));
     });
   }
@@ -376,6 +380,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       if(reserved) return reserved.digest===digest
         ? reserved.result??{operationId,status:'interrupted' as const,error:'Operation outcome is unknown; it will not be replayed'}
         : {operationId,status:'failed' as const,error:'operationId was already used with different arguments'};
+      if(action.type==='writeFile' || action.type==='gitClone') await this.markCheckpointDirty(operationId,health.bootId);
       this.active();
       let result: ComputerResult;
       let operationStage: "checkpoint" | "action" | "artifact_read" | "artifact_store" = "action";
@@ -383,7 +388,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         if (action.type === "checkpoint") {
           operationStage = "checkpoint";
           const checkpoint = await this.withWorkspace(() => this.saveCheckpoint(botId));
-          result = {operationId,status:"completed",checkpointId:checkpoint.id};
+          result = {operationId,status:"completed",checkpointId:checkpoint.id,checkpointStatus:'saved'};
         } else {
           const response = await this.dispatchAction(botId,operationId,action);
           if (!response.ok) throw new Error(`Computer rejected action (${response.status})`);
@@ -405,11 +410,11 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
           // portable checkpoint before acknowledging these filesystem operations.
           if (action.type === "writeFile" || action.type === "gitClone") {
             operationStage = "checkpoint";
-            try { result.checkpointId = (await this.withWorkspace(() => this.saveCheckpoint(botId))).id; }
+            try { result.checkpointId = (await this.withWorkspace(() => this.saveCheckpoint(botId))).id;result.checkpointStatus='saved'; }
             catch(error) {
               const failure=safeError(error);
               console.error("computer.failure",{stage:"checkpoint",code:failure.code});
-              result.error = `${result.error ? result.error + " " : ""}The action finished, but its files are not yet checkpointed. ${failure.publicMessage} Do not repeat the action to save its files.`;
+              result=await this.recordCheckpointFailure(operationId,result,failure);
             }
           }
         }
@@ -422,7 +427,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
           : {operationId,status:"interrupted",error:"Computer connection or persistence failed; the action may have completed. Inspect effects before submitting a new operation."};
       }
       this.active();
-      await this.ctx.storage.put<OperationRecord>(key, {digest,result});
+      await this.ctx.storage.put<OperationRecord>(key, {...await this.ctx.storage.get<OperationRecord>(key),digest,result});
       // The effect's outcome is now durable. Failure to renew its idle lifetime
       // must not replace that known result with an uncertain transport failure.
       try { await this.touch(); }
@@ -449,7 +454,8 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
 
   private async storeExecution(processId:string,session:ExecSession):Promise<void> {
     this.active();
-    await this.ctx.storage.put({[`exec-session:${processId}`]:session,[`operation:${processId}`]:{digest:session.digest,processId,result:session.result} satisfies OperationRecord});
+    const previous=await this.ctx.storage.get<OperationRecord>(`operation:${processId}`);
+    await this.ctx.storage.put({[`exec-session:${processId}`]:session,[`operation:${processId}`]:{...previous,digest:session.digest,processId,result:session.result} satisfies OperationRecord});
   }
 
   private async hasActiveExecutions():Promise<boolean> {
@@ -462,7 +468,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
 
   private executionResult(session:ExecSession,operationId:string):ComputerResult {
     const result={...session.result,operationId};
-    if(result.status!=='running' && session.checkpoint!=='done') result.error=`${result.error?result.error+' ':''}Files are not yet checkpointed. A checkpoint is scheduled after all active commands finish.`;
+    if(result.status!=='running' && session.checkpoint!=='done') result.checkpointStatus='pending';
     return result;
   }
 
@@ -528,6 +534,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         return true;
       });
       if(!dispatch) return {operationId:processId,processId,status:'cancelled' as const,output:''};
+      await this.markCheckpointDirty(processId,health.bootId);
       // Admission is short. The process owns its lifetime, not this request.
       try { await this.updateExecution(processId,await this.executionRequest(processId,{...action,yieldMs:0},0)); }
       catch(error) {
@@ -549,7 +556,10 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     this.validExecution(processId,yieldMs);
     this.active();
     let session=await this.ctx.storage.get<ExecSession>(`exec-session:${processId}`);
-    if(!session) return {operationId,processId,status:await this.ctx.storage.get(`exec-cancelled:${processId}`)?'cancelled':'interrupted',error:'Execution session is unavailable; inspect its effects before creating another operation.'};
+    if(!session) {
+      const cancelled=!!await this.ctx.storage.get(`exec-cancelled:${processId}`);
+      return {operationId,processId,processKnown:cancelled,status:cancelled?'cancelled':'interrupted',error:cancelled?undefined:'Execution session is unavailable; inspect its effects before creating another operation.'};
+    }
     if(session.result.status==='running') {
       const lost=async()=>this.updateExecution(processId,{operationId:processId,processId,status:'interrupted',output:session!.result.output,error:'The execution computer was restarted or stopped. Inspect its effects before creating another operation. Uncheckpointed files may have been lost.'},true);
       if(!this.container?.running) session=await lost();
@@ -631,8 +641,8 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       } catch(error) {failure=safeError(error);console.error('computer.failure',{stage:'checkpoint',code:failure.code});}
       for(const [key,session] of pending) {
         session.checkpoint='done';
-        if(checkpoint) session.result.checkpointId=checkpoint.id;
-        else session.result.error=`${session.result.error?session.result.error+' ':''}The action finished, but its files are not yet checkpointed. ${failure!.publicMessage} Do not repeat the action to save its files.`;
+        if(checkpoint) {session.result.checkpointId=checkpoint.id;session.result.checkpointStatus='saved';}
+        else session.result=await this.recordCheckpointFailure(key.slice('exec-session:'.length),session.result,failure!);
         await this.storeExecution(key.slice('exec-session:'.length),session);
       }
       try {await this.touch();} catch(error) {this.active();console.error('computer.failure',{stage:'post_result_touch',code:safeError(error).code});}
@@ -640,11 +650,164 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     return this.finalizingExecutions;
   }
 
+  private async markCheckpointDirty(operationId:string,bootId:string):Promise<void> {
+    this.active();
+    await this.ctx.storage.transaction(async txn=>{
+      const record=await txn.get<OperationRecord>(`operation:${operationId}`);
+      if(!record || record.checkpoint) return;
+      const revision=(await txn.get<number>('checkpointRevision')??0)+1;
+      const previous=await txn.get<CheckpointRetry>('checkpointRetry');
+      const retry:CheckpointRetry=previous?.bootId===bootId?{...previous,revision,blocked:false}:{bootId,revision,attempts:0,nextAttemptAt:Date.now()};
+      record.checkpoint={bootId,revision};
+      await txn.put({[`operation:${operationId}`]:record,checkpointRevision:revision,checkpointRetry:retry});
+      await txn.setAlarm(Date.now()+1_000);
+    });
+  }
+
+  private async recordCheckpointFailure(operationId:string,result:ComputerResult,failure:ComputerProviderError):Promise<ComputerResult> {
+    const record=await this.ctx.storage.get<OperationRecord>(`operation:${operationId}`);
+    const retry=await this.ctx.storage.get<CheckpointRetry>('checkpointRetry');
+    const warning=failure.code!=='computer_checkpoint_persist_failed' || !retry || retry.blocked || retry.attempts>=3
+      ? `The action finished, but its files are not yet checkpointed. ${failure.publicMessage} Do not repeat the action to save its files.` : undefined;
+    let error=result.error;
+    if(record?.checkpoint?.warning && error?.endsWith(record.checkpoint.warning)) error=error.slice(0,-record.checkpoint.warning.length).trimEnd()||undefined;
+    const value={...result,checkpointStatus:retry && !retry.blocked?'pending' as const:'failed' as const,error:warning?`${error?error+' ':''}${warning}`:error};
+    if(record?.checkpoint) {record.checkpoint.warning=warning;record.result=value;this.active();await this.ctx.storage.put(`operation:${operationId}`,record);}
+    return value;
+  }
+
+  private async scheduleComputerAlarm(fallback:number):Promise<void> {
+    this.active();
+    const retry=await this.ctx.storage.get<CheckpointRetry>('checkpointRetry');
+    const active=await this.hasActiveExecutions();
+    const execution=active || await this.needsExecutionMaintenance();
+    const deadline=retry && !retry.blocked && !active?Math.max(Date.now()+100,retry.nextAttemptAt):Infinity;
+    this.active();
+    await this.ctx.storage.setAlarm(Math.min(fallback,execution?Date.now()+EXEC_POLL_MS:Infinity,deadline));
+  }
+
+  private checkpointDiagnostic(phase:'archive_upload'|'pointer_publish'|'retry_intent'|'candidate_lookup',error:unknown):void {
+    const message=error instanceof Error?error.message:'';
+    const cause=phase==='pointer_publish' || phase==='retry_intent'?'metadata_write'
+      :/known length/i.test(message)?'stream_length'
+      :/checksum|digest mismatch/i.test(message)?'checksum'
+      :/429|too many|rate.?limit/i.test(message)?'rate_limit'
+      :/network|disconnect|connection|fetch failed|socket/i.test(message)?'transport':'unknown';
+    console.error('computer.checkpoint_failure',{phase,cause});
+  }
+
+  private async deferCheckpoint(failure:ComputerProviderError):Promise<boolean> {
+    const retry=await this.ctx.storage.get<CheckpointRetry>('checkpointRetry');
+    if(!retry) return false;
+    const retryable=failure.status>=500 || failure.code==='computer_execution_active' || failure.code==='computer_checkpoint_changed';
+    retry.attempts=Math.min(retry.attempts+1,32);
+    retry.nextAttemptAt=Date.now()+Math.min(60_000,1000*2**Math.min(retry.attempts-1,6));
+    retry.blocked=!retryable;retry.errorCode=failure.code;
+    this.active();
+    try {
+      await this.ctx.storage.put('checkpointRetry',retry);
+      for(const [key,record] of await this.ctx.storage.list<OperationRecord>({prefix:'operation:'})) {
+        if(record.checkpoint?.bootId!==retry.bootId || !record.result || record.result.status==='running') continue;
+        const processId=key.slice('operation:'.length),result=await this.recordCheckpointFailure(processId,record.result,failure);
+        if(record.processId===processId) {
+          const session=await this.ctx.storage.get<ExecSession>(`exec-session:${processId}`);
+          if(session) {session.result=result;await this.storeExecution(processId,session);}
+        }
+      }
+      await this.scheduleComputerAlarm(Date.now()+IDLE_MS);
+    }
+    catch(error) {this.checkpointDiagnostic('retry_intent',error);throw new ComputerProviderError('computer_checkpoint_persist_failed');}
+    return retryable;
+  }
+
+  private async publishCheckpoint(checkpoint:Checkpoint):Promise<void> {
+    this.active();
+    try {
+      await this.ctx.storage.transaction(async txn=>{
+        await txn.put('lastCheckpoint',checkpoint);
+        const operations=await txn.list<OperationRecord>({prefix:'operation:'});
+        for(const [key,record] of operations) {
+          const pending=record.checkpoint;
+          if(!pending || pending.bootId!==checkpoint.bootId || pending.revision>(checkpoint.revision??-1)) continue;
+          if(record.result) {
+            let error=record.result.error;
+            if(pending.warning && error?.endsWith(pending.warning)) error=error.slice(0,-pending.warning.length).trimEnd()||undefined;
+            record.result={...record.result,checkpointId:checkpoint.id,checkpointStatus:'saved',error};
+          }
+          delete record.checkpoint;
+          await txn.put(key,record);
+          const processId=key.slice('operation:'.length);
+          if(record.processId===processId) {
+            const session=await txn.get<ExecSession>(`exec-session:${processId}`);
+            if(session && session.result.status!=='running') {session.checkpoint='done';session.result=record.result??{...session.result,checkpointId:checkpoint.id,checkpointStatus:'saved'};await txn.put(`exec-session:${processId}`,session);}
+          }
+        }
+        const retry=await txn.get<CheckpointRetry>('checkpointRetry');
+        if(retry && retry.bootId===checkpoint.bootId) {
+          if(retry.revision<=(checkpoint.revision??-1)) await txn.delete('checkpointRetry');
+          else {delete retry.candidate;retry.attempts=0;retry.blocked=false;retry.nextAttemptAt=Date.now();await txn.put('checkpointRetry',retry);}
+        }
+      });
+    } catch(error) {this.checkpointDiagnostic('pointer_publish',error);throw new ComputerProviderError('computer_checkpoint_persist_failed');}
+  }
+
+  private async recoverCheckpointCandidate():Promise<Checkpoint|undefined> {
+    const retry=await this.ctx.storage.get<CheckpointRetry>('checkpointRetry');
+    const candidate=retry?.candidate;
+    if(!retry || !candidate) return undefined;
+    const published=await this.ctx.storage.get<Checkpoint>('lastCheckpoint');
+    if(published?.id===candidate.id) {await this.publishCheckpoint(candidate);return candidate;}
+    let object:R2Object|null;
+    try {object=await this.env.FILES.head(candidate.key);}
+    catch(error) {this.checkpointDiagnostic('candidate_lookup',error);throw new ComputerProviderError('computer_checkpoint_persist_failed');}
+    if(object) {
+      const checksum=object.checksums.sha256;
+      const actual=checksum?Array.from(new Uint8Array(checksum),byte=>byte.toString(16).padStart(2,'0')).join(''):undefined;
+      if(object.size!==candidate.size || actual!==candidate.sha256) throw new ComputerProviderError('computer_checkpoint_integrity_failed');
+      await this.publishCheckpoint(candidate);return candidate;
+    }
+    delete retry.candidate;
+    this.active();await this.ctx.storage.put('checkpointRetry',retry);
+    return undefined;
+  }
+
+  private async abandonCheckpoint():Promise<void> {
+    const retry=await this.ctx.storage.get<CheckpointRetry>('checkpointRetry');
+    if(!retry) return;
+    const failure=new ComputerProviderError('computer_checkpoint_lost');
+    retry.blocked=true;retry.errorCode=failure.code;
+    await this.ctx.storage.put('checkpointRetry',retry);
+    for(const [key,record] of await this.ctx.storage.list<OperationRecord>({prefix:'operation:'})) {
+      if(record.checkpoint?.bootId!==retry.bootId || !record.result) continue;
+      const result=await this.recordCheckpointFailure(key.slice('operation:'.length),record.result,failure);
+      if(record.processId===key.slice('operation:'.length)) {
+        const session=await this.ctx.storage.get<ExecSession>(`exec-session:${record.processId}`);
+        if(session) {session.result=result;session.checkpoint='done';await this.storeExecution(record.processId,session);}
+      }
+    }
+  }
+
+  private async retryCheckpoint(botId:string):Promise<void> {
+    await this.serialize(()=>this.withWorkspace(async()=>{
+      const retry=await this.ctx.storage.get<CheckpointRetry>('checkpointRetry');
+      if(!retry || retry.blocked || retry.nextAttemptAt>Date.now() || await this.hasActiveExecutions()) return;
+      try {
+        await this.recoverCheckpointCandidate();
+        if(!await this.ctx.storage.get('checkpointRetry')) return;
+        if(!this.container?.running || (await this.health()).bootId!==retry.bootId) {await this.abandonCheckpoint();return;}
+        await this.saveCheckpoint(botId);
+      } catch(error) {
+        this.active();console.error('computer.failure',{stage:'checkpoint_retry',code:safeError(error).code});
+        await this.deferCheckpoint(safeError(error));
+      }
+    }));
+  }
+
   private async touch(): Promise<void> {
     this.active();
     await this.ctx.storage.put("lastActivity", Date.now());
     this.active();
-    await this.ctx.storage.setAlarm(Date.now() + (await this.needsExecutionMaintenance()?EXEC_POLL_MS:IDLE_MS));
+    await this.scheduleComputerAlarm(Date.now()+IDLE_MS);
     this.active();
     if (this.container?.running) await stage("computer_lifecycle_failed", () => this.container!.setInactivityTimeout(SAFETY_TIMEOUT_MS));
   }
@@ -720,8 +883,11 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         }
         await this.finalizeExecutions(botId);
       } catch { /* Keep a durable wake for unavailable process status or checkpointing. */ }
-      if(!this.deleted && await this.needsExecutionMaintenance()) { await this.ctx.storage.setAlarm(Date.now()+EXEC_POLL_MS);return; }
+      if(!this.deleted && await this.needsExecutionMaintenance()) { await this.scheduleComputerAlarm(Date.now()+EXEC_POLL_MS);return; }
     }
+    if(botId) await this.retryCheckpoint(botId);
+    const checkpointRetry=await this.ctx.storage.get<CheckpointRetry>('checkpointRetry');
+    if(checkpointRetry && !checkpointRetry.blocked) {await this.scheduleComputerAlarm(Date.now()+IDLE_MS);return;}
     await this.serialize(() => this.withWorkspace(async () => {
       if(this.deleted) return;
       const lastActivity = await this.ctx.storage.get<number>("lastActivity") ?? 0;
@@ -821,6 +987,11 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     const storedBoot = await this.ctx.storage.get<string>("restoredBoot");
     this.active();
     if (storedBoot !== health.bootId) {
+      // An upload may have completed before the pointer write was interrupted.
+      // Recover it before deciding which saved workspace a new computer restores.
+      await this.recoverCheckpointCandidate();
+      const retry=await this.ctx.storage.get<CheckpointRetry>('checkpointRetry');
+      if(retry && retry.bootId!==health.bootId) await this.abandonCheckpoint();
       const checkpoint = await this.ctx.storage.get<Checkpoint>("lastCheckpoint");
       if (checkpoint) {
         const object = await stage("computer_restore_failed", () => this.env.FILES.get(checkpoint.key));
@@ -874,23 +1045,69 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   private async saveCheckpoint(botId: string, quiesce = false, checkpointId?:string): Promise<Checkpoint> {
     this.active();
     if(await this.hasActiveExecutions()) throw new ComputerProviderError('computer_execution_active');
-    const response = await stage("computer_checkpoint_failed", () => this.call("/checkpoint", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({quiesce})}));
-    if (!response.ok) throw await checkpointResponseError(response);
-    if (!response.body) throw new ComputerProviderError("computer_checkpoint_failed");
-    const size = Number(response.headers.get("Content-Length"));
-    if (!Number.isSafeInteger(size) || size <= 0 || size > 256 * 1024 * 1024) throw new ComputerProviderError("computer_checkpoint_integrity_failed");
-    const id = checkpointId??crypto.randomUUID();
-    const key = `bots/${botId}/checkpoints/${id}.tar.gz`;
-    const checksum = response.headers.get("X-Content-SHA256") ?? "";
-    if (!/^[a-f0-9]{64}$/.test(checksum)) throw new ComputerProviderError("computer_checkpoint_integrity_failed");
-    this.active();
-    const object = await stage("computer_checkpoint_persist_failed", () => this.env.FILES.put(key,response.body,{httpMetadata:{contentType:"application/gzip"},sha256:checksum}));
-    this.active();
-    if (!object || object.size !== size) throw new ComputerProviderError("computer_checkpoint_integrity_failed");
-    const checkpoint: Checkpoint = {id,key,size,sha256:checksum,createdAt:new Date().toISOString()};
-    // R2 atomically publishes an object. Only then does this durable pointer move.
-    await stage("computer_checkpoint_persist_failed", () => this.ctx.storage.put("lastCheckpoint",checkpoint));
-    return checkpoint;
+    const bootId=await this.ctx.storage.get<string>('restoredBoot');
+    if(!bootId) throw new ComputerProviderError('computer_checkpoint_failed');
+    let retry!:CheckpointRetry;
+    try {
+      await this.ctx.storage.transaction(async txn=>{
+        const existing=await txn.get<CheckpointRetry>('checkpointRetry');
+        const revision=(await txn.get<number>('checkpointRevision')??0)+1;
+        // Every explicit capture includes current files, even if a previous
+        // upload can be recovered. Desktop/background writers have no tool ID.
+        retry=existing?.bootId===bootId?{...existing,revision,blocked:false}:{bootId,revision,attempts:0,nextAttemptAt:Date.now()};
+        await txn.put({checkpointRevision:revision,checkpointRetry:retry});
+      });
+      await this.scheduleComputerAlarm(Date.now()+1_000);
+    }
+    catch(error) {this.checkpointDiagnostic('retry_intent',error);throw new ComputerProviderError('computer_checkpoint_persist_failed');}
+    for(let attempt=0;attempt<2;attempt++) {
+      try {
+        const recovered=await this.recoverCheckpointCandidate();
+        const current=await this.ctx.storage.get<CheckpointRetry>('checkpointRetry');
+        if(!current) {
+          const saved=recovered??await this.ctx.storage.get<Checkpoint>('lastCheckpoint');
+          if(saved?.bootId===bootId && (saved.revision??-1)>=retry.revision) return saved;
+          throw new ComputerProviderError('computer_checkpoint_persist_failed');
+        }
+        const response=await stage('computer_checkpoint_failed',()=>this.call('/checkpoint',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({quiesce})}));
+        if(!response.ok) throw await checkpointResponseError(response);
+        if(!response.body) throw new ComputerProviderError('computer_checkpoint_failed');
+        const size=Number(response.headers.get('Content-Length')),checksum=response.headers.get('X-Content-SHA256')??'';
+        if(!Number.isSafeInteger(size) || size<=0 || size>256*1024*1024 || !/^[a-f0-9]{64}$/.test(checksum)) throw new ComputerProviderError('computer_checkpoint_integrity_failed');
+        const id=attempt===0 && checkpointId?checkpointId:crypto.randomUUID();
+        const checkpoint:Checkpoint={id,key:`bots/${botId}/checkpoints/${id}.tar.gz`,size,sha256:checksum,createdAt:new Date().toISOString(),bootId,revision:current.revision};
+        current.candidate=checkpoint;
+        try {this.active();await this.ctx.storage.put('checkpointRetry',current);}
+        catch(error) {this.checkpointDiagnostic('retry_intent',error);await response.body.cancel().catch(()=>{});throw new ComputerProviderError('computer_checkpoint_persist_failed');}
+        // A Content-Length header is not sufficient to give a JS/tunnel stream
+        // a known length. Preserve streaming and enforce the byte count for R2.
+        const transfer=new FixedLengthStream(size),abort=new AbortController();
+        const upload=Promise.resolve().then(()=>this.env.FILES.put(checkpoint.key,transfer.readable,{httpMetadata:{contentType:'application/gzip'},sha256:checksum})).catch(error=>{abort.abort();throw error;});
+        const pump=response.body.pipeTo(transfer.writable,{signal:abort.signal});
+        let object:R2Object;
+        try {
+          [object]=await Promise.all([upload,pump]);
+        } catch(error) {
+          abort.abort();
+          // Deletion drains this lifecycle gate. A failed pump must not leave
+          // an R2 write running after deletion has swept the bot's objects.
+          await Promise.allSettled([upload,pump]);
+          this.checkpointDiagnostic('archive_upload',error);throw new ComputerProviderError('computer_checkpoint_persist_failed');
+        }
+        this.active();
+        if(!object || object.size!==size) throw new ComputerProviderError('computer_checkpoint_integrity_failed');
+        await this.publishCheckpoint(checkpoint);
+        return checkpoint;
+      } catch(error) {
+        this.active();
+        const failure=safeError(error),retryable=await this.deferCheckpoint(failure);
+        // A transient persistence failure gets one immediate checkpoint-only
+        // recovery attempt. Longer outages use the durable alarm and backoff.
+        if(attempt===0 && retryable && failure.code==='computer_checkpoint_persist_failed') continue;
+        throw failure;
+      }
+    }
+    throw new ComputerProviderError('computer_checkpoint_persist_failed');
   }
 }
 

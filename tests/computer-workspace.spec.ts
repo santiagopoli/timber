@@ -70,7 +70,7 @@ describe("workspace inspection alongside computer effects",()=>{
     await runInDurableObject(stub,async(instance,state)=>{
       const reading=deferred(),releaseRead=deferred(),checkpointing=deferred(),releaseCheckpoint=deferred();
       let running=true,starts=0,destroys=0,reads=0,restores=0;
-      Object.defineProperty(instance,"env",{value:{FILES:{async put(){return {size:1};},async get(){return {size:1,body:new Response("x").body};}}}});
+      Object.defineProperty(instance,"env",{value:{FILES:{async put(_key:string,body:ReadableStream){await new Response(body).arrayBuffer();return {size:1};},async get(){return {size:1,body:new Response("x").body};}}}});
       Object.defineProperty(instance,"container",{get:()=>({get running(){return running;},images:{base:"test-image"},start(){running=true;starts++;},async destroy(){running=false;destroys++;},async setInactivityTimeout(){},getTcpPort(){return {async fetch(input:string,init:RequestInit){
         const path=new URL(input).pathname;
         if(path==="/health")return health(`boot-${starts}`);

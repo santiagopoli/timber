@@ -17,7 +17,7 @@ type Submission = {operation_id:string;run_id:string;text:string;admitted:number
 type MentionDelivery = {operation_id:string;run_id:string;target_id:string;text:string;attempts:number};
 
 type AdmissionRetry = {attempts:number;next_at:number};
-type ProcessRow = {process_id:string;run_id:string|null;subagent_id:string|null;tool_call_id:string|null;action:string;input:string;status:ComputerResult["status"];result:string|null;cancel_requested:number;cancel_attempts:number;next_at:number};
+type ProcessRow = {process_id:string;run_id:string|null;subagent_id:string|null;tool_call_id:string|null;action:string;input:string;status:ComputerResult["status"];result:string|null;dispatch_state:"registered"|"dispatching"|"uncertain"|"received";cancel_requested:number;cancel_attempts:number;next_at:number};
 type ProcessObservation = {process_id:string;sequence:number;operation_id:string|null;next_at:number};
 type RuntimeProjection = {type:string;data:Record<string,unknown>;operationId?:string;eventKey?:string};
 type RuntimeAnswer = {answerId?:string;answerOperationId?:string};
@@ -42,6 +42,7 @@ export class BotDO extends DurableObject<Env> {
   private finishingApprovals=new Map<string,Promise<void>>();
   private cancellingProcesses=new Map<string,Promise<void>>();
   private pollingProcesses=new Map<string,Promise<void>>();
+  private dispatchingProcesses=new Map<string,number>();
   private streams=0;
   private lastComputerTouch=0;
   private takingControl=false;
@@ -71,11 +72,12 @@ export class BotDO extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, source_key TEXT UNIQUE, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS mention_deliveries (operation_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,target_id TEXT NOT NULL,text TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS cancelled_agent_inputs (operation_id TEXT PRIMARY KEY);
-      CREATE TABLE IF NOT EXISTS run_processes (process_id TEXT PRIMARY KEY,run_id TEXT,subagent_id TEXT,tool_call_id TEXT,action TEXT NOT NULL,input TEXT NOT NULL,status TEXT NOT NULL,result TEXT,cancel_requested INTEGER NOT NULL DEFAULT 0,cancel_attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS run_processes (process_id TEXT PRIMARY KEY,run_id TEXT,subagent_id TEXT,tool_call_id TEXT,action TEXT NOT NULL,input TEXT NOT NULL,status TEXT NOT NULL,result TEXT,dispatch_state TEXT NOT NULL DEFAULT 'registered',cancel_requested INTEGER NOT NULL DEFAULT 0,cancel_attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS computer_operations (operation_id TEXT PRIMARY KEY,action TEXT NOT NULL,run_id TEXT);
       CREATE TABLE IF NOT EXISTS process_observations (process_id TEXT PRIMARY KEY,sequence INTEGER NOT NULL DEFAULT 0,operation_id TEXT,next_at INTEGER NOT NULL);
     `);
     if(!ctx.storage.sql.exec<{name:string}>("PRAGMA table_info(submissions)").toArray().some(column=>column.name==="subagent_id")) ctx.storage.sql.exec("ALTER TABLE submissions ADD COLUMN subagent_id TEXT");
+    if(!ctx.storage.sql.exec<{name:string}>("PRAGMA table_info(run_processes)").toArray().some(column=>column.name==="dispatch_state")) ctx.storage.sql.exec("ALTER TABLE run_processes ADD COLUMN dispatch_state TEXT NOT NULL DEFAULT 'registered'");
     this.runtime=createPiRuntime({
       owner:this,
       storage:ctx.storage,
@@ -181,8 +183,9 @@ export class BotDO extends DurableObject<Env> {
     const priority:RunStatus[]=["waiting_approval","waiting_connection","running","queued"];
     const message=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM messages WHERE json_extract(data,'$.role') IN ('user','assistant') ORDER BY rowid DESC LIMIT 1").toArray()[0];
     const latest=message?JSON.parse(message.data) as Message:undefined;
+    const preview=latest?.text.trim() ? latest.text : latest?.attachments?.length ? (latest.attachments.length===1 ? "Image" : `${latest.attachments.length} images`) : latest?.text;
     const activeProcesses=this.ctx.storage.sql.exec<{total:number}>("SELECT COUNT(*) AS total FROM run_processes WHERE status='running'").toArray()[0].total;
-    return {status:priority.find(status=>roots.some(run=>run.status===status))??(activeProcesses?"running":"ready"),activeRuns:roots.length,activeAgents:new Set(active.flatMap(run=>run.subagent_id?[run.subagent_id]:[])).size,activeProcesses,...(latest?{lastMessage:{text:latest.text.slice(0,240),createdAt:latest.createdAt}}:{})};
+    return {status:priority.find(status=>roots.some(run=>run.status===status))??(activeProcesses?"running":"ready"),activeRuns:roots.length,activeAgents:new Set(active.flatMap(run=>run.subagent_id?[run.subagent_id]:[])).size,activeProcesses,...(latest?{lastMessage:{text:(preview??"").slice(0,240),createdAt:latest.createdAt}}:{})};
   }
   private listRuns(url:URL):RunPage {
     const limitRaw=url.searchParams.get("limit");
@@ -624,7 +627,13 @@ export class BotDO extends DurableObject<Env> {
     if(this.recovering) return this.recovering;
     this.recovering=(async()=>{
       await this.flushProcessCancellations();
-      for(const process of this.ctx.storage.sql.exec<ProcessRow>("SELECT * FROM run_processes WHERE status='running' AND result IS NOT NULL AND cancel_requested=0").toArray()) {
+      for(const process of this.ctx.storage.sql.exec<ProcessRow>("SELECT * FROM run_processes WHERE (status='running' OR json_extract(result,'$.checkpointStatus')='pending') AND cancel_requested=0").toArray()) {
+        if(!process.result) {
+          // A live initial request may still be provisioning. Only a failed RPC
+          // or a restart makes its missing receipt an observation to reconcile.
+          if(this.dispatchingProcesses.has(process.process_id) || !["dispatching","uncertain"].includes(process.dispatch_state)) continue;
+          this.ctx.storage.sql.exec("UPDATE run_processes SET dispatch_state='uncertain' WHERE process_id=?",process.process_id);
+        }
         const observation=this.ctx.storage.sql.exec<ProcessObservation>("SELECT * FROM process_observations WHERE process_id=?",process.process_id).toArray()[0];
         if(!observation) this.scheduleProcessPoll(process.process_id);
         else if(observation.next_at<=Date.now()) await this.pollProcess(process.process_id);
@@ -690,17 +699,38 @@ export class BotDO extends DurableObject<Env> {
     if(process.status!=="running" && result.status==="running" || process.status==="cancelled" && result.status!=="cancelled") return {...JSON.parse(process.result!),operationId:result.operationId};
     const receipt={...result,processId:id};
     const cancellationPending=process.cancel_requested && result.status==="running";
-    if(process.result===JSON.stringify(receipt) && !!process.cancel_requested===!!cancellationPending) return receipt;
-    this.ctx.storage.sql.exec("UPDATE run_processes SET status=?,result=?,cancel_requested=? WHERE process_id=?",result.status,JSON.stringify(receipt),cancellationPending?1:0,id);
+    const previous=process.result?JSON.parse(process.result) as ComputerResult:undefined;
+    if(previous?.checkpointStatus==="saved" && process.status!=="running" && (receipt.checkpointStatus!=="saved" || !receipt.checkpointId)) {
+      // Concurrent polls and the original command/cancel RPC can return an older
+      // terminal snapshot after persistence was confirmed. Keep that confirmation
+      // monotonic without changing the newly observed command's terminal status.
+      receipt.checkpointStatus="saved";
+      receipt.checkpointId=previous.checkpointId;
+      if(receipt.status===previous.status) {
+        if(previous.error===undefined) delete receipt.error;
+        else receipt.error=previous.error;
+      }
+    }
+    // A fresh observation ID is a receipt identity, not a change in the process.
+    // Do not repeatedly persist its entire output when nothing has changed.
+    const comparable=(value:ComputerResult)=>JSON.stringify(value,Object.keys(value).filter(key=>key!=="operationId").sort());
+    if(previous && comparable(previous)===comparable(receipt) && !!process.cancel_requested===!!cancellationPending) {
+      this.scheduleProcessPoll(id);
+      return receipt;
+    }
+    this.ctx.storage.sql.exec("UPDATE run_processes SET status=?,result=?,dispatch_state='received',cancel_requested=? WHERE process_id=?",result.status,JSON.stringify(receipt),cancellationPending?1:0,id);
     this.publishProcess(this.process(id)!,receipt);
-    if(result.status==="running" && !cancellationPending) this.scheduleProcessPoll(id);
-    else if(result.status!=="running") this.ctx.storage.sql.exec("DELETE FROM process_observations WHERE process_id=?",id);
+    if((receipt.status==="running" || receipt.checkpointStatus==="pending") && !cancellationPending) this.scheduleProcessPoll(id);
+    else this.ctx.storage.sql.exec("DELETE FROM process_observations WHERE process_id=?",id);
     return receipt;
+  }
+  private needsProcessObservation(process:ProcessRow):boolean {
+    return process.status==="running" && (!!process.result || process.dispatch_state==="uncertain" && !this.dispatchingProcesses.has(process.process_id)) || !!process.result && (JSON.parse(process.result) as ComputerResult).checkpointStatus==="pending";
   }
   private scheduleProcessPoll(id:string,delayMs=10_000):void {
     if(this.deleted) return;
     const process=this.process(id);
-    if(!process || process.status!=="running" || process.cancel_requested) return;
+    if(!process || !this.needsProcessObservation(process) || process.cancel_requested) return;
     this.ctx.storage.sql.exec("INSERT INTO process_observations(process_id,next_at) VALUES(?,?) ON CONFLICT(process_id) DO UPDATE SET next_at=excluded.next_at",id,Date.now()+delayMs);
     this.ctx.waitUntil(this.runtime.scheduleAdmissionRetry(`process-poll:${id}`,delayMs));
   }
@@ -709,7 +739,7 @@ export class BotDO extends DurableObject<Env> {
     const pending=(async()=>{
       if(this.deleted) return;
       let process=this.process(id);
-      if(!process || process.status!=="running") return;
+      if(!process || !this.needsProcessObservation(process)) return;
       if(process.cancel_requested) {await this.cancelProcess(id);return;}
       let observation=this.ctx.storage.sql.exec<ProcessObservation>("SELECT * FROM process_observations WHERE process_id=?",id).toArray()[0];
       if(!observation) {this.scheduleProcessPoll(id);return;}
@@ -718,7 +748,7 @@ export class BotDO extends DurableObject<Env> {
           const sequence=observation.sequence+1;
           const op=`process-poll:${await fingerprint({processId:id,sequence})}`;
           process=this.process(id);
-          if(this.deleted || !process || process.status!=="running" || process.cancel_requested) return;
+          if(this.deleted || !process || !this.needsProcessObservation(process) || process.cancel_requested) return;
           this.ctx.storage.sql.exec("UPDATE process_observations SET operation_id=?,sequence=? WHERE process_id=?",op,sequence,id);
           observation={...observation,sequence,operation_id:op};
         }
@@ -727,6 +757,13 @@ export class BotDO extends DurableObject<Env> {
         const result=await this.computer.exec(this.bot().id,observation.operation_id!,{type:"execPoll",processId:id,yieldMs:0});
         if(this.deleted) return;
         this.ctx.storage.sql.exec("UPDATE process_observations SET operation_id=NULL WHERE process_id=?",id);
+        if(result.processKnown===false) {
+          // Missing admission is not proof that a delayed request cannot start.
+          // Fence its original ID and acknowledge cancellation before finishing.
+          this.ctx.storage.sql.exec("UPDATE run_processes SET cancel_requested=1,next_at=0 WHERE process_id=?",id);
+          await this.cancelProcess(id);
+          return;
+        }
         this.recordProcessResult(id,result);
       } catch {if(!this.deleted) this.scheduleProcessPoll(id);}
     })().finally(()=>this.pollingProcesses.delete(id));
@@ -749,6 +786,11 @@ export class BotDO extends DurableObject<Env> {
     } else if(action.type==="execPoll" || action.type==="execCancel") {
       process=this.authorizeProcess(action,run);
     }
+    const initial=action.type==="exec" && process && !process.result;
+    if(initial) {
+      this.ctx.storage.sql.exec("UPDATE run_processes SET dispatch_state='dispatching' WHERE process_id=?",process!.process_id);
+      this.dispatchingProcesses.set(process!.process_id,(this.dispatchingProcesses.get(process!.process_id)??0)+1);
+    }
     try {
       const result=await this.computer.exec(this.bot().id,op,action);
       if(!process || this.deleted) return result;
@@ -756,9 +798,19 @@ export class BotDO extends DurableObject<Env> {
       if(this.process(process.process_id)?.cancel_requested) this.ctx.waitUntil(this.cancelProcess(process.process_id));
       return receipt;
     } catch(error) {
+      if(initial && !this.deleted) this.ctx.storage.sql.exec("UPDATE run_processes SET dispatch_state='uncertain' WHERE process_id=? AND result IS NULL",process!.process_id);
       if(action.type==="execCancel" && process && !this.deleted && !(error instanceof ComputerProviderError && error.code==="computer_idempotency_conflict")) this.ctx.storage.sql.exec("UPDATE run_processes SET cancel_requested=1,next_at=0 WHERE process_id=?",process.process_id);
       if(process && !this.deleted && this.process(process.process_id)?.cancel_requested) this.ctx.waitUntil(this.cancelProcess(process.process_id));
       throw error;
+    } finally {
+      if(initial) {
+        const remaining=(this.dispatchingProcesses.get(process!.process_id)??1)-1;
+        if(remaining) this.dispatchingProcesses.set(process!.process_id,remaining);
+        else {
+          this.dispatchingProcesses.delete(process!.process_id);
+          if(!this.deleted && this.process(process!.process_id)?.dispatch_state==="uncertain") this.scheduleProcessPoll(process!.process_id);
+        }
+      }
     }
   }
   private flushProcessCancellations():Promise<void> {

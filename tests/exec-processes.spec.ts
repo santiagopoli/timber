@@ -51,6 +51,8 @@ describe("durable command ownership and Stop",()=>{
       const input=request(run,{type:"exec",command:"long build",yieldMs:30_000});const pending=target.executeTool(input);
       try {
         await entered.promise;
+        expect(state.storage.sql.exec<{dispatch_state:string}>("SELECT dispatch_state FROM run_processes").toArray()).toEqual([{dispatch_state:"dispatching"}]);
+        expect(state.storage.sql.exec("SELECT * FROM process_observations").toArray()).toHaveLength(0);
         expect((await target.cancelRun(run.id)).status).toBe("cancelled");
         expect(cancellations).toBe(1);
         release.resolve();
@@ -220,6 +222,115 @@ describe("durable command ownership and Stop",()=>{
       try {await target.executeTool(request(run,{type:"exec",command:"background build"},op));await target.cancelRun(run.id);await target.admit(`process-cancel:${op}`);expect(cancels).toBe(1);expect(state.storage.sql.exec<{cancel_requested:number}>("SELECT cancel_requested FROM run_processes").toArray()).toEqual([{cancel_requested:0}]);expect(await state.storage.get(`fixture-admission-retry:process-cancel:${op}`)).toBeUndefined();}
       finally {target.computer=provider;target.runtime=runtime;}
     });
+  });
+
+  it("keeps observing terminal commands until their pending checkpoint is saved without replaying the command",async()=>{
+    const bot=await setup();
+    await runInDurableObject(stubFor(bot),async(instance,state)=>{
+      const target=instance as unknown as Internals,provider=target.computer,run=insertRun(state,bot),op=crypto.randomUUID();let starts=0,polls=0;
+      target.computer={...provider,exec:async(_bot,operationId,action)=>{
+        if(action.type==="exec") {starts++;return {operationId,processId:op,status:"completed",output:"Built once",exitCode:0,checkpointStatus:"pending",error:"Workspace save is pending."};}
+        polls++;
+        return polls===1?{operationId,processId:op,status:"completed",output:"Built once",exitCode:0,checkpointStatus:"pending",error:"Workspace save is pending."}:{operationId,processId:op,status:"completed",output:"Built once",exitCode:0,checkpointStatus:"saved",checkpointId:"saved-checkpoint"};
+      }};
+      try {
+        const original=await target.executeTool(request(run,{type:"exec",command:"build"},op));
+        state.storage.sql.exec("UPDATE runs SET data=? WHERE id=?",JSON.stringify({...run,status:"completed"}),run.id);
+        expect(state.storage.sql.exec("SELECT * FROM process_observations").toArray()).toHaveLength(1);
+        await target.admit(`process-poll:${op}`);
+        // Poll IDs change; identical process snapshots must not duplicate output.
+        expect(eventRows(state).filter(event=>event.type==="process.updated")).toHaveLength(1);
+        expect(await state.storage.get(`fixture-admission-retry:process-poll:${op}`)).toMatchObject({delayMs:10_000});
+        await target.admit(`process-poll:${op}`);
+        expect(starts).toBe(1);expect(polls).toBe(2);
+        const latest=eventRows(state).filter(event=>event.type==="process.updated").at(-1)!;
+        expect(latest.data.result).toMatchObject({status:"completed",checkpointStatus:"saved",checkpointId:"saved-checkpoint",output:"Built once",exitCode:0});
+        expect(latest.data.result).not.toHaveProperty("error");
+        expect(state.storage.sql.exec("SELECT * FROM process_observations").toArray()).toHaveLength(0);
+        expect(original).toMatchObject({checkpointStatus:"pending",error:"Workspace save is pending."});
+        expect(state.storage.sql.exec("SELECT * FROM messages").toArray()).toHaveLength(0);
+      } finally {target.computer=provider;}
+    });
+  });
+
+  it("reconciles a lost initial receipt after eviction without replaying its already admitted command",async()=>{
+    const bot=await setup(),op=crypto.randomUUID();
+    computerFixtureControl.execSession={pollsBeforeComplete:0};
+    try {
+      await runInDurableObject(stubFor(bot),async(instance,state)=>{
+        const target=instance as unknown as Internals,provider=target.computer,run=insertRun(state,bot);
+        target.computer={...provider,exec:async(...args)=>{await provider.exec(...args);throw new Error("Initial receipt was lost");}};
+        try {
+          await expect(target.executeTool(request(run,{type:"exec",command:"build once"},op))).rejects.toThrow("Initial receipt was lost");
+          expect(state.storage.sql.exec<{dispatch_state:string;result:string|null}>("SELECT dispatch_state,result FROM run_processes").toArray()).toEqual([{dispatch_state:"uncertain",result:null}]);
+          expect(state.storage.sql.exec("SELECT * FROM process_observations").toArray()).toHaveLength(1);
+          state.storage.sql.exec("UPDATE runs SET data=? WHERE id=?",JSON.stringify({...run,status:"interrupted"}),run.id);
+        } finally {target.computer=provider;}
+      });
+    } finally {delete computerFixtureControl.execSession;}
+    await evictDurableObject(stubFor(bot));
+    await runInDurableObject(stubFor(bot),async(instance,state)=>{
+      await (instance as unknown as Internals).admit(`process-poll:${op}`);
+      expect(state.storage.sql.exec<{status:string;dispatch_state:string}>("SELECT status,dispatch_state FROM run_processes").toArray()).toEqual([{status:"completed",dispatch_state:"received"}]);
+      expect(eventRows(state).filter(event=>event.type==="process.updated").at(-1)?.data.result).toMatchObject({status:"completed",processId:op});
+    });
+    await runInDurableObject(bindings.COMPUTER.get(bindings.COMPUTER.idFromName(bot.id)),(_instance,state)=>expect(state.storage.sql.exec("SELECT id FROM effects WHERE json_extract(action,'$.type')='exec'").toArray()).toHaveLength(1));
+  });
+
+  it.each(["completed","failed","cancelled"] as const)("keeps a saved checkpoint when a late %s receipt still reports an older save outcome",async status=>{
+    const bot=await setup();
+    await runInDurableObject(stubFor(bot),async(instance,state)=>{
+      const target=instance as unknown as Internals,provider=target.computer;
+      for(const checkpointStatus of ["pending","failed",undefined] as const) {
+        const run=insertRun(state,bot),op=crypto.randomUUID(),slowOp=crypto.randomUUID(),entered=deferred(),release=deferred();
+        const commandError=status==="failed"?"Command failed before saving its files.":undefined;
+        const saved:ComputerResult={operationId:op,processId:op,status,output:"Final command output",exitCode:status==="completed"?0:status==="failed"?1:137,checkpointStatus:"saved",checkpointId:"confirmed-checkpoint",...(commandError?{error:commandError}:{})};
+        target.computer={...provider,exec:async(_bot,operationId,action)=>{
+          if(action.type==="exec") return {operationId,processId:op,status:"running"};
+          if(operationId===slowOp) {
+            entered.resolve();await release.promise;
+            const stale={...saved,operationId,error:"Old checkpoint warning.",checkpointStatus};
+            delete stale.checkpointId;
+            if(checkpointStatus===undefined) delete stale.checkpointStatus;
+            return stale;
+          }
+          return {...saved,operationId};
+        }};
+        await target.executeTool(request(run,{type:"exec",command:"one command"},op));
+        const pending=target.executeTool(request(run,{type:"execPoll",processId:op},slowOp));
+        try {
+          await entered.promise;
+          await target.admit(`process-poll:${op}`);
+          expect(state.storage.sql.exec("SELECT * FROM process_observations WHERE process_id=?",op).toArray()).toHaveLength(0);
+          release.resolve();
+          const late=await pending as ComputerResult;
+          expect(late).toMatchObject({status,checkpointStatus:"saved",checkpointId:"confirmed-checkpoint",exitCode:saved.exitCode});
+          expect(late.error).toBe(commandError);
+          const current=JSON.parse(state.storage.sql.exec<{result:string}>("SELECT result FROM run_processes WHERE process_id=?",op).toArray()[0].result) as ComputerResult;
+          expect(current).toMatchObject({status,checkpointStatus:"saved",checkpointId:"confirmed-checkpoint"});expect(current.error).toBe(commandError);
+          expect(eventRows(state).filter(event=>event.type==="process.updated" && event.data.processId===op)).toHaveLength(2);
+          expect(state.storage.sql.exec("SELECT * FROM process_observations WHERE process_id=?",op).toArray()).toHaveLength(0);
+        } finally {release.resolve();await pending.catch(()=>{});target.computer=provider;}
+      }
+    });
+  });
+
+  it("fences unknown admission before declaring a lost initial request finished, blocking a delayed start",async()=>{
+    const bot=await setup(),op=crypto.randomUUID();
+    await runInDurableObject(stubFor(bot),async(instance,state)=>{
+      const target=instance as unknown as Internals,provider=target.computer,run=insertRun(state,bot),entered=deferred(),release=deferred();
+      target.computer={...provider,exec:async(...args)=>{if(args[2].type==="exec") throw new Error("Request delivery unknown");return provider.exec(...args);},cancel:async(...args)=>{entered.resolve();await release.promise;return provider.cancel(...args);}};
+      let pending:Promise<void>|undefined;
+      try {
+        await expect(target.executeTool(request(run,{type:"exec",command:"must not start late"},op))).rejects.toThrow("Request delivery unknown");
+        pending=target.admit(`process-poll:${op}`);await entered.promise;
+        expect(state.storage.sql.exec<{status:string;cancel_requested:number}>("SELECT status,cancel_requested FROM run_processes").toArray()).toEqual([{status:"running",cancel_requested:1}]);
+        release.resolve();await pending;
+        expect(state.storage.sql.exec<{status:string;cancel_requested:number}>("SELECT status,cancel_requested FROM run_processes").toArray()).toEqual([{status:"cancelled",cancel_requested:0}]);
+        expect(await provider.exec(bot.id,op,{type:"exec",command:"must not start late"})).toMatchObject({status:"cancelled",processId:op});
+      } finally {release.resolve();await pending?.catch(()=>{});target.computer=provider;}
+    });
+    await runInDurableObject(bindings.COMPUTER.get(bindings.COMPUTER.idFromName(bot.id)),(_instance,state)=>expect(state.storage.sql.exec("SELECT id FROM effects WHERE json_extract(action,'$.type')='exec'").toArray()).toHaveLength(0));
   });
 });
 

@@ -36,11 +36,11 @@ function AgentActivity({events, agentId, hiddenIdentities}: {events:BotEvent[];a
   if(!records.length)return null;
   return <details className="timber-agent-activity"><summary>Tool activity · {records.length}</summary>{records.map(({event: original,process,aliases}) => {
     const event=process?{...original,type:process.type,data:{...original.data,...process.data,toolName:'exec'}}:original;
-    const result = event.data.result as {output?:string;error?:string;status?:string} | undefined;
+    const result = event.data.result as {output?:string;error?:string;status?:string;checkpointStatus?:'pending'|'saved'|'failed'} | undefined;
     const input = event.data.input && typeof event.data.input === 'object' ? event.data.input as Record<string,unknown> : {};
     const summary = ['command','path','url','key'].flatMap(key => typeof input[key] === 'string' ? [input[key] as string] : []).join(' · ');
     const status = event.type === 'subagent.tool.started' ? 'running' : result?.status || String(event.data.status || 'completed');
-    return <article key={[...aliases][0]}><div className="timber-agent-card-heading"><strong>{String(event.data.toolName || event.data.actionType || 'Tool')}</strong><span className="status" data-status={status}>{status==='running' && event.data.cancellationRequested?'Stopping…':label(status)}</span></div>{summary && <pre>{summary.slice(0,1000)}</pre>}{result?.output && <pre>{result.output.slice(0,4000)}</pre>}{result?.error && <p className="error">{result.error}</p>}</article>;
+    return <article key={[...aliases][0]}><div className="timber-agent-card-heading"><strong>{String(event.data.toolName || event.data.actionType || 'Tool')}</strong><span className="status" data-status={status}>{status==='running' && event.data.cancellationRequested?'Stopping…':label(status)}</span></div>{summary && <pre>{summary.slice(0,1000)}</pre>}{result?.checkpointStatus==='pending' && <p className="hint" data-checkpoint-status="pending">Saving files…</p>}{result?.output && <pre>{result.output.slice(0,4000)}</pre>}{result?.error && <p className={result.status==='completed'?'timber-save-warning':'error'}>{result.error}</p>}</article>;
   })}</details>;
 }
 

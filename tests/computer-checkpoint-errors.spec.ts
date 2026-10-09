@@ -20,7 +20,7 @@ describe("checkpoint failures preserve known computer outcomes",()=>{
     const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
     await runInDurableObject(stub,async(instance,state)=>{
       let effects=0,checkpoints=0,uploads=0,recovered=false;
-      Object.defineProperty(instance,"env",{value:{FILES:{async put(){uploads++;return {size:1};}}}});
+      Object.defineProperty(instance,"env",{value:{FILES:{async put(_key:string,body:ReadableStream){await new Response(body).arrayBuffer();uploads++;return {size:1};}}}});
       Object.defineProperty(instance,"container",{get:()=>({running:true,async setInactivityTimeout(){},getTcpPort(){return {async fetch(input:string){
         const path=new URL(input).pathname;
         if(path==="/health")return Response.json({ok:true,bootId:"known",desktop:true,capabilities:["execSessions"]});

@@ -9,6 +9,7 @@ export class HarnessProbe extends DurableObject {
   runtime: ReturnType<typeof createPiRuntime>;
   heldTool?: Promise<void>;
   releaseHeldTool?: () => void;
+  abortHeldTool?: boolean;
   heldInference?: Promise<void>;
   releaseHeldInference?: () => void;
   holdInferenceAfterToolCount?: number;
@@ -102,11 +103,21 @@ export class HarnessProbe extends DurableObject {
             ? { operationId, status: 'completed', output: 'Repository cloned by the host.' }
             : { status: 'pending_connection', requestId: 'connection-fixture', provider: 'github', repository: 'owner/private', permission: 'write' };
         },
-        execute: async ({ operationId, runOperationId, subagentId, subagentOperationId, toolCallId, action }) => {
+        execute: async ({ operationId, runOperationId, subagentId, subagentOperationId, toolCallId, action, signal }) => {
           // Enforce the real computer boundary, even though execution is a fixture.
           if (operationId.length > 160 || /[^A-Za-z0-9:_.-]/.test(operationId)) throw new Error('Invalid computer operation ID');
           const call = ctx.storage.sql.exec<{ id: number }>('INSERT INTO tool_calls(input) VALUES(?) RETURNING id', JSON.stringify({ operationId, runOperationId, subagentId, subagentOperationId, toolCallId, action })).one();
-          await this.heldTool;
+          if (this.heldTool && this.abortHeldTool) {
+            // The fake transport must release its request on cancellation just
+            // like fetch; cancelling an observer does not finish other agents.
+            let rejectAbort!: (reason: unknown) => void;
+            const aborted = new Promise<never>((_resolve, reject) => {rejectAbort = reject;});
+            const onAbort = () => rejectAbort(signal.reason);
+            signal.addEventListener('abort', onAbort, {once:true});
+            if (signal.aborted) onAbort();
+            try { await Promise.race([this.heldTool, aborted]); }
+            finally { signal.removeEventListener('abort', onAbort); }
+          } else await this.heldTool;
           if (this.toolDelayMs) await new Promise(resolve => setTimeout(resolve, this.toolDelayMs));
           const nextContext = this.setting('afterToolApprovalContext');
           if (nextContext) ctx.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)', 'approvalContext', nextContext);

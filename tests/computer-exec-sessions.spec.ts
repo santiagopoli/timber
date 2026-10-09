@@ -31,7 +31,7 @@ function machine() {
     return Response.json({...sessions.get(processId)??{status:'completed',output:'files'},operationId});
   }};}};
   return {container,sessions,actions,get checkpoints(){return checkpoints;},get starts(){return starts;},set running(value:boolean){running=value;},set bootId(value:string){bootId=value;},set capabilities(value:string[]){capabilities=value;},set poll(value:typeof poll){poll=value;},
-    attach(instance:object){Object.defineProperty(instance,'container',{configurable:true,get:()=>container});Object.defineProperty(instance,'env',{configurable:true,value:{FILES:{async put(){return {size:1};}}}});}};
+    attach(instance:object){Object.defineProperty(instance,'container',{configurable:true,get:()=>container});Object.defineProperty(instance,'env',{configurable:true,value:{FILES:{async put(_key:string,body:ReadableStream){await new Response(body).arrayBuffer();return {size:1};}}}});}};
 }
 
 describe('durable execution sessions',()=>{
@@ -186,7 +186,7 @@ describe('durable execution sessions',()=>{
       for(const id of ['first','second']) await instance.fetch(request(botId,id,{type:'exec',command:id,yieldMs:0}));
       vm.sessions.set('first',{operationId:'first',processId:'first',status:'completed',output:'first',exitCode:0});
       const first=await (await instance.fetch(request(botId,'poll-first',{type:'execPoll',processId:'first',yieldMs:0}))).json<ComputerResult>();
-      expect(first.status).toBe('completed');expect(first.checkpointId).toBeUndefined();expect(first.error).toContain('active commands');expect(vm.checkpoints).toBe(0);
+      expect(first.status).toBe('completed');expect(first.checkpointId).toBeUndefined();expect(first.checkpointStatus).toBe('pending');expect(first.error).toBeUndefined();expect(vm.checkpoints).toBe(0);
       vm.sessions.set('second',{operationId:'second',processId:'second',status:'completed',output:'second',exitCode:0});
       const second=await (await instance.fetch(request(botId,'poll-second',{type:'execPoll',processId:'second',yieldMs:0}))).json<ComputerResult>();
       const firstSaved=await (await instance.fetch(request(botId,'poll-first-final',{type:'execPoll',processId:'first',yieldMs:0}))).json<ComputerResult>();

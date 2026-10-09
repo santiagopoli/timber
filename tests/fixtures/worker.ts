@@ -43,6 +43,7 @@ export class ComputerDO extends DurableObject {
     if(input.action.type==="execPoll" || input.action.type==="execCancel") {
       const id=input.action.processId;
       const session=this.ctx.storage.sql.exec<{result:string;polls:number;remaining:number}>("SELECT * FROM exec_sessions WHERE id=?",id).toArray()[0];
+      if(!session && input.action.type==="execPoll") return Response.json({operationId:input.operationId,processId:id,status:"interrupted",processKnown:false,error:"Execution session is unavailable."});
       if(!session) return Response.json({error:{code:"process_not_found",message:"Process not found."}},{status:404});
       let result:ComputerResult=input.action.type==="execCancel"?this.cancel(id):JSON.parse(session.result);
       if(input.action.type==="execPoll" && result.status==="running") {

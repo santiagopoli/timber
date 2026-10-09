@@ -12,4 +12,7 @@
 .bot-activity-status{font-size:9px;color:var(--muted);margin-left:auto;flex:none;text-transform:none}
 .bot-activity-status[data-status=running],.bot-activity-status[data-status=queued]{color:var(--success)}
 .bot-activity-status[data-status=waiting_approval],.bot-activity-status[data-status=waiting_connection]{color:var(--ink)}
+/* Apply the selected background with the dark text palette, without briefly
+   retaining its light-theme background during the button color transition. */
+@media(prefers-color-scheme:dark) and (min-width:761px){.bot-item.selected{background:var(--soft);color:var(--ink);transition:none}}
 @media(prefers-color-scheme:dark){[data-agent-color=fern]{--agent-fill:#273d2e;--agent-ink:#b1d9bb}[data-agent-color=iris]{--agent-fill:#393047;--agent-ink:#d0bee9}[data-agent-color=ocean]{--agent-fill:#253c45;--agent-ink:#afd6e6}[data-agent-color=clay]{--agent-fill:#463329;--agent-ink:#e8c5a9}[data-agent-color=rose]{--agent-fill:#452e39;--agent-ink:#e8b5cd}[data-agent-color=gold]{--agent-fill:#413c27;--agent-ink:#ded29a}}

@@ -2192,3 +2192,53 @@ test('sidebar image-only messages replace an older text preview and keep caption
     await preview.filter({hasText:/^Compare these diagrams\.$/}).waitFor();assert.equal(await preview.innerText(),captioned.text);
   });
 });
+
+test('selected sidebar keeps readable contrast when switching between light and dark themes', async () => {
+  await withPage(async ({page,login}) => {
+    await login();
+    for(const colorScheme of ['light','dark']){
+      await page.emulateMedia({colorScheme});
+      const colors=await page.locator('.bot-item.selected').evaluate(button=>{
+        const rgb=value=>(value.match(/[\d.]+/g)||[]).slice(0,3).map(Number);
+        const background=rgb(getComputedStyle(button).backgroundColor),name=rgb(getComputedStyle(button.querySelector('.bot-name')).color),preview=rgb(getComputedStyle(button.querySelector('.bot-preview')).color);
+        const luminance=channels=>channels.map(channel=>{const n=channel/255;return n<=.04045?n/12.92:((n+.055)/1.055)**2.4;}).reduce((total,n,index)=>total+n*[.2126,.7152,.0722][index],0);
+        const contrast=color=>{const a=luminance(color),b=luminance(background);return (Math.max(a,b)+.05)/(Math.min(a,b)+.05);};
+        return {background,nameContrast:contrast(name),previewContrast:contrast(preview)};
+      });
+      assert.ok(colors.nameContrast>=4.5,`${colorScheme} selected bot name has ${colors.nameContrast.toFixed(2)}:1 contrast`);
+      if(colorScheme==='dark')assert.ok(colors.previewContrast>=4.5,`dark selected preview has ${colors.previewContrast.toFixed(2)}:1 contrast`);
+      if(process.env.TIMBER_CAPTURE_UI)await page.screenshot({path:`/tmp/timber-sidebar-contrast-${colorScheme}.png`});
+    }
+  });
+});
+
+for(const approved of [false,true]) test(`checkpoint recovery replaces stale warnings while preserving successful ${approved?'approved':'automatic'} commands`, async () => {
+  await withPage(async ({page,state,login}) => {
+    const createdAt=new Date().toISOString(),processId=`checkpoint-process-${approved?'approved':'automatic'}`,run={id:`checkpoint-run-${approved}`,botId:BOT_A,operationId:`checkpoint-request-${approved}`,status:'completed',createdAt,updatedAt:createdAt};
+    const oldResult={operationId:processId,processId,status:'completed',checkpointStatus:'pending',output:'Wrote report.txt\n',exitCode:0,error:'Workspace checkpoint is temporarily unavailable.'};
+    state.runs.set(BOT_A,[run]);state.messages.set(BOT_A,[{id:`checkpoint-message-${approved}`,botId:BOT_A,runId:run.id,role:'user',text:'Create the report and save its files.',createdAt}]);
+    if(approved)state.approvals.set(BOT_A,[{id:'checkpoint-approval',botId:BOT_A,runId:run.id,operationId:processId,status:'completed',action:{type:'exec',command:'python report.py',yieldMs:1000},result:oldResult,createdAt,expiresAt:new Date(Date.now()+60000).toISOString()}]);
+    const update=result=>state.emit(BOT_A,'process.updated',{processId,operationId:processId,input:{command:'python report.py',yieldMs:1000},result},run.id);
+    state.emit(BOT_A,'tool.completed',{operationId:processId,toolName:'exec',input:{command:'python report.py'},result:oldResult},run.id);update(oldResult);
+    await login();
+    const row=approved?page.locator('[data-timeline-approval="checkpoint-approval"]'):page.locator(`#messages [data-tool-operation-id="${processId}"]`);
+    if(approved)await row.locator('.timber-approval-history > summary').click();
+    await row.locator('.timber-save-warning').filter({hasText:oldResult.error}).waitFor();
+    await row.locator('[data-checkpoint-status="pending"]').filter({hasText:'Saving files…'}).waitFor();
+    assert.equal(await row.locator('.timber-inline-error').count(),0,'a checkpoint warning does not turn a successful command into a failed command');
+    const pending={operationId:'checkpoint-observation',processId,status:'completed',checkpointStatus:'pending',output:oldResult.output,exitCode:0};
+    update(pending);await row.locator('.timber-save-warning').waitFor({state:'hidden'});
+    await row.locator('[data-checkpoint-status="pending"]').waitFor();
+    const saved={...pending,checkpointStatus:'saved',checkpointId:'saved-checkpoint'};update(saved);
+    state.emit(BOT_A,'tool.completed',{operationId:processId,toolName:'exec',result:oldResult},run.id);
+    await row.locator('[data-checkpoint-status="pending"]').waitFor({state:'hidden'});
+    assert.equal(await row.locator('.timber-save-warning,.timber-inline-error').count(),0,'a later snapshot clears fields omitted from its authoritative result');
+    assert.match(await row.innerText(),/Wrote report\.txt/);
+    await openPanel(page,'activity');const activity=page.locator(`[data-activity-tool-operation-id="${processId}"]`);await activity.locator('.timber-tool-status[aria-label="Completed · exit 0"]').waitFor();
+    assert.equal(await activity.locator('.timber-save-warning,[data-checkpoint-status="pending"]').count(),0,'activity does not restore the persisted old receipt');
+    await openPanel(page,'conversation');await page.reload();await row.waitFor();
+    if(approved)await row.locator('.timber-approval-history > summary').click();
+    assert.equal(await row.locator('.timber-save-warning,[data-checkpoint-status="pending"]').count(),0,'durable event replay retains the recovered checkpoint state');
+    assert.match(await row.innerText(),/Wrote report\.txt/);assert.equal(await page.locator('#cancel-run').isVisible(),false,'saving files does not imply a shell process is still running');
+  });
+});
