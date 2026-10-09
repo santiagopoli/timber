@@ -968,7 +968,11 @@ test('streamed Markdown preserves recovered prefixes, open fences, replay order 
     state.messages.set(BOT_A, [user, final]); state.emit(BOT_A, 'message.created', {message: final}, run.id);
     run.status = 'completed'; run.updatedAt = final.createdAt; state.emit(BOT_A, 'run.updated', {run}, run.id);
     await page.locator('#streaming-message').waitFor({state: 'hidden'}); await until(page, '[data-message-id="stream-final"]', 'Servidor pendiente');
-    assert.equal(await page.locator('[data-message-id="stream-final"]').count(), 1); assert.equal(await page.locator('#messages pre code').innerText(), 'Linux fixture-kernel\n/workspace\n<img src=x onerror=alert(1)>');
+    // The saved message mounts a new lazy code renderer. Its trailing prose can
+    // appear before that independent code body has finished rendering.
+    const expectedCode = 'Linux fixture-kernel\n/workspace\n<img src=x onerror=alert(1)>';
+    await page.waitForFunction(expected => document.querySelector('[data-message-id="stream-final"] pre code')?.innerText === expected, expectedCode);
+    assert.equal(await page.locator('[data-message-id="stream-final"]').count(), 1); assert.equal(await page.locator('[data-message-id="stream-final"] pre code').innerText(), expectedCode);
     state.emit(BOT_A, 'runtime.snapshot', {busy: true, partialText: 'stale ghost'}, run.id); state.emit(BOT_A, 'message.delta', {delta: 'must not return'}, run.id);
     assert.equal(await page.locator('#streaming-message').isVisible(), false); assert.equal(await page.locator('#messages img').count(), 0);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
