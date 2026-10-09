@@ -1,10 +1,10 @@
-/* Collaboration is an event in the transcript, not another message bubble. */
-.timber-agent-created,.timber-collaboration-message{display:flex;flex-direction:column;align-items:stretch;gap:0;min-width:0;width:100%;padding:2px 0}
-.timber-agent-created>.timber-agent-created-pill,.timber-collaboration-message>.timber-collaboration-message-row{display:flex;align-items:center;justify-content:flex-start;gap:10px;box-sizing:border-box;min-width:0;min-height:54px;width:100%;max-width:100%;margin:0;padding:8px;border:0;border-radius:8px;background:transparent;box-shadow:none;color:var(--ink);font:inherit;text-align:left;white-space:normal;text-decoration:none}
+/* Keep collaboration events as compact, centered capsules, not full-width headers. */
+.timber-agent-created,.timber-collaboration-message{display:flex;flex-direction:column;align-items:center;gap:6px;min-width:0;width:100%;padding:3px 0}
+.timber-agent-created>.timber-agent-created-pill,.timber-collaboration-message>.timber-collaboration-message-row{display:flex;align-items:center;justify-content:flex-start;gap:8px;box-sizing:border-box;min-width:0;min-height:44px;width:fit-content;max-width:min(100%,360px);margin:0;padding:4px 12px;border:1px solid var(--line);border-radius:999px;background:var(--surface);box-shadow:none;color:var(--ink);font:inherit;text-align:left;white-space:normal;text-decoration:none}
 .timber-agent-created>button.timber-agent-created-pill,.timber-collaboration-message>button.timber-collaboration-message-row{cursor:pointer}
 .timber-agent-created>button.timber-agent-created-pill:hover,.timber-collaboration-message>button.timber-collaboration-message-row:hover{background:var(--soft);filter:none}
 .timber-agent-created>button.timber-agent-created-pill:focus-visible,.timber-collaboration-message>button.timber-collaboration-message-row:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
-.timber-collaboration-summary{display:flex;flex:1;flex-direction:column;gap:0;min-width:0}
+.timber-collaboration-summary{display:flex;flex:0 1 auto;flex-direction:column;gap:0;min-width:0;max-width:260px}
 .timber-collaboration-summary>.timber-collaborator-link,.timber-collaboration-summary>.timber-agent-created-link{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;min-width:0;overflow:hidden;overflow-wrap:anywhere;white-space:normal;color:var(--ink);font-size:13px;line-height:18px;font-weight:500;text-decoration:none}
 .timber-collaboration-meta{display:flex;flex-wrap:wrap;align-items:baseline;gap:0 5px;min-width:0;color:var(--muted);font-size:11px;line-height:16px;font-weight:400;overflow-wrap:anywhere}
 .timber-collaboration-direction{min-width:0;overflow-wrap:anywhere}
@@ -17,7 +17,7 @@
 .timber-collaboration-message-icon{box-sizing:border-box;width:24px;height:24px;flex:none;padding:4px;color:var(--muted)}
 .timber-collaboration-disclosure,.timber-agent-created-toggle{width:15px;height:15px;flex:none;margin-left:auto;color:var(--muted);transition:transform .15s}
 .timber-collaboration-disclosure.is-expanded,.timber-agent-created-toggle.is-expanded{transform:rotate(180deg)}
-.timber-collaboration-message-body,.timber-agent-created-details{display:flex;flex-direction:column;align-items:stretch;gap:8px;box-sizing:border-box;min-width:0;width:100%;padding:4px 8px 12px 42px;border:0;border-radius:0;background:transparent;box-shadow:none;text-align:left;overflow-wrap:anywhere}
+.timber-collaboration-message-body,.timber-agent-created-details{display:flex;flex-direction:column;align-items:stretch;gap:8px;box-sizing:border-box;min-width:0;width:min(100%,600px);padding:4px 12px 12px;border:0;border-radius:0;background:transparent;box-shadow:none;text-align:left;overflow-wrap:anywhere}
 .timber-collaboration-message-body .timber-markdown{font-size:13px}
 .timber-collaboration-message-body>.timber-inline-error{font-size:12px;margin:0}
 .timber-collaboration-detail-meta{display:flex;flex-direction:column;align-items:flex-start;gap:5px;min-width:0}

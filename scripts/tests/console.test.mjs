@@ -1824,7 +1824,7 @@ for (const viewport of [{width:1440,height:1050},{width:390,height:844}]) test(`
     const stamp=new Date().toISOString(),agent={id:'child-research',name:'Researcher',task:'Review the project architecture',parentOperationId:'parent-operation',operationId:'child-operation',status:'running',createdAt:stamp,updatedAt:stamp};
     state.agents.set(BOT_A,[agent]);state.agentMessages.set(agent.id,[{id:'child-response',role:'assistant',text:'The architecture review is underway.',createdAt:stamp}]);
     state.runs.set(BOT_A,[{id:'child-run',botId:BOT_A,operationId:agent.operationId,subagentId:agent.id,parentRunId:'parent-run',status:'running',createdAt:stamp,updatedAt:stamp}]);
-    await login();assert.equal(await page.locator('#run-status').isVisible(),false,'child activity has its own status and does not replace the parent header');await page.locator('[data-chat-agent="child-research"]').click();
+    await login();assert.equal(await page.locator('#run-status').isVisible(),false,'child activity has its own status and does not replace the parent header');await page.locator('[data-chat-agents-toggle]').click();await page.locator('[data-chat-agent="child-research"]').click();
     await page.locator('[data-agent-detail="child-research"]').waitFor();await page.getByText('The architecture review is underway.',{exact:true}).waitFor();
     await page.locator('#agent-message').fill('Also review persistence');await page.getByRole('button',{name:'Send message to Researcher',exact:true}).click();
     await page.getByText('Also review persistence',{exact:true}).waitFor();
@@ -1891,7 +1891,7 @@ test('undelivered subagent reports remain visible after reload without changing 
     const stamp=new Date().toISOString(),agentId='child-report';
     state.agents.set(BOT_A,[{id:agentId,name:'Researcher',task:'Review persistence',parentOperationId:'parent',operationId:'child',status:'completed',result:'The review is complete.',createdAt:stamp,updatedAt:stamp}]);
     state.agentMessages.set(agentId,[{id:'saved-result',role:'assistant',text:'The review is complete.',createdAt:stamp}]);
-    await login();await page.locator(`[data-chat-agent="${agentId}"]`).click();await page.getByText('The review is complete.',{exact:true}).waitFor();
+    await login();await page.locator('[data-chat-agents-toggle]').click();await page.locator(`[data-chat-agent="${agentId}"]`).click();await page.getByText('The review is complete.',{exact:true}).waitFor();
     const message='The subagent result is saved, but its parent could not be notified.';
     state.emit(BOT_A,'subagent.report_failed',{subagentId:agentId,errorCode:'parent_report_failed',message});
     await page.locator(`[data-agent-report-error="${agentId}"]`).filter({hasText:message}).waitFor();
@@ -1975,7 +1975,7 @@ test('Retry sending clears only accepted image previews after a failed delivery'
   });
 });
 
-for (const viewport of [{width:1440,height:1050},{width:390,height:844}]) test(`agent creation cards and left-aligned messages survive live updates and reload at ${viewport.width}px`, async () => {
+for (const viewport of [{width:1440,height:1050},{width:390,height:844}]) test(`agent creation and message pills survive live updates and reload at ${viewport.width}px`, async () => {
   await withPage(async ({page,state,login}) => {
     const stamp='2026-10-09T12:00:00.000Z',run={id:'collab-root',botId:BOT_A,operationId:'collab-root-operation',status:'running',createdAt:stamp,updatedAt:stamp};
     const agent={id:'collab-researcher',name:'Researcher',task:'Review architecture and persistence',parentOperationId:run.operationId,operationId:'collab-spawn-operation',status:'queued',createdAt:stamp,updatedAt:stamp};
@@ -1989,10 +1989,13 @@ for (const viewport of [{width:1440,height:1050},{width:390,height:844}]) test(`
     state.emit(BOT_A,'tool.completed',{toolName:'spawn_subagent',toolCallId:'collab-spawn-call',operationId:agent.operationId,result:{status:'completed'}},run.id);
     const card=page.locator(`[data-agent-created="${agent.id}"]`);
     await card.getByRole('button',{name:'Show Researcher agent details',exact:true}).waitFor();assert.equal(await card.locator('[data-status="queued"]').count(),1);
-    assert.equal(await card.locator('.timber-agent-created-details').count(),0,'creation starts as a collapsed event header');
+    assert.equal(await card.locator('.timber-agent-created-details').count(),0,'creation starts as a collapsed pill');
     const pillBox=await card.locator('.timber-agent-created-pill').boundingBox(),cardBox=await card.boundingBox();
     assert.ok(pillBox&&cardBox&&pillBox.height>=44&&pillBox.width<=cardBox.width+1,'creation respects the conversation width and minimum touch target');
-    assert.ok(Math.abs(pillBox.x-cardBox.x)<2,'the creation header is left-aligned in the conversation');
+    assert.ok(Math.abs(pillBox.x+pillBox.width/2-cardBox.x-cardBox.width/2)<2,'the creation pill is centered in the conversation');
+    assert.ok(pillBox.width<260&&pillBox.width<cardBox.width-20,'a short name produces a content-sized capsule, not a stretched header');
+    const pillStyle=await card.locator('.timber-agent-created-pill').evaluate(node=>{const style=getComputedStyle(node);return {radius:parseFloat(style.borderRadius),border:parseFloat(style.borderTopWidth),background:style.backgroundColor};});
+    assert.ok(pillStyle.radius>=pillBox.height/2,'creation retains a rounded capsule silhouette');assert.equal(pillStyle.border,1,'creation retains its subtle outline');assert.notEqual(pillStyle.background,'rgba(0, 0, 0, 0)','creation retains its subtle background');
     assert.ok(pillBox.x>=0&&pillBox.x+pillBox.width<=viewport.width+1,'creation does not overflow the viewport');
     await card.getByRole('button',{name:'Show Researcher agent details',exact:true}).click();
     await card.getByText('Review architecture and persistence',{exact:true}).waitFor();
@@ -2027,7 +2030,7 @@ for (const viewport of [{width:1440,height:1050},{width:390,height:844}]) test(`
   },{viewport,...(viewport.width<760?{isMobile:true,hasTouch:true}:{})});
 });
 
-for(const width of [320,390,768])for(const colorScheme of ['light','dark'])test(`collaboration whole headers preserve distinct events and keyboard navigation at ${width}px ${colorScheme}`,async()=>{
+for(const width of [320,390,768])for(const colorScheme of ['light','dark'])test(`collaboration capsules preserve distinct events and keyboard navigation at ${width}px ${colorScheme}`,async()=>{
   await withPage(async({page,state,login})=>{
     const stamp='2026-10-09T12:01:00.000Z',run={id:'header-root',botId:BOT_A,operationId:'header-root-op',status:'completed',createdAt:stamp,updatedAt:stamp};
     const name='AccessibilityAndPersistenceReviewerWithAnExtremelyLongUnbrokenAgentName';
@@ -2045,7 +2048,7 @@ for(const width of [320,390,768])for(const colorScheme of ['light','dark'])test(
     const cards=[page.locator(`[data-agent-created="${agent.id}"]`),page.locator(`[data-agent-created="${spaced.id}"]`)];
     for(const article of [first,second,third,...cards]){
       const header=article.locator(':scope > button[aria-expanded]');
-      assert.equal(await article.locator('button').count(),1,'a collapsed event has exactly one whole-header button');
+      assert.equal(await article.locator('button').count(),1,'a collapsed pill has exactly one whole-button disclosure');
       assert.equal(await header.locator('button,a,[role="button"]').count(),0,'the header has no nested interactive navigation');
       assert.equal(await header.getAttribute('aria-expanded'),'false');assert.ok(await header.getAttribute('aria-controls'),'disclosure identifies its detail');
       assert.equal(await article.getByRole('button',{name:/^Open .* conversation$/}).count(),0,'navigation is only inside expanded detail');
@@ -2054,13 +2057,15 @@ for(const width of [320,390,768])for(const colorScheme of ['light','dark'])test(
         const box=node.getBoundingClientRect(),parent=node.parentElement.getBoundingClientRect();
         const avatar=node.querySelector('.timber-collaborator-avatar').getBoundingClientRect(),summary=node.querySelector('.timber-collaboration-summary').getBoundingClientRect(),chevron=node.lastElementChild.getBoundingClientRect();
         const name=node.querySelector('strong'),meta=node.querySelector('.timber-collaboration-meta');
-        return {x:box.x,right:box.right,width:box.width,height:box.height,parentX:parent.x,parentWidth:parent.width,avatarRight:avatar.right,summaryLeft:summary.left,summaryRight:summary.right,chevronLeft:chevron.left,nameWeight:Number(getComputedStyle(name).fontWeight),metaWeight:Number(getComputedStyle(meta).fontWeight),align:getComputedStyle(node).textAlign,background:getComputedStyle(node).backgroundColor,scroll:node.scrollWidth,client:node.clientWidth};
+        return {x:box.x,right:box.right,width:box.width,height:box.height,parentX:parent.x,parentWidth:parent.width,avatarRight:avatar.right,summaryLeft:summary.left,summaryRight:summary.right,chevronLeft:chevron.left,nameWeight:Number(getComputedStyle(name).fontWeight),metaWeight:Number(getComputedStyle(meta).fontWeight),align:getComputedStyle(node).textAlign,background:getComputedStyle(node).backgroundColor,radius:parseFloat(getComputedStyle(node).borderRadius),border:parseFloat(getComputedStyle(node).borderTopWidth),nameHeight:name.getBoundingClientRect().height,nameLineHeight:parseFloat(getComputedStyle(name).lineHeight),nameClamp:getComputedStyle(name).webkitLineClamp,scroll:node.scrollWidth,client:node.clientWidth};
       });
-      assert.ok(geometry.height>=44,'the whole header meets minimum touch size, even when names wrap');
-      assert.ok(Math.abs(geometry.x-geometry.parentX)<2&&geometry.width<=geometry.parentWidth+1,'headers are left-aligned and constrained to conversation width');
+      assert.ok(geometry.height>=44&&geometry.height<=80,'the capsule stays compact while meeting minimum touch size, even when names wrap');
+      assert.ok(Math.abs(geometry.x+geometry.width/2-geometry.parentX-geometry.parentWidth/2)<2&&geometry.width<=Math.min(geometry.parentWidth,360)+1,'capsules are centered and bounded instead of full-conversation-width headers');
       assert.ok(geometry.x>=0&&geometry.right<=width+1&&geometry.scroll<=geometry.client+1,'long names do not overflow the viewport or header');
       assert.ok(geometry.avatarRight<=geometry.summaryLeft&&geometry.summaryRight<=geometry.chevronLeft+1,'avatar, name, and disclosure do not overlap');
-      assert.ok(geometry.nameWeight>geometry.metaWeight,'the agent name is visually primary');assert.equal(geometry.align,'left');assert.equal(geometry.background,'rgba(0, 0, 0, 0)','the event is flat, not a pill bubble');
+      assert.ok(geometry.nameWeight>geometry.metaWeight,'the agent name is visually primary');assert.equal(geometry.align,'left');assert.notEqual(geometry.background,'rgba(0, 0, 0, 0)','the pill retains a subtle background');
+      assert.ok(geometry.radius>=geometry.height/2,'the event retains a rounded capsule silhouette');assert.equal(geometry.border,1,'the pill retains a subtle border');
+      assert.equal(geometry.nameClamp,'2');assert.ok(geometry.nameHeight<=geometry.nameLineHeight*2+1,'long names are bounded to two lines, not giant capsules');
     }
     assert.equal(await first.locator('.timber-collaboration-direction').innerText(),'Message from agent');
     assert.equal(await second.locator('.timber-collaboration-direction').innerText(),'Message to agent');
@@ -2380,7 +2385,7 @@ test('subagent reports separate attribution from new and historical bodies witho
   });
 });
 
-for(const viewport of [{width:1440,height:1050},{width:390,height:844}])test(`historical and current subagent messages use left-aligned headers without duplicate activity at ${viewport.width}px`,async()=>{
+for(const viewport of [{width:1440,height:1050},{width:390,height:844}])test(`historical and current subagent messages retain centered pills without duplicate activity at ${viewport.width}px`,async()=>{
   await withPage(async({page,state,login})=>{
     const stamp='2026-10-09T16:00:00.000Z',run={id:'pill-message-root',botId:BOT_A,operationId:'pill-message-root-op',status:'running',createdAt:stamp,updatedAt:stamp};
     const agent={id:'pill-message-child',name:'Reviewer',task:'Review the desktop changes.',parentOperationId:run.operationId,operationId:'pill-message-child-op',status:'running',createdAt:stamp,updatedAt:stamp};
@@ -2405,7 +2410,7 @@ for(const viewport of [{width:1440,height:1050},{width:390,height:844}])test(`hi
     const pending=page.locator('[data-collaboration-notice]').filter({has:page.locator('[data-status="running"]')});assert.equal(await pending.count(),1,'a started send remains visibly pending');
     assert.equal(await page.locator('#messages [data-tool-operation-id]').count(),0,'message operations are represented by pills, not wide tool rows');
     for(const pill of await page.locator('#messages .timber-collaboration-message-row').all()){
-      const box=await pill.boundingBox(),parent=await pill.locator('..').boundingBox();assert.ok(box&&parent&&box.height>=44&&box.width<=parent.width+1);assert.ok(Math.abs(box.x-parent.x)<2,'event headers align with the conversation left edge');assert.ok(box.x>=0&&box.x+box.width<=viewport.width+1,'event headers do not overflow');
+      const box=await pill.boundingBox(),parent=await pill.locator('..').boundingBox();assert.ok(box&&parent&&box.height>=44&&box.width<=parent.width+1);assert.ok(Math.abs(box.x+box.width/2-parent.x-parent.width/2)<2,'event pills are centered in the conversation');assert.ok(box.x>=0&&box.x+box.width<=viewport.width+1,'event headers do not overflow');
     }
     await known.getByRole('button',{name:'Show message to Reviewer',exact:true}).click();await known.getByText('Please review the compact message pills.',{exact:true}).waitFor();
     if(process.env.TIMBER_CAPTURE_UI)await page.screenshot({path:`/tmp/timber-message-pills-${viewport.width}.png`});

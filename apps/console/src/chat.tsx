@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, useId, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
 import { XIcon, PaperclipIcon, ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon, HistoryIcon, SquareIcon } from 'lucide-react';
@@ -605,27 +605,50 @@ function MiniActivity({model, historyOpen, onHistory, callbacks}: {model: ChatMo
   </section>;
 }
 
-function Chat({ model, callbacks, dockTarget }: { model: ChatModel; callbacks: ChatCallbacks; dockTarget: HTMLElement | null }) {
+function ChatAgents({model, callbacks, headerTarget}: {model: ChatModel; callbacks: ChatCallbacks; headerTarget: HTMLElement | null}) {
+  const [expanded, setExpanded] = useState(false);
+  const listId = useId();
+  const toggle = useRef<HTMLButtonElement>(null);
+  const count = model.subagents.length + model.delegations.length;
+  useEffect(() => {if (!count) setExpanded(false);}, [count]);
+  if (!count || !headerTarget) return null;
+  return <>
+    {createPortal(<button ref={toggle} type="button" className="timber-chat-agents-toggle" data-chat-agents-toggle aria-expanded={expanded} aria-controls={listId} onClick={() => setExpanded(value => !value)} onKeyDown={event => {
+      if (event.key === 'Escape' && expanded) {event.preventDefault();event.stopPropagation();setExpanded(false);}
+    }}>
+      <GitBranchIcon className="timber-chat-agents-icon" aria-hidden="true"/><span>Agents {count}</span><ChevronDownIcon className={expanded ? 'is-expanded' : ''} aria-hidden="true"/>
+    </button>, headerTarget)}
+    <section id={listId} className="timber-chat-agents" aria-label="Agent collaboration" hidden={!expanded} onKeyDown={event => {
+      if (event.key === 'Escape') {event.preventDefault();event.stopPropagation();setExpanded(false);toggle.current?.focus();}
+    }}>
+      {expanded && <>
+        <div className="timber-chat-agent-list">
+          {model.subagents.map(agent => <button type="button" key={agent.id} data-chat-agent={agent.id} onClick={() => callbacks.onOpenAgents(agent.id)}><span className="timber-chat-agent-name">{agent.name}</span><span className="status" data-status={agent.status}>{label(agent.status)}</span></button>)}
+          {model.delegations.map(delegation => <button type="button" key={delegation.id} data-chat-delegation={delegation.id} onClick={() => callbacks.onOpenAgents()}><span className="timber-chat-agent-name">{delegation.targetBotName}</span><span className="status" data-status={delegation.status}>{label(delegation.status)}</span></button>)}
+        </div>
+        <button type="button" className="timber-chat-agent-manage" onClick={() => callbacks.onOpenAgents()}>View all agents<ExternalLinkIcon aria-hidden="true"/></button>
+      </>}
+    </section>
+  </>;
+}
+
+function Chat({ model, callbacks, dockTarget, headerTarget }: { model: ChatModel; callbacks: ChatCallbacks; dockTarget: HTMLElement | null; headerTarget: HTMLElement | null }) {
   const [historyOpen,setHistoryOpen] = useState(false);
   useEffect(()=>{if(!dockTarget)setHistoryOpen(false);},[dockTarget]);
   const composer = <Composer model={model} callbacks={callbacks}/>;
   const conversation = <Conversation className="timber-conversation"><ConversationBody model={model} callbacks={callbacks}/></Conversation>;
   return <div className="timber-chat-layout">
-    {(model.subagents.length > 0 || model.delegations.length > 0) && <div className="timber-chat-agents" aria-label="Agent collaboration">
-      <button type="button" onClick={() => callbacks.onOpenAgents()}><GitBranchIcon/>Agents <span>{model.subagents.length + model.delegations.length}</span></button>
-      {model.subagents.slice(-3).map(agent => <button type="button" key={agent.id} data-chat-agent={agent.id} onClick={() => callbacks.onOpenAgents(agent.id)}>{agent.name}<span className="status" data-status={agent.status}>{label(agent.status)}</span></button>)}
-      {model.delegations.slice(0,2).map(delegation => <button type="button" key={delegation.id} onClick={() => callbacks.onOpenAgents()}>{delegation.targetBotName}<span className="status" data-status={delegation.status}>{label(delegation.status)}</span></button>)}
-    </div>}
+    <ChatAgents model={model} callbacks={callbacks} headerTarget={headerTarget}/>
     {model.runFilter && <div id="run-filter" className="timber-filter"><span>Filtered by task</span><Button id="clear-run-filter" variant="ghost" size="sm" onClick={callbacks.onClearFilter}>Show all messages</Button></div>}
     {!(dockTarget && historyOpen) && conversation}
     {dockTarget ? createPortal(<div className="timber-focus-chat"><MiniActivity model={model} historyOpen={historyOpen} onHistory={setHistoryOpen} callbacks={callbacks}/>{historyOpen && <div className="timber-focus-history" aria-label="Conversation history">{conversation}</div>}{composer}</div>,dockTarget) : composer}
   </div>;
 }
 
-export function mountChat(element: HTMLElement, callbacks: ChatCallbacks, loadArtifact: ArtifactLoader) {
+export function mountChat(element: HTMLElement, callbacks: ChatCallbacks, loadArtifact: ArtifactLoader, headerTarget: HTMLElement | null) {
   const root = createRoot(element);
   let model: ChatModel | null = null, dockTarget: HTMLElement | null = null;
-  const render = () => root.render(model ? <ArtifactProvider load={loadArtifact}><Chat key={model.bot.id} model={model} callbacks={callbacks} dockTarget={dockTarget}/></ArtifactProvider> : null);
+  const render = () => root.render(model ? <ArtifactProvider load={loadArtifact}><Chat key={model.bot.id} model={model} callbacks={callbacks} dockTarget={dockTarget} headerTarget={headerTarget}/></ArtifactProvider> : null);
   return {
     update(value: ChatModel) {model = value; render();},
     setDock(target: HTMLElement | null) {if (dockTarget !== target) {dockTarget = target; render();}},

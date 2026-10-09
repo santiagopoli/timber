@@ -66,7 +66,7 @@ import './src/layout.css';
     onClearFilter: () => { runFilter = null; renderMessages(); },
     onStop: (botId, runId) => { if (selected?.id === botId) void guarded(() => cancelRun(runId)); },
     onConnect: (botId, requestId) => { if (selected?.id === botId) void connectGitHub(botId, requestId); },
-  }, loadArtifact);
+  }, loadArtifact, $('chat-agents-header'));
   const agentsView = mountAgents($('agents-root'), {
     request: (botId, path, options) => request(`${botPath(botId)}${path}`, options),
     onSelect: id => {selectedAgentId = id;renderAgents();syncAgentHash();},
@@ -938,6 +938,7 @@ import './src/layout.css';
     $('expand-workspace').title = workspaceExpanded ? 'Dock workspace' : 'Expand workspace';
     $('expand-workspace').setAttribute('aria-pressed', String(workspaceExpanded));
     for (const name of panelNames) $(`panel-${name}`).hidden = name === 'conversation' ? open && !docked : name !== currentPanel;
+    $('chat-agents-header').hidden = $('panel-conversation').hidden;
     for (const button of document.querySelectorAll('[data-panel]')) {
       const active = button.dataset.panel === currentPanel;
       button.classList.toggle('active', active);
