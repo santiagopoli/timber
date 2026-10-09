@@ -2432,7 +2432,10 @@ test('unavailable model catalogs keep the saved model readable and allow a delib
     const settings=page.getByRole('dialog',{name:'Model settings',exact:true});await settings.getByRole('alert').filter({hasText:'temporarily unavailable'}).waitFor();
     const model=settings.getByRole('combobox',{name:'Model',exact:true});assert.equal(await model.isDisabled(),true);assert.equal(await model.inputValue(),'gpt-6.1-sol');assert.equal(await model.locator('option').count(),1);assert.equal(await settings.getByRole('switch').count(),0);
     state.modelsError=null;await settings.getByRole('button',{name:'Try again'}).click();await page.waitForFunction(()=>!document.querySelector('.timber-model-popover select').disabled);assert.equal(await model.locator('option').count(),1);
-    await page.keyboard.press('Escape');await settings.waitFor({state:'hidden'});assert.equal(await trigger.evaluate(node=>node===document.activeElement),true,'Escape restores keyboard focus to the settings control');
+    await page.keyboard.press('Escape');await settings.waitFor({state:'hidden'});
+    // Radix restores focus in a deferred unmount callback, after the panel hides.
+    await trigger.and(page.locator(':focus')).waitFor({timeout:3000});
+    assert.equal(await trigger.evaluate(node=>node===document.activeElement),true,'Escape restores keyboard focus to the settings control');
   });
 });
 
