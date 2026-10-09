@@ -87,8 +87,12 @@ function MarkdownCode({children,compact}: {children?:ReactNode;compact?:boolean}
 }
 
 export function ActivityOutput({format, compact=false, source=format.code}: {format:Format;compact?:boolean;source?:string}) {
+  // The collapsed output shows only three lines. Do not retain hundreds of
+  // hidden token/line elements per action just because the source is short.
+  // Command previews use ActivityCode directly and keep horizontal scrolling.
+  const visible = compact ? format.code.slice(0,format.language === 'markdown' ? 600 : 2_000).split('\n',3).join('\n') : format.code;
   if (format.language === 'markdown') return <div className={`timber-tool-markdown${compact ? ' is-compact' : ''}`}>
-    <MessageResponse className="timber-markdown" mode="static" skipHtml plugins={{}} components={{img:()=>null,a:compact ? ({children})=><span>{children}</span> : undefined,pre:({children})=><MarkdownCode compact={compact} children={children}/>}} controls={false} linkSafety={{enabled:false}} urlTransform={defaultUrlTransform}>{compact ? format.code.slice(0,600) : format.code.slice(0,65_536)}</MessageResponse>
+    <MessageResponse className="timber-markdown" mode="static" skipHtml plugins={{}} components={{img:()=>null,a:compact ? ({children})=><span>{children}</span> : undefined,pre:({children})=><MarkdownCode compact={compact} children={children}/>}} controls={false} linkSafety={{enabled:false}} urlTransform={defaultUrlTransform}>{visible.slice(0,65_536)}</MessageResponse>
   </div>;
-  return <ActivityCode code={format.code} copyText={source} language={format.language} compact={compact}/>;
+  return <ActivityCode code={visible} copyText={source} language={format.language} compact={compact}/>;
 }

@@ -2,7 +2,7 @@
 *{box-sizing:border-box}
 html,body{min-width:320px;margin:0}
 body{color:var(--ink);background:var(--bg);font-size:14px;line-height:1.5;overscroll-behavior:none}
-html:has(>body[data-authenticated="true"]){height:100%;overflow:hidden}
+html:has(>body[data-authenticated="true"]){height:100%;overflow:hidden;overscroll-behavior-y:none}
 /* Safari may pan the visual viewport as well as shrinking it for the keyboard.
    Anchor the shell to that visible area; only the panels own content scrolling. */
 body[data-authenticated="true"]{position:fixed;top:var(--app-top,0px);left:0;right:0;height:var(--app-height);overflow:hidden}

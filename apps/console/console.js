@@ -949,6 +949,7 @@ import './src/layout.css';
     $('current-panel').hidden = !open || docked;
     $('back-to-chat').hidden = !open || docked;
     desktop.setActive(currentPanel === 'computer');
+    activity.setActive(authenticated && currentPanel === 'activity');
     syncChatDock();
   }
   function showPanel(name, focus = false) {

@@ -635,5 +635,13 @@ export function mountChat(element: HTMLElement, callbacks: ChatCallbacks, loadAr
 
 export function mountToolActivity(element: HTMLElement, loadArtifact: ArtifactLoader, callbacks:Pick<ChatCallbacks,'onOpenBot'|'onOpenAgents'>) {
   const root = createRoot(element);
-  return { update(model: ActivityModel) {root.render(<ArtifactProvider load={loadArtifact}><ActivityPanel key={model.bot.id} model={model} callbacks={callbacks}/></ArtifactProvider>);}, clear() {root.render(null);} };
+  let model: ActivityModel | null = null, active = false;
+  const render = () => root.render(active && model ? <ArtifactProvider load={loadArtifact}><ActivityPanel key={model.bot.id} model={model} callbacks={callbacks}/></ArtifactProvider> : null);
+  return {
+    // Keep the latest data without duplicating the conversation's code blocks
+    // and screenshot previews in a hidden panel.
+    update(value: ActivityModel) {model = value; if (active) render();},
+    setActive(value: boolean) {if (active !== value) {active = value; render();}},
+    clear() {model = null; render();},
+  };
 }

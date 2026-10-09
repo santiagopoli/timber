@@ -2595,6 +2595,76 @@ for(const width of [1440,390])test(`ChatGPT allowance failure directs to usage a
   },{viewport:{width,height:900},...(width<760?{isMobile:true,hasTouch:true}:{})});
 });
 
+for (const width of [1440, 390]) test(`long activity keeps collapsed output small and mounts its panel only when visible (${width}px)`, async () => {
+  await withPage(async ({page, context, state, login, url}) => {
+    const createdAt = new Date().toISOString(), run = {id: 'bounded-activity', botId: BOT_A, operationId: 'bounded-request', status: 'running', createdAt, updatedAt: createdAt};
+    const output = Array.from({length: 100}, (_, i) => `Output line ${i}`).join('\r\n') + '\r\n';
+    state.runs.set(BOT_A, [run]);
+    state.messages.set(BOT_A, [{id: 'bounded-user', botId: BOT_A, runId: run.id, role: 'user', text: 'Review these actions.', createdAt}]);
+    for (let i = 0; i < 50; i++) state.emit(BOT_A, 'tool.completed', {operationId: `bounded-${i}`, toolName: 'exec', input: {command: `echo task-${i}`}, result: {status: 'completed', output, exitCode: 0}}, run.id);
+    await context.grantPermissions(['clipboard-read', 'clipboard-write'], {origin: new URL(url).origin});
+    await login(); await page.locator('[data-tool-operation-id="bounded-49"]').waitFor();
+    assert.equal(await page.locator('[data-tool-operation-id]').count(), 50, 'all actions remain available');
+    assert.equal(await page.locator('#activity-tools').evaluate(node => node.childElementCount), 0, 'hidden activity does not duplicate tool DOM');
+    const row = page.locator('[data-tool-operation-id="bounded-49"]');
+    assert.equal((await row.locator('[data-tool-result-preview] pre').textContent()).replaceAll('\r', ''), 'Output line 0\nOutput line 1\nOutput line 2');
+    assert.ok(await page.locator('[data-tool-result-preview]').evaluateAll(nodes => nodes.every(node => node.querySelectorAll('*').length < 50)), 'collapsed outputs have bounded token DOM, even with many short lines');
+    await row.locator('summary').click();
+    assert.match(await row.locator('.timber-tool-output pre').textContent(), /Output line 99/);
+    await row.getByRole('button', {name: 'Copy code', exact: true}).click();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), output, 'copy retains all lines, CRLF and the final newline');
+    await row.locator('summary').click();
+    await openPanel(page, 'activity');
+    await page.locator('[data-activity-tool-operation-id="bounded-49"]').waitFor();
+    assert.equal(await page.locator('[data-activity-tool-operation-id]').count(), 50);
+    state.emit(BOT_A, 'tool.started', {operationId: 'bounded-live', toolName: 'exec', input: {command: 'pwd'}}, run.id);
+    await page.locator('[data-activity-tool-operation-id="bounded-live"][data-tool-status="running"]').waitFor();
+    await openPanel(page, 'conversation');
+    await page.waitForFunction(() => document.querySelector('#activity-tools').childElementCount === 0);
+    state.emit(BOT_A, 'tool.completed', {operationId: 'bounded-live', toolName: 'exec', result: {status: 'completed', output: '/workspace\n', exitCode: 0}}, run.id);
+    await page.locator('[data-tool-operation-id="bounded-live"][data-tool-status="completed"]').waitFor();
+    assert.equal(await page.locator('#activity-tools').evaluate(node => node.childElementCount), 0);
+    await openPanel(page, 'activity');
+    await page.locator('[data-activity-tool-operation-id="bounded-live"][data-tool-status="completed"]').waitFor();
+    assert.equal(await page.locator('[data-activity-tool-operation-id]').count(), 51, 'reopening uses updates received while the panel was hidden');
+    await selectBot(page, BOT_B);
+    await page.waitForFunction(() => !document.querySelector('[data-activity-tool-operation-id]'));
+    await signOut(page);
+    await page.waitForFunction(() => document.querySelector('#activity-tools').childElementCount === 0);
+  }, {viewport: {width, height: 844}, isMobile: width === 390, hasTouch: width === 390});
+});
+
+test('mobile conversation survives repeated stream reconnects and foreground refreshes without reloading', async () => {
+  await withPage(async ({page, state, login}) => {
+    const run = scrollHistory(state), documents = [];
+    page.on('request', request => {if (request.isNavigationRequest() && request.frame() === page.mainFrame()) documents.push(request.url());});
+    await login(); await atChatBottom(page);
+    await page.locator('#message').fill('Keep my unsent draft');
+    await page.locator('#messages').evaluate(node => {node.scrollTop = 250;});
+    await page.getByRole('button', {name: 'Jump to latest message'}).waitFor();
+    const initial = await chatScroll(page);
+    await page.evaluate(() => {globalThis.__stableChat = {document, root: document.querySelector('#messages'), message: document.querySelector('[data-message-id="scroll-history-0"]'), timeOrigin: performance.timeOrigin};});
+    for (let i = 0; i < 3; i++) {
+      const reconnected = page.waitForResponse(response => new URL(response.url()).pathname.endsWith('/events'));
+      for (const stream of state.streams) if (stream.botId === BOT_A) stream.response.end();
+      await reconnected;
+      state.emit(BOT_A, 'message.delta', {delta: `Reconnect ${i}.\n\n`}, run.id);
+      await page.waitForFunction(i => document.querySelector('#streaming-text')?.textContent.includes(`Reconnect ${i}.`), i);
+    }
+    const refreshed = page.waitForResponse(response => new URL(response.url()).pathname === '/v1/bots');
+    await page.evaluate(() => {window.dispatchEvent(new Event('focus')); document.dispatchEvent(new Event('visibilitychange')); window.dispatchEvent(new PageTransitionEvent('pageshow', {persisted: true}));});
+    await refreshed; await settleChat(page);
+    await page.locator('#mobile-back').click(); await page.locator(`[data-bot-id="${BOT_A}"]`).click(); await settleChat(page);
+    const stable = await page.evaluate(() => ({document: globalThis.__stableChat.document === document, root: globalThis.__stableChat.root === document.querySelector('#messages'), message: globalThis.__stableChat.message === document.querySelector('[data-message-id="scroll-history-0"]'), timeOrigin: globalThis.__stableChat.timeOrigin === performance.timeOrigin}));
+    assert.deepEqual(stable, {document: true, root: true, message: true, timeOrigin: true});
+    assert.equal(documents.length, 1, 'only the initial document request; fragment navigation is not a reload');
+    assert.equal(await page.locator('#message').inputValue(), 'Keep my unsent draft');
+    assert.ok(Math.abs((await chatScroll(page)).top - initial.top) <= 2, 'background updates preserve reading position');
+    assert.equal(await page.locator('[data-message-id]').count(), 25, 'replay does not duplicate the conversation');
+    assert.equal(await page.locator('html').evaluate(node => getComputedStyle(node).overscrollBehaviorY), 'none', 'root gestures do not request browser pull-to-refresh');
+  }, {viewport: {width: 390, height: 844}, isMobile: true, hasTouch: true});
+});
+
 const chatScroll = page => page.locator('#messages').evaluate(node => ({top: node.scrollTop, height: node.clientHeight, total: node.scrollHeight, gap: node.scrollHeight - node.clientHeight - node.scrollTop}));
 const atChatBottom = page => page.waitForFunction(() => {
   const node = document.querySelector('#messages');
