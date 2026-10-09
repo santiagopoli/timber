@@ -1,4 +1,6 @@
-FROM node:24.14.0-bookworm-slim
+# Same official Node image, pinned through Google's Docker Hub cache so shared
+# CI runners do not depend on Docker Hub's anonymous pull allowance.
+FROM mirror.gcr.io/library/node:24.14.0-bookworm-slim@sha256:d8e448a56fc63242f70026718378bd4b00f8c82e78d20eefb199224a4d8e33d8
 
 # Versions of the image and application are fixed in git; Debian security updates
 # are intentionally taken at build time. Publish and deploy an immutable digest.
