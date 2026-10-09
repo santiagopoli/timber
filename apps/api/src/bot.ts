@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import type { ModelCatalog, ModelSettings, AgentDelegation, Approval, Bot, BotEvent, ComputerAction, ComputerResult, ComputerStatus, ConnectionRequest, Message, MessageProvenance, Run, RunDelegation, RunPage, RunStatus } from "@botspace/contracts";
+import {isModelErrorCode, MODEL_FAILURES} from "@botspace/contracts";
 import { createCloudComputerProvider, touchCloudComputer, suspendCloudComputer, deleteCloudComputer, ComputerProviderError } from "@botspace/computer";
 import { createPiRuntime, parseRuntimeLimit, ModelConfigurationError, type AgentRuntime, type RuntimeApprovalContext, type RuntimeApprovalSummary, type RuntimeToolResult, type RuntimeHostToolRequest, type RuntimeSubagent } from "@botspace/runtime";
 import { agentCoordinatorRequest } from "./agent-coordination";
@@ -257,14 +258,17 @@ export class BotDO extends DurableObject<Env> {
     this.ctx.storage.sql.exec("INSERT INTO messages (id,source_key,data) VALUES (?,?,?)",message.id,sourceKey,JSON.stringify(message));
     this.emit("message.created",{message},message.runId,`message:${sourceKey}`);
   }
-  private updateStatus(runId:string,status:RunStatus,error?:string):void {
-    if(this.deleted) return;
+  private updateStatus(runId:string,status:RunStatus,error?:string,errorCode?:string):boolean {
+    if(this.deleted) return false;
     const run=this.getRun(runId);
-    if(run.status===status && run.error===error) return;
+    const safeCode=error && isModelErrorCode(errorCode)?errorCode:undefined;
+    if(run.status===status && run.error===error && run.errorCode===safeCode) return false;
     const updated:Run={...run,status,updatedAt:timestamp(),...(error?{error}:{})};
     if(!error) delete updated.error;
+    if(safeCode) updated.errorCode=safeCode;else delete updated.errorCode;
     this.saveRun(updated);
     this.emit("run.updated",{run:updated},runId);
+    return true;
   }
   private approvalContext():RuntimeApprovalContext {
     const now=timestamp();
@@ -319,13 +323,15 @@ export class BotDO extends DurableObject<Env> {
     const cancellation=event.type==="run.failed" && row.native_operation_id===event.operationId?this.runtimeCancellation(row.id,event.data.reason,event.data.cancellationId):undefined;
     const run=JSON.parse(this.getRunRow(row.id).data) as Run;
     // Do not expose raw provider error strings, which may contain request details.
-    const data=event.type==="runtime.error"?{message:"The runtime reported an error."}:event.data;
+    const errorCode=isModelErrorCode(event.data.errorCode)?event.data.errorCode:undefined;
+    const data:Record<string,unknown>=event.type==="runtime.error"?{message:"The runtime reported an error."}:event.type==="run.failed"?{...event.data,...(errorCode?{errorCode,publicMessage:MODEL_FAILURES[errorCode]}:{})}:event.data;
+    if(event.type==="run.failed"&&!errorCode)delete data.errorCode;
     this.emit(cancellation?"run.cancelled":event.type,cancellation?{cancellation}:data,run.id,event.eventKey?`runtime:${event.eventKey}`:undefined);
     if(row.native_operation_id!==event.operationId) return;
     // A durable terminal event may provide a safe diagnostic after wait() already
     // projected a generic error. It must never undo user cancellation or success.
     const genericInterruption=run.status==="interrupted" && ["The agent run was interrupted before a final answer.","The agent run was interrupted."].includes(run.error??"");
-    const enrichFailure=event.type==="run.failed" && typeof event.data.publicMessage==="string" && (run.status==="failed" || genericInterruption);
+    const enrichFailure=event.type==="run.failed" && (errorCode || typeof event.data.publicMessage==="string") && (run.status==="failed" || genericInterruption);
     if(terminal.has(run.status) && !enrichFailure) return;
     if(Date.now()-this.lastComputerTouch>60_000) {
       this.lastComputerTouch=Date.now();
@@ -337,8 +343,9 @@ export class BotDO extends DurableObject<Env> {
       if(this.hasPendingConnection(run.id)) this.updateStatus(run.id,"waiting_connection");
       else if(this.hasPendingApproval(run.id)) this.updateStatus(run.id,"waiting_approval");
       else {
-        const failure=this.operationFailure(typeof event.data.reason==="string"?event.data.reason:undefined,typeof event.data.publicMessage==="string"?event.data.publicMessage:undefined);
-        this.updateStatus(run.id,failure.status,failure.error);
+        const failure=this.operationFailure(typeof event.data.reason==="string"?event.data.reason:undefined,errorCode?MODEL_FAILURES[errorCode]:typeof event.data.publicMessage==="string"?event.data.publicMessage:undefined);
+        const changed=this.updateStatus(run.id,failure.status,failure.error,errorCode);
+        if(changed && errorCode) console.warn(JSON.stringify({event:"model.failure",errorCode,stage:"runtime"}));
       }
     }
   }
@@ -744,7 +751,7 @@ export class BotDO extends DurableObject<Env> {
         this.ctx.storage.transactionSync(()=>{
           this.ctx.storage.sql.exec("INSERT OR REPLACE INTO configuration_admissions(operation_id,code) VALUES(?,?)",nativeOperationId,error.code);
           this.ctx.storage.sql.exec("INSERT OR REPLACE INTO admission_retries(operation_id,attempts,next_at) VALUES(?,?,?)",nativeOperationId,attempts,Date.now()+delayMs);
-          this.updateStatus(run.id,error.retryable?"queued":"failed",error.message);
+          this.updateStatus(run.id,error.retryable?"queued":"failed",error.message,error.code);
         });
         if(error.retryable && attempts<maxAdmissionAttempts) await this.runtime.scheduleAdmissionRetry(nativeOperationId,delayMs);
         return;

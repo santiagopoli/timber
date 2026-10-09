@@ -12,7 +12,7 @@ const ENTRYPOINTS = new Set(['ComputerDO', 'BotDO', 'WorkspaceDO', 'ChatGPTAuthD
 const OUTCOMES = new Set(['ok', 'exception', 'canceled', 'cancelled', 'exceededCpu', 'exceededMemory', 'responseStreamDisconnected', 'scriptNotFound', 'unknown']);
 const EVENT_TYPES = new Set(['fetch', 'scheduled', 'alarm', 'cron', 'queue', 'email', 'tail', 'rpc', 'jsrpc', 'websocket', 'workflow', 'unknown']);
 const LEVELS = new Set(['debug', 'info', 'log', 'warn', 'error']);
-const STAGES = new Set(['request', 'checkpoint', 'post_result_touch', 'exec_admission', 'checkpoint_retry', 'git_capability_revoke', 'preview_touch', 'start', 'restore', 'execute']);
+const STAGES = new Set(['request', 'stream', 'runtime', 'checkpoint', 'post_result_touch', 'exec_admission', 'checkpoint_retry', 'git_capability_revoke', 'preview_touch', 'start', 'restore', 'execute']);
 const CHECKPOINT_PHASES = new Set(['archive_upload', 'pointer_publish', 'retry_intent', 'candidate_lookup']);
 const CHECKPOINT_CAUSES = new Set(['metadata_write', 'stream_length', 'checksum', 'rate_limit', 'transport', 'unknown']);
 export const DIAGNOSTIC_CODES = new Set([
@@ -29,8 +29,14 @@ export const DIAGNOSTIC_CODES = new Set([
   'chatgpt_refresh_pending', 'chatgpt_refresh_failed', 'chatgpt_not_connected',
   'subscription_sharing_usage_limit_exceeded', 'subscription_sharing_usage_unavailable',
   'subscription_sharing_unsupported_capability', 'subscription_sharing_route_not_supported',
+  'chatgpt_usage_unavailable', 'model_unavailable', 'model_reasoning_unsupported',
+  'model_fast_unsupported', 'model_access_denied', 'model_context_length_exceeded',
+  'model_request_invalid', 'model_history_invalid', 'model_rate_limited', 'model_timeout',
+  'model_connection_interrupted', 'model_provider_unavailable', 'model_request_failed',
+  'model_output_limit', 'model_response_filtered', 'model_billing_required',
+  'model_empty_response', 'runtime_budget_exceeded', 'run_aborted',
 ]);
-const KNOWN_LOGS = new Set(['computer.failure', 'computer.checkpoint_failure', 'approval.failure']);
+const KNOWN_LOGS = new Set(['computer.failure', 'computer.checkpoint_failure', 'approval.failure', 'model.failure']);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {};
 const increment = (table, value) => { table[value] = (table[value] ?? 0) + 1; };
 const finite = (value, maximum = 1e12) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= maximum;
@@ -66,13 +72,20 @@ function labels(value, output, depth = 0) {
       if (DIAGNOSTIC_CODES.has(word)) output.codes.add(word);
       if (KNOWN_LOGS.has(word)) output.logs.add(word);
     }
+    // Cloudflare can serialize a structured console object inside its message.
+    // Parse only a small complete JSON value, then apply the same field allowlist.
+    if (value.length <= 32_000 && /^[\s]*[\[{]/.test(value)) {
+      try {labels(JSON.parse(value), output, depth + 1);} catch { /* Not structured JSON. */ }
+    }
     return;
   }
   if (!value || typeof value !== 'object') return;
   for (const [key, item] of Object.entries(value).slice(0, 80)) {
+    if (key === 'event' && KNOWN_LOGS.has(item)) output.logs.add(item);
     if (key === 'stage' && (STAGES.has(item) || DIAGNOSTIC_CODES.has(item))) output.stages.add(item);
     if (key === 'phase' && CHECKPOINT_PHASES.has(item)) output.phases.add(item);
     if (key === 'cause' && CHECKPOINT_CAUSES.has(item)) output.causes.add(item);
+    if (key === 'status' && Number.isInteger(item) && item >= 100 && item <= 599) output.statuses.add(String(item));
     // Credentials and request payloads are neither interpreted nor traversed.
     if (['message', 'error', 'code', 'errorCode', 'logs', 'exceptions', 'arguments', 'stage', 'phase', 'cause'].includes(key)) labels(item, output, depth + 1);
   }
@@ -83,7 +96,8 @@ export function summarize(events, window, {pages = 1, truncated = false} = {}) {
     worker: SCRIPT, window: {from: new Date(window.from).toISOString(), to: new Date(window.to).toISOString()},
     pages, sampledEvents: 0, ignoredEvents: 0, truncated,
     limitation: 'Sampled Cloudflare telemetry only. Missing events do not prove absence of failures. This report contains no bot transcript or command output.',
-    counts: {entrypoints: {}, outcomes: {}, eventTypes: {}, levels: {}, httpStatuses: {}, diagnosticCodes: {}, logTypes: {}, stages: {}, checkpointPhases: {}, checkpointCauses: {}},
+    counts: {entrypoints: {}, outcomes: {}, eventTypes: {}, levels: {}, httpStatuses: {}, httpStatusesByEntrypoint: {}, diagnosticCodes: {}, logTypes: {}, stages: {}, modelFailureHttpStatuses: {}, checkpointPhases: {}, checkpointCauses: {}},
+    observedWindow: null, diagnosticWindows: {},
     deploymentIds: [], durationMs: {observed: 0, total: 0, max: 0},
   };
   const versions = new Set();
@@ -92,18 +106,31 @@ export function summarize(events, window, {pages = 1, truncated = false} = {}) {
     if ((metadata.service !== SCRIPT && worker.scriptName !== SCRIPT) || (metadata.service && metadata.service !== SCRIPT) || (worker.scriptName && worker.scriptName !== SCRIPT)
       || !finite(event.timestamp, 8.64e15) || event.timestamp < window.from || event.timestamp > window.to) { summary.ignoredEvents++; continue; }
     summary.sampledEvents++;
+    const at = new Date(event.timestamp).toISOString();
+    if (!summary.observedWindow) summary.observedWindow = {from: at, to: at};
+    else {summary.observedWindow.from = summary.observedWindow.from < at ? summary.observedWindow.from : at; summary.observedWindow.to = summary.observedWindow.to > at ? summary.observedWindow.to : at;}
     for (const [field, value, allow] of [['entrypoints', worker.entrypoint, ENTRYPOINTS], ['outcomes', worker.outcome, OUTCOMES], ['eventTypes', worker.eventType, EVENT_TYPES], ['levels', metadata.level, LEVELS]]) {
       increment(summary.counts[field], allow.has(value) ? value : 'unspecified');
     }
     const status = metadata.statusCode ?? object(object(worker.event).response).status;
-    if (Number.isInteger(status) && status >= 100 && status <= 599) increment(summary.counts.httpStatuses, String(status));
+    if (Number.isInteger(status) && status >= 100 && status <= 599) {
+      increment(summary.counts.httpStatuses, String(status));
+      const entrypoint = ENTRYPOINTS.has(worker.entrypoint) ? worker.entrypoint : 'unspecified';
+      summary.counts.httpStatusesByEntrypoint[entrypoint] ??= {};
+      increment(summary.counts.httpStatusesByEntrypoint[entrypoint], String(status));
+    }
     const duration = metadata.duration ?? worker.wallTimeMs;
     if (finite(duration)) {summary.durationMs.observed++; summary.durationMs.total += duration; summary.durationMs.max = Math.max(summary.durationMs.max, duration);}
     const version = object(worker.scriptVersion).id;
     if (typeof version === 'string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(version)) versions.add(version);
-    const found = {codes: new Set(), logs: new Set(), stages: new Set(), phases: new Set(), causes: new Set()};
+    const found = {codes: new Set(), logs: new Set(), stages: new Set(), phases: new Set(), causes: new Set(), statuses: new Set()};
     labels(event.source, found); labels(metadata.message, found); labels(metadata.error, found);
     for (const [field, values] of [['diagnosticCodes', found.codes], ['logTypes', found.logs], ['stages', found.stages], ['checkpointPhases', found.phases], ['checkpointCauses', found.causes]]) for (const value of values) increment(summary.counts[field], value);
+    for (const code of found.codes) {
+      const prior = summary.diagnosticWindows[code];
+      summary.diagnosticWindows[code] = {from: prior && prior.from < at ? prior.from : at, to: prior && prior.to > at ? prior.to : at};
+    }
+    if (found.logs.has('model.failure')) for (const value of found.statuses) increment(summary.counts.modelFailureHttpStatuses, value);
   }
   summary.deploymentIds = [...versions].sort();
   return summary;

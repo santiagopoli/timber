@@ -236,9 +236,29 @@ describe("ChatGPT refresh ownership, billing route and verification", () => {
     const response = await infer(stub);
     expect(response.status).toBe(403);
     const text = await response.text();
-    expect(text).toContain("subscription_sharing_route_not_supported");
+    expect(text).toContain("model_access_denied");
     expect(text).not.toContain("private-token-and-provider-details");
     expect(responseCalls).toHaveLength(1);
+  });
+
+  it.each([
+    [400,{code:'unsupported_value',param:'service_tier'},'model_fast_unsupported'],
+    [400,{code:'unsupported_value',param:'reasoning.effort'},'model_reasoning_unsupported'],
+    [400,{code:'context_length_exceeded'},'model_context_length_exceeded'],
+    [400,{code:'invalid_encrypted_content'},'model_history_invalid'],
+    [503,{code:'unknown_provider_error'},'model_provider_unavailable'],
+  ] as const)('preserves actionable inference errors without exposing provider data (%s %j)',async(status,error,code)=>{
+    const stub=newStub();expect((await connect(stub)).status).toBe(200);
+    const log=vi.spyOn(console,'warn').mockImplementation(()=>{});
+    try {
+      inference=()=>Response.json({error:{...error,message:'PRIVATE_PROVIDER_DATA'}},{status,headers:{'x-request-id':'PRIVATE_PROVIDER_HEADER'}});
+      const response=await infer(stub);
+      expect(response.status).toBe(status);
+      const text=await response.text();expect(JSON.parse(text).error.code).toBe(code);
+      expect(text).not.toContain('PRIVATE_PROVIDER');
+      expect(JSON.stringify(log.mock.calls)).not.toContain('PRIVATE_PROVIDER');
+      expect(responseCalls).toHaveLength(1);
+    } finally {log.mockRestore();}
   });
 
   it.each([
@@ -252,6 +272,14 @@ describe("ChatGPT refresh ownership, billing route and verification", () => {
     const response = await stub.fetch("https://chatgpt/verify", {method: "POST"});
     expect(response.status).toBe(502); await response.text();
     expect((await status(stub)).status).toBe("connected_unverified");
+  });
+
+  it.each([['max_output_tokens','model_output_limit'],['content_filter','model_response_filtered']])('keeps incomplete verification diagnostic %s',async(reason,code)=>{
+    const stub=newStub();expect((await connect(stub)).status).toBe(200);
+    inference=()=>new Response(`data: ${JSON.stringify({type:'response.incomplete',response:{status:'incomplete',incomplete_details:{reason}}})}\n\n`);
+    const response=await stub.fetch('https://chatgpt/verify',{method:'POST'});
+    expect(response.status).toBe(502);expect(await response.json()).toMatchObject({error:{code}});
+    expect((await status(stub)).status).toBe('connected_unverified');
   });
 
   it("marks a completed terminal response as verified", async () => {

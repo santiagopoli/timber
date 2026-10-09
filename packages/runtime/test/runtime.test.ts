@@ -279,10 +279,11 @@ describe('ChatGPT subscription boundary', () => {
 });
 
 
-it('restores only registered host tool namespaces after switching models',()=>{
+it('restores host tool namespaces from original call provenance after switching models',()=>{
   const tool={type:'function',name:'exec',parameters:{type:'object'}};
   const input={type:'function_call',name:'exec',call_id:'call_existing',arguments:'{}'};
-  const payload=chatgptPayload({input:[input],tools:[tool]},{model:'gpt-6-astra',reasoningEffort:'ultra',fast:true},{id:'gpt-6-astra',name:'Astra',provider:'openai',reasoningEfforts:['ultra'],supportsFast:true,fastServiceTier:'priority'});
+  const history:Parameters<typeof chatgptPayload>[3]=[{role:'assistant',api:'openai-responses',provider:'openai',model:'gpt-6.1-sol',content:[{type:'toolCall',id:'call_existing|fc_existing',name:'exec',namespace:'timber_computer',arguments:{}}],stopReason:'toolUse',timestamp:0,usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}}}];
+  const payload=chatgptPayload({input:[input],tools:[tool]},{model:'gpt-6-astra',reasoningEffort:'ultra',fast:true},{id:'gpt-6-astra',name:'Astra',provider:'openai',reasoningEfforts:['ultra'],supportsFast:true,fastServiceTier:'priority'},history);
   expect(payload).toMatchObject({model:'gpt-6-astra',reasoning:{effort:'ultra'},service_tier:'priority',input:[{...input,namespace:'timber_computer'}]});
   expect(()=>chatgptPayload({input:[{...input,namespace:'foreign'}],tools:[tool]})).toThrow('chatgpt_invalid_tool_namespace');
   expect(()=>chatgptPayload({input:[{...input,name:'unknown'}],tools:[tool]})).toThrow('chatgpt_invalid_tool_namespace');

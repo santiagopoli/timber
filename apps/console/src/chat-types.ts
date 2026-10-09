@@ -28,6 +28,7 @@ export type ChatCallbacks = {
   onModelSettings(botId:string,settings:ModelSelection):Promise<void>;
   onRefreshModels():void;
   onContextRequest:ContextMemoryRequest;
+  onRecovery(botId:string,target:'model'|'connection'|'context'):void;
 
   onRetry(botId: string, operationId: string): void;
   onDecision(botId: string, approvalId: string, decision: 'approve' | 'deny', allowComputer?: boolean): void;

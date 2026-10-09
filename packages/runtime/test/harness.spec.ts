@@ -4,6 +4,7 @@ import { afterEach, beforeEach, expect, it } from 'vitest';
 import type { HarnessProbe } from './worker.js';
 import { createBudget } from '../src/budget.js';
 import { PiHarness } from 'agents/harness/pi';
+import {configure,ROOT_CONVERSATION_ID} from '@earendil-works/pi-durable';
 let probeId: string;
 beforeEach(() => { probeId = crypto.randomUUID(); });
 const request = (path: string, input?: unknown) => exports.default.fetch(`https://test${path}`, { headers: { 'content-type': 'application/json', 'x-probe-id': probeId }, ...(input ? { method: 'POST', body: JSON.stringify(input) } : {}) });
@@ -1022,4 +1023,59 @@ it('a pending spawn inherits its generating request when a newer steer selects a
     const state=await(await request('/inspect')).json<{calls:{input:string}[]}>();
     expect(state.calls.map(row=>{const call=JSON.parse(row.input);return {model:call.model,reasoning:call.reasoning?.effort,fast:call.service_tier};})).toContainEqual({model:'gpt-6-astra',reasoning:'ultra',fast:undefined});
   } finally {await runInDurableObject(stub,instance=>{instance.releaseHeldInference?.();});}
+});
+
+it('continues with Astra after a completed Sol tool is retired without executing the tool again',async()=>{
+  await request('/host-context',{mode:'automatic'});
+  await request('/submit',{text:'request-exec',operationId:'sol-executed-once',chatgpt:true});
+  expect(await(await request('/wait?id=sol-executed-once')).json()).toMatchObject({status:'done'});
+  const namespace=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE;
+  const original=PiHarness.prototype.pi;
+  PiHarness.prototype.pi=async function(){
+    const native=await original.call(this);
+    await native.commit(tx=>configure(tx,ROOT_CONVERSATION_ID,{tools:{remove:[{name:'exec'}]}}),{abortSignal:undefined,value:()=>undefined,toString:()=>'[retired tool test]'});
+    return native;
+  };
+  try{await runInDurableObject(namespace.getByName(probeId),instance=>instance.runtime.contextStatus());}finally{PiHarness.prototype.pi=original;}
+  const selected={model:'gpt-6-astra',reasoningEffort:'ultra',fast:true};
+  await request('/submit',{text:'Continue with the new model',operationId:'astra-continues',modelSettings:selected});
+  expect(await(await request('/wait?id=astra-continues')).json()).toMatchObject({status:'done'});
+  await abortAllDurableObjects();
+  await request('/submit',{text:'Continue after recovery',operationId:'astra-recovers',modelSettings:selected});
+  expect(await(await request('/wait?id=astra-recovers')).json()).toMatchObject({status:'done'});
+  const state=await(await request('/inspect')).json<{calls:{input:string}[];toolCalls:{input:string}[]}>();
+  expect(state.toolCalls).toHaveLength(1);expect(state.calls).toHaveLength(4);
+  for(const row of state.calls.slice(2)) {
+    const wire=JSON.parse(row.input);expect(wire.model).toBe('gpt-6-astra');
+    expect(wire.input).toContainEqual(expect.objectContaining({type:'function_call',name:'exec',namespace:'timber_computer'}));
+    expect(wire.tools.flatMap((group:{tools:{name:string}[]})=>group.tools).some((tool:{name:string})=>tool.name==='exec')).toBe(false);
+  }
+});
+
+it.each([{text:'request-sse-server-error',attempts:3,errorCode:'model_provider_unavailable'},{text:'request-sse-fast-error',attempts:1,errorCode:'model_fast_unsupported'}])('uses native retry policy for $text and retains the safe final diagnostic',async({text,attempts,errorCode})=>{
+  await request('/submit',{text,operationId:'native-sse-failure',chatgpt:true});
+  expect(await(await request('/wait?id=native-sse-failure')).json()).toMatchObject({status:'unanswered'});
+  const state=await(await request('/inspect')).json<{calls:unknown[];events:{event:string}[]}>();
+  expect(state.calls).toHaveLength(attempts);
+  expect(state.events.map(row=>JSON.parse(row.event))).toContainEqual(expect.objectContaining({type:'run.failed',data:expect.objectContaining({errorCode})}));
+  expect(JSON.stringify(state.events)).not.toContain('Private fixture provider details');
+});
+
+it('native overflow compaction recovers a safe SSE context error without replaying recorded tool effects',async()=>{
+  for(let index=0;index<4;index++) {
+    await request('/submit',{text:`Retained fact ${index}: `+'old verified context '.repeat(1500),operationId:`long-history-${index}`,chatgpt:true});
+    expect(await(await request(`/wait?id=long-history-${index}`)).json()).toMatchObject({status:'done'});
+  }
+  await request('/host-context',{mode:'automatic'});
+  await request('/submit',{text:'request-exec',operationId:'before-overflow'});
+  expect(await(await request('/wait?id=before-overflow')).json()).toMatchObject({status:'done'});
+  await request('/submit',{text:'request-sse-context-error',operationId:'recover-context'});
+  expect(await(await request('/wait?id=recover-context')).json()).toMatchObject({status:'done'});
+  const stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+  const context=await runInDurableObject(stub,instance=>instance.runtime.contextStatus());
+  expect(context.compactions).toContainEqual(expect.objectContaining({reason:'overflow',status:'completed',summaryApplied:true}));
+  const state=await(await request('/inspect')).json<{calls:{input:string}[];toolCalls:unknown[];messages:{role:string;text:string}[]}>();
+  expect(state.toolCalls).toHaveLength(1);expect(state.calls).toHaveLength(9);
+  for(let index=0;index<4;index++)expect(state.messages.some(message=>message.role==='user'&&message.text.startsWith(`Retained fact ${index}:`))).toBe(true);
+  expect(JSON.stringify(state.calls.at(-1))).toContain('<summary>');
 });

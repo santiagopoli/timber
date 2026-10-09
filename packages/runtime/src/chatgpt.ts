@@ -1,7 +1,7 @@
 import type { Model, SimpleStreamOptions, TranscriptContext } from '@earendil-works/pi-ai';
 import { streamSimple } from '@earendil-works/pi-ai/api/openai-responses';
 import { createProvider } from '@earendil-works/pi-ai/models';
-import type { ModelOption, ModelSettings } from '@botspace/contracts';
+import {classifyModelFailure,type ModelOption,type ModelSettings} from '@botspace/contracts';
 import type { PiRuntimeOptions } from './types.js';
 
 export const CHATGPT_MODEL = 'gpt-6.1-sol';
@@ -25,8 +25,38 @@ function object(value: unknown): JsonObject {
   return value as JsonObject;
 }
 
+/** Count generated text and arguments, never opaque encrypted reasoning state. */
+function outputSize(item:JsonObject):number {
+  if(item.type==='function_call')return typeof item.arguments==='string'?item.arguments.length:0;
+  const textSize=(parts:unknown)=>Array.isArray(parts)?parts.reduce((total:number,part:unknown)=>{
+    if(!part||typeof part!=='object')return total;
+    const value=part as JsonObject;
+    return total+(typeof value.text==='string'?value.text.length:typeof value.refusal==='string'?value.refusal.length:0);
+  },0):0;
+  if(item.type==='message')return textSize(item.content);
+  if(item.type==='reasoning')return textSize(item.summary)+textSize(item.content);
+  return 0;
+}
+const OUTPUT_DELTAS=new Set(['response.output_text.delta','response.refusal.delta','response.function_call_arguments.delta','response.reasoning_summary_text.delta','response.reasoning_text.delta']);
+const callKey=(id:unknown,name:unknown)=>JSON.stringify([id,name]);
+function callOrigins(messages:TranscriptContext['messages']) {
+  const origins=new Map<string,{namespace?:string}>();
+  for(const message of messages) {
+    if(message.role!=='assistant'||['error','aborted'].includes(message.stopReason))continue;
+    for(const call of message.content) {
+      if(call.type!=='toolCall')continue;
+      if(call.namespace!==undefined&&call.namespace!==TOOL_NAMESPACE)throw new Error('chatgpt_invalid_tool_namespace');
+      const id=call.id.split('|')[0]!;
+      // Pi's Responses serializer normalizes call IDs when switching models.
+      const normalized=id.replace(/[^a-zA-Z0-9_-]/g,'_').slice(0,64).replace(/_+$/,'');
+      for(const value of new Set([id,normalized]))origins.set(callKey(value,call.name),{namespace:call.namespace});
+    }
+  }
+  return origins;
+}
+
 /** Rebuild the allowed request shape; future SDK defaults cannot add paid-API-only fields. */
-export function chatgptPayload(value: unknown, settings: ModelSettings = {model:CHATGPT_MODEL}, capability?: ModelOption): JsonObject {
+export function chatgptPayload(value: unknown, settings: ModelSettings = {model:CHATGPT_MODEL}, capability?: ModelOption,originalMessages:TranscriptContext['messages']=[]): JsonObject {
   const payload = object(value);
   if (!Array.isArray(payload.input)) throw new Error('chatgpt_invalid_protocol');
   const functions = Array.isArray(payload.tools) ? payload.tools.map(value => {
@@ -35,12 +65,15 @@ export function chatgptPayload(value: unknown, settings: ModelSettings = {model:
     return tool;
   }) : [];
   const names=new Set(functions.map(tool=>tool.name));
+  const origins=callOrigins(originalMessages);
   const input = payload.input.map(value => {
     const item = object(value);
     if (item.type === 'function_call') {
-      // Pi drops namespaces when replaying across models. Restore only our
-      // registered host tools; never accept a foreign namespace or unknown tool.
-      if(item.namespace===undefined&&names.has(item.name))return {...item,namespace:TOOL_NAMESPACE};
+      // Pi drops namespaces across models. Recover from the original call's
+      // provenance, including retired tools whose completed results stay in
+      // history. This never adds that tool to the current executable tool set.
+      const origin=origins.get(callKey(item.call_id,item.name));
+      if(item.namespace===undefined&&origin&&(origin.namespace===TOOL_NAMESPACE||origin.namespace===undefined&&names.has(item.name)))return {...item,namespace:TOOL_NAMESPACE};
       if(item.namespace!==TOOL_NAMESPACE)throw new Error('chatgpt_invalid_tool_namespace');
     }
     return item.role === 'system' ? { ...item, role: 'developer' } : item;
@@ -65,12 +98,28 @@ export function createChatGPTProvider(transport: PiRuntimeOptions<object>['chatg
     const settings=configured.timberSettings??{model:model.id};
     const controller = new AbortController();
     const signal = options?.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
-    let outputCharacters = 0;
+    const outputSizes=new Map<number,{delta:number;snapshot:number}>();
+    const toolNamespaces=new Map<number,{id?:string;callId?:string;name?:string;namespace?:string}>();
+    const validateToolItem=(item:JsonObject,index:number,final:boolean)=>{
+      if(item.type==='custom_tool_call')throw new Error('chatgpt_unsupported_tool');
+      if(item.type!=='function_call')return;
+      if(item.namespace!==undefined&&item.namespace!==TOOL_NAMESPACE)throw new Error('chatgpt_invalid_tool_namespace');
+      const previous=toolNamespaces.get(index)??{};
+      const identity={...(typeof item.id==='string'?{id:item.id}:{}),...(typeof item.call_id==='string'?{callId:item.call_id}:{}),...(typeof item.name==='string'?{name:item.name}:{})};
+      for(const key of ['id','callId','name'] as const)if(previous[key]!==undefined&&identity[key]!==undefined&&previous[key]!==identity[key])throw new Error('chatgpt_invalid_tool_namespace');
+      const proof={...previous,...identity,...(item.namespace===TOOL_NAMESPACE?{namespace:TOOL_NAMESPACE}:{})};
+      if(final&&proof.namespace!==TOOL_NAMESPACE)throw new Error('chatgpt_invalid_tool_namespace');
+      toolNamespaces.set(index,proof);
+    };
+    const observeOutput=(index:number,delta:number,snapshot:number)=>{
+      const previous=outputSizes.get(index)??{delta:0,snapshot:0};
+      outputSizes.set(index,{delta:previous.delta+delta,snapshot:Math.max(previous.snapshot,snapshot)});
+    };
     return streamSimple({...model,id:settings.model}, context, {
       // Deliberately do not forward apiKey, base URL, headers, env, fetch or payload hooks.
       apiKey: SDK_SENTINEL, signal, timeoutMs: options?.timeoutMs ?? 1_800_000,
       maxRetries: 0, cacheRetention: 'none', env: {},
-      onPayload: value=>chatgptPayload(value,settings,configured.timberCapability),
+      onPayload: value=>chatgptPayload(value,settings,configured.timberCapability,context.messages),
       fetch: async (input, init) => {
         const incoming = new Request(input, init);
         if (incoming.url !== RESPONSES_URL || incoming.method !== 'POST') throw new Error('chatgpt_invalid_endpoint');
@@ -84,6 +133,12 @@ export function createChatGPTProvider(transport: PiRuntimeOptions<object>['chatg
       },
       onProviderStreamEvent(value) {
         const event = object(value);
+        if(event.type==='error'||event.type==='response.failed') {
+          const parent=event.type==='response.failed'?object(event.response):event;
+          const detail=parent.error&&typeof parent.error==='object'?object(parent.error):parent;
+          const failure=classifyModelFailure({code:detail.code,param:detail.param,message:detail.message,...(typeof detail.status==='number'?{status:detail.status}:{})});
+          throw new Error(`${failure.errorCode}: ${failure.publicMessage}`);
+        }
         if (event.type === 'response.incomplete') {
           const response = event.response ? object(event.response) : undefined;
           const details = response?.incomplete_details ? object(response.incomplete_details) : undefined;
@@ -92,13 +147,24 @@ export function createChatGPTProvider(transport: PiRuntimeOptions<object>['chatg
           throw new Error('chatgpt_incomplete_response: stream ended without a terminal response');
         }
         const item = event.item ? object(event.item) : undefined;
-        if (item?.type === 'function_call' && item.namespace !== TOOL_NAMESPACE) throw new Error('chatgpt_invalid_tool_namespace');
-        if (item?.type === 'custom_tool_call') throw new Error('chatgpt_unsupported_tool');
+        const index=typeof event.output_index==='number'?event.output_index:-1;
+        if(item)validateToolItem(item,index,event.type!=='response.output_item.added');
         // This endpoint forbids max_output_tokens. Bound generated content locally and abort
         // before Pi can accept unfinished calls. The harness separately enforces a timeout.
-        if (typeof event.delta === 'string') outputCharacters += event.delta.length;
-        const finalSize = item && event.type === 'response.output_item.done' ? JSON.stringify(item).length : 0;
-        if (outputCharacters > MAX_OUTPUT_CHARACTERS || finalSize > MAX_OUTPUT_CHARACTERS) {
+        if(OUTPUT_DELTAS.has(String(event.type))&&typeof event.delta==='string')observeOutput(index,event.delta.length,0);
+        if(item&&['response.output_item.added','response.output_item.done'].includes(String(event.type)))observeOutput(index,0,outputSize(item));
+        if(event.type==='response.completed'&&event.response&&typeof event.response==='object') {
+          const completed=(event.response as JsonObject).output;
+          if(Array.isArray(completed))completed.forEach((value,index)=>{
+            const final=object(value);
+            validateToolItem(final,index,true);
+            observeOutput(index,0,outputSize(final));
+          });
+        }
+        // A final snapshot may repeat streamed deltas, or be the only copy of an
+        // item's text. Count the larger observation once for each output item.
+        const outputCharacters=[...outputSizes.values()].reduce((total,size)=>total+Math.max(size.delta,size.snapshot),0);
+        if (outputCharacters > MAX_OUTPUT_CHARACTERS) {
           controller.abort();
           throw new Error('chatgpt_output_limit');
         }

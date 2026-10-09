@@ -52,6 +52,7 @@ import './src/layout.css';
     onModelSettings:updateModelSettings,
     onRefreshModels:()=>void loadModelCatalog(),
     onContextRequest:(botId,path,options)=>request(`${botPath(botId)}${path}`,options),
+    onRecovery:(botId,target)=>{if(selected?.id!==botId||!authenticated)return;const control=target==='connection'?$('settings-button'):document.querySelector(target==='model'?'.timber-model-trigger':'.timber-memory-trigger');control?.click();},
 
     onRetry: (botId, operationId) => {
       if (selected?.id !== botId || !authenticated) return;
@@ -701,7 +702,7 @@ import './src/layout.css';
     cursor = event.id;
     // Actions belong to the conversation, including after a task completes.
     // Only the separate diagnostic log is capped; SSE replay restores history.
-    if (['process.updated','tool.started','tool.completed','subagent.tool.started','subagent.tool.completed','run.retrying','run.cancellation.requested'].includes(event.type)) events.push(event);
+    if (['process.updated','tool.started','tool.completed','subagent.tool.started','subagent.tool.completed','run.retrying','run.failed','run.cancellation.requested'].includes(event.type)) events.push(event);
     if(['subagent.created','subagent.updated','subagent.stopped','subagent.reported','subagent.message.sent','agent.named.created','delegation.updated'].includes(event.type)) {
       collaborationEvents.push({...event,data:redact(event.data)});
       const agent=event.data.subagent;
@@ -746,7 +747,7 @@ import './src/layout.css';
     // Tool progress is already in the stream. Rendering it must not wait for
     // transcript/runs REST refreshes (which may be delayed by ongoing work).
     if (event.type === 'process.updated') renderRuns();
-    else if (['tool.started','tool.completed','subagent.tool.started','subagent.tool.completed','run.retrying','run.cancellation.requested'].includes(event.type)) renderMessages();
+    else if (['tool.started','tool.completed','subagent.tool.started','subagent.tool.completed','run.retrying','run.failed','run.cancellation.requested'].includes(event.type)) renderMessages();
     scheduleRefresh(version);
   }
   const pause = (ms, signal) => new Promise((resolve) => { if (signal.aborted) return resolve(); const done = () => { clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); }; const timer = setTimeout(done, ms); signal.addEventListener('abort', done, { once: true }); });

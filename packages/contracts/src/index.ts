@@ -1,4 +1,5 @@
 export * from './models.js';
+export * from './model-errors.js';
 export type RunStatus = "queued" | "running" | "waiting_approval" | "waiting_connection" | "completed" | "failed" | "cancelled" | "interrupted";
 export type ComputerApprovalMode = "ask" | "automatic";
 export interface Bot { id: string; name: string; instructions: string; runtime: "pi"; model: string; reasoningEffort?: string; fast?: boolean; computerApprovalMode?: ComputerApprovalMode; allowNamedAgents?: boolean; createdByBotId?: string; createdAt: string; updatedAt: string; }
@@ -8,7 +9,7 @@ export interface AgentDelegation extends RunDelegation { sourceBotName: string; 
 export interface ImageAttachment { artifactId: string; mimeType: "image/png" | "image/jpeg"; size: number; }
 export interface Message { attachments?: ImageAttachment[]; id: string; botId: string; runId?: string; role: "user" | "assistant" | "tool" | "system"; kind?: "progress" | "final"; text: string; provenance?: MessageProvenance; mentions?: string[]; createdAt: string; }
 export interface RunCancellation { id: string; requestedRunId: string; }
-export interface Run { admissionRetryable?: boolean; model?: string; reasoningEffort?: string; fast?: boolean; id: string; botId: string; operationId: string; status: RunStatus; delegation?: RunDelegation; subagentId?: string; parentRunId?: string; cancellation?: RunCancellation; createdAt: string; updatedAt: string; error?: string; }
+export interface Run { admissionRetryable?: boolean; model?: string; reasoningEffort?: string; fast?: boolean; id: string; botId: string; operationId: string; status: RunStatus; delegation?: RunDelegation; subagentId?: string; parentRunId?: string; cancellation?: RunCancellation; createdAt: string; updatedAt: string; error?: string; errorCode?: string; }
 export interface Subagent { model?: string; reasoningEffort?: string; fast?: boolean; id: string; name: string; task: string; parentOperationId: string; parentSubagentId?: string; operationId: string; status: "queued" | "running" | "waiting_approval" | "waiting_connection" | "completed" | "failed" | "cancelled"; createdAt: string; updatedAt: string; result?: string; error?: string; }
 
 /** A newest-first history page plus all currently active runs, independent of pagination. */

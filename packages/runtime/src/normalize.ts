@@ -1,5 +1,6 @@
 import type { EntryRecord } from '@earendil-works/pi-durable';
 import type { RuntimeMessage } from './types.js';
+import {MODEL_FAILURES, classifyModelFailure, modelFailure, type ModelErrorCode} from '@botspace/contracts';
 
 /** Do not expose provider-specific payloads or private reasoning in the app. */
 export function textContent(content: unknown): string {
@@ -49,6 +50,15 @@ export function toolCompletion(entry: EntryRecord | undefined): { operationId?: 
 /** Publish an actionable failure category without copying provider bodies or prompts. */
 export function classifyFailure(reason: string, detail: unknown): { errorCode: string; publicMessage: string } {
   const text = typeof detail === 'string' ? detail : '';
+  // New transport errors carry a fixed code. Classify it before looking at
+  // prose, which may itself mention billing, limits or context as reassurance.
+  for(const code of Object.keys(MODEL_FAILURES) as ModelErrorCode[]) {
+    if(new RegExp(`\\b${code}\\b`).test(text))return modelFailure(code);
+  }
+  if(/chatgpt_invalid_tool_namespace|invalid_encrypted_content/.test(text))return modelFailure('model_history_invalid');
+  if(/chatgpt_invalid_protocol|chatgpt_unsupported_tool|chatgpt_invalid_request|chatgpt_invalid_endpoint/.test(text))return modelFailure('model_request_invalid');
+  const providerCode=text.match(/\b(?:subscription_sharing_[a-z_]+|chatpass_v2_[a-z_]+|context_length_exceeded|invalid_request_error|invalid_value|unsupported_parameter|model_not_found|rate_limit_exceeded|server_error|internal_error|service_unavailable)\b/)?.[0];
+  if(providerCode)return classifyModelFailure({code:providerCode,message:text});
   if (/model_empty_response/.test(text)) {
     return { errorCode: 'model_empty_response', publicMessage: 'The model returned no answer after automatic retries. Your recorded tool results are preserved.' };
   }
@@ -66,7 +76,7 @@ export function classifyFailure(reason: string, detail: unknown): { errorCode: s
   if (/chatgpt_output_limit/.test(text)) {
     return { errorCode: 'model_output_limit', publicMessage: 'The model response exceeded this bot’s output limit.' };
   }
-  if (/paid(?:\s+access|\s+plan|\s+account)|billing|payment|insufficient\s+(?:balance|credits)|free\s+(?:tier|plan)/i.test(text)) {
+  if (/paid(?:\s+access|\s+plan|\s+account)|(?:billing|payment).*(?:required|exhausted|disabled|not enabled)|insufficient\s+(?:balance|credits)|free\s+(?:tier|plan)/i.test(text)) {
     return { errorCode: 'model_billing_required', publicMessage: 'The selected model requires paid Workers AI access or available billing credits.' };
   }
   if (reason === 'no_model' || /(?:model.*(?:not found|does not exist|unavailable)|unknown model)/i.test(text)) {
@@ -82,5 +92,5 @@ export function classifyFailure(reason: string, detail: unknown): { errorCode: s
     return { errorCode: 'model_timeout', publicMessage: 'The model request exceeded its time limit.' };
   }
   if (reason !== 'aborted' && /chatgpt_incomplete_response|ended without|stream ended before|connection.?lost|socket hang up|fetch failed|terminated/i.test(text)) return { errorCode: 'model_connection_interrupted', publicMessage: 'The model connection was interrupted and could not recover. Your recorded tool results are preserved.' };
-  return { errorCode: reason === 'aborted' ? 'run_aborted' : 'model_request_failed', publicMessage: reason === 'aborted' ? 'The run was stopped before an answer completed.' : 'The model request failed before an answer completed.' };
+  return reason === 'aborted' ? {errorCode:'run_aborted',publicMessage:'The run was stopped before an answer completed.'} : modelFailure('model_request_failed');
 }

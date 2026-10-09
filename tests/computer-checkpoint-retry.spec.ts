@@ -100,7 +100,13 @@ describe('checkpoint upload and durable recovery',()=>{
       vm.attach(instance);const fault=failPointer(state.storage,()=>true);
       const result=await (await instance.fetch(request(botId,'pointer-window',{type:'exec',command:'one effect',yieldMs:0}))).json<ComputerResult>();
       expect(result).toMatchObject({status:'completed',checkpointStatus:'pending'});expect(result.error).toBeUndefined();
-      candidateId=(await state.storage.get<{candidate:{id:string}}>('checkpointRetry'))!.candidate.id;
+      const retry=(await state.storage.get<{candidate:{id:string};nextAttemptAt:number}>('checkpointRetry'))!;
+      candidateId=retry.candidate.id;
+      // Keep recovery pending until the post-eviction step explicitly makes it
+      // due. A real alarm must not win this test's recovery race under load.
+      const nextAttemptAt=Date.now()+60_000;
+      await state.storage.put('checkpointRetry',{...retry,nextAttemptAt});
+      await state.storage.setAlarm(nextAttemptAt);
       expect(vm.state.archives).toBe(1);expect(vm.state.uploads).toBe(1);expect(await state.storage.get('lastCheckpoint')).toBeUndefined();
       expect(log).toHaveBeenCalledWith('computer.checkpoint_failure',{phase:'pointer_publish',cause:'metadata_write'});
       expect(JSON.stringify(log.mock.calls)).not.toContain('private metadata');fault.mockRestore();

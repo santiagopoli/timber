@@ -62,7 +62,7 @@ export function ContextMemoryControl({botId,request,refreshKey}: {botId:string;r
   return <Dialog.Root open={open} onOpenChange={setOpen}>
     <Dialog.Trigger asChild><button type="button" className="timber-memory-trigger" aria-label="Context and memory"><BrainIcon aria-hidden="true"/><span>Context</span></button></Dialog.Trigger>
     <Dialog.Portal container={document.fullscreenElement||document.body}>
-      <Dialog.Overlay className="timber-memory-overlay"/>
+      {open&&<div className="timber-memory-overlay" aria-hidden="true"/>}
       <Dialog.Content className="timber-memory-dialog">
         <div className="timber-memory-heading"><Dialog.Title>Context and memory</Dialog.Title><Dialog.Close className="quiet icon-button" aria-label="Close context and memory"><XIcon aria-hidden="true"/></Dialog.Close></div>
         <Dialog.Description>Older context is summarized automatically. Your full conversation history stays saved.</Dialog.Description>

@@ -150,6 +150,12 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   cancellation appear once after that task's activity; they do not label the bot
   or the entire conversation. Continue submits a new explicit request using the
   recorded context, rather than replaying an old computer operation.
+  Model failures retain an allowlisted `Run.errorCode` alongside the safe public
+  error. The console uses this category to open connection, model or context
+  settings for failures that need a change; transient failures retain an explicit
+  continuation. HTTP and streaming provider errors use the same categories.
+  Production diagnostics log only the category, stage and optional HTTP status,
+  never provider error bodies, conversation text or credentials.
 - GET /v1/bots/:id/computer -> {computer:ComputerStatus}. `starting` means an
   initialization is currently in flight. A failed control-server probe or saved
   startup failure is `unavailable`, with optional fixed `error:{code,message}`.

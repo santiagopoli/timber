@@ -44,3 +44,29 @@ test('preserves legacy CI key authentication and rejects oversized responses wit
   await collect({env:legacy,now,fetcher:async(_url,init)=>{assert.equal(init.headers['X-Auth-Key'],'legacy-secret');assert.equal(init.headers.Authorization,undefined);return Response.json({success:true,result:{events:{events:[]}}});}});
   await assert.rejects(collect({env,now,fetcher:async()=>new Response('x'.repeat(4*1024*1024+1))}),{message:'diagnostics_response_too_large'});
 });
+
+test('correlates fixed HTTP entrypoints and categorized model failures without retaining raw log details',()=>{
+  const privateValue='PRIVATE_MODEL_BOT_TOKEN_PROMPT';
+  const report=summarize([
+    event({timestamp:now-5000,$workers:{scriptName:'timber-api',entrypoint:'ChatGPTAuthDO',eventType:'fetch',outcome:'ok'},$metadata:{service:'timber-api',statusCode:400,level:'warn'},source:{event:'model.failure',errorCode:'model_fast_unsupported',stage:'request',status:400,model:privateValue,botId:privateValue,message:privateValue}}),
+    event({timestamp:now-1000,$workers:{scriptName:'timber-api',entrypoint:'BotDO',eventType:'fetch',outcome:'ok'},$metadata:{service:'timber-api',statusCode:200,level:'warn'},source:{message:JSON.stringify({event:'model.failure',errorCode:'model_fast_unsupported',stage:'runtime',status:400,prompt:privateValue})}}),
+    event({timestamp:now-3000,$workers:{scriptName:'timber-api',entrypoint:privateValue,eventType:'fetch',outcome:'ok'},$metadata:{service:'timber-api',statusCode:403,level:'warn'},source:{event:privateValue,errorCode:privateValue,stage:privateValue,status:privateValue}}),
+  ],timeframe({},now));
+  assert.deepEqual(report.counts.httpStatusesByEntrypoint,{ChatGPTAuthDO:{'400':1},BotDO:{'200':1},unspecified:{'403':1}});
+  assert.deepEqual(report.counts.modelFailureHttpStatuses,{'400':2});
+  assert.deepEqual(report.counts.diagnosticCodes,{model_fast_unsupported:2});
+  assert.deepEqual(report.counts.logTypes,{'model.failure':2});
+  assert.deepEqual(report.counts.stages,{request:1,runtime:1});
+  assert.deepEqual(report.observedWindow,{from:'2026-10-09T14:59:55.000Z',to:'2026-10-09T14:59:59.000Z'});
+  assert.deepEqual(report.diagnosticWindows,{model_fast_unsupported:{from:'2026-10-09T14:59:55.000Z',to:'2026-10-09T14:59:59.000Z'}});
+  assert.equal(JSON.stringify(report).includes(privateValue),false);
+});
+
+test('keeps observed time coverage empty for rejected events and filters arbitrary model log categories',()=>{
+  const window=timeframe({},now);
+  const rejected=summarize([event({timestamp:'private-invalid-time'}),event({timestamp:now+1})],window);
+  assert.equal(rejected.observedWindow,null);assert.deepEqual(rejected.diagnosticWindows,{});
+  const report=summarize([event({source:{event:'model.failure',errorCode:'arbitrary_private_provider_error',stage:'private_stage',status:999}})],window);
+  assert.deepEqual(report.counts.diagnosticCodes,{});assert.deepEqual(report.counts.stages,{});assert.deepEqual(report.counts.modelFailureHttpStatuses,{});
+  assert.equal(JSON.stringify(report).includes('arbitrary_private_provider_error'),false);
+});

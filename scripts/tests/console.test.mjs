@@ -3,6 +3,7 @@ import {after, before, test} from 'node:test';
 import {mkdir} from 'node:fs/promises';
 import {chromium} from 'playwright';
 import {createConsoleFixture, TEST_TOKEN, BOT_A, BOT_B} from './console-fixture.mjs';
+import {MODEL_FAILURES} from '../../packages/contracts/src/model-errors.ts';
 
 let browser;
 before(async () => {
@@ -738,7 +739,7 @@ for (const status of ['failed','queued']) test(`a ${status} model admission fail
     assert.deepEqual(sentMessages(state,BOT_A).map(call=>call.body),[{text,operationId:run.operationId,attachments:[attachment.artifactId],...(mentions.length?{mentions}:{})}]);
     assert.equal(run.model,'account-fixed');assert.equal(state.runs.get(BOT_A).length,1);assert.equal(state.messages.get(BOT_A).length,1);assert.equal(await page.locator(`[data-message-id="${message.id}"]`).count(),1);assert.equal(await page.locator('#message').inputValue(),'Keep my next draft');
     Object.assign(run,{status:'failed',admissionRetryable:false,error:'The model could not complete this request.',updatedAt:new Date(Date.now()+3000).toISOString()});state.emit(BOT_A,'run.updated',{run},run.id);
-    await page.getByRole('button',{name:'Continue',exact:true}).waitFor();assert.equal(await retry.count(),0,'a failure after admission cannot replay the original request');
+    await page.getByRole('button',{name:'Try again',exact:true}).waitFor();assert.equal(await retry.count(),0,'a failure after admission cannot replay the original request');
   });
 });
 
@@ -2467,5 +2468,35 @@ test('create and edit bot forms share the account model catalog and temporary ag
     await page.locator('#new-bot').click();await page.locator('#bot-name').fill('Model-aware helper');await page.locator('#bot-model').selectOption('account-reviewer');await page.locator('#bot-reasoning').selectOption('xhigh');await page.locator('#bot-fast').check();await page.locator('#create-form [type=submit]').click();await page.locator('#bot-dialog').waitFor({state:'hidden'});
     const created=state.bots.find(bot=>bot.name==='Model-aware helper');assert.ok(created);assert.equal(created.model,'account-reviewer');assert.equal(created.reasoningEffort,'xhigh');assert.equal(created.fast,true);
     await page.reload();await page.locator('#selected-avatar .timber-model-badge[data-model="account-reviewer"]').waitFor();
+  });
+});
+
+for(const width of [1440,390])test(`model failures show actionable safe diagnostics from live and historical events at ${width}px`,async()=>{
+  await withPage(async({page,state,login})=>{
+    const bot=state.bots.find(item=>item.id===BOT_A);Object.assign(bot,{name:'Polibot',model:'gpt-6-astra',reasoningEffort:'high',fast:true});state.modelCatalog.models.push({id:'gpt-6-astra',name:'GPT-6 Astra',provider:'openai',reasoningEfforts:['high'],defaultReasoningEffort:'high',supportsFast:true});
+    const stamp=new Date().toISOString(),run={id:'model-diagnostic-run',botId:BOT_A,operationId:'model-diagnostic-operation',model:bot.model,reasoningEffort:'high',fast:true,status:'running',createdAt:stamp,updatedAt:stamp};
+    state.runs.set(BOT_A,[run]);state.messages.set(BOT_A,[{id:'model-diagnostic-request',botId:BOT_A,runId:run.id,role:'user',text:'Review the project.',createdAt:stamp}]);await login();
+    state.emit(BOT_A,'run.failed',{reason:'model_error',errorCode:'model_fast_unsupported',publicMessage:'Private provider detail must never be rendered.'},run.id);Object.assign(run,{status:'failed',error:'The model request failed before an answer completed.',updatedAt:new Date(Date.now()+1000).toISOString()});state.emit(BOT_A,'run.updated',{run},run.id);
+    const notice=page.locator(`[data-run-outcome="${run.id}"]`);await notice.getByText('The provider rejected Fast mode for this request. Turn off Fast or choose another supported model.',{exact:true}).waitFor();
+    assert.equal(await notice.getByRole('button',{name:'Continue',exact:true}).count(),0);assert.equal(await notice.getByRole('button',{name:'Try again',exact:true}).count(),0);assert.equal(await page.getByText('Private provider detail must never be rendered.',{exact:true}).count(),0);assert.equal(sentMessages(state,BOT_A).length,0);
+    await page.reload();await notice.getByRole('button',{name:'Review model settings',exact:true}).waitFor();await notice.locator('summary').click();await notice.getByText('model_fast_unsupported',{exact:true}).waitFor();await notice.getByText('gpt-6-astra · high reasoning · Fast',{exact:true}).waitFor();
+    if(process.env.TIMBER_CAPTURE_UI)await page.screenshot({path:`/tmp/timber-model-failure-${width}.png`,animations:'disabled'});
+    await page.locator('#message').fill('Preserve this draft');await notice.getByRole('button',{name:'Review model settings',exact:true}).click();const settings=page.getByRole('dialog',{name:'Model settings',exact:true});await settings.waitFor();assert.equal(await settings.getByRole('combobox',{name:'Model',exact:true}).inputValue(),'gpt-6-astra');assert.equal(await settings.getByRole('switch',{name:'Fast mode'}).isChecked(),true);assert.equal(await page.locator('#message').inputValue(),'Preserve this draft');assert.equal(sentMessages(state,BOT_A).length,0,'reviewing settings never retries the failed request');
+  },{viewport:{width,height:900},...(width<760?{isMobile:true,hasTouch:true}:{})});
+});
+
+test('permanent model failures route to connection or context and do not offer unchanged continuation',async()=>{
+  for(const [errorCode,target]of [['chatgpt_not_connected','Open Settings'],['model_context_length_exceeded','Review context'],['model_request_invalid',null],['chatgpt_allowance_exhausted',null]])await withPage(async({page,state,login})=>{
+    const stamp=new Date().toISOString(),run={id:'permanent-failure',botId:BOT_A,operationId:'permanent-operation',status:'failed',error:'A safe older fallback.',errorCode,createdAt:stamp,updatedAt:stamp};state.runs.set(BOT_A,[run]);state.messages.set(BOT_A,[{id:'permanent-request',botId:BOT_A,runId:run.id,role:'user',text:'Original task',createdAt:stamp}]);await login();const notice=page.locator(`[data-run-outcome="${run.id}"]`);await notice.waitFor();assert.equal(await notice.getByRole('button',{name:/^(Continue|Try again)$/}).count(),0);
+    if(target){await notice.getByRole('button',{name:target,exact:true}).click();if(target==='Open Settings')await page.locator('#settings-dialog').waitFor();else await page.getByRole('dialog',{name:'Context and memory',exact:true}).waitFor();}
+    assert.equal(sentMessages(state,BOT_A).length,0);
+  });
+});
+
+test('transient model failure continuation preserves recorded results and starts only after an explicit click',async()=>{
+  await withPage(async({page,state,login})=>{
+    const stamp=new Date().toISOString(),run={id:'transient-failure',botId:BOT_A,operationId:'transient-operation',status:'failed',error:'A safe older fallback.',errorCode:'model_connection_interrupted',createdAt:stamp,updatedAt:stamp};state.runs.set(BOT_A,[run]);state.messages.set(BOT_A,[{id:'transient-request',botId:BOT_A,runId:run.id,role:'user',text:'Inspect the saved build result.',createdAt:stamp}]);state.emit(BOT_A,'tool.completed',{operationId:'preserved-build',toolName:'exec',result:{status:'completed',output:'Build passed.',exitCode:0}},run.id);await login();
+    const notice=page.locator(`[data-run-outcome="${run.id}"]`);await notice.getByText(MODEL_FAILURES.model_connection_interrupted,{exact:true}).waitFor();assert.equal(sentMessages(state,BOT_A).length,0);assert.equal(await page.locator('[data-tool-operation-id="preserved-build"][data-tool-status="completed"]').count(),1);
+    const accepted=page.waitForResponse(response=>response.request().method()==='POST'&&response.url().endsWith('/messages'));await notice.getByRole('button',{name:'Continue',exact:true}).click();await accepted;const sent=sentMessages(state,BOT_A);assert.equal(sent.length,1);assert.notEqual(sent[0].body.operationId,run.operationId);assert.match(sent[0].body.text,/Inspect the saved build result/);assert.match(sent[0].body.text,/do not repeat completed work/);assert.equal(state.actions.length,0);
   });
 });

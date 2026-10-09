@@ -2,6 +2,7 @@ import { env, exports } from "cloudflare:workers";
 import { evictAllDurableObjects, evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { Approval, Bot, BotEvent, Message, Run } from "@botspace/contracts";
+import {MODEL_FAILURES} from "@botspace/contracts";
 import type { Env } from "../apps/api/src/env";
 import worker from "../apps/api/src/index";
 import { computerFixtureControl } from "./fixtures/worker";
@@ -106,7 +107,8 @@ describe("durable runs and approval boundaries with deterministic external adapt
     const bot = await createBot();
     const run = await submit(bot, "fixture:model-error");
     const failed = await waitRun(bot, run, "failed");
-    expect(failed.error).toBe("This model requires a paid Cloudflare Workers plan.");
+    expect(failed.error).toBe(MODEL_FAILURES.model_billing_required);
+    expect(failed.errorCode).toBe("model_billing_required");
   });
 
   it("enriches a generic wait failure when the safe diagnostic arrives later", async () => {
@@ -119,7 +121,9 @@ describe("durable runs and approval boundaries with deterministic external adapt
         publicMessage: "This model requires a paid Cloudflare Workers plan.",
       });
     });
-    expect((await waitRun(bot, run, "failed")).error).toBe("This model requires a paid Cloudflare Workers plan.");
+    const enriched=await waitRun(bot,run,"failed");
+    expect(enriched.error).toBe(MODEL_FAILURES.model_billing_required);
+    expect(enriched.errorCode).toBe("model_billing_required");
   });
 
   it.each(["completed", "cancelled"] as const)("does not overwrite %s with a late model-error diagnostic", async (terminalStatus) => {
@@ -140,6 +144,25 @@ describe("durable runs and approval boundaries with deterministic external adapt
     });
     const current = await waitRun(bot, run, terminalStatus);
     expect(current.error).toBeUndefined();
+    expect(current.errorCode).toBeUndefined();
+  });
+
+  it("persists only fixed model diagnostics and does not repeat an identical failure update",async()=>{
+    const bot=await createBot(),run=await submit(bot,"fixture:model-error-late");await waitRun(bot,run,"failed");
+    const result=await runInDurableObject(bindings.BOT.get(bindings.BOT.idFromName(`owner:${bot.id}`)),async(_instance,state)=>{
+      const payload={reason:"model_error",errorCode:"model_fast_unsupported",publicMessage:"Untrusted provider body must never replace the fixed diagnostic."};
+      await emitFixtureRuntimeEvent(run.operationId,"run.failed",payload);
+      const snapshot=()=>state.storage.sql.exec<{data:string}>("SELECT data FROM events").toArray().map(row=>JSON.parse(row.data) as BotEvent);
+      const first=snapshot().filter(event=>event.type==="run.updated").length;
+      await emitFixtureRuntimeEvent(run.operationId,"run.failed",payload);
+      return {events:snapshot(),first};
+    });
+    const failed=await waitRun(bot,run,"failed");expect(failed.errorCode).toBe("model_fast_unsupported");expect(failed.error).toBe(MODEL_FAILURES.model_fast_unsupported);
+    expect(result.events.filter(event=>event.type==="run.updated")).toHaveLength(result.first);
+    expect(JSON.stringify(result.events)).not.toContain("Untrusted provider body");
+    expect(result.events.filter(event=>event.type==="run.failed").at(-1)?.data).toMatchObject({errorCode:"model_fast_unsupported",publicMessage:MODEL_FAILURES.model_fast_unsupported});
+    await evictDurableObject(bindings.BOT.get(bindings.BOT.idFromName(`owner:${bot.id}`)));
+    expect((await waitRun(bot,run,"failed")).errorCode).toBe("model_fast_unsupported");
   });
 
   it("deduplicates concurrent submissions and rejects reuse with different input", async () => {

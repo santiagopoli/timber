@@ -5,6 +5,13 @@ export function responsesFixture(payload: { input: Record<string, unknown>[] }, 
   const userIndex = payload.input.map(item => item.role === 'user').lastIndexOf(true);
   const user = payload.input[userIndex];
   const text = JSON.stringify(user);
+  const serverFailure=text.includes('request-sse-server-error'),fastFailure=text.includes('request-sse-fast-error');
+  const contextFailure=text.includes('request-sse-context-error')&&!JSON.stringify(payload.input).includes('<summary>');
+  if(serverFailure||fastFailure||contextFailure) {
+    const error={code:serverFailure?'server_error':fastFailure?'unsupported_value':'context_length_exceeded',...(fastFailure?{param:'service_tier'}:{}),message:'Private fixture provider details must not be projected.'};
+    const event={type:'response.failed',response:{id:'resp_error_fixture',object:'response',status:'failed',output:[],error}};
+    return new Response(`data: ${JSON.stringify(event)}\n\n`,{headers:{'content-type':'text/event-stream'}});
+  }
   if (text.includes('request-resumable-exec') || text.includes('request-cancel-resumable-exec')) return resumableExecResponse(payload.input.slice(userIndex + 1), text.includes('request-cancel-resumable-exec'));
   if (text.includes('request-multistep-recovery')) return multistepResponse(payload.input.slice(userIndex + 1));
   if (text.includes('request-tool-budget')) return multistepResponse(payload.input.slice(userIndex + 1),'budget');

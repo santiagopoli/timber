@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { normalizeModelCatalog, resolveModelSettings, type ModelCatalog, type ModelOption, type ModelSettings } from "@botspace/contracts";
+import { classifyModelFailure, normalizeModelCatalog, resolveModelSettings, type ModelCatalog, type ModelOption, type ModelSettings } from "@botspace/contracts";
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 import type { Env } from "./env";
 import { ApiError, errorResponse, json } from "./errors";
@@ -37,19 +37,9 @@ function authURL(value:unknown):string {
   if(url.origin!==ISSUER || url.username || url.password || url.hash) throw new ApiError(502,"chatgpt_discovery_failed","Unexpected OpenAI authentication configuration.");
   return url.href;
 }
-function publicProviderError(status:number,code?:string):{code:string;message:string} {
-  const messages:Record<string,string>={
-    subscription_sharing_user_not_eligible:"ChatGPT plan sharing is unavailable for this account, workspace, or policy.",
-    subscription_sharing_usage_limit_exceeded:"The ChatGPT plan allowance available to Timber has been reached. Check ChatGPT Settings → Usage.",
-    subscription_sharing_usage_unavailable:"ChatGPT could not check the available allowance. Try again later.",
-    subscription_sharing_unsupported_capability:"OpenAI rejected a capability on the ChatGPT plan route.",
-    subscription_sharing_route_not_supported:"OpenAI has not enabled this ChatGPT plan route for the current integration.",
-    subscription_sharing_invalid_user:"OpenAI could not validate this ChatGPT connection. Sign in again.",
-    chatpass_v2_scope_not_authorized:"The ChatGPT authorization does not permit this request.",
-    chatpass_v2_invalid_authorization_context:"The ChatGPT authorization context does not permit this request.",
-  };
-  const safeCode=code && /^[a-zA-Z0-9_]{1,100}$/.test(code)?code:`chatgpt_http_${status}`;
-  return {code:safeCode,message:messages[safeCode]??(status===401?"ChatGPT authorization was rejected. Sign in again.":status===403?"OpenAI policy or regional access prevented this request.":status===429?"ChatGPT usage or rate limit reached. Check ChatGPT Settings → Usage.":"The ChatGPT request could not be completed. No alternative billing provider was used.")};
+function publicProviderError(status:number,error?:{code?:unknown;message?:unknown;param?:unknown}):{code:string;message:string} {
+  const failure=classifyModelFailure({...error,status});
+  return {code:failure.errorCode,message:failure.publicMessage};
 }
 
 /** One credential owner and refresh writer, independent of every bot/computer. */
@@ -252,12 +242,13 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
     const cleanup=()=>{clearTimeout(timer);this.active.delete(controller);};
     let response:Response;
     try {response=await fetch(`${RESOURCE}/responses`,{method:"POST",headers:{Authorization:`Bearer ${token}`,"content-type":"application/json","User-Agent":"Timber/0.1.0"},body:JSON.stringify(payload),redirect:"manual",signal});}
-    catch {cleanup();throw new ApiError(502,"chatgpt_transport_error","The ChatGPT connection was interrupted. No alternative billing provider was used.");}
+    catch {cleanup();throw new ApiError(502,"model_connection_interrupted","Connection lost while contacting ChatGPT. Try again later.");}
     if(!response.ok) {
-      const data=await response.json<{error?:{code?:string}}>().catch(()=>({error:undefined}));
+      const data=await response.json<{error?:{code?:unknown;message?:unknown;param?:unknown}}>().catch(()=>({error:undefined}));
       cleanup();
-      const failure=publicProviderError(response.status,data.error?.code);
-      return json({error:{...failure,...(response.headers.get("x-request-id")?{requestId:response.headers.get("x-request-id")}:{} )}},response.status>=400?response.status:502);
+      const failure=publicProviderError(response.status,data.error);
+      console.warn(JSON.stringify({event:"model.failure",stage:"request",status:response.status,errorCode:failure.code}));
+      return json({error:failure},response.status>=400?response.status:502);
     }
     if(!response.body) {cleanup();throw new ApiError(502,"chatgpt_empty_response","OpenAI returned an empty inference response.");}
     // Track active streams so disconnect cancels current inference as well as new work.
@@ -285,11 +276,12 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
         while((index=buffer.indexOf("\n"))>=0) {
           const line=buffer.slice(0,index).trim();buffer=buffer.slice(index+1);
           if(!line.startsWith("data:") || line==="data: [DONE]") continue;
-          let event:{type?:string;response?:{status?:string;error?:{code?:string}};error?:{code?:string}};
+          let event:{type?:string;code?:string;message?:string;param?:string;response?:{status?:string;incomplete_details?:{reason?:string};error?:{code?:string;message?:string;param?:string}};error?:{code?:string;message?:string;param?:string}};
           try {event=JSON.parse(line.slice(5).trim());} catch {continue;}
           if(event.type==="response.completed" && (!event.response?.status || event.response.status==="completed")) completed=true;
           if(["response.failed","response.incomplete","error"].includes(event.type??"")) {
-            const failure=publicProviderError(502,event.response?.error?.code??event.error?.code);
+            const reason=event.response?.incomplete_details?.reason;
+            const failure=publicProviderError(502,reason==="max_output_tokens"?{code:"model_output_limit"}:reason==="content_filter"?{code:"model_response_filtered"}:event.response?.error??event.error??event);
             throw new ApiError(502,failure.code,failure.message);
           }
         }
