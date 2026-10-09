@@ -29,8 +29,22 @@ async function withPage(work, options = {}) {
     if (page.viewportSize().width <= 760) await page.locator('.bot-item').first().click();
     await page.locator('#bot-workspace').waitFor({state: 'visible'}); await page.locator('#stream-state').filter({hasText: 'Live'}).waitFor({state: 'attached'});
   };
-  try {await work({...fixture, page, context, login}); assert.deepEqual(errors, [], 'no uncaught browser errors'); assert.deepEqual(cspViolations, [], 'bundled conversation works within the production content security policy'); assert.deepEqual(fixture.state.failures, [], 'fixture requests completed');}
-  finally {await context.close(); await fixture.close();}
+  try {
+    try {await work({...fixture, page, context, login});}
+    finally {
+      // Polling may still be between route.fetch() and route.fulfill(). Drain
+      // handlers before close() disposes their APIResponses, including on a
+      // failed assertion. Gated handlers release their gates in their own finally.
+      const drained = await Promise.allSettled([
+        page.unrouteAll({behavior: 'wait'}),
+        context.unrouteAll({behavior: 'wait'}),
+      ]);
+      for (const result of drained) if (result.status === 'rejected') throw result.reason;
+    }
+    assert.deepEqual(errors, [], 'no uncaught browser errors');
+    assert.deepEqual(cspViolations, [], 'bundled conversation works within the production content security policy');
+    assert.deepEqual(fixture.state.failures, [], 'fixture requests completed');
+  } finally {try {await context.close();} finally {await fixture.close();}}
 }
 const until = async (page, id, text) => page.locator(id).filter({hasText: text}).waitFor({state: ['#selected-computer-mode', '#run-status'].includes(id) ? 'attached' : 'visible'});
 const selectBot = async (page, botId) => {
