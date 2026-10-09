@@ -1717,6 +1717,7 @@ for (const width of [390,820]) test(`focused composer follows the keyboard viewp
       assert.ok(geometry.prompt.bottom<=geometry.viewport+1 && geometry.prompt.bottom>=geometry.viewport-24,'the prompt remains immediately above the keyboard, not merely somewhere on screen');
       assert.equal(geometry.inputFocused,true,'viewport updates do not blur the composer');
       assert.ok(geometry.pageWidth<=geometry.width+1);
+      await atChatBottom(page);
       if(process.env.CONSOLE_SCREENSHOT_DIR && offsetTop===320){
         await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});
         await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/keyboard-${width}.png`,clip:{x:0,y:offsetTop,width,height}});
@@ -2518,3 +2519,121 @@ for(const width of [1440,390])test(`ChatGPT allowance failure directs to usage a
     const popupReady=page.waitForEvent('popup');await link.click();const popup=await popupReady;await popup.waitForLoadState();assert.equal(popup.url(),'https://chatgpt.com/settings/usage');assert.equal(await popup.evaluate(()=>window.opener===null),true);await popup.close();assert.equal(await page.locator('#message').inputValue(),'Keep this draft for later');assert.equal(sentMessages(state,BOT_A).length,0);
   },{viewport:{width,height:900},...(width<760?{isMobile:true,hasTouch:true}:{})});
 });
+
+const chatScroll = page => page.locator('#messages').evaluate(node => ({top: node.scrollTop, height: node.clientHeight, total: node.scrollHeight, gap: node.scrollHeight - node.clientHeight - node.scrollTop}));
+const atChatBottom = page => page.waitForFunction(() => {
+  const node = document.querySelector('#messages');
+  return node && node.scrollHeight - node.clientHeight - node.scrollTop <= 2;
+}, null, {timeout: 3000});
+const settleChat = page => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => requestAnimationFrame(resolve)))));
+function scrollHistory(state) {
+  state.messages.set(BOT_A, Array.from({length: 25}, (_, i) => ({id: `scroll-history-${i}`, botId: BOT_A, role: 'assistant', text: `History ${i}. ${'Earlier conversation. '.repeat(15)}`, createdAt: '2026-10-06T12:00:00Z'})));
+  const run = {id: 'scroll-run', botId: BOT_A, operationId: 'scroll-operation', status: 'running', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()};
+  state.runs.set(BOT_A, [run]);
+  return run;
+}
+
+for (const width of [1440, 390]) {
+  const options = {viewport: {width, height: 844}, isMobile: width === 390, hasTouch: width === 390};
+  test(`chat scroll follows streaming and viewport changes only while at the bottom (${width}px)`, async () => {
+    await withPage(async ({page, login, state, context}) => {
+      const run = scrollHistory(state);
+      await login(); await atChatBottom(page);
+      state.emit(BOT_A, 'message.delta', {delta: 'First response paragraph.\n\n'.repeat(10)}, run.id);
+      await page.locator('#streaming-text').waitFor(); await atChatBottom(page);
+      const initial = await chatScroll(page);
+      await page.locator('#message').fill('Multiline draft\n'.repeat(12));
+      await page.waitForFunction(height => document.querySelector('#messages').clientHeight < height, initial.height);
+      await atChatBottom(page);
+      await page.locator('#message').fill('Short draft'); await atChatBottom(page);
+      await page.setViewportSize({width, height: 600}); await atChatBottom(page);
+      await page.setViewportSize({width, height: 844}); await atChatBottom(page);
+      // Real input must release the follow lock; DOM reads never scroll a locator into view.
+      const box = await page.locator('#messages').boundingBox();
+      if (width === 390) {
+        const session = await context.newCDPSession(page);
+        const x = Math.round(box.x + box.width / 2), y = Math.round(box.y + 80);
+        await session.send('Input.dispatchTouchEvent', {type: 'touchStart', touchPoints: [{x, y}]});
+        for (let offset = 25; offset <= 400; offset += 25) {
+          await session.send('Input.dispatchTouchEvent', {type: 'touchMove', touchPoints: [{x, y: y + offset}]});
+          await settleChat(page);
+        }
+        await session.send('Input.dispatchTouchEvent', {type: 'touchEnd', touchPoints: []});
+        await session.detach();
+      } else {
+        await page.mouse.move(box.x + box.width / 2, box.y + 80); await page.mouse.wheel(0, -400);
+      }
+      await page.getByRole('button', {name: 'Jump to latest message'}).waitFor(); await settleChat(page);
+      const reviewed = await chatScroll(page);
+      assert.ok(reviewed.gap > 100, 'scrolling up leaves the latest message');
+      state.emit(BOT_A, 'message.delta', {delta: 'More response paragraphs.\n\n'.repeat(12)}, run.id);
+      await page.waitForFunction(total => document.querySelector('#messages').scrollHeight > total, reviewed.total); await settleChat(page);
+      assert.ok(Math.abs((await chatScroll(page)).top - reviewed.top) <= 2, 'streaming does not pull a reader down');
+      await page.locator('#message').fill('A growing draft while reading\n'.repeat(10)); await settleChat(page);
+      assert.ok(Math.abs((await chatScroll(page)).top - reviewed.top) <= 2, 'composer resizing preserves history position');
+      await page.getByRole('button', {name: 'Jump to latest message'}).click(); await atChatBottom(page);
+      state.emit(BOT_A, 'message.delta', {delta: 'Following again.\n\n'.repeat(8)}, run.id);
+      await page.waitForFunction(() => document.querySelector('#streaming-text')?.textContent.includes('Following again.')); await atChatBottom(page);
+      await page.locator('#messages').evaluate(node => {node.scrollTop -= 300;});
+      await page.getByRole('button', {name: 'Jump to latest message'}).waitFor();
+      await page.locator('#messages').evaluate(node => {node.scrollTop = node.scrollHeight;});
+      await page.getByRole('button', {name: 'Jump to latest message'}).waitFor({state: 'hidden'});
+      state.emit(BOT_A, 'message.delta', {delta: 'Manually returned to bottom.\n\n'.repeat(6)}, run.id);
+      await page.waitForFunction(() => document.querySelector('#streaming-text')?.textContent.includes('Manually returned to bottom.')); await atChatBottom(page);
+      // A streamed reply is replaced by a separately mounted saved message.
+      const text = await page.locator('#streaming-text').innerText();
+      const message = {id: 'scroll-final', botId: BOT_A, runId: run.id, role: 'assistant', text, createdAt: new Date().toISOString()};
+      state.messages.get(BOT_A).push(message); state.emit(BOT_A, 'message.created', {message}, run.id);
+      run.status = 'completed'; state.emit(BOT_A, 'run.updated', {run}, run.id);
+      await page.locator('#streaming-text').waitFor({state: 'detached'}); await atChatBottom(page); await settleChat(page);
+      assert.ok((await chatScroll(page)).gap <= 2, 'saving the stream keeps the last reply visible');
+    }, options);
+  });
+
+  test(`chat scroll goes to latest on send and keeps following after acknowledgement (${width}px)`, async () => {
+    await withPage(async ({page, login, state}) => {
+      const run = scrollHistory(state);
+      await login(); await atChatBottom(page);
+      // A send from history must follow immediately, before the network responds.
+      await page.locator('#messages').evaluate(node => {node.scrollTop = 250;});
+      await page.getByRole('button', {name: 'Jump to latest message'}).waitFor();
+      let release; state.messageResponseGates.set(BOT_A, new Promise(resolve => {release = resolve;}));
+      try {
+        await page.locator('#message').fill('New multiline request\n'.repeat(10));
+        await page.locator('#message').press('Enter');
+        await page.waitForFunction(() => document.querySelector('.timber-delivery'));
+        await atChatBottom(page);
+      } finally {release(); state.messageResponseGates.delete(BOT_A);}
+      await page.waitForFunction(() => document.querySelector('#message').value === '');
+      await page.waitForFunction(() => !document.querySelector('.timber-delivery')); await settleChat(page); await atChatBottom(page);
+      const before = await chatScroll(page);
+      state.emit(BOT_A, 'message.delta', {delta: 'Response after accepted send.\n\n'.repeat(15)}, run.id);
+      await page.waitForFunction(total => document.querySelector('#messages').scrollHeight > total, before.total); await atChatBottom(page);
+      // Sending while already following must also survive the shrinking composer.
+      await page.locator('#message').fill('Second multiline request\n'.repeat(10)); await sendMessage(page);
+      await page.waitForFunction(() => document.querySelector('#message').value === '' && !document.querySelector('.timber-delivery')); await settleChat(page); await atChatBottom(page);
+      const accepted = await chatScroll(page);
+      state.emit(BOT_A, 'message.delta', {delta: 'Response after second send.\n\n'.repeat(12)}, run.id);
+      await page.waitForFunction(total => document.querySelector('#messages').scrollHeight > total, accepted.total); await atChatBottom(page);
+      assert.equal(sentMessages(state, BOT_A).length, 2);
+    }, options);
+  });
+
+  test(`chat scroll preserves history when an earlier send is acknowledged (${width}px)`, async () => {
+    await withPage(async ({page, login, state}) => {
+      scrollHistory(state);
+      await login(); await atChatBottom(page);
+      let release; state.messageResponseGates.set(BOT_A, new Promise(resolve => {release = resolve;}));
+      let reviewed;
+      try {
+        await page.locator('#message').fill('A request with delayed acknowledgement\n'.repeat(10));
+        await page.locator('#message').press('Enter'); await page.locator('.timber-delivery').waitFor(); await atChatBottom(page);
+        await page.locator('#messages').evaluate(node => {node.scrollTop = 250;});
+        await page.getByRole('button', {name: 'Jump to latest message'}).waitFor();
+        reviewed = await chatScroll(page);
+      } finally {release(); state.messageResponseGates.delete(BOT_A);}
+      await page.waitForFunction(() => document.querySelector('#message').value === '' && !document.querySelector('.timber-delivery')); await settleChat(page);
+      assert.ok(Math.abs((await chatScroll(page)).top - reviewed.top) <= 2, 'the acknowledgement and composer shrink respect the reader');
+    }, options);
+  });
+}

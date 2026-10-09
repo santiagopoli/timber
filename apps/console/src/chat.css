@@ -2,7 +2,8 @@
 .timber-chat{--chat-width:780px;display:flex;flex:1;min-width:0;min-height:0;color:var(--ink)}
 .timber-chat-layout{display:flex;flex-direction:column;flex:1;height:100%;min-height:0;min-width:0}
 .timber-conversation{flex:1;min-height:0;min-width:0;scrollbar-width:thin}
-.timber-conversation #messages{overscroll-behavior-y:contain;-webkit-overflow-scrolling:touch;scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+/* The follow controller owns scroll positioning, including optimistic-message replacement. */
+.timber-conversation-scroll{height:100%;width:100%;overflow:auto;overflow-anchor:none;scrollbar-gutter:stable both-edges;overscroll-behavior-y:contain;-webkit-overflow-scrolling:touch;scrollbar-width:thin;scrollbar-color:var(--line) transparent}
 .timber-conversation-content{width:100%;max-width:var(--chat-width);min-height:100%;margin:0 auto;gap:26px;padding:28px 28px 18px}
 .timber-timeline-entry{min-width:0}
 .timber-chat-empty{min-height:160px;height:auto;flex:1;margin:auto;color:var(--muted);gap:0;padding:24px}

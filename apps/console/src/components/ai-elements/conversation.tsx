@@ -5,34 +5,35 @@ import { cn } from "@/lib/utils";
 import type { UIMessage } from "ai";
 import { ArrowDownIcon, DownloadIcon } from "lucide-react";
 import type { ComponentProps } from "react";
-import { useCallback } from "react";
-import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
+import { createContext, useContext, useCallback } from "react";
+import { useConversationScroll } from "@/use-conversation-scroll";
 
-export type ConversationProps = ComponentProps<typeof StickToBottom>;
+const ConversationContext = createContext<ReturnType<typeof useConversationScroll> | null>(null);
+export function useConversationContext() {
+  const context = useContext(ConversationContext);
+  if (!context) throw new Error('Conversation context is required');
+  return context;
+}
 
-export const Conversation = ({ className, ...props }: ConversationProps) => (
-  <StickToBottom
-    className={cn("relative flex-1 overflow-y-hidden", className)}
-    initial="smooth"
-    resize="smooth"
-    role="log"
-    {...props}
-  />
-);
+export type ConversationProps = ComponentProps<'div'>;
+export const Conversation = ({ className, ...props }: ConversationProps) => {
+  const scroll = useConversationScroll();
+  return <ConversationContext.Provider value={scroll}>
+    <div className={cn("relative flex-1 overflow-y-hidden", className)} role="log" {...props} />
+  </ConversationContext.Provider>;
+};
 
-export type ConversationContentProps = ComponentProps<
-  typeof StickToBottom.Content
->;
+export type ConversationContentProps = ComponentProps<'div'>;
 
 export const ConversationContent = ({
   className,
   ...props
-}: ConversationContentProps) => (
-  <StickToBottom.Content
-    className={cn("flex flex-col gap-8 p-4", className)}
-    {...props}
-  />
-);
+}: ConversationContentProps) => {
+  const {scrollRef, contentRef} = useConversationContext();
+  return <div ref={scrollRef} className="timber-conversation-scroll">
+    <div ref={contentRef} className={cn("flex flex-col gap-8 p-4", className)} {...props} />
+  </div>;
+};
 
 export type ConversationEmptyStateProps = ComponentProps<"div"> & {
   title?: string;
@@ -75,11 +76,7 @@ export const ConversationScrollButton = ({
   className,
   ...props
 }: ConversationScrollButtonProps) => {
-  const { isAtBottom, scrollToBottom } = useStickToBottomContext();
-
-  const handleScrollToBottom = useCallback(() => {
-    scrollToBottom();
-  }, [scrollToBottom]);
+  const { isAtBottom, scrollToBottom } = useConversationContext();
 
   return (
     !isAtBottom && (
@@ -88,7 +85,7 @@ export const ConversationScrollButton = ({
           "absolute bottom-4 left-[50%] translate-x-[-50%] rounded-full dark:bg-background dark:hover:bg-muted",
           className
         )}
-        onClick={handleScrollToBottom}
+        onClick={scrollToBottom}
         size="icon"
         type="button"
         variant="outline"

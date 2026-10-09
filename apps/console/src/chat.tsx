@@ -2,9 +2,8 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode }
 import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
 import { XIcon, PaperclipIcon, ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon, HistoryIcon, SquareIcon } from 'lucide-react';
-import { useStickToBottomContext } from 'use-stick-to-bottom';
 import { defaultUrlTransform, type UrlTransform } from 'streamdown';
-import { Conversation, ConversationContent, ConversationEmptyState, ConversationScrollButton } from '@/components/ai-elements/conversation';
+import { Conversation, ConversationContent, ConversationEmptyState, ConversationScrollButton, useConversationContext } from '@/components/ai-elements/conversation';
 import { Message, MessageActions, MessageAction, MessageContent, MessageResponse } from '@/components/ai-elements/message';
 import { PromptInput, PromptInputBody, PromptInputSubmit, PromptInputTextarea, usePromptInputAttachments } from '@/components/ai-elements/prompt-input';
 import { Tool, ToolContent } from '@/components/ai-elements/tool';
@@ -421,8 +420,16 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks): TimelineEntry[] {
 }
 
 function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: ChatCallbacks }) {
-  const { scrollRef } = useStickToBottomContext();
+  const { scrollRef, scrollToBottom } = useConversationContext();
   const focus = useRef(model.focusApproval);
+  const sending = useRef(new Set<string>());
+  useLayoutEffect(() => {
+    const next = new Set(model.deliveries.filter(delivery => delivery.state === 'sending').map(delivery => delivery.operationId));
+    // A local send follows immediately, including when reading history. An
+    // acknowledgement must not pull back someone who has since scrolled away.
+    if ([...next].some(id => !sending.current.has(id))) scrollToBottom();
+    sending.current = next;
+  }, [model.deliveries, scrollToBottom]);
   useEffect(() => {
     const node = scrollRef.current;
     if (node) {node.id = 'messages'; node.setAttribute('aria-label', `${model.bot.name} conversation`);}
@@ -602,7 +609,7 @@ function Chat({ model, callbacks, dockTarget }: { model: ChatModel; callbacks: C
   const [historyOpen,setHistoryOpen] = useState(false);
   useEffect(()=>{if(!dockTarget)setHistoryOpen(false);},[dockTarget]);
   const composer = <Composer model={model} callbacks={callbacks}/>;
-  const conversation = <Conversation className="timber-conversation" initial="instant" resize="instant"><ConversationBody model={model} callbacks={callbacks}/></Conversation>;
+  const conversation = <Conversation className="timber-conversation"><ConversationBody model={model} callbacks={callbacks}/></Conversation>;
   return <div className="timber-chat-layout">
     {(model.subagents.length > 0 || model.delegations.length > 0) && <div className="timber-chat-agents" aria-label="Agent collaboration">
       <button type="button" onClick={() => callbacks.onOpenAgents()}><GitBranchIcon/>Agents <span>{model.subagents.length + model.delegations.length}</span></button>
