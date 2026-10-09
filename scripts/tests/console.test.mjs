@@ -1975,7 +1975,7 @@ test('Retry sending clears only accepted image previews after a failed delivery'
   });
 });
 
-for (const viewport of [{width:1440,height:1050},{width:390,height:844}]) test(`agent creation cards and centered messages survive live updates and reload at ${viewport.width}px`, async () => {
+for (const viewport of [{width:1440,height:1050},{width:390,height:844}]) test(`agent creation cards and left-aligned messages survive live updates and reload at ${viewport.width}px`, async () => {
   await withPage(async ({page,state,login}) => {
     const stamp='2026-10-09T12:00:00.000Z',run={id:'collab-root',botId:BOT_A,operationId:'collab-root-operation',status:'running',createdAt:stamp,updatedAt:stamp};
     const agent={id:'collab-researcher',name:'Researcher',task:'Review architecture and persistence',parentOperationId:run.operationId,operationId:'collab-spawn-operation',status:'queued',createdAt:stamp,updatedAt:stamp};
@@ -1988,11 +1988,12 @@ for (const viewport of [{width:1440,height:1050},{width:390,height:844}]) test(`
     state.emit(BOT_A,'subagent.created',{subagent:agent,operationId:agent.operationId,toolCallId:'collab-spawn-call'},'collab-child-run');
     state.emit(BOT_A,'tool.completed',{toolName:'spawn_subagent',toolCallId:'collab-spawn-call',operationId:agent.operationId,result:{status:'completed'}},run.id);
     const card=page.locator(`[data-agent-created="${agent.id}"]`);
-    await card.getByRole('button',{name:'Open Researcher conversation',exact:true}).waitFor();assert.equal(await card.locator('[data-status="queued"]').count(),1);
-    assert.equal(await card.locator('.timber-agent-created-details').count(),0,'creation starts as a collapsed pill');
+    await card.getByRole('button',{name:'Show Researcher agent details',exact:true}).waitFor();assert.equal(await card.locator('[data-status="queued"]').count(),1);
+    assert.equal(await card.locator('.timber-agent-created-details').count(),0,'creation starts as a collapsed event header');
     const pillBox=await card.locator('.timber-agent-created-pill').boundingBox(),cardBox=await card.boundingBox();
-    assert.ok(pillBox&&cardBox&&pillBox.height<=44&&pillBox.width<=400,'creation remains a compact pill');
-    assert.ok(Math.abs(pillBox.x+pillBox.width/2-cardBox.x-cardBox.width/2)<2,'the creation pill is centered in the conversation');
+    assert.ok(pillBox&&cardBox&&pillBox.height>=44&&pillBox.width<=cardBox.width+1,'creation respects the conversation width and minimum touch target');
+    assert.ok(Math.abs(pillBox.x-cardBox.x)<2,'the creation header is left-aligned in the conversation');
+    assert.ok(pillBox.x>=0&&pillBox.x+pillBox.width<=viewport.width+1,'creation does not overflow the viewport');
     await card.getByRole('button',{name:'Show Researcher agent details',exact:true}).click();
     await card.getByText('Review architecture and persistence',{exact:true}).waitFor();
     assert.equal(await card.getByRole('button',{name:'Hide Researcher agent details',exact:true}).getAttribute('aria-expanded'),'true');
@@ -2004,8 +2005,8 @@ for (const viewport of [{width:1440,height:1050},{width:390,height:844}]) test(`
     state.emit(BOT_A,'tool.completed',{toolName:'send_subagent_message',toolCallId:'collab-send-call',operationId:'collab-send',result:{status:'completed'}},run.id);
     state.emit(BOT_A,'subagent.reported',{subagentId:agent.id,text:'The saved result survives reconnect.',operationId:'collab-report'},run.id);
     state.emit(BOT_A,'subagent.message.sent',{sourceSubagentId:agent.id,sourceName:agent.name,targetName:'Ada',text:'The saved result survives reconnect.',operationId:'collab-report',toolCallId:'collab-report-call'},'collab-child-run');
-    await page.locator('[data-collaboration-notice="sent:collab-send"]').filter({hasText:'Messages to'}).waitFor();
-    await page.locator('[data-collaboration-notice="sent:collab-report"]').filter({hasText:'Messages from'}).waitFor();
+    await page.locator('[data-collaboration-notice="sent:collab-send"]').filter({hasText:'Message to'}).waitFor();
+    await page.locator('[data-collaboration-notice="sent:collab-report"]').filter({hasText:'Message from'}).waitFor();
     assert.equal(await page.locator('[data-collaboration-notice]').count(),2,'explicit child report and its durable parent receipt form one notice');
     assert.equal(await page.locator('#messages [data-tool-operation-id]').count(),0,'successful agent operations use their product cards without duplicate generic tool rows');
     await page.getByRole('button',{name:'Show message to Researcher',exact:true}).click();await page.getByText('Also check recovery after reconnect.',{exact:true}).waitFor();
@@ -2016,12 +2017,80 @@ for (const viewport of [{width:1440,height:1050},{width:390,height:844}]) test(`
       await card.getByRole('button',{name:'Show Researcher agent details',exact:true}).click();await page.screenshot({path:`/tmp/timber-pill-${viewport.width}-dark-expanded.png`});
       await card.getByRole('button',{name:'Hide Researcher agent details',exact:true}).click();await page.emulateMedia({colorScheme:'light'});
     }
+    await card.getByRole('button',{name:'Show Researcher agent details',exact:true}).click();
     await card.getByRole('button',{name:'Open Researcher conversation',exact:true}).click();await page.locator(`[data-agent-detail="${agent.id}"]`).waitFor();await page.getByText('Persistence and reconnect behavior are covered.',{exact:true}).waitFor();
     await openPanel(page,'conversation');await page.reload();await page.locator(`[data-agent-created="${agent.id}"] [data-status="running"]`).waitFor();
     await page.locator('[data-collaboration-notice="sent:collab-report"]').waitFor();assert.equal(await page.locator('[data-collaboration-notice]').count(),2);assert.equal(await page.locator('#messages [data-tool-operation-id]').count(),0);
+    await page.locator('[data-collaboration-notice="sent:collab-report"]').getByRole('button',{name:'Show message from Researcher',exact:true}).click();
     await page.locator('[data-collaboration-notice="sent:collab-report"]').getByRole('button',{name:'Open Researcher conversation',exact:true}).click();await page.locator(`[data-agent-detail="${agent.id}"]`).waitFor();
     const overflow=await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth);assert.equal(overflow,false);
   },{viewport,...(viewport.width<760?{isMobile:true,hasTouch:true}:{})});
+});
+
+for(const width of [320,390,768])for(const colorScheme of ['light','dark'])test(`collaboration whole headers preserve distinct events and keyboard navigation at ${width}px ${colorScheme}`,async()=>{
+  await withPage(async({page,state,login})=>{
+    const stamp='2026-10-09T12:01:00.000Z',run={id:'header-root',botId:BOT_A,operationId:'header-root-op',status:'completed',createdAt:stamp,updatedAt:stamp};
+    const name='AccessibilityAndPersistenceReviewerWithAnExtremelyLongUnbrokenAgentName';
+    const agent={id:'header-agent',name,task:'Review persistence without hiding event identity.',parentOperationId:run.operationId,operationId:'header-child-op',status:'waiting_connection',model:'gpt-6.1-sol',createdAt:stamp,updatedAt:stamp};
+    const spaced={...agent,id:'header-spaced',name:'Desktop visual QA and accessibility reviewer with a long display name',operationId:'header-spaced-op'};
+    state.runs.set(BOT_A,[run]);state.agents.set(BOT_A,[agent,spaced]);
+    state.messages.set(BOT_A,[{id:'header-request',botId:BOT_A,runId:run.id,role:'user',text:'Coordinate two updates from the same reviewer.',createdAt:stamp}]);
+    state.agentMessages.set(agent.id,[{id:'header-agent-reply',role:'assistant',text:'The separate reviewer conversation is open.',createdAt:stamp}]);
+    state.emit(BOT_A,'subagent.reported',{subagentId:agent.id,subagentName:name,operationId:'header-first',contentFormat:'plain',text:'First distinct update.'},run.id);
+    state.emit(BOT_A,'subagent.reported',{subagentId:agent.id,subagentName:name,operationId:'header-third',contentFormat:'plain',text:'Another distinct incoming update.'},run.id);
+    state.emit(BOT_A,'subagent.message.sent',{targetSubagentId:agent.id,targetName:name,sourceName:'Ada',operationId:'header-second',text:'Second distinct update.'},run.id);
+    await login();
+    const first=page.locator('[data-collaboration-notice="reported:header-first"]'),second=page.locator('[data-collaboration-notice="sent:header-second"]'),third=page.locator('[data-collaboration-notice="reported:header-third"]');
+    await first.waitFor();await second.waitFor();await third.waitFor();assert.equal(await page.locator('#messages [data-collaboration-notice]').count(),3,'distinct operations with the same agent never merge, including two incoming reports');
+    const cards=[page.locator(`[data-agent-created="${agent.id}"]`),page.locator(`[data-agent-created="${spaced.id}"]`)];
+    for(const article of [first,second,third,...cards]){
+      const header=article.locator(':scope > button[aria-expanded]');
+      assert.equal(await article.locator('button').count(),1,'a collapsed event has exactly one whole-header button');
+      assert.equal(await header.locator('button,a,[role="button"]').count(),0,'the header has no nested interactive navigation');
+      assert.equal(await header.getAttribute('aria-expanded'),'false');assert.ok(await header.getAttribute('aria-controls'),'disclosure identifies its detail');
+      assert.equal(await article.getByRole('button',{name:/^Open .* conversation$/}).count(),0,'navigation is only inside expanded detail');
+      assert.equal(await header.locator('.timber-model-badge,[data-model]').count(),0,'there is no model badge to overlap the name');
+      const geometry=await header.evaluate(node=>{
+        const box=node.getBoundingClientRect(),parent=node.parentElement.getBoundingClientRect();
+        const avatar=node.querySelector('.timber-collaborator-avatar').getBoundingClientRect(),summary=node.querySelector('.timber-collaboration-summary').getBoundingClientRect(),chevron=node.lastElementChild.getBoundingClientRect();
+        const name=node.querySelector('strong'),meta=node.querySelector('.timber-collaboration-meta');
+        return {x:box.x,right:box.right,width:box.width,height:box.height,parentX:parent.x,parentWidth:parent.width,avatarRight:avatar.right,summaryLeft:summary.left,summaryRight:summary.right,chevronLeft:chevron.left,nameWeight:Number(getComputedStyle(name).fontWeight),metaWeight:Number(getComputedStyle(meta).fontWeight),align:getComputedStyle(node).textAlign,background:getComputedStyle(node).backgroundColor,scroll:node.scrollWidth,client:node.clientWidth};
+      });
+      assert.ok(geometry.height>=44,'the whole header meets minimum touch size, even when names wrap');
+      assert.ok(Math.abs(geometry.x-geometry.parentX)<2&&geometry.width<=geometry.parentWidth+1,'headers are left-aligned and constrained to conversation width');
+      assert.ok(geometry.x>=0&&geometry.right<=width+1&&geometry.scroll<=geometry.client+1,'long names do not overflow the viewport or header');
+      assert.ok(geometry.avatarRight<=geometry.summaryLeft&&geometry.summaryRight<=geometry.chevronLeft+1,'avatar, name, and disclosure do not overlap');
+      assert.ok(geometry.nameWeight>geometry.metaWeight,'the agent name is visually primary');assert.equal(geometry.align,'left');assert.equal(geometry.background,'rgba(0, 0, 0, 0)','the event is flat, not a pill bubble');
+    }
+    assert.equal(await first.locator('.timber-collaboration-direction').innerText(),'Message from agent');
+    assert.equal(await second.locator('.timber-collaboration-direction').innerText(),'Message to agent');
+    const toggle=async(article,showName,hideName,bodyText)=>{
+      let header=article.getByRole('button',{name:showName,exact:true});await header.focus();await page.keyboard.press('Enter');
+      header=article.getByRole('button',{name:hideName,exact:true});assert.equal(await header.getAttribute('aria-expanded'),'true');
+      const controlled=await header.getAttribute('aria-controls');
+      assert.equal(await page.evaluate(id=>Boolean(document.getElementById(id)),controlled),true,'aria-controls resolves to the expanded detail');
+      await article.getByText(bodyText,{exact:true}).waitFor();await header.focus();await page.keyboard.press('Space');
+      header=article.getByRole('button',{name:showName,exact:true});assert.equal(await header.getAttribute('aria-expanded'),'false');
+      assert.equal(await article.getByText(bodyText,{exact:true}).count(),0,'Space collapses without navigation');await header.focus();await page.keyboard.press('Space');
+      assert.equal(await article.getByRole('button',{name:hideName,exact:true}).getAttribute('aria-expanded'),'true');
+    };
+    await toggle(first,`Show message from ${name}`,`Hide message from ${name}`,'First distinct update.');
+    assert.equal(await first.locator('.timber-markdown').innerText(),'First distinct update.');await first.getByText('Model: gpt-6.1-sol',{exact:true}).waitFor();
+    assert.equal(await second.locator('.timber-markdown').count(),0,'opening one event does not open another from the same agent');
+    assert.equal(await third.locator('.timber-markdown').count(),0,'same-direction reports retain independent disclosure state');
+    await toggle(cards[0],`Show ${name} agent details`,`Hide ${name} agent details`,agent.task);
+    await cards[0].getByRole('button',{name:`Open ${name} conversation`,exact:true}).click();
+    await page.locator(`[data-agent-detail="${agent.id}"]`).getByText('The separate reviewer conversation is open.',{exact:true}).waitFor();
+    assert.equal(new URL(page.url()).hash.includes(`agent=${agent.id}`),true,'creation navigation uses the agent route');
+    await openPanel(page,'conversation');await page.reload();await first.waitFor();await second.waitFor();
+    await third.waitFor();assert.equal(await page.locator('#messages [data-collaboration-notice]').count(),3,'reload preserves all durable event identities');
+    await third.getByRole('button',{name:`Show message from ${name}`,exact:true}).click();assert.equal(await third.locator('.timber-markdown').innerText(),'Another distinct incoming update.');
+    await second.getByRole('button',{name:`Show message to ${name}`,exact:true}).click();assert.equal(await second.locator('.timber-markdown').innerText(),'Second distinct update.');
+    await second.getByRole('button',{name:`Open ${name} conversation`,exact:true}).click();await page.locator(`[data-agent-detail="${agent.id}"]`).waitFor();
+    assert.equal(new URL(page.url()).hash.includes(`agent=${agent.id}`),true,'message navigation works only after expanding its detail');
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+    assert.equal(state.calls.some(call=>call.method!=='GET'),false,'header interaction never sends or replays work');
+  },{viewport:{width,height:1000},colorScheme,...(width<760?{isMobile:true,hasTouch:true}:{})});
 });
 
 test('named agent creation and incoming collaboration use direct colored conversation links', async () => {
@@ -2037,12 +2106,16 @@ test('named agent creation and incoming collaboration use direct colored convers
     state.emit(BOT_A,'tool.started',{toolName:'send_to_bot',toolCallId:'send-named-call'},run.id);
     state.emit(BOT_A,'delegation.updated',{delegation,operationId:'send-named-operation',toolCallId:'send-named-call'},run.id);
     state.emit(BOT_A,'tool.completed',{toolName:'send_to_bot',toolCallId:'send-named-call',operationId:'send-named-operation',result:{status:'completed'}},run.id);
-    await login();await page.locator(`[data-agent-created="${BOT_B}"]`).getByRole('button',{name:'Open Linus conversation',exact:true}).waitFor();
-    await page.locator('[data-collaboration-notice="delegation:named-task"]').filter({hasText:'Messages to'}).waitFor();
+    await login();await page.locator(`[data-agent-created="${BOT_B}"]`).getByRole('button',{name:'Show Linus agent details',exact:true}).waitFor();
+    const namedCreation=page.locator(`[data-agent-created="${BOT_B}"]`);assert.equal(await namedCreation.locator('button').count(),1,'named creation also has one whole-header control');
+    await namedCreation.getByRole('button',{name:'Show Linus agent details',exact:true}).click();await namedCreation.getByRole('button',{name:'Open Linus conversation',exact:true}).waitFor();await namedCreation.getByRole('button',{name:'Hide Linus agent details',exact:true}).click();
+    const routingOnly=page.locator('[data-collaboration-notice="delegation:named-task"]');await routingOnly.filter({hasText:'Message to'}).waitFor();
+    await routingOnly.getByRole('button',{name:'Show message to Linus',exact:true}).click();assert.equal(await routingOnly.locator('.timber-markdown').count(),0,'routing-only receipts do not invent message content');
+    await routingOnly.getByRole('button',{name:'Open Linus conversation',exact:true}).click();await until(page,'#selected-name','Linus');await selectBot(page,BOT_A);
     const incoming={id:'named-incoming',botId:BOT_A,runId:run.id,role:'assistant',text:'The review is complete. **Persistence looks good.**',provenance:{kind:'delegation_result',sourceBotId:BOT_B,sourceBotName:'Linus',delegationId:delegation.id},createdAt:'2026-10-09T12:03:00.000Z'};
     state.messages.get(BOT_A).push(incoming);state.emit(BOT_A,'message.created',{message:incoming},run.id);
     delegation.status='completed';delegation.updatedAt=incoming.createdAt;state.emit(BOT_A,'delegation.updated',{delegation},run.id);
-    await page.locator('[data-message-id="named-incoming"]').filter({hasText:'Messages from'}).waitFor();assert.equal(await page.locator('#messages [data-tool-operation-id]').count(),0);
+    await page.locator('[data-message-id="named-incoming"]').filter({hasText:'Message from'}).waitFor();assert.equal(await page.locator('#messages [data-tool-operation-id]').count(),0);
     await page.getByRole('button',{name:'Show message from Linus',exact:true}).click();await page.getByText('Persistence looks good.',{exact:true}).waitFor();
     if(process.env.TIMBER_CAPTURE_UI)await page.screenshot({path:'/tmp/timber-named-collaboration-1440.png'});
     const color=await page.locator(`[data-agent-created="${BOT_B}"] [data-agent-color]`).getAttribute('data-agent-color');
@@ -2188,8 +2261,8 @@ test('child collaboration keeps creation cards and messages scoped to its conver
     state.emit(BOT_A,'subagent.reported',{subagentId:researcher.id,operationId:'child-scope-send-root',text:'The parent can use these findings.'},parentRun.id);
     state.emit(BOT_A,'subagent.message.sent',{sourceSubagentId:sibling.id,targetSubagentId:researcher.id,sourceName:sibling.name,targetName:researcher.name,operationId:'child-scope-incoming',text:'The source transcript remains available.'},siblingRun.id);
     state.emit(BOT_A,'subagent.message.sent',{targetSubagentId:sibling.id,targetName:sibling.name,operationId:'child-scope-unrelated',text:'This belongs to a different child.'},parentRun.id);
-    await detail.locator('[data-collaboration-notice="sent:child-scope-send-root"]').filter({hasText:'Messages to'}).waitFor();
-    await detail.locator('[data-collaboration-notice="sent:child-scope-incoming"]').filter({hasText:'Messages from'}).waitFor();
+    await detail.locator('[data-collaboration-notice="sent:child-scope-send-root"]').filter({hasText:'Message to'}).waitFor();
+    await detail.locator('[data-collaboration-notice="sent:child-scope-incoming"]').filter({hasText:'Message from'}).waitFor();
     assert.equal(await detail.locator('[data-collaboration-notice]').count(),2,'the explicit report and receipt are one outgoing notice');
     assert.equal(await detail.locator('[data-collaboration-notice="sent:child-scope-unrelated"]').count(),0);
     assert.equal(await detail.locator('.timber-agent-activity').count(),0,'successful child collaboration has no duplicate generic tool section');
@@ -2197,6 +2270,7 @@ test('child collaboration keeps creation cards and messages scoped to its conver
     await detail.getByRole('button',{name:'Show message to Ada',exact:true}).click();await detail.getByText('The parent can use these findings.',{exact:true}).waitFor();
     await page.reload();await detail.locator(`[data-agent-created="${nested.id}"]`).waitFor();await detail.locator('[data-collaboration-notice="sent:child-scope-incoming"]').waitFor();
     assert.equal(await detail.locator('[data-collaboration-notice]').count(),2);assert.equal(await detail.locator('.timber-agent-activity').count(),0);
+    await detail.locator(`[data-agent-created="${nested.id}"]`).getByRole('button',{name:'Show Verifier agent details',exact:true}).click();
     await detail.locator(`[data-agent-created="${nested.id}"]`).getByRole('button',{name:'Open Verifier conversation',exact:true}).click();await page.locator(`[data-agent-detail="${nested.id}"]`).getByText('The scoped findings are verified.',{exact:true}).waitFor();
   });
 });
@@ -2280,7 +2354,7 @@ test('subagent reports separate attribution from new and historical bodies witho
     const host=`Subagent ${name}: `,manual=`Message from subagent ${name}:\n`,completion=`Subagent ${name} completed its task:\n`;
     const report=(operationId,text,extra={})=>state.emit(BOT_A,'subagent.reported',{subagentId:agentId,operationId,text,...extra},run.id);
     const oldEvent=report('legacy-explicit',host+manual+'Still awaiting the updated desktop build.');
-    const expand=async operationId=>{const notice=page.locator(`[data-collaboration-notice="reported:${operationId}"]`);await notice.getByRole('button',{name:`Show message from ${name}`,exact:true}).click();return notice.locator('.timber-collaboration-message-body');};
+    const expand=async operationId=>{const notice=page.locator(`[data-collaboration-notice="reported:${operationId}"]`);await notice.getByRole('button',{name:`Show message from ${name}`,exact:true}).click();return notice.locator('.timber-collaboration-message-body .timber-markdown');};
     await login();const first=await expand('legacy-explicit');assert.equal(await first.innerText(),'Still awaiting the updated desktop build.');
     if(process.env.TIMBER_CAPTURE_UI){await page.screenshot({path:'/tmp/timber-report-body-1440.png'});await page.setViewportSize({width:390,height:844});await page.screenshot({path:'/tmp/timber-report-body-390.png'});await page.setViewportSize({width:1440,height:1050});}
     const examples=[
@@ -2306,7 +2380,7 @@ test('subagent reports separate attribution from new and historical bodies witho
   });
 });
 
-for(const viewport of [{width:1440,height:1050},{width:390,height:844}])test(`historical and current subagent messages use centered pills without duplicate activity at ${viewport.width}px`,async()=>{
+for(const viewport of [{width:1440,height:1050},{width:390,height:844}])test(`historical and current subagent messages use left-aligned headers without duplicate activity at ${viewport.width}px`,async()=>{
   await withPage(async({page,state,login})=>{
     const stamp='2026-10-09T16:00:00.000Z',run={id:'pill-message-root',botId:BOT_A,operationId:'pill-message-root-op',status:'running',createdAt:stamp,updatedAt:stamp};
     const agent={id:'pill-message-child',name:'Reviewer',task:'Review the desktop changes.',parentOperationId:run.operationId,operationId:'pill-message-child-op',status:'running',createdAt:stamp,updatedAt:stamp};
@@ -2327,11 +2401,11 @@ for(const viewport of [{width:1440,height:1050},{width:390,height:844}])test(`hi
     await page.locator('#activity-list .event-title').filter({hasText:`#${lateCancellation.id} ·`}).waitFor({state:'attached'});
     assert.equal(await unknown.locator('[data-status="completed"]').count(),1,'a late cancellation cannot undo an already completed message operation');
     assert.equal(await unknown.locator('button').count(),0,'a late cancellation error does not replace its completed receipt');
-    const known=page.locator('[data-collaboration-notice="legacy-send:old-known-operation"]');await known.getByRole('button',{name:'Open Reviewer conversation',exact:true}).waitFor();
+    const known=page.locator('[data-collaboration-notice="legacy-send:old-known-operation"]');await known.getByRole('button',{name:'Show message to Reviewer',exact:true}).waitFor();
     const pending=page.locator('[data-collaboration-notice]').filter({has:page.locator('[data-status="running"]')});assert.equal(await pending.count(),1,'a started send remains visibly pending');
     assert.equal(await page.locator('#messages [data-tool-operation-id]').count(),0,'message operations are represented by pills, not wide tool rows');
     for(const pill of await page.locator('#messages .timber-collaboration-message-row').all()){
-      const box=await pill.boundingBox(),parent=await pill.locator('..').boundingBox();assert.ok(box&&parent&&box.height<=44);assert.ok(Math.abs(box.x+box.width/2-parent.x-parent.width/2)<2);
+      const box=await pill.boundingBox(),parent=await pill.locator('..').boundingBox();assert.ok(box&&parent&&box.height>=44&&box.width<=parent.width+1);assert.ok(Math.abs(box.x-parent.x)<2,'event headers align with the conversation left edge');assert.ok(box.x>=0&&box.x+box.width<=viewport.width+1,'event headers do not overflow');
     }
     await known.getByRole('button',{name:'Show message to Reviewer',exact:true}).click();await known.getByText('Please review the compact message pills.',{exact:true}).waitFor();
     if(process.env.TIMBER_CAPTURE_UI)await page.screenshot({path:`/tmp/timber-message-pills-${viewport.width}.png`});
@@ -2342,6 +2416,7 @@ for(const viewport of [{width:1440,height:1050},{width:390,height:844}])test(`hi
     const failed=page.locator('[data-collaboration-notice="legacy-send:failed-message-operation"]');await failed.locator('[data-status="failed"]').waitFor();await failed.getByRole('button',{name:'Show message to Subagent',exact:true}).click();await failed.getByText('The subagent is no longer accepting messages.',{exact:true}).waitFor();
     await openPanel(page,'activity');await page.locator('[data-activity-collaboration-notice="sent:old-known-operation"]').waitFor();assert.equal(await page.locator('#activity-tools [data-activity-tool-operation-id]').count(),0);
     if(process.env.TIMBER_CAPTURE_UI)await page.screenshot({path:`/tmp/timber-message-pills-activity-${viewport.width}.png`});
+    await page.locator('[data-activity-collaboration-notice="sent:old-known-operation"]').getByRole('button',{name:'Show message to Reviewer',exact:true}).click();
     await page.locator('[data-activity-collaboration-notice="sent:old-known-operation"]').getByRole('button',{name:'Open Reviewer conversation',exact:true}).click();await page.locator(`[data-agent-detail="${agent.id}"]`).waitFor();
     await openPanel(page,'conversation');await page.reload();await page.locator('[data-collaboration-notice="sent:old-known-operation"]').waitFor();assert.equal(await page.locator('#messages [data-collaboration-notice]').count(),4);assert.equal(await page.locator('#messages [data-tool-operation-id]').count(),0);
   },{viewport,...(viewport.width<760?{isMobile:true,hasTouch:true}:{})});
@@ -2362,8 +2437,8 @@ test('nested historical messages resolve parent routing and reused call IDs rema
     state.emit(BOT_A,'tool.started',{toolName:'send_subagent_message',toolCallId:'reused-call',input:{targetId:agent.id,text:'Second task message.'}},otherRun.id);
     state.emit(BOT_A,'tool.completed',{toolName:'send_subagent_message',toolCallId:'reused-call',operationId:'second-task-message',status:'completed'},otherRun.id);
     await login();await page.locator('[data-collaboration-notice="sent:first-task-message"]').waitFor();await page.locator('[data-collaboration-notice="legacy-send:second-task-message"]').waitFor();
-    const notice=page.locator('[data-collaboration-notice="legacy-send:nested-message-operation"]');await notice.getByRole('button',{name:'Open Researcher conversation',exact:true}).waitFor();await notice.getByRole('button',{name:'Open Verifier conversation',exact:true}).click();
-    const detail=page.locator(`[data-agent-detail="${nested.id}"]`);await detail.locator('[data-collaboration-notice="legacy-send:nested-message-operation"]').filter({hasText:'Messages to'}).waitFor();assert.equal(await detail.locator('.timber-agent-activity').count(),0);
+    const notice=page.locator('[data-collaboration-notice="legacy-send:nested-message-operation"]');await notice.locator('button[aria-expanded]').click();await notice.getByRole('button',{name:'Open Researcher conversation',exact:true}).waitFor();await notice.getByRole('button',{name:'Open Verifier conversation',exact:true}).click();
+    const detail=page.locator(`[data-agent-detail="${nested.id}"]`);await detail.locator('[data-collaboration-notice="legacy-send:nested-message-operation"]').filter({hasText:'Message to'}).waitFor();assert.equal(await detail.locator('.timber-agent-activity').count(),0);
     await detail.getByRole('button',{name:'Show message to Researcher',exact:true}).click();await detail.getByText('The findings are verified.',{exact:true}).waitFor();
     await openPanel(page,'runs');await page.locator(`[data-run-id="${otherRun.id}"]`).getByRole('button',{name:'View messages',exact:true}).click();
     await page.locator('#messages [data-collaboration-notice="legacy-send:second-task-message"]').waitFor();assert.equal(await page.locator('#messages [data-collaboration-notice="sent:first-task-message"]').count(),0);
@@ -2467,7 +2542,7 @@ test('create and edit bot forms share the account model catalog and temporary ag
     state.modelCatalog.models.push({id:'account-reviewer',name:'Account reviewer',provider:'openai',reasoningEfforts:['high','xhigh'],defaultReasoningEffort:'high',supportsFast:true});
     const stamp=new Date().toISOString(),agent={id:'model-child',name:'Specialist',task:'Use the selected model for this review.',parentOperationId:'model-parent',operationId:'model-child-op',status:'completed',model:'account-reviewer',reasoningEffort:'xhigh',fast:true,createdAt:stamp,updatedAt:stamp};
     state.agents.set(BOT_A,[agent]);await login();
-    const pill=page.locator(`[data-agent-created="${agent.id}"]`);await pill.locator('[data-model="account-reviewer"]').waitFor();await pill.getByRole('button',{name:'Open Specialist conversation',exact:true}).click();
+    const pill=page.locator(`[data-agent-created="${agent.id}"]`);await pill.getByRole('button',{name:'Show Specialist agent details',exact:true}).waitFor();assert.equal(await pill.locator('.timber-agent-created-pill .timber-model-badge').count(),0,'model badges do not crowd event headers');await pill.getByRole('button',{name:'Show Specialist agent details',exact:true}).click();await pill.getByText('Model: account-reviewer',{exact:true}).waitFor();await pill.getByRole('button',{name:'Open Specialist conversation',exact:true}).click();
     await page.locator(`[data-agent-model="account-reviewer"]`).filter({hasText:'xhigh reasoning · Fast'}).waitFor();await openPanel(page,'conversation');
     await openBotEditor(page);await page.locator('#edit-model').selectOption('account-reviewer');assert.equal(await page.locator('#edit-reasoning').inputValue(),'high');await page.locator('#edit-fast').check();await page.locator('#edit-form [type=submit]').click();await page.locator('#edit-dialog').waitFor({state:'hidden'});
     assert.equal(state.bots.find(bot=>bot.id===BOT_A).model,'account-reviewer');assert.equal(state.bots.find(bot=>bot.id===BOT_A).fast,true);

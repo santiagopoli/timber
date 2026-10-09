@@ -1,11 +1,10 @@
-import {useState} from 'react';
-import {ArrowRightIcon, ChevronDownIcon, ChevronRightIcon, GitBranchIcon, MessageSquareIcon} from 'lucide-react';
+import {useId, useState} from 'react';
+import {ChevronDownIcon, ChevronRightIcon, MessageSquareIcon} from 'lucide-react';
 import type {BotEvent, Message, Subagent} from '../../../packages/contracts/src/index';
 import type {ChatCallbacks, ChatModel} from './chat-types';
 import {MessageResponse} from './components/ai-elements/message';
 import {agentColor} from './agent-colors';
 import {collectLegacyAgentMessages} from './legacy-agent-messages';
-import {ModelBadge} from './model-identity';
 import './collaboration-timeline.css';
 
 export type AgentLink = {id:string;name:string;kind:'bot'|'subagent';model?:string};
@@ -33,40 +32,58 @@ function reportBody(event:BotEvent,sourceName?:string):string {
 }
 
 function AgentAvatar({agent}: {agent:AgentLink}) {
-  return <span className={`timber-collaborator-avatar timber-model-avatar is-${agent.kind}`} data-agent-color={agentColor(agent.id)} aria-hidden="true">{agent.name.slice(0,1).toUpperCase()}<ModelBadge model={agent.model}/></span>;
+  return <span className={`timber-collaborator-avatar timber-model-avatar is-${agent.kind}`} data-agent-color={agentColor(agent.id)} aria-hidden="true">{agent.name.slice(0,1).toUpperCase()}</span>;
 }
 function openAgent(agent:AgentLink,callbacks:Pick<ChatCallbacks,'onOpenBot'|'onOpenAgents'>) {
   if(agent.kind==='subagent') callbacks.onOpenAgents(agent.id);else callbacks.onOpenBot(agent.id);
 }
 export function AgentMessageNotice({notice,callbacks,eventKey,context='timeline'}: {notice:Notice;callbacks:Pick<ChatCallbacks,'onOpenBot'|'onOpenAgents'>;eventKey:string;context?:'timeline'|'activity'|'preview'}) {
   const [expanded,setExpanded]=useState(false);
-  const identity=(agent:AgentLink)=><button type="button" className="timber-collaborator-link" aria-label={`Open ${agent.name} conversation`} aria-description={agent.model?`Model: ${agent.model}`:undefined} title={`${agent.name}${agent.model?` · ${agent.model}`:''}`} onClick={()=>openAgent(agent,callbacks)}><AgentAvatar agent={agent}/><strong>{agent.name}</strong></button>;
-  const detail=Boolean(notice.text||notice.error),attributes=context==='activity'?{'data-activity-collaboration-notice':eventKey}:context==='preview'?{'data-preview-collaboration-notice':eventKey}:{'data-collaboration-notice':eventKey};
+  const bodyId=useId();
+  const detail=Boolean(notice.text||notice.error||notice.agent.id||notice.recipient?.id),attributes=context==='activity'?{'data-activity-collaboration-notice':eventKey}:context==='preview'?{'data-preview-collaboration-notice':eventKey}:{'data-collaboration-notice':eventKey};
+  const direction=notice.label||(notice.direction==='between'?`Message to ${notice.recipient?.name||'agent'}`:`Message ${notice.direction} agent`);
+  const header=<>
+    {notice.agent.id?<AgentAvatar agent={notice.agent}/>:<MessageSquareIcon className="timber-collaboration-message-icon" aria-hidden="true"/>}
+    <span className="timber-collaboration-summary">
+      <strong className="timber-collaborator-link" title={notice.agent.name}>{notice.agent.name}</strong>
+      <span className="timber-collaboration-meta"><span className="timber-collaboration-direction">{direction}</span>
+        {notice.status && (notice.historical||active.has(notice.status)||['failed','interrupted','cancelled'].includes(notice.status)) && <><span aria-hidden="true">·</span><span className="timber-collaboration-status" data-status={notice.status}>{statusLabel(notice.status)}</span></>}
+      </span>
+    </span>
+    {detail&&<ChevronDownIcon className={`timber-collaboration-disclosure${expanded?' is-expanded':''}`} aria-hidden="true"/>}
+  </>;
+  const openLink=(agent:AgentLink)=><button type="button" className="timber-collaboration-open" aria-label={`Open ${agent.name} conversation`} title={agent.model?`${agent.name} · ${agent.model}`:agent.name} onClick={()=>openAgent(agent,callbacks)}>Open {notice.recipient?agent.name:'conversation'}<ChevronRightIcon aria-hidden="true"/></button>;
   return <article className="timber-collaboration-message" {...attributes} data-message-id={context==='timeline'?notice.messageId:undefined}>
-    <div className="timber-collaboration-message-row timber-agent-source">
-      {!notice.agent.id&&<MessageSquareIcon className="timber-collaboration-message-icon" aria-hidden="true"/>}
-      <span className="timber-collaboration-direction">{notice.label||(notice.direction==='between'?'Messages from':`Messages ${notice.direction}`)}</span>{notice.agent.id&&identity(notice.agent)}
-      {notice.recipient && <><ArrowRightIcon className="timber-collaboration-arrow" aria-label="to"/>{identity(notice.recipient)}</>}
-      {notice.status && (notice.historical||active.has(notice.status)||['failed','interrupted','cancelled'].includes(notice.status)) && <span className="timber-collaboration-status" data-status={notice.status}>{statusLabel(notice.status)}</span>}
-      {detail && <button type="button" className="timber-collaboration-disclosure" aria-expanded={expanded} aria-label={`${expanded?'Hide':'Show'} message ${notice.direction==='to'?'to':'from'} ${notice.agent.name}`} onClick={()=>setExpanded(value=>!value)}><ChevronDownIcon className={expanded?'is-expanded':''}/></button>}
-    </div>
-    {expanded && detail && <div className="timber-collaboration-message-body">{notice.text&&<MessageResponse className="timber-markdown" mode="static" skipHtml plugins={{}} components={{img:()=>null}} linkSafety={{enabled:false}} controls={false}>{notice.text}</MessageResponse>}{notice.error&&<p className="timber-inline-error">{notice.error}</p>}</div>}
+    {detail?<button type="button" className="timber-collaboration-message-row timber-agent-source" aria-expanded={expanded} aria-controls={bodyId} aria-label={`${expanded?'Hide':'Show'} message ${notice.direction==='to'?'to':'from'} ${notice.agent.name}`} onClick={()=>setExpanded(value=>!value)}>{header}</button>:<div className="timber-collaboration-message-row timber-agent-source">{header}</div>}
+    {expanded && detail && <div id={bodyId} className="timber-collaboration-message-body">
+      {notice.text&&<MessageResponse className="timber-markdown" mode="static" skipHtml plugins={{}} components={{img:()=>null}} linkSafety={{enabled:false}} controls={false}>{notice.text}</MessageResponse>}
+      {notice.error&&<p className="timber-inline-error">{notice.error}</p>}
+      <div className="timber-collaboration-detail-meta">
+        {notice.agent.model&&<span className="timber-agent-created-caption">Model: {notice.agent.model}</span>}
+        {notice.agent.id&&openLink(notice.agent)}
+        {notice.recipient&&<>{notice.recipient.model&&<span className="timber-agent-created-caption">{notice.recipient.name} model: {notice.recipient.model}</span>}{openLink(notice.recipient)}</>}
+      </div>
+    </div>}
   </article>;
 }
 export function AgentCreationCard({creation,callbacks,context='timeline'}: {creation:Creation;callbacks:Pick<ChatCallbacks,'onOpenBot'|'onOpenAgents'>;context?:'timeline'|'activity'}) {
   const [expanded,setExpanded]=useState(false);
+  const bodyId=useId();
   const kind=creation.agent.kind==='subagent'?'subagent':'named agent';
   return <article className="timber-agent-created" {...(context==='activity'?{'data-activity-agent-created':creation.agent.id}:{'data-agent-created':creation.agent.id})} data-agent-kind={creation.agent.kind}>
-    <div className="timber-agent-created-pill">
-      <button type="button" className="timber-agent-created-link" onClick={()=>openAgent(creation.agent,callbacks)} aria-label={`Open ${creation.agent.name} conversation`} aria-description={creation.agent.model?`Model: ${creation.agent.model}`:undefined} title={`Created ${kind}${creation.agent.model?` · ${creation.agent.model}`:''}${creation.task?` · ${creation.task}`:''}`}><GitBranchIcon className="timber-agent-created-icon" aria-hidden="true"/><AgentAvatar agent={creation.agent}/><strong>{creation.agent.name}</strong></button>
-      <span className="status" data-status={creation.status}>{statusLabel(creation.status)}</span>
-      <button type="button" className="timber-agent-created-toggle" onClick={()=>setExpanded(value=>!value)} aria-expanded={expanded} aria-label={`${expanded?'Hide':'Show'} ${creation.agent.name} agent details`}><ChevronDownIcon className={expanded?'is-expanded':''}/></button>
-    </div>
-    {expanded && <div className="timber-agent-created-details">
+    <button type="button" className="timber-agent-created-pill" onClick={()=>setExpanded(value=>!value)} aria-expanded={expanded} aria-controls={bodyId} aria-label={`${expanded?'Hide':'Show'} ${creation.agent.name} agent details`}>
+      <AgentAvatar agent={creation.agent}/>
+      <span className="timber-collaboration-summary">
+        <strong className="timber-agent-created-link" title={creation.agent.name}>{creation.agent.name}</strong>
+        <span className="timber-collaboration-meta"><span>Agent created</span><span aria-hidden="true">·</span><span className="status" data-status={creation.status}>{statusLabel(creation.status)}</span></span>
+      </span>
+      <ChevronDownIcon className={`timber-agent-created-toggle${expanded?' is-expanded':''}`} aria-hidden="true"/>
+    </button>
+    {expanded && <div id={bodyId} className="timber-agent-created-details">
       <span className="timber-agent-created-caption">Created {kind}{creation.creator?` · by ${creation.creator.name}`:''}</span>
-      {creation.agent.model&&<span className="timber-agent-created-caption">{creation.agent.model}</span>}
+      {creation.agent.model&&<span className="timber-agent-created-caption">Model: {creation.agent.model}</span>}
       {creation.task && <p className="timber-agent-created-task">{creation.task}</p>}
-      <button type="button" className="timber-agent-created-open" onClick={()=>openAgent(creation.agent,callbacks)}>Open conversation<ChevronRightIcon aria-hidden="true"/></button>
+      <button type="button" className="timber-agent-created-open" aria-label={`Open ${creation.agent.name} conversation`} onClick={()=>openAgent(creation.agent,callbacks)}>Open conversation<ChevronRightIcon aria-hidden="true"/></button>
     </div>}
   </article>;
 }

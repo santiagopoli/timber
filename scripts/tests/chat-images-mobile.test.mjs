@@ -30,6 +30,7 @@ for(const width of [390,320]) test(`mobile image composer geometry and accessibl
  };
  try{
   await page.goto(fixture.url);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('.bot-item').first().click();await page.locator('#message').waitFor({state:'visible'});
+  assert.equal(await page.locator('#message').getAttribute('placeholder'),'Message Ada','short placeholder omits mention instructions');
   await capture('empty');await geometry(0);assert.equal(await page.getByRole('button',{name:'Send message',exact:true}).isDisabled(),true);
   const chooser=page.waitForEvent('filechooser');await page.getByRole('button',{name:'Attach images',exact:true}).click();await(await chooser).setFiles(image(1));await page.locator('.timber-image-attachments img').waitFor();
   await capture('one');await geometry(1);assert.equal(await page.getByRole('button',{name:'Send message',exact:true}).isEnabled(),true,'image-only input can send');
