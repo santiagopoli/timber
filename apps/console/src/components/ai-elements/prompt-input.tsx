@@ -78,10 +78,21 @@ import {
 // Helpers
 // ============================================================================
 
+const attachmentBlobs = new Map<string, Blob>();
+const attachmentUrl = (file: File): string => {
+  const url = URL.createObjectURL(file);
+  attachmentBlobs.set(url, file);
+  return url;
+};
+const revokeAttachmentUrl = (url: string) => {
+  attachmentBlobs.delete(url);
+  URL.revokeObjectURL(url);
+};
+
 const convertBlobUrlToDataUrl = async (url: string): Promise<string | null> => {
   try {
-    const response = await fetch(url);
-    const blob = await response.blob();
+    const blob = attachmentBlobs.get(url);
+    if (!blob) return null;
     // FileReader uses callback-based API, wrapping in Promise is necessary
     // oxlint-disable-next-line eslint-plugin-promise(avoid-new)
     return new Promise((resolve) => {
@@ -274,7 +285,7 @@ export const PromptInputProvider = ({
         id: nanoid(),
         mediaType: file.type,
         type: "file" as const,
-        url: URL.createObjectURL(file),
+        url: attachmentUrl(file),
       })),
     ]);
   }, []);
@@ -283,7 +294,7 @@ export const PromptInputProvider = ({
     setAttachmentFiles((prev) => {
       const found = prev.find((f) => f.id === id);
       if (found?.url) {
-        URL.revokeObjectURL(found.url);
+        revokeAttachmentUrl(found.url);
       }
       return prev.filter((f) => f.id !== id);
     });
@@ -293,7 +304,7 @@ export const PromptInputProvider = ({
     setAttachmentFiles((prev) => {
       for (const f of prev) {
         if (f.url) {
-          URL.revokeObjectURL(f.url);
+          revokeAttachmentUrl(f.url);
         }
       }
       return [];
@@ -312,7 +323,7 @@ export const PromptInputProvider = ({
     () => () => {
       for (const f of attachmentsRef.current) {
         if (f.url) {
-          URL.revokeObjectURL(f.url);
+          revokeAttachmentUrl(f.url);
         }
       }
     },
@@ -617,7 +628,7 @@ export const PromptInput = ({
             id: nanoid(),
             mediaType: file.type,
             type: "file",
-            url: URL.createObjectURL(file),
+            url: attachmentUrl(file),
           });
         }
         return [...prev, ...next];
@@ -631,7 +642,7 @@ export const PromptInput = ({
       setItems((prev) => {
         const found = prev.find((file) => file.id === id);
         if (found?.url) {
-          URL.revokeObjectURL(found.url);
+          revokeAttachmentUrl(found.url);
         }
         return prev.filter((file) => file.id !== id);
       }),
@@ -689,7 +700,7 @@ export const PromptInput = ({
         : setItems((prev) => {
             for (const file of prev) {
               if (file.url) {
-                URL.revokeObjectURL(file.url);
+                revokeAttachmentUrl(file.url);
               }
             }
             return [];
@@ -792,7 +803,7 @@ export const PromptInput = ({
       if (!usingProvider) {
         for (const f of filesRef.current) {
           if (f.url) {
-            URL.revokeObjectURL(f.url);
+            revokeAttachmentUrl(f.url);
           }
         }
       }
@@ -862,7 +873,7 @@ export const PromptInput = ({
       try {
         // Convert blob URLs to data URLs asynchronously
         const convertedFiles: FileUIPart[] = await Promise.all(
-          files.map(async ({ id: _id, ...item }) => {
+          files.map(async (item) => {
             if (item.url?.startsWith("blob:")) {
               const dataUrl = await convertBlobUrlToDataUrl(item.url);
               // If conversion failed, keep the original blob URL

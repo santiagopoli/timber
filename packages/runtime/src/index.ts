@@ -399,13 +399,13 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
 
   return {
     scheduleAdmissionRetry: (operationId, delayMs) => admissionRetries.schedule(operationId, delayMs),
-    async submit(text: string, input: { operationId: string }): Promise<RuntimeReceipt> {
+    async submit(text: string, input: { operationId: string; images?: {data:string;mimeType:string}[] }): Promise<RuntimeReceipt> {
       assertActive();
       const bot = await options.getBot();
       assertActive();
       await harness.session().setModel(resolveModel(bot.model));
       assertActive();
-      const result = await harness.submit(text, { operationId: input.operationId });
+      const result = await harness.submit(input.images?.length ? [{type:'text' as const,text},...input.images.map(image=>({type:'image' as const,...image}))] : text, { operationId: input.operationId });
       return { operationId: result.operationId, accepted: result.accepted };
     },
     async wait(operationId: string): Promise<RuntimeOperationResult> {

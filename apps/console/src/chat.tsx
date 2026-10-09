@@ -1,12 +1,12 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
-import { ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon, HistoryIcon } from 'lucide-react';
+import { PaperclipIcon, ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon, HistoryIcon } from 'lucide-react';
 import { useStickToBottomContext } from 'use-stick-to-bottom';
 import { defaultUrlTransform, type UrlTransform } from 'streamdown';
 import { Conversation, ConversationContent, ConversationEmptyState, ConversationScrollButton } from '@/components/ai-elements/conversation';
 import { Message, MessageActions, MessageAction, MessageContent, MessageResponse } from '@/components/ai-elements/message';
-import { PromptInput, PromptInputBody, PromptInputSubmit, PromptInputTextarea } from '@/components/ai-elements/prompt-input';
+import { PromptInput, PromptInputBody, PromptInputSubmit, PromptInputTextarea, usePromptInputAttachments } from '@/components/ai-elements/prompt-input';
 import { Tool, ToolContent } from '@/components/ai-elements/tool';
 import { Confirmation, ConfirmationAction, ConfirmationActions } from '@/components/ai-elements/confirmation';
 import { Button } from '@/components/ui/button';
@@ -340,7 +340,8 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks): TimelineEntry[] {
     // the transcript just like a final answer, never in a reasoning disclosure.
     entries.push({key: `message:${message.id}`, ...messagePosition(message,index), node: <Message from={message.role === 'user' && !message.provenance ? 'user' : 'assistant'} data-message-id={message.id} data-message-kind={message.kind} data-progress-message-id={message.kind === 'progress' ? message.id : undefined} data-run-id={message.runId} className={`timber-message timber-message-${message.role}`}>
       {message.provenance ? <div className="timber-message-meta timber-agent-source"><button type="button" onClick={() => callbacks.onOpenBot(message.provenance!.sourceBotId)}>{message.provenance.sourceBotName}</button><span>{message.provenance.kind === 'delegation_result' ? 'returned a result' : message.provenance.kind === 'mention' ? 'mentioned this bot' : 'sent a message'}</span></div> : message.role !== 'user' && <div className="timber-message-meta"><span>{message.role === 'assistant' ? model.bot.name : label(message.role)}</span></div>}
-      <MessageContent className="timber-message-content"><Response text={message.text} /></MessageContent>
+      <MessageContent className="timber-message-content"><Response text={message.text} />{message.attachments?.map(image=><ArtifactPreview key={image.artifactId} botId={model.bot.id} artifactId={image.artifactId} compact />)}</MessageContent>
+
       {['user', 'assistant'].includes(message.role) && <CopyMessage text={message.text} createdAt={message.createdAt} />}
       {message.role === 'user' && <MessageRunStatus model={model} runId={message.runId} callbacks={callbacks} />}
     </Message>});
@@ -420,8 +421,24 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
   </>;
 }
 
+function ImageControls({sending,hasText,acceptedIds}: {sending:boolean;hasText:boolean;acceptedIds?:string[]}) {
+  const attachments=usePromptInputAttachments();
+  useEffect(()=>{
+    for(const id of acceptedIds??[]) if(attachments.files.some(file=>file.id===id)) attachments.remove(id);
+  },[acceptedIds,attachments]);
+  return <>
+    <div className="timber-image-attachments">{attachments.files.map(file=><div key={file.id}>
+      <img src={file.url} alt={file.filename || 'Attached image'} />
+      <button type="button" aria-label="Remove image" disabled={sending} onClick={()=>attachments.remove(file.id)}>×</button>
+    </div>)}</div>
+    <Button type="button" variant="ghost" size="sm" disabled={sending} aria-label="Attach images" onClick={()=>attachments.openFileDialog()}><PaperclipIcon aria-hidden="true" />Attach images</Button>
+    <PromptInputSubmit className="timber-send" aria-label="Send message" title="Send message" disabled={sending || (!hasText && !attachments.files.length)}>{sending ? <LoaderCircleIcon className="timber-spinner" /> : <ArrowUpIcon />}</PromptInputSubmit>
+  </>;
+}
+
 function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallbacks }) {
   const textarea = useRef<HTMLTextAreaElement>(null);
+  const [attachmentError,setAttachmentError]=useState('');
   const pendingCaret = useRef<{text:string;position:number} | null>(null);
   const [caret, setCaret] = useState(model.draft.length), [mentionIndex, setMentionIndex] = useState(0), [dismissed, setDismissed] = useState(false);
   const mentionMatch = /(?:^|\s)@([^\n@]{0,80})$/.exec(model.draft.slice(0, caret));
@@ -445,6 +462,7 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
     textarea.current?.focus({preventScroll:true});
     textarea.current?.setSelectionRange(pending.position,pending.position);
   },[model.draft]);
+
   useLayoutEffect(() => {
     // Native sizing avoids briefly collapsing a focused textarea on every key.
     if (CSS.supports('field-sizing', 'content')) return;
@@ -471,7 +489,12 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
         {choices.map((bot, index) => <button type="button" key={bot.id} id={`mention-${bot.id}`} role="option" aria-selected={index === Math.min(mentionIndex, choices.length - 1)} data-mention-bot={bot.id} onMouseDown={event => event.preventDefault()} onClick={() => chooseMention(bot)}><span className="timber-mini-avatar" aria-hidden="true">{bot.name.slice(0, 1)}</span><span><strong>{mentionName(bot)}</strong><small>{bot.instructions?.split('\n')[0] || 'Named bot'}</small></span></button>)}
       </div>}
       {selectedMentions.length > 0 && <div className="timber-selected-mentions" aria-label="Message recipients">{selectedMentions.map(bot => <span key={bot.id}>To {mentionName(bot)}<button type="button" aria-label={`Remove ${mentionName(bot)} recipient`} onClick={() => callbacks.onDraft(model.bot.id, model.draft, model.draftMentions.filter(id => id !== bot.id))}>×</button></span>)}</div>}
-      <PromptInput id="message-form" className="timber-composer" maxFiles={0} onReset={event => event.preventDefault()} onSubmit={({text}) => {if (!model.sending && text.trim()) callbacks.onSend(model.bot.id, text, selectedMentions.map(bot => bot.id));}}>
+      <PromptInput id="message-form" className="timber-composer" accept="image/png,image/jpeg" multiple maxFiles={4} maxFileSize={5_000_000} onError={error=>setAttachmentError(error.message)} onReset={event => event.preventDefault()} onSubmit={async ({text,files}) => {
+        if(model.sending || (!text.trim() && !files.length)) throw new Error('Not ready');
+        if(files.length && selectedMentions.length) {setAttachmentError('Image messages cannot mention other bots yet.');throw new Error('Unsupported recipients');}
+        setAttachmentError('');
+        try {await callbacks.onSend(model.bot.id,text,selectedMentions.map(bot=>bot.id),files);} catch {setAttachmentError('Images were not delivered. Retry sending to check the same request safely.');throw new Error('Not delivered');}
+      }}>
         <PromptInputBody><PromptInputTextarea ref={textarea} id="message" rows={1} aria-label={`Message ${model.bot.name}`} placeholder={`Message ${model.bot.name} · @ to mention a bot`} value={model.draft}
           aria-autocomplete="list" aria-controls={choices.length ? 'bot-mentions' : undefined} aria-expanded={choices.length > 0} aria-activedescendant={choices.length ? `mention-${choices[Math.min(mentionIndex, choices.length - 1)].id}` : undefined}
           onChange={event => {pendingCaret.current=null;setCaret(event.currentTarget.selectionStart);setMentionIndex(0);setDismissed(false);callbacks.onDraft(model.bot.id, event.currentTarget.value);}}
@@ -482,7 +505,8 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
             else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {event.preventDefault();setMentionIndex(index => (index + (event.key === 'ArrowDown' ? 1 : choices.length - 1)) % choices.length);}
             else if (event.key === 'Enter' && !event.shiftKey || event.key === 'Tab') {event.preventDefault();chooseMention(choices[Math.min(mentionIndex, choices.length - 1)]);}
           }} />
-          <PromptInputSubmit className="timber-send" aria-label="Send message" title="Send message" disabled={model.sending || !model.draft.trim()}>{model.sending ? <LoaderCircleIcon className="timber-spinner" /> : <ArrowUpIcon />}</PromptInputSubmit>
+          <ImageControls sending={model.sending} hasText={!!model.draft.trim()} acceptedIds={model.acceptedImageIds} />{attachmentError && <div role="alert">{attachmentError}</div>}
+
         </PromptInputBody>
       </PromptInput>
     </div>;

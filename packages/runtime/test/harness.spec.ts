@@ -719,3 +719,13 @@ it('refreshes automatic policy for new requests while retaining historical pendi
   expect(events).toContainEqual(expect.objectContaining({ type: 'message', operationId: 'automatic-retry', data: expect.objectContaining({ role: 'assistant', text: answer }) }));
   expect(events).toContainEqual(expect.objectContaining({ type: 'run.completed', operationId: 'automatic-retry', data: { text: answer, kind: 'final' } }));
 });
+
+it('sends attached image bytes through the real PiHarness to the ChatGPT transport',async()=>{
+  const data='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=';
+  await request('/submit',{text:'Describe this image',operationId:'multimodal-input',chatgpt:true,images:[{data,mimeType:'image/png'}]});
+  expect(await (await request('/wait?id=multimodal-input')).json()).toMatchObject({status:'done'});
+  const state=await (await request('/inspect')).json<{calls:{input:string}[]}>();
+  expect(state.calls).toHaveLength(1);
+  expect(state.calls[0].input).toContain('input_image');
+  expect(state.calls[0].input).toContain(`data:image/png;base64,${data}`);
+});

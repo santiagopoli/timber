@@ -37,12 +37,16 @@ export function operationId(value:unknown):string {
   if(typeof value!=="string" || !OPERATION_ID.test(value)) invalid("operationId must be 1 to 128 letters, numbers, dots, colons, hyphens or underscores.");
   return value as string;
 }
-export function parseMessage(value:unknown):{text:string;operationId:string;mentions?:string[]} {
+export function parseMessage(value:unknown):{text:string;operationId:string;mentions?:string[];attachments?:string[]} {
   const data=object(value);
-  const text=string(data.text,"text",32_000);
-  if(!text.trim()) invalid("text cannot be blank.");
+    const text=string(data.text,"text",32_000,0);
+  const attachments=data.attachments;
+  if(attachments!==undefined && (!Array.isArray(attachments) || attachments.length>4 || attachments.some(id=>typeof id!=="string" || !UUID.test(id)) || new Set(attachments).size!==attachments.length)) invalid("attachments must contain up to four distinct image IDs.");
+  const ids=attachments as string[]|undefined;
+  if(!text.trim() && !ids?.length) invalid("A message or image is required.");
   if(data.mentions!==undefined && (!Array.isArray(data.mentions) || data.mentions.length>8 || data.mentions.some(id=>typeof id!=="string" || !UUID.test(id)) || new Set(data.mentions).size!==data.mentions.length)) invalid("mentions must contain at most eight unique bot IDs.");
-  return {text,operationId:operationId(data.operationId),...(data.mentions===undefined?{}:{mentions:data.mentions as string[]})};
+  return {text,operationId:operationId(data.operationId),...(ids?.length?{attachments:ids}:{}),...(data.mentions===undefined?{}:{mentions:data.mentions as string[]})};
+
 }
 export function parseBotInput(value:unknown,patch=false):{name?:string;instructions?:string;model?:string;computerApprovalMode?:ComputerApprovalMode;allowNamedAgents?:boolean} {
   const data=object(value);

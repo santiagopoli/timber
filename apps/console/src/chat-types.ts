@@ -9,7 +9,7 @@ export type MessageDelivery = {
 };
 export type ChatModel = {
   bot: Bot; messages: Message[]; runs: Run[]; approvals: ChatApproval[]; connections: ChatConnection[]; events: BotEvent[];
-  deliveries: MessageDelivery[]; draft: string; sending: boolean; loading: boolean;
+  acceptedImageIds?: string[]; deliveries: MessageDelivery[]; draft: string; sending: boolean; loading: boolean;
   mentionBots: Bot[]; draftMentions: string[];
   subagents: Subagent[]; delegations: AgentDelegation[];
   currentRun: Run | null; runFilter: string | null; focusApproval: number;
@@ -18,9 +18,10 @@ export type ChatModel = {
 };
 export type ChatCallbacks = {
   onDraft(botId: string, text: string, mentions?: string[]): void;
-  onSend(botId: string, text: string, mentions?: string[]): void;
+  onSend(botId: string, text: string, mentions?: string[], files?: {url:string;mediaType?:string;filename?:string}[]): void | Promise<void>;
   onOpenBot(botId: string): void;
   onOpenAgents(agentId?: string): void;
+
   onRetry(botId: string, operationId: string): void;
   onDecision(botId: string, approvalId: string, decision: 'approve' | 'deny', allowComputer?: boolean): void;
   onClearFilter(): void;

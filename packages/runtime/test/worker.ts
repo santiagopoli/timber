@@ -139,9 +139,9 @@ export class HarnessProbe extends DurableObject {
       return Response.json({ ok: true });
     }
     if (path === '/submit') {
-      const input = await request.json<{ text: string; operationId: string; chatgpt?: boolean }>();
+      const input = await request.json<{ text: string; operationId: string; images?: {data:string;mimeType:string}[]; chatgpt?: boolean }>();
       if (input.chatgpt) this.ctx.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)', 'model', DEFAULT_MODEL);
-      return Response.json(await this.runtime.submit(input.text, { operationId: input.operationId }));
+      return Response.json(await this.runtime.submit(input.text, { operationId: input.operationId, images:input.images }));
     }
     if (path === '/wait') return Response.json(await this.runtime.wait(new URL(request.url).searchParams.get('id')!));
     if (path === '/inspect') return Response.json({

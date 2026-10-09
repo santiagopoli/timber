@@ -38,9 +38,10 @@ import './src/layout.css';
   const validView = (version) => version === generation && authenticated;
   const chat = mountChat($('chat-root'), {
     onDraft: (botId, text, mentions) => { if (selected?.id === botId && authenticated) { drafts.set(botId, text); draftMentions.set(botId, (mentions || draftMentions.get(botId) || []).filter(id => bots.some(bot => bot.id === id && hasBotMention(text, bot.name)))); renderMessages(); } },
-    onSend: (botId, text, mentions) => { void sendMessage(botId, text, undefined, mentions); },
+    onSend: (botId, text, mentions, files) => sendMessage(botId, text, undefined, mentions, files),
     onOpenBot: openAgentBot,
     onOpenAgents: openAgents,
+
     onRetry: (botId, operationId) => {
       if (selected?.id !== botId || !authenticated) return;
       const run = [...runs.values()].find(item => item.operationId === operationId && item.status === 'queued' && item.error?.includes('Retry this message'));
@@ -126,9 +127,9 @@ import './src/layout.css';
     const targetId = /^\/v1\/bots\/([^/?]+)/.exec(path)?.[1];
     if (targetId && removedBots.has(targetId) && !(method === 'DELETE' && path === botPath(targetId))) throw new DOMException('This bot is no longer available.', 'AbortError');
     const session = authSession, headers = { 'X-Timber-Client': 'console' };
-    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    if (body !== undefined) headers['Content-Type'] = body instanceof Blob ? body.type : 'application/json';
     let response;
-    try { response = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: signal ? AbortSignal.any([signal, sessionController.signal]) : sessionController.signal, cache: 'no-store', credentials: 'same-origin', redirect: 'error', keepalive }); }
+    try { response = await fetch(path, { method, headers, body: body === undefined ? undefined : body instanceof Blob ? body : JSON.stringify(body), signal: signal ? AbortSignal.any([signal, sessionController.signal]) : sessionController.signal, cache: 'no-store', credentials: 'same-origin', redirect: 'error', keepalive }); }
     catch (error) { if (error.name === 'AbortError') throw error; throw new Error(method === 'GET' ? 'Connection lost. Check your network, then refresh or reconnect.' : 'The response was lost. The action may have been accepted. Inspect its state before retrying; nothing was retried automatically.'); }
     if (!response.ok) {
       const detail = await response.json().catch(() => ({}));
@@ -217,12 +218,18 @@ import './src/layout.css';
       return { ...value, status: value.status === 'pending' && Date.parse(value.expiresAt) <= Date.now() ? 'expired' : value.status, busy: work?.busy === true };
     });
   }
+  const acceptedImageIds = new Map();
+  function acceptDeliveryImages(delivery) {
+    const ids=(delivery.files || []).map(file=>file.id).filter(Boolean);
+    if(ids.length) acceptedImageIds.set(delivery.botId, ids);
+  }
   function reconcileDeliveries(serverRuns = []) {
     for (const [operationId, delivery] of pendingMessages) {
       if (delivery.botId !== selected?.id) continue;
       const run = serverRuns.find(item => item.operationId === operationId);
       if (run) {
         const newlyAccepted = delivery.state !== 'accepted';
+        acceptDeliveryImages(delivery);
         delivery.runId = run.id; delivery.runStatus = run.status; delivery.state = 'accepted'; delete delivery.error;
         if (newlyAccepted && (drafts.get(delivery.botId) || '').trim() === delivery.text) {drafts.delete(delivery.botId);draftMentions.delete(delivery.botId);}
       }
@@ -234,7 +241,7 @@ import './src/layout.css';
     const visibleApprovals = effectiveApprovals(), pending = visibleApprovals.filter(approval => approval.status === 'pending');
     $('approval-count').textContent = String(pending.length); $('approval-shortcut').hidden = !pending.length;
     const stream = [...streamDrafts.entries()].find(([id, text]) => text && activeRunIds.has(id) && !terminal.has(runs.get(id)?.status) && (!runFilter || id === runFilter));
-    const model = { bot: selected, messages, runs: [...runs.values()], approvals: visibleApprovals, connections: connections.map(item => ({...item, ...connectionWork.get(`${selected.id}:${item.id}`)})), events: events.map(event => ({...event, data: redact(event.data)})),
+    const model = { acceptedImageIds: acceptedImageIds.get(selected.id) || [], bot: selected, messages, runs: [...runs.values()], approvals: visibleApprovals, connections: connections.map(item => ({...item, ...connectionWork.get(`${selected.id}:${item.id}`)})), events: events.map(event => ({...event, data: redact(event.data)})),
       deliveries: [...pendingMessages.values()].filter(delivery => delivery.botId === selected.id).map(delivery => ({...delivery})), draft: drafts.get(selected.id) || '', mentionBots: bots, subagents, delegations, draftMentions: draftMentions.get(selected.id) || [], sending: sendBusy.has(selected.id), loading: chatLoading,
       currentRun, runFilter, focusApproval, stream: stream ? {runId: stream[0], text: stream[1]} : null, feedback: approvalFeedback.get(selected.id) };
     chat.update(model); activity.update({...model, runFilter: null});
@@ -260,30 +267,48 @@ import './src/layout.css';
       if (validView(version) && sequence === agentsRequest && (currentPanel === 'agents' || subagents.some(agent => !terminal.has(agent.status)) || delegations.some(task => !terminal.has(task.status)))) agentsTimer=setTimeout(() => void loadAgents(version),3000);
     }
   }
-  async function sendMessage(botId, rawText, retryOperationId, mentions = []) {
-    const text = rawText.trim(); if (!authenticated || selected?.id !== botId || !text || sendBusy.has(botId)) return;
+  async function sendMessage(botId, rawText, retryOperationId, mentions = [], files = []) {
+    const text = rawText.trim(); if (!authenticated || selected?.id !== botId || (!text && !files.length && !retryOperationId) || sendBusy.has(botId)) return;
     const session = authSession;
-    const previous = retryOperationId ? pendingMessages.get(retryOperationId) : [...pendingMessages.values()].find(item => item.botId === botId && item.text === text && JSON.stringify(item.mentions || []) === JSON.stringify(mentions) && ['unknown', 'rejected'].includes(item.state));
+    const previous = retryOperationId ? pendingMessages.get(retryOperationId) : [...pendingMessages.values()].find(item => item.botId === botId && item.text === text && JSON.stringify(item.mentions || []) === JSON.stringify(mentions) && JSON.stringify(item.files || []) === JSON.stringify(files) && ['unknown', 'rejected'].includes(item.state));
     if (previous && (previous.botId !== botId || previous.text !== text || previous.state === 'accepted' || previous.state === 'sending')) return;
-    const delivery = previous || { botId, operationId: crypto.randomUUID(), text, mentions: [...new Set(mentions)], createdAt: new Date().toISOString() };
+    const delivery = previous || { botId, operationId: crypto.randomUUID(), text, files, imageIds: files.map(() => crypto.randomUUID()), mentions: [...new Set(mentions)], createdAt: new Date().toISOString() };
     delivery.state = 'sending'; delete delivery.error; pendingMessages.set(delivery.operationId, delivery); sendBusy.add(botId); renderMessages();
     try {
-      const {run} = await request(`${botPath(botId)}/messages`, {method: 'POST', body: {text, operationId: delivery.operationId, ...(delivery.mentions?.length ? {mentions: delivery.mentions} : {})}});
+      if (!delivery.attachments) {
+        delivery.attachments = [];
+        try {
+          for (const [index, file] of (delivery.files || []).entries()) {
+            if (!/^data:image\/(png|jpeg);base64,/.test(file.url)) throw new Error('Only PNG and JPEG images are supported.');
+            const [header, encoded] = file.url.split(',');
+            const bytes = Uint8Array.from(atob(encoded), char => char.charCodeAt(0));
+            if (bytes.length > 5_000_000) throw new Error('Images must be at most 5 MB.');
+            const blob = new Blob([bytes], {type: header.slice(5, header.indexOf(';'))});
+            await request(`${botPath(botId)}/attachments/${delivery.imageIds[index]}`, {method: 'PUT', body: blob});
+            delivery.attachments.push(delivery.imageIds[index]);
+          }
+        } catch (error) {delete delivery.attachments; throw error;}
+      }
+      const {run} = await request(`${botPath(botId)}/messages`, {method: 'POST', body: {text, operationId: delivery.operationId, ...(delivery.attachments.length ? {attachments: delivery.attachments} : {}), ...(delivery.mentions?.length ? {mentions: delivery.mentions} : {})}});
+
       if (session !== authSession) return;
       if (!run || typeof run.id !== 'string' || !run.id || run.botId !== botId || run.operationId !== delivery.operationId || !['queued', 'running', 'waiting_approval', 'waiting_connection', ...terminal].includes(run.status)) throw new Error('The server acknowledgment could not be verified. Your message may have been accepted. Retry sending to check the same request safely.');
+      acceptDeliveryImages(delivery);
       delivery.state = 'accepted'; delivery.runId = run.id; delivery.runStatus = run.status;
       if ((drafts.get(botId) || '').trim() === text) {drafts.delete(botId);draftMentions.delete(botId);}
       if (selected?.id === botId) { mergeRun(run); if (!terminal.has(run.status)) activeRunIds.add(run.id); runRevision++; runFilter = null; reconcileDeliveries([run]); renderRuns(); scheduleRefresh(generation); }
     } catch (error) {
       if (session !== authSession || error.name === 'AbortError' || delivery.runId) return;
       delivery.state = !error.status || error.status >= 500 ? 'unknown' : 'rejected'; delivery.error = errorText(error); delivery.canRetry = !error.status || error.status >= 500 || error.status === 429;
+      if (files.length) throw error;
     } finally { if (session === authSession) { sendBusy.delete(botId); if (selected?.id === botId) renderMessages(); } }
   }
   async function retryAdmission(botId, run, text, mentions) {
     if (!authenticated || selected?.id !== botId || sendBusy.has(botId)) return;
     const session = authSession; sendBusy.add(botId); renderMessages();
     try {
-      const result = await request(`${botPath(botId)}/messages`, {method: 'POST', body: {text, operationId: run.operationId, ...(mentions?.length ? {mentions} : {})}});
+      const result = await request(`${botPath(botId)}/messages`, {method: 'POST', body: {text, operationId: run.operationId, attachments: messages.find(message => message.runId === run.id && message.role === 'user')?.attachments?.map(image => image.artifactId), ...(mentions?.length ? {mentions} : {})}});
+
       if (session !== authSession) return;
       if (result.run?.id !== run.id || result.run.botId !== botId || result.run.operationId !== run.operationId || !['queued', 'running', 'waiting_approval', 'waiting_connection', ...terminal].includes(result.run.status)) throw new Error('Delivery retry was not confirmed. Inspect this run before trying again.');
       if (selected?.id === botId) {mergeRun(result.run); reconcileDeliveries([result.run]); renderRuns(); scheduleRefresh(generation);}

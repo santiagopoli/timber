@@ -60,7 +60,23 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   assistant commentary accompanying native tool calls; it is durably deduplicated
   by its native message identity. Final answers retain operation-based deduplication.
   Messages without kind remain ordinary messages for backward compatibility.
-- POST /v1/bots/:id/messages {text,operationId,mentions?:string[]} -> 202 {run:Run}
+- PUT /v1/bots/:id/attachments/:imageId uploads raw PNG/JPEG bytes (5 MB maximum)
+  under a client-generated UUID and returns `{attachment:{artifactId,mimeType,size}}`.
+  Authentication and bot membership apply; MIME and byte signatures are checked.
+  Repeated IDs with identical content succeed; different content returns 409.
+  Images are immutable R2 artifacts under the bot prefix, deleted with the bot.
+  GET uses the existing authenticated artifact route, never a public URL.
+- POST /v1/bots/:id/messages {text,operationId,mentions?:string[],attachments?:string[]} -> 202 {run:Run}
+  Up to four distinct uploaded image IDs are allowed; text can be empty only with
+  an image. References from other bots or non-chat artifacts are rejected.
+  The message fingerprint covers text and ordered image IDs. The transcript stores
+  image metadata; admission reads the immutable bytes into native multimodal input,
+  including explicit delivery retries. No images are silently dropped or replaced
+  with URLs. The promptbox supports file selection, clipboard paste and local
+  drag/drop, removable previews, and retains attachments after a failed send.
+  Blob conversion uses FileReader, without weakening the console CSP.
+  Image attachments with bot mentions are currently rejected, not silently omitted.
+
   The receipt confirms durable storage of the user input. A busy bot processes
   subsequent inputs in order. Transient engine admission failures stay queued
   with a fixed diagnostic and retry through the shared Lifecycle alarm using the

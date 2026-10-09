@@ -1873,3 +1873,76 @@ test('undelivered subagent reports remain visible after reload without changing 
     assert.equal(await page.locator('.timber-agent-detail-heading [data-status="completed"]').count(),1,'notification failure does not mislabel the completed subagent task');
   });
 });
+
+test('promptbox attaches, pastes and drops images; removes previews and sends image-only input', async () => {
+  await withPage(async ({page,login,state}) => {
+    const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=','base64');
+    const uploaded=[];
+    await page.route('**/attachments/*',async route=>{
+      uploaded.push(route.request().url());
+      await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({attachment:{artifactId:route.request().url().split('/').pop(),mimeType:'image/png',size:png.length}})});
+    });
+    await login();
+    await page.locator('input[type=file][accept="image/png,image/jpeg"]').setInputFiles({name:'picked.png',mimeType:'image/png',buffer:png});
+    await page.locator('.timber-image-attachments img').waitFor();
+    await page.evaluate(bytes=>{
+      const transfer=new DataTransfer();transfer.items.add(new File([Uint8Array.from(bytes)],'pasted.png',{type:'image/png'}));
+      document.querySelector('#message').dispatchEvent(new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:transfer}));
+    },[...png]);
+    await page.evaluate(bytes=>{
+      const transfer=new DataTransfer();transfer.items.add(new File([Uint8Array.from(bytes)],'dropped.png',{type:'image/png'}));
+      document.querySelector('#message-form').dispatchEvent(new DragEvent('drop',{bubbles:true,cancelable:true,dataTransfer:transfer}));
+    },[...png]);
+    assert.equal(await page.locator('.timber-image-attachments img').count(),3);
+    await page.getByRole('button',{name:'Remove image'}).first().click();
+    assert.equal(await page.locator('.timber-image-attachments img').count(),2);
+    await sendMessage(page);
+    await page.waitForFunction(()=>document.querySelectorAll('.timber-image-attachments img').length===0);
+    assert.equal(uploaded.length,2);
+    const sent=sentMessages(state,BOT_A);assert.equal(sent.length,1);assert.equal(sent[0].body.text,'');assert.equal(sent[0].body.attachments.length,2);
+  });
+});
+
+test('an uncertain image send retains previews and retries the same message and attachments', async () => {
+  await withPage(async ({page,login,state}) => {
+    const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=','base64');
+    let uploads=0;const deliveries=[];
+    await page.route('**/attachments/*',async route=>{uploads++;await route.fulfill({status:200,contentType:'application/json',body:'{}'});});
+    await page.route(`**/v1/bots/${BOT_A}/messages`,async route=>{
+      if(route.request().method()!=='POST') return route.continue();
+      deliveries.push(route.request().postDataJSON());
+      if(deliveries.length===1) {await route.fetch();await route.abort();} else await route.continue();
+    });
+    await login();await page.locator('input[type=file][accept="image/png,image/jpeg"]').setInputFiles({name:'retry.png',mimeType:'image/png',buffer:png});
+    await page.locator('#message').fill('Inspect this image');await sendMessage(page);
+    await page.locator('#message-form [role=alert]').waitFor();
+    assert.equal(await page.locator('.timber-image-attachments img').count(),1);
+    await sendMessage(page);
+    await page.waitForFunction(()=>document.querySelectorAll('.timber-image-attachments img').length===0);
+    assert.equal(uploads,1);assert.equal(deliveries.length,2);assert.deepEqual(deliveries[0],deliveries[1]);
+    assert.equal(state.messages.get(BOT_A).filter(message=>message.text==='Inspect this image').length,1);
+
+  });
+});
+
+test('Retry sending clears only accepted image previews after a failed delivery', async () => {
+  await withPage(async ({page,login,state}) => {
+    const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=','base64');
+    let uploads=0;const deliveries=[];
+    await page.route('**/attachments/*',async route=>{uploads++;await route.fulfill({status:200,contentType:'application/json',body:'{}'});});
+    await page.route(`**/v1/bots/${BOT_A}/messages`,async route=>{
+      if(route.request().method()!=='POST') return route.continue();
+      deliveries.push(route.request().postDataJSON());
+      if(deliveries.length===1) {await route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:{message:'Try again'}})});} else await route.continue();
+    });
+    await login();await page.locator('input[type=file][accept="image/png,image/jpeg"]').setInputFiles({name:'retry.png',mimeType:'image/png',buffer:png});
+    await page.locator('#message').fill('Inspect this image');await sendMessage(page);
+    await page.locator('#message-form [role=alert]').waitFor();
+    assert.equal(await page.locator('.timber-image-attachments img').count(),1);
+    await page.getByRole('button',{name:'Retry sending',exact:true}).click();
+    await page.waitForFunction(()=>document.querySelectorAll('.timber-image-attachments img').length===0);
+    assert.equal(uploads,1);assert.equal(deliveries.length,2);assert.deepEqual(deliveries[0],deliveries[1]);
+    assert.equal(state.messages.get(BOT_A).filter(message=>message.text==='Inspect this image').length,1);
+
+  });
+});

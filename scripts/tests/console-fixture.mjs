@@ -123,7 +123,7 @@ export async function createConsoleFixture({port = 0} = {}) {
       if (tail === '/messages') {
         if (request.method === 'GET') {const snapshot = structuredClone(state.messages.get(id)); if (state.readsGate) await state.readsGate; return json({messages: snapshot});}
         if (state.messageGates.has(id)) await state.messageGates.get(id);
-        if (typeof body.text !== 'string' || !body.text.trim() || typeof body.operationId !== 'string' || !body.operationId) return json({error: {code: 'invalid_request', message: 'text and operationId are required.'}}, 400);
+        if (typeof body.text !== 'string' || (!body.text.trim() && !body.attachments?.length) || typeof body.operationId !== 'string' || !body.operationId) return json({error: {code: 'invalid_request', message: 'text and operationId are required.'}}, 400);
         const key = `${id}:${body.operationId}`, previous = state.messageOperations.get(key);
         if (previous) {
           if (previous.text !== body.text || JSON.stringify(previous.mentions || []) !== JSON.stringify(body.mentions || [])) return json({error: {code: 'operation_conflict', message: 'This operation ID belongs to another message.'}}, 409);

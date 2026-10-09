@@ -4,9 +4,11 @@ export interface Bot { id: string; name: string; instructions: string; runtime: 
 export interface MessageProvenance { kind: "bot" | "mention" | "delegation_result"; sourceBotId: string; sourceBotName: string; sourceRunId?: string; delegationId?: string; }
 export interface RunDelegation { id: string; sourceBotId: string; sourceRunId: string; path: string[]; }
 export interface AgentDelegation extends RunDelegation { sourceBotName: string; targetBotId: string; targetBotName: string; targetRunId?: string; status: RunStatus; createdAt: string; updatedAt: string; error?: string; }
-export interface Message { id: string; botId: string; runId?: string; role: "user" | "assistant" | "tool" | "system"; kind?: "progress" | "final"; text: string; provenance?: MessageProvenance; mentions?: string[]; createdAt: string; }
+export interface ImageAttachment { artifactId: string; mimeType: "image/png" | "image/jpeg"; size: number; }
+export interface Message { attachments?: ImageAttachment[]; id: string; botId: string; runId?: string; role: "user" | "assistant" | "tool" | "system"; kind?: "progress" | "final"; text: string; provenance?: MessageProvenance; mentions?: string[]; createdAt: string; }
 export interface Run { id: string; botId: string; operationId: string; status: RunStatus; delegation?: RunDelegation; subagentId?: string; parentRunId?: string; createdAt: string; updatedAt: string; error?: string; }
 export interface Subagent { id: string; name: string; task: string; parentOperationId: string; parentSubagentId?: string; operationId: string; status: "queued" | "running" | "waiting_approval" | "waiting_connection" | "completed" | "failed" | "cancelled"; createdAt: string; updatedAt: string; result?: string; error?: string; }
+
 /** A newest-first history page plus all currently active runs, independent of pagination. */
 export interface RunPage { runs: Run[]; activeRuns: Run[]; nextCursor: string | null; }
 export interface BotEvent { id: number; botId: string; runId?: string; type: string; data: Record<string, unknown>; createdAt: string; }

@@ -244,3 +244,8 @@
 .timber-chat-agents svg{height:13px;width:13px}
 .timber-chat-agents .status{font-size:10px;padding:1px 5px}
 @media(max-width:760px){.timber-mention-menu{left:10px;right:10px}.timber-selected-mentions button{min-height:32px;min-width:32px}.timber-chat-agents>button{min-height:40px}}
+
+.timber-image-attachments { display: flex; gap: 8px; flex-wrap: wrap; }
+.timber-image-attachments > div { position: relative; }
+.timber-image-attachments img { width: 72px; height: 72px; object-fit: cover; border-radius: 8px; }
+.timber-image-attachments button { position: absolute; right: 0; top: 0; background: var(--background, white); border-radius: 50%; }

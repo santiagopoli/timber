@@ -111,11 +111,11 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
       // Tests explicitly dispatch this durable intent; no wall-clock timer.
       await options.storage.put(`fixture-admission-retry:${operationId}`, {operationId, delayMs, dueAt: Date.now() + delayMs});
     },
-    async submit(text: string, input: {operationId: string}) {
+    async submit(text: string, input: {operationId: string;images?: {data:string;mimeType:string}[]}) {
       assertActive();
       fixtureEvents.set(input.operationId, (type, data) => emit(input.operationId, type, data));
       const existing = await options.storage.get(key(input.operationId));
-      if (!existing) await options.storage.put(key(input.operationId), {text, status: "queued"});
+      if (!existing) await options.storage.put(key(input.operationId), {text, images:input.images, status: "queued"});
       return {operationId: input.operationId, session: "1" as const, accepted: !existing};
     },
     wait(operationId: string) {

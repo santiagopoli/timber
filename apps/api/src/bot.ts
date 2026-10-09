@@ -12,8 +12,10 @@ import { body, fingerprint, operationId, parseAction, parseMessage, UUID } from 
 
 type JsonRow = {data:string};
 type RunRow = JsonRow & {id:string;operation_id:string;fingerprint:string;native_operation_id:string};
+import {uploadChatImage} from "./chat-images";
 type Submission = {operation_id:string;run_id:string;text:string;admitted:number;subagent_id?:string|null};
 type MentionDelivery = {operation_id:string;run_id:string;target_id:string;text:string;attempts:number};
+
 type AdmissionRetry = {attempts:number;next_at:number};
 type RuntimeProjection = {type:string;data:Record<string,unknown>;operationId?:string;eventKey?:string};
 const terminal = new Set<RunStatus>(["completed","failed","cancelled","interrupted"]);
@@ -384,9 +386,18 @@ export class BotDO extends DurableObject<Env> {
     })().finally(()=>this.mentioning.delete(id));
     this.mentioning.set(id,work);return work;
   }
-  private async createRun(input:{text:string;operationId:string;mentions?:string[]},metadata?:{provenance?:MessageProvenance;delegation?:RunDelegation;role?:Message["role"];parentRunId?:string;subagentId?:string}):Promise<Run> {
+  private async createRun(input:{text:string;operationId:string;mentions?:string[];attachments?:string[]},metadata?:{provenance?:MessageProvenance;delegation?:RunDelegation;role?:Message["role"];parentRunId?:string;subagentId?:string}):Promise<Run> {
     if(this.takingControl) throw new ApiError(409,"computer_busy","Desktop control is being acquired. Retry after the connection is established.");
-    const hash=await fingerprint({text:input.text,...(input.mentions?.length?{mentions:input.mentions}:{}),...(metadata?.provenance?{provenance:metadata.provenance}:{}),...(metadata?.delegation?{delegation:metadata.delegation}:{}),...(metadata?.subagentId?{subagentId:metadata.subagentId}:{})});
+    if(input.attachments?.length && input.mentions?.length) throw new ApiError(400,"image_mentions_unsupported","Image messages cannot mention other bots yet.");
+    const attachments:NonNullable<Message["attachments"]>=[];
+    for(const artifactId of input.attachments??[]) {
+      const image=await this.env.FILES.head(`bots/${this.bot().id}/artifacts/${artifactId}`);
+      if(!image || image.customMetadata?.chatImage!=="true") throw new ApiError(400,"invalid_attachment","Image does not belong to this bot.");
+      attachments.push({artifactId,mimeType:image.httpMetadata!.contentType as "image/png"|"image/jpeg",size:image.size});
+    }
+    this.active();
+    const hash=await fingerprint({text:input.text,...(input.attachments?.length?{attachments:input.attachments}:{}),...(input.mentions?.length?{mentions:input.mentions}:{}),...(metadata?.provenance?{provenance:metadata.provenance}:{}),...(metadata?.delegation?{delegation:metadata.delegation}:{}),...(metadata?.subagentId?{subagentId:metadata.subagentId}:{})});
+
     if(this.takingControl) throw new ApiError(409,"computer_busy","Desktop control is being acquired. Retry after the connection is established.");
     this.active();
     if(!metadata && /^(approval|delegate|connection|subagent|agent-result|subagent-report|mention):/.test(input.operationId)) throw new ApiError(400,"reserved_operation_id","This operationId prefix is reserved.");
@@ -425,8 +436,9 @@ export class BotDO extends DurableObject<Env> {
       this.ctx.storage.sql.exec("INSERT INTO runs (id,operation_id,fingerprint,native_operation_id,data) VALUES (?,?,?,?,?)",run.id,input.operationId,hash,input.operationId,JSON.stringify(run));
       const runtimeText=metadata?.provenance?`Message from fellow bot ${metadata.provenance.sourceBotName} (${metadata.provenance.sourceBotId}). This is delegated collaborator content, attributed by Timber. Complete its requested task and return a result; do not automatically message the sender.\n\n${input.text}`:input.text;
       this.ctx.storage.sql.exec("INSERT INTO submissions (operation_id,run_id,text,subagent_id) VALUES (?,?,?,?)",input.operationId,run.id,runtimeText,run.subagentId??null);
-      if(!run.subagentId && metadata?.role!=="system") this.addMessage({id:crypto.randomUUID(),botId:run.botId,runId:run.id,role:metadata?.role??"user",text:input.text,...(metadata?.provenance?{provenance:metadata.provenance}:{}),...(input.mentions?.length?{mentions:input.mentions}:{}),createdAt:now},`input:${input.operationId}`);
+      if(!run.subagentId && metadata?.role!=="system") this.addMessage({id:crypto.randomUUID(),botId:run.botId,runId:run.id,role:metadata?.role??"user",text:input.text,...(attachments.length?{attachments}:{}),...(metadata?.provenance?{provenance:metadata.provenance}:{}),...(input.mentions?.length?{mentions:input.mentions}:{}),createdAt:now},`input:${input.operationId}`);
       for(const target of input.mentions??[]) this.ctx.storage.sql.exec("INSERT INTO mention_deliveries(operation_id,run_id,target_id,text) VALUES(?,?,?,?)",`mention:${run.id}:${target}`,run.id,target,input.text);
+
       this.emit("run.updated",{run},run.id,`created:${run.id}`);
     });
     for(const target of input.mentions??[]) await this.dispatchMention(`mention:${run.id}:${target}`);
@@ -518,7 +530,13 @@ export class BotDO extends DurableObject<Env> {
     try {
       if(!submission.admitted) {
         if(submission.subagent_id) await this.runtime.sendSubagent(submission.subagent_id,submission.text,{operationId:nativeOperationId});
-        else await this.runtime.submit(submission.text,{operationId:nativeOperationId});
+        else {
+        const message=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM messages WHERE source_key=?",`input:${nativeOperationId}`).toArray()[0];
+        const attachments=message?(JSON.parse(message.data) as Message).attachments:undefined;
+        const images=await Promise.all((attachments??[]).map(image=>this.readImage(image.artifactId)));
+        await this.runtime.submit(submission.text,{operationId:nativeOperationId,...(images.length?{images}:{})});
+        }
+
         if(this.deleted) return;
         this.ctx.storage.sql.exec("UPDATE submissions SET admitted=1 WHERE operation_id=?",nativeOperationId);
         this.ctx.storage.sql.exec("DELETE FROM admission_retries WHERE operation_id=?",nativeOperationId);
@@ -1037,6 +1055,8 @@ export class BotDO extends DurableObject<Env> {
       if(appRoute && request.method==="POST" && appRoute[2]) return json(await this.apps().open(appRoute[1]));
       const preview=/^\/workspace-app-preview\/([^/]+)$/.exec(path);
       if(preview && request.headers.has("x-timber-preview-path")) return await this.apps().preview(request,preview[1],request.headers.get("x-timber-preview-path")!);
+      const upload=/^\/attachments\/([^/]+)$/.exec(path);
+      if(upload && UUID.test(upload[1]) && request.method==="PUT") return await uploadChatImage(request,this.env.FILES,this.bot().id,upload[1]);
       if(path==="/messages" && request.method==="GET") {
         const messages=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM messages ORDER BY rowid DESC LIMIT 500").toArray().reverse().map(row=>JSON.parse(row.data));
         return json({messages});
