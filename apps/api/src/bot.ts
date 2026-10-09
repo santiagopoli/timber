@@ -1422,7 +1422,7 @@ export class BotDO extends DurableObject<Env> {
       }
       this.configure(request);
       if(path==="/summary" && request.method==="GET") return json({summary:this.summary()});
-      if(["/context","/context/compact","/memory"].includes(path)) return await maintenanceRequest(request,path,this.runtime);
+      if(["/context","/context/compact","/memory"].includes(path)||path.startsWith('/memory/')) return await maintenanceRequest(request,path,this.runtime);
       this.ctx.waitUntil(this.recover());
       if(["/agent-messages","/agent-results","/agent-cancel"].includes(path)) {
         if(request.headers.get("x-timber-internal")!=="agents" || request.method!=="POST") throw new ApiError(403,"internal_only","This agent route is internal.");

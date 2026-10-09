@@ -1,5 +1,5 @@
 import type { DurableObject } from 'cloudflare:workers';
-import type { ModelCatalog, ModelSettings, Approval, Bot, BotContextStatus, BotMemory, CompactionReceipt, ComputerAction, ComputerResult } from '@botspace/contracts';
+import type { ModelCatalog, ModelSettings, Approval, Bot, BotContextStatus, BotMemory, MemoryEntry,MemoryRevision,MemorySearchResult,MemorySaveInput,MemoryForgetInput,MemoryAcceptInput,MemoryMutationResult,MemoryReviewStatus, CompactionReceipt, ComputerAction, ComputerResult } from '@botspace/contracts';
 import type { AISettings } from 'agents/models/pi-ai';
 
 export type PendingApproval = {
@@ -138,6 +138,13 @@ export interface AgentRuntime {
   compact(input: {operationId:string;instructions?:string}): Promise<CompactionReceipt>;
   memory(): Promise<BotMemory>;
   updateMemory(content:string,revision:number): Promise<BotMemory>;
+  memoryEntry(id:string):Promise<MemoryEntry>;
+  memoryHistory(id:string):Promise<MemoryRevision[]>;
+  searchMemory(query:string,limit?:number):Promise<MemorySearchResult>;
+  saveMemory(input:MemorySaveInput):Promise<MemoryMutationResult>;
+  forgetMemory(input:MemoryForgetInput):Promise<MemoryMutationResult>;
+  acceptMemory(input:MemoryAcceptInput):Promise<MemoryMutationResult>;
+  reviewMemory(input:{operationId:string}):Promise<MemoryReviewStatus>;
   dispose(): Promise<void>;
   /** Permanently fence new work and await quiescence before host storage deletion.
    * Rejects if shutdown exceeds its bounded wait; retain the tombstone and retry. */

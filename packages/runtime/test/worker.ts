@@ -20,6 +20,7 @@ export class HarnessProbe extends DurableObject {
   constructor(ctx: DurableObjectState, env: object) {
     super(ctx, env);
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS calls(id INTEGER PRIMARY KEY AUTOINCREMENT, input TEXT)');
+    ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS review_calls(id INTEGER PRIMARY KEY AUTOINCREMENT, input TEXT)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS tool_calls(id INTEGER PRIMARY KEY AUTOINCREMENT, input TEXT)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS host_calls(id INTEGER PRIMARY KEY AUTOINCREMENT, input TEXT)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS projected(id INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT)');
@@ -36,6 +37,10 @@ export class HarnessProbe extends DurableObject {
         {id:'gpt-6-astra',name:'Astra fixture',provider:'openai',reasoningEfforts:['high','ultra'],defaultReasoningEffort:'high',supportsFast:true,fastServiceTier:'priority',contextWindow:128_000,inputModalities:['text','image']},
       ]}), fetch: async request => {
         const input = await request.json<{ input: Record<string, unknown>[] }>();
+        if(isMemoryReview(input.input)) {
+          ctx.storage.sql.exec('INSERT INTO review_calls(input) VALUES(?)',JSON.stringify(input));
+          return memoryReviewResponse('responses');
+        }
         const call = ctx.storage.sql.exec<{id:number}>('INSERT INTO calls(input) VALUES(?) RETURNING id', JSON.stringify({ ...input, fixtureUrl: request.url, fixtureHeaders: Object.fromEntries(request.headers) })).one();
         if (input.input.filter(item => item.type === 'function_call_output').length === this.holdInferenceAfterToolCount) {
           // Match a real fetch: cancellation must release a held provider request.
@@ -51,6 +56,10 @@ export class HarnessProbe extends DurableObject {
         return responsesFixture(input,call.id);
       } },
       ai: { run: async (_model: string, input: { messages: { role: string; content: unknown }[] }) => {
+        if(isMemoryReview(input.messages)) {
+          ctx.storage.sql.exec('INSERT INTO review_calls(input) VALUES(?)',JSON.stringify(input));
+          return memoryReviewResponse('chat-completions');
+        }
         ctx.storage.sql.exec('INSERT INTO calls(input) VALUES(?)', JSON.stringify(input));
         const user = input.messages.filter(message => message.role === 'user').at(-1);
         const text = JSON.stringify(user?.content);
@@ -180,12 +189,37 @@ export class HarnessProbe extends DurableObject {
     if (path === '/inspect') return Response.json({
       messages: await this.runtime.messages(),
       calls: ctxRows(this.ctx.storage, 'SELECT input FROM calls'),
+      reviewCalls: ctxRows(this.ctx.storage, 'SELECT input FROM review_calls'),
       toolCalls: ctxRows(this.ctx.storage, 'SELECT input FROM tool_calls'),
       hostCalls: ctxRows(this.ctx.storage, 'SELECT input FROM host_calls'),
       events: ctxRows(this.ctx.storage, 'SELECT event FROM projected'),
     });
     return new Response('Not found', { status: 404 });
   }
+}
+/** Maintenance is real inference, recorded separately from conversational retry counts. */
+function isMemoryReview(messages: {role?:unknown;content?:unknown}[]):boolean {
+  return messages.some(message=>['system','developer'].includes(String(message.role))&&JSON.stringify(message.content)?.includes('TIMBER_MEMORY_REVIEW_V1'));
+}
+function memoryReviewResponse(protocol:'responses'|'chat-completions'):Response {
+  const text=JSON.stringify({candidates:[]});
+  if(protocol==='chat-completions') {
+    const chunks=[
+      {id:'review-fixture',object:'chat.completion.chunk',choices:[{index:0,delta:{role:'assistant',content:text},finish_reason:null}]},
+      {id:'review-fixture',object:'chat.completion.chunk',choices:[{index:0,delta:{},finish_reason:'stop'}],usage:{prompt_tokens:10,completion_tokens:8,total_tokens:18}},
+    ];
+    return new Response(chunks.map(chunk=>`data: ${JSON.stringify(chunk)}\n\n`).join('')+'data: [DONE]\n\n',{headers:{'content-type':'text/event-stream'}});
+  }
+  const item={type:'message',id:'msg_review_fixture',role:'assistant',status:'completed',content:[{type:'output_text',text,annotations:[]}]};
+  const response={id:'resp_review_fixture',object:'response',status:'completed',output:[item],usage:{input_tokens:10,output_tokens:8,total_tokens:18}};
+  const events=[
+    {type:'response.created',response:{...response,status:'in_progress',output:[]}},
+    {type:'response.output_item.added',output_index:0,item:{...item,content:[],status:'in_progress'}},
+    {type:'response.output_text.delta',output_index:0,content_index:0,delta:text},
+    {type:'response.output_item.done',output_index:0,item},
+    {type:'response.completed',response},
+  ];
+  return new Response(events.map(event=>`data: ${JSON.stringify(event)}\n\n`).join(''),{headers:{'content-type':'text/event-stream'}});
 }
 function ctxRows(storage: DurableObjectStorage, query: string) { return storage.sql.exec(query).toArray(); }
 export default {
