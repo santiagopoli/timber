@@ -278,16 +278,11 @@ export const PromptInputProvider = ({
       return;
     }
 
-    setAttachmentFiles((prev) => [
-      ...prev,
-      ...incoming.map((file) => ({
-        filename: file.name,
-        id: nanoid(),
-        mediaType: file.type,
-        type: "file" as const,
-        url: attachmentUrl(file),
-      })),
-    ]);
+    const next = incoming.map((file) => ({
+      filename: file.name, id: nanoid(), mediaType: file.type,
+      type: "file" as const, url: attachmentUrl(file),
+    }));
+    setAttachmentFiles((prev) => [...prev, ...next]);
   }, []);
 
   const remove = useCallback((id: string) => {
@@ -503,6 +498,7 @@ export type PromptInputProps = Omit<
 > & {
   // e.g., "image/*" or leave undefined for any
   accept?: string;
+  disabled?: boolean;
   multiple?: boolean;
   // When true, accepts drops anywhere on document. Default false (opt-in).
   globalDrop?: boolean;
@@ -524,6 +520,7 @@ export type PromptInputProps = Omit<
 
 export const PromptInput = ({
   className,
+  disabled = false,
   accept,
   multiple,
   globalDrop,
@@ -538,10 +535,16 @@ export const PromptInput = ({
   // Try to use a provider controller if present
   const controller = useOptionalPromptInputController();
   const usingProvider = !!controller;
+  const controllerRef = useRef(controller);
+  controllerRef.current = controller;
 
   // Refs
   const inputRef = useRef<HTMLInputElement | null>(null);
   const formRef = useRef<HTMLFormElement | null>(null);
+  const submittingRef = useRef(false);
+  const disabledRef = useRef(disabled);
+  disabledRef.current = disabled;
+  const mutationsBlocked = () => disabledRef.current || submittingRef.current;
 
   // ----- Local attachments (only used when no provider)
   const [items, setItems] = useState<(FileUIPart & { id: string })[]>([]);
@@ -560,7 +563,7 @@ export const PromptInput = ({
   }, [files]);
 
   const openFileDialogLocal = useCallback(() => {
-    inputRef.current?.click();
+    if (!mutationsBlocked()) inputRef.current?.click();
   }, []);
 
   const matchesAccept = useCallback(
@@ -588,6 +591,7 @@ export const PromptInput = ({
 
   const addLocal = useCallback(
     (fileList: File[] | FileList) => {
+      if (mutationsBlocked()) return;
       const incoming = [...fileList];
       const accepted = incoming.filter((f) => matchesAccept(f));
       if (incoming.length && accepted.length === 0) {
@@ -608,50 +612,32 @@ export const PromptInput = ({
         return;
       }
 
-      setItems((prev) => {
-        const capacity =
-          typeof maxFiles === "number"
-            ? Math.max(0, maxFiles - prev.length)
-            : undefined;
-        const capped =
-          typeof capacity === "number" ? sized.slice(0, capacity) : sized;
-        if (typeof capacity === "number" && sized.length > capacity) {
-          onError?.({
-            code: "max_files",
-            message: "Too many files. Some were not added.",
-          });
-        }
-        const next: (FileUIPart & { id: string })[] = [];
-        for (const file of capped) {
-          next.push({
-            filename: file.name,
-            id: nanoid(),
-            mediaType: file.type,
-            type: "file",
-            url: attachmentUrl(file),
-          });
-        }
-        return [...prev, ...next];
+      const capacity = typeof maxFiles === "number"
+        ? Math.max(0, maxFiles - filesRef.current.length) : sized.length;
+      if (sized.length > capacity) onError?.({
+        code: "max_files", message: "Too many files. Some were not added.",
       });
+      const next = sized.slice(0, capacity).map(file => ({
+        filename: file.name, id: nanoid(), mediaType: file.type,
+        type: "file" as const, url: attachmentUrl(file),
+      }));
+      filesRef.current = [...filesRef.current, ...next];
+      setItems(filesRef.current);
     },
     [matchesAccept, maxFiles, maxFileSize, onError]
   );
 
-  const removeLocal = useCallback(
-    (id: string) =>
-      setItems((prev) => {
-        const found = prev.find((file) => file.id === id);
-        if (found?.url) {
-          revokeAttachmentUrl(found.url);
-        }
-        return prev.filter((file) => file.id !== id);
-      }),
-    []
-  );
+  const removeLocal = useCallback((id: string) => {
+    const found = filesRef.current.find(file => file.id === id);
+    if (found?.url) revokeAttachmentUrl(found.url);
+    filesRef.current = filesRef.current.filter(file => file.id !== id);
+    setItems(filesRef.current);
+  }, []);
 
   // Wrapper that validates files before calling provider's add
   const addWithProviderValidation = useCallback(
     (fileList: File[] | FileList) => {
+      if (mutationsBlocked()) return;
       const incoming = [...fileList];
       const accepted = incoming.filter((f) => matchesAccept(f));
       if (incoming.length && accepted.length === 0) {
@@ -719,17 +705,14 @@ export const PromptInput = ({
     ? controller.attachments.openFileDialog
     : openFileDialogLocal;
 
-  const clear = useCallback(() => {
-    clearAttachments();
-    clearReferencedSources();
-  }, [clearAttachments, clearReferencedSources]);
+
 
   // Let provider know about our hidden file input so external menus can call openFileDialog()
   useEffect(() => {
     if (!usingProvider) {
       return;
     }
-    controller.__registerFileInput(inputRef, () => inputRef.current?.click());
+    controller.__registerFileInput(inputRef, () => { if (!mutationsBlocked()) inputRef.current?.click(); });
   }, [usingProvider, controller]);
 
   // Note: File input cannot be programmatically set for security reasons
@@ -864,11 +847,9 @@ export const PromptInput = ({
             return (formData.get("message") as string) || "";
           })();
 
-      // Reset form immediately after capturing text to avoid race condition
-      // where user input during async blob conversion would be lost
-      if (!usingProvider) {
-        form.reset();
-      }
+      if (mutationsBlocked()) return;
+      submittingRef.current = true;
+      const submittedIds = files.map(file => file.id);
 
       try {
         // Convert blob URLs to data URLs asynchronously
@@ -876,7 +857,8 @@ export const PromptInput = ({
           files.map(async (item) => {
             if (item.url?.startsWith("blob:")) {
               const dataUrl = await convertBlobUrlToDataUrl(item.url);
-              // If conversion failed, keep the original blob URL
+              if (!dataUrl) throw new Error("Image could not be read. Please attach it again.");
+              // Never submit an unreadable blob URL
               return {
                 ...item,
                 url: dataUrl ?? item.url,
@@ -886,31 +868,22 @@ export const PromptInput = ({
           })
         );
 
-        const result = onSubmit({ files: convertedFiles, text }, event);
-
-        // Handle both sync and async onSubmit
-        if (result instanceof Promise) {
-          try {
-            await result;
-            clear();
-            if (usingProvider) {
-              controller.textInput.clear();
-            }
-          } catch {
-            // Don't clear on error - user may want to retry
-          }
+        await onSubmit({ files: convertedFiles, text }, event);
+        // Clear only the submitted selection, never files added meanwhile.
+        for (const id of submittedIds) remove(id);
+        if (usingProvider) {
+          if (controllerRef.current?.textInput.value === text) controllerRef.current.textInput.clear();
         } else {
-          // Sync function completed without throwing, clear inputs
-          clear();
-          if (usingProvider) {
-            controller.textInput.clear();
-          }
+          const input = form.elements.namedItem("message");
+          if (input instanceof HTMLTextAreaElement && input.value === text) form.reset();
         }
       } catch {
-        // Don't clear on error - user may want to retry
+        // Preserve text and images on conversion/upload/delivery failure.
+      } finally {
+        submittingRef.current = false;
       }
     },
-    [usingProvider, controller, files, onSubmit, clear]
+    [usingProvider, controller, files, onSubmit, remove]
   );
 
   // Render with or without local provider
@@ -918,6 +891,7 @@ export const PromptInput = ({
     <>
       <input
         accept={accept}
+        disabled={disabled}
         aria-label="Upload files"
         className="hidden"
         multiple={multiple}
@@ -978,6 +952,7 @@ export const PromptInputTextarea = ({
   const handleKeyDown: KeyboardEventHandler<HTMLTextAreaElement> = useCallback(
     (e) => {
       // Call the external onKeyDown handler first
+      if (props.disabled) return;
       onKeyDown?.(e);
 
       // If the external handler prevented default, don't run internal logic
@@ -1019,11 +994,12 @@ export const PromptInputTextarea = ({
         }
       }
     },
-    [onKeyDown, isComposing, attachments]
+    [onKeyDown, isComposing, attachments, props.disabled]
   );
 
   const handlePaste: ClipboardEventHandler<HTMLTextAreaElement> = useCallback(
     (event) => {
+      if (props.disabled) return;
       const items = event.clipboardData?.items;
 
       if (!items) {
@@ -1046,7 +1022,7 @@ export const PromptInputTextarea = ({
         attachments.add(files);
       }
     },
-    [attachments]
+    [attachments, props.disabled]
   );
 
   const handleCompositionEnd = useCallback(() => setIsComposing(false), []);

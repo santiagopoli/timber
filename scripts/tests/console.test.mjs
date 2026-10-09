@@ -1916,7 +1916,7 @@ test('promptbox attaches, pastes and drops images; removes previews and sends im
       document.querySelector('#message-form').dispatchEvent(new DragEvent('drop',{bubbles:true,cancelable:true,dataTransfer:transfer}));
     },[...png]);
     assert.equal(await page.locator('.timber-image-attachments img').count(),3);
-    await page.getByRole('button',{name:'Remove image'}).first().click();
+    await page.getByRole('button',{name:'Remove picked.png',exact:true}).click();
     assert.equal(await page.locator('.timber-image-attachments img').count(),2);
     await sendMessage(page);
     await page.waitForFunction(()=>document.querySelectorAll('.timber-image-attachments img').length===0);

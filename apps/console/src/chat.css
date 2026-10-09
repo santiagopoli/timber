@@ -39,7 +39,7 @@
 .timber-composer-wrap{flex:none;width:100%;max-width:var(--chat-width);margin:0 auto;padding:8px 28px 14px;background:var(--background)}
 .timber-composer{border:1px solid var(--line);border-radius:26px;background:var(--soft);box-shadow:none;overflow:hidden}
 .timber-composer:focus-within{border-color:color-mix(in srgb,var(--ink) 35%,var(--line))}
-.timber-composer>[data-slot="input-group"]{display:flex;flex-direction:row;align-items:flex-end;gap:0;border:0;border-radius:0;box-shadow:none;outline:0;min-height:52px;height:auto;background:transparent;padding:0}
+.timber-composer>[data-slot="input-group"]{display:flex;flex-direction:column;align-items:stretch;gap:0;border:0;border-radius:0;box-shadow:none;outline:0;min-height:52px;height:auto;background:transparent;padding:0}
 .timber-composer textarea{flex:1;min-width:0;width:0;padding:14px 6px 14px 18px;min-height:52px;max-height:160px;resize:none;background:transparent;border:0;border-radius:0;box-shadow:none;font-size:16px;line-height:24px;field-sizing:content;outline:0;box-sizing:border-box}
 .timber-composer textarea:focus{outline:0;box-shadow:none}
 .timber-composer textarea::placeholder{color:var(--muted);opacity:1}
@@ -249,17 +249,21 @@
 .timber-chat-agents .status{font-size:10px;padding:1px 5px}
 @media(max-width:760px){.timber-mention-menu{left:10px;right:10px}.timber-selected-mentions button{min-height:32px;min-width:32px}.timber-chat-agents>button{min-height:40px}}
 
-.timber-image-attachments { display: flex; gap: 8px; flex-wrap: wrap; }
-.timber-image-attachments > div { position: relative; }
-.timber-image-attachments img { width: 72px; height: 72px; object-fit: cover; border-radius: 8px; }
-.timber-image-attachments button { position: absolute; right: 0; top: 0; background: var(--background, white); border-radius: 50%; }
-
-/* Attachment is a peer icon control, not a competing text CTA. */
-.timber-composer .timber-attach{order:-1;align-self:flex-end;flex:none;border:0;border-radius:50%;width:38px;height:38px;min-width:38px;min-height:38px;padding:9px;margin:7px 0 7px 7px;color:var(--ink);background:transparent;box-shadow:none}
-.timber-composer .timber-attach:hover:not(:disabled){background:var(--surface)}
+/* Attachments sit above the draft, never compete with its text width. */
+.timber-composer-row{display:flex;align-items:flex-end;width:100%;min-width:0}
+.timber-image-attachments{display:flex;gap:10px;overflow-x:auto;max-width:100%;padding:14px 16px 4px;scrollbar-width:thin}
+.timber-image-attachment{position:relative;flex:none;width:76px;height:76px}
+.timber-image-attachment img{display:block;width:100%;height:100%;object-fit:cover;border:1px solid var(--line);border-radius:12px;background:var(--surface)}
+.timber-image-remove{position:absolute;right:-5px;top:-5px;display:flex;align-items:center;justify-content:center;width:26px;height:26px;min-height:26px;padding:5px;border:1px solid var(--line);border-radius:50%;background:var(--surface);color:var(--ink);box-shadow:0 2px 6px #0002;cursor:pointer}
+.timber-image-remove svg{width:14px;height:14px}
+.timber-image-remove:hover:not(:disabled){background:var(--soft)}
+.timber-image-remove:disabled{opacity:.4;cursor:default}
+.timber-composer .timber-attach{align-self:flex-end;flex:none;width:38px;height:38px;min-width:38px;min-height:38px;margin:7px 0;padding:9px;border:0;border-radius:50%;background:transparent;color:var(--muted);box-shadow:none}
 .timber-composer .timber-attach svg{width:20px;height:20px}
-.timber-composer .timber-attach:disabled{opacity:.28}
-.timber-composer:has(.timber-attach) textarea{padding-left:10px}
-@media(max-width:760px){.timber-composer .timber-attach{width:44px;height:44px;min-width:44px;min-height:44px;margin:5px 0 5px 5px}}
+.timber-composer .timber-attach:hover:not(:disabled){color:var(--ink);background:color-mix(in srgb,var(--ink) 8%,transparent)}
+.timber-composer .timber-attach:disabled{opacity:.35;cursor:default}
+.timber-attachment-status,.timber-attachment-error{padding:0 18px 12px;font-size:11px;line-height:1.5;color:var(--muted);overflow-wrap:anywhere}
+.timber-attachment-error{color:var(--danger)}
+@media(max-width:600px){.timber-composer .timber-attach{width:44px;height:44px;min-width:44px;min-height:44px;margin:5px 0}.timber-image-remove{width:32px;height:32px;min-height:32px}.timber-image-attachments{padding-top:16px;gap:12px}}
 .timber-composer .timber-attach,.timber-composer .timber-send{display:inline-flex;align-items:center;justify-content:center;line-height:1;padding:0}
 .timber-composer .timber-attach svg,.timber-composer .timber-send svg{display:block;flex:none}

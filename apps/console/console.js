@@ -60,7 +60,7 @@ import './src/layout.css';
       const message = run && messages.find(item => item.role === 'user' && item.runId === run.id);
       const delivery = pendingMessages.get(operationId);
       if (run && (message || delivery?.botId === botId)) { void retryAdmission(botId, run, message ? message.text : delivery.text, message?.mentions || delivery?.mentions); return; }
-      if (delivery?.botId === botId) void sendMessage(botId, delivery.text, operationId);
+      if (delivery?.botId === botId) void sendMessage(botId, delivery.text, operationId, delivery.mentions || [], delivery.files || []).catch(() => {});
     },
     onDecision: (botId, approvalId, decision, allowComputer) => { if (selected?.id !== botId) return; const approval = approvals.find(item => item.id === approvalId); if (approval) void decideApproval(botId, approval, decision, allowComputer); },
     onClearFilter: () => { runFilter = null; renderMessages(); },
@@ -166,7 +166,7 @@ import './src/layout.css';
     stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId=null; generation++; authSession++; authenticated = false; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
     selected = null; currentRun = null; stoppableRun = null; bots = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
     clearTimeout(botSummaryTimer);botSummaries.clear();botSummaryLoading=false;botSummaryPending=false;botRenderKey='';
-    removedBots.clear(); deletionPending.clear(); deleteTarget = null; deleteBusy = false; editBotId = null; drafts.clear(); draftMentions.clear(); pendingMessages.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); connectionWork.clear(); appWork.clear(); closeDialogs(); clearScreen();
+    removedBots.clear(); deletionPending.clear(); deleteTarget = null; deleteBusy = false; editBotId = null; drafts.clear(); draftMentions.clear(); pendingMessages.clear(); acceptedImageIds.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); connectionWork.clear(); appWork.clear(); closeDialogs(); clearScreen();
     chatGPTConnected = false; chatGPTAccount = null; chatGPTBusy = false;
     modelCatalog={models:[],connected:false,defaultModel:''};modelCatalogLoading=false;modelCatalogError='';modelCatalogRequest++;modelSettingsWork.clear();
     chat.clear(); activity.clear(); $('toggle-bots').hidden = true;
@@ -307,7 +307,7 @@ import './src/layout.css';
   const acceptedImageIds = new Map();
   function acceptDeliveryImages(delivery) {
     const ids=(delivery.files || []).map(file=>file.id).filter(Boolean);
-    if(ids.length) acceptedImageIds.set(delivery.botId, ids);
+    if(ids.length) acceptedImageIds.set(delivery.botId, [...new Set([...(acceptedImageIds.get(delivery.botId) || []), ...ids])]);
   }
   function reconcileDeliveries(serverRuns = []) {
     for (const [operationId, delivery] of pendingMessages) {
@@ -315,9 +315,9 @@ import './src/layout.css';
       const run = serverRuns.find(item => item.operationId === operationId);
       if (run) {
         const newlyAccepted = delivery.state !== 'accepted';
-        acceptDeliveryImages(delivery);
+        if (newlyAccepted) acceptDeliveryImages(delivery);
         delivery.runId = run.id; delivery.runStatus = run.status; delivery.state = 'accepted'; delete delivery.error;
-        if (newlyAccepted && (drafts.get(delivery.botId) || '').trim() === delivery.text) {drafts.delete(delivery.botId);draftMentions.delete(delivery.botId);}
+        if (newlyAccepted && (drafts.get(delivery.botId) || '').trim() === delivery.text && JSON.stringify(draftMentions.get(delivery.botId) || []) === JSON.stringify(delivery.mentions || [])) {drafts.delete(delivery.botId);draftMentions.delete(delivery.botId);}
       }
       if (delivery.runId && messages.some(message => message.role === 'user' && message.runId === delivery.runId)) pendingMessages.delete(operationId);
     }
@@ -383,7 +383,7 @@ import './src/layout.css';
       if (!run || typeof run.id !== 'string' || !run.id || run.botId !== botId || run.operationId !== delivery.operationId || !['queued', 'running', 'waiting_approval', 'waiting_connection', ...terminal].includes(run.status)) throw new Error('The server acknowledgment could not be verified. Your message may have been accepted. Retry sending to check the same request safely.');
       acceptDeliveryImages(delivery);
       delivery.state = 'accepted'; delivery.runId = run.id; delivery.runStatus = run.status;
-      if ((drafts.get(botId) || '').trim() === text) {drafts.delete(botId);draftMentions.delete(botId);}
+      if ((drafts.get(botId) || '').trim() === text && JSON.stringify(draftMentions.get(botId) || []) === JSON.stringify(delivery.mentions || [])) {drafts.delete(botId);draftMentions.delete(botId);}
       if (selected?.id === botId) { mergeRun(run); if (!terminal.has(run.status)) activeRunIds.add(run.id); runRevision++; runFilter = null; reconcileDeliveries([run]); renderRuns(); scheduleRefresh(generation); }
     } catch (error) {
       if (session !== authSession || error.name === 'AbortError' || delivery.runId) return;

@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
-import { PlusIcon, ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon, HistoryIcon, SquareIcon } from 'lucide-react';
+import { XIcon, PaperclipIcon, ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon, HistoryIcon, SquareIcon } from 'lucide-react';
 import { useStickToBottomContext } from 'use-stick-to-bottom';
 import { defaultUrlTransform, type UrlTransform } from 'streamdown';
 import { Conversation, ConversationContent, ConversationEmptyState, ConversationScrollButton } from '@/components/ai-elements/conversation';
@@ -462,18 +462,22 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
   </>;
 }
 
-function ImageControls({sending,hasText,acceptedIds}: {sending:boolean;hasText:boolean;acceptedIds?:string[]}) {
+function ImageControls({sending,hasText,acceptedIds,children}: {sending:boolean;hasText:boolean;acceptedIds?:string[];children:ReactNode}) {
   const attachments=usePromptInputAttachments();
   useEffect(()=>{
     for(const id of acceptedIds??[]) if(attachments.files.some(file=>file.id===id)) attachments.remove(id);
   },[acceptedIds,attachments]);
+  const full = attachments.files.length >= 4;
   return <>
-    <div className="timber-image-attachments">{attachments.files.map(file=><div key={file.id}>
+    {attachments.files.length > 0 && <div className="timber-image-attachments" aria-label="Attached images">{attachments.files.map(file=><div key={file.id} className="timber-image-attachment">
       <img src={file.url} alt={file.filename || 'Attached image'} />
-      <button type="button" aria-label="Remove image" disabled={sending} onClick={()=>attachments.remove(file.id)}>×</button>
-    </div>)}</div>
-    <Button type="button" variant="ghost" size="icon" className="timber-attach" disabled={sending} aria-label="Attach images" title="Attach images" onClick={()=>attachments.openFileDialog()}><PlusIcon aria-hidden="true" /></Button>
-    <PromptInputSubmit className="timber-send" aria-label="Send message" title="Send message" disabled={sending || (!hasText && !attachments.files.length)}>{sending ? <LoaderCircleIcon className="timber-spinner" /> : <ArrowUpIcon />}</PromptInputSubmit>
+      <button className="timber-image-remove" type="button" aria-label={`Remove ${file.filename || 'image'}`} title={`Remove ${file.filename || 'image'}`} disabled={sending} onClick={()=>attachments.remove(file.id)}><XIcon aria-hidden="true" /></button>
+    </div>)}</div>}
+    <div className="timber-composer-row">{children}
+      <Button className="timber-attach" type="button" variant="ghost" size="icon" disabled={sending || full} aria-label="Attach images" title={full ? 'Maximum 4 images attached' : 'Attach images · PNG or JPEG, up to 5 MB each'} onClick={()=>attachments.openFileDialog()}><PaperclipIcon aria-hidden="true" /></Button>
+      <PromptInputSubmit className="timber-send" aria-label="Send message" title="Send message" disabled={sending || (!hasText && !attachments.files.length)}>{sending ? <LoaderCircleIcon className="timber-spinner" aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}</PromptInputSubmit>
+    </div>
+    {attachments.files.length > 0 && <div className="timber-attachment-status" role="status">{sending ? 'Sending images…' : `${attachments.files.length} of 4 images · Ready to send`}</div>}
   </>;
 }
 
@@ -531,13 +535,13 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
       </div>}
       {selectedMentions.length > 0 && <div className="timber-selected-mentions" aria-label="Message recipients">{selectedMentions.map(bot => <span key={bot.id}>To {mentionName(bot)}<button type="button" aria-label={`Remove ${mentionName(bot)} recipient`} onClick={() => callbacks.onDraft(model.bot.id, model.draft, model.draftMentions.filter(id => id !== bot.id))}>×</button></span>)}</div>}
       <div className="timber-composer-controls"><ModelSettings value={model.bot} state={model.modelSettings} disabled={model.sending} onChange={value=>callbacks.onModelSettings(model.bot.id,value)} onRefresh={callbacks.onRefreshModels}/><ContextMemoryControl botId={model.bot.id} request={callbacks.onContextRequest} refreshKey={model.events.at(-1)?.id}/></div>
-      <PromptInput id="message-form" className="timber-composer" accept="image/png,image/jpeg" multiple maxFiles={4} maxFileSize={5_000_000} onError={error=>setAttachmentError(error.message)} onReset={event => event.preventDefault()} onSubmit={async ({text,files}) => {
+      <PromptInput id="message-form" className="timber-composer" disabled={model.sending} accept="image/png,image/jpeg" multiple maxFiles={4} maxFileSize={5_000_000} onError={error=>setAttachmentError(error.message)} onReset={event => event.preventDefault()} onSubmit={async ({text,files}) => {
         if(model.sending || (!text.trim() && !files.length)) throw new Error('Not ready');
         if(files.length && selectedMentions.length) {setAttachmentError('Image messages cannot mention other bots yet.');throw new Error('Unsupported recipients');}
         setAttachmentError('');
-        try {await callbacks.onSend(model.bot.id,text,selectedMentions.map(bot=>bot.id),files);} catch {setAttachmentError('Images were not delivered. Retry sending to check the same request safely.');throw new Error('Not delivered');}
+        try {await callbacks.onSend(model.bot.id,text,selectedMentions.map(bot=>bot.id),files);} catch {setAttachmentError(`${files.length ? 'Images were' : 'Message was'} not delivered. Retry sending to check the same request safely.`);throw new Error('Not delivered');}
       }}>
-        <PromptInputBody><PromptInputTextarea ref={textarea} id="message" rows={1} aria-label={`Message ${model.bot.name}`} placeholder={`Message ${model.bot.name} · @ to mention a bot`} value={model.draft}
+        <PromptInputBody><ImageControls sending={model.sending} hasText={!!model.draft.trim()} acceptedIds={model.acceptedImageIds}><PromptInputTextarea ref={textarea} id="message" rows={1} aria-label={`Message ${model.bot.name}`} placeholder={`Message ${model.bot.name} · @ to mention a bot`} value={model.draft}
           aria-autocomplete="list" aria-controls={choices.length ? 'bot-mentions' : undefined} aria-expanded={choices.length > 0} aria-activedescendant={choices.length ? `mention-${choices[Math.min(mentionIndex, choices.length - 1)].id}` : undefined}
           onChange={event => {pendingCaret.current=null;setCaret(event.currentTarget.selectionStart);setMentionIndex(0);setDismissed(false);callbacks.onDraft(model.bot.id, event.currentTarget.value);}}
           onSelect={event => setCaret(event.currentTarget.selectionStart)}
@@ -547,7 +551,7 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
             else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {event.preventDefault();setMentionIndex(index => (index + (event.key === 'ArrowDown' ? 1 : choices.length - 1)) % choices.length);}
             else if (event.key === 'Enter' && !event.shiftKey || event.key === 'Tab') {event.preventDefault();chooseMention(choices[Math.min(mentionIndex, choices.length - 1)]);}
           }} />
-          <ImageControls sending={model.sending} hasText={!!model.draft.trim()} acceptedIds={model.acceptedImageIds} />{attachmentError && <div role="alert">{attachmentError}</div>}
+          </ImageControls>{attachmentError && <div className="timber-attachment-error" role="alert">{attachmentError}</div>}
 
         </PromptInputBody>
       </PromptInput>
