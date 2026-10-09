@@ -28,6 +28,9 @@ export interface RuntimeToolRequest {
   operationId: string;
   /** The original user submission, used to attach approvals to the right run. */
   runOperationId: string;
+  /** Temporary child identity and its own durable input, when dispatched by a child. */
+  subagentId?: string;
+  subagentOperationId?: string;
   /** Opaque display correlation only; never use this as the computer journal identity. */
   toolCallId?: string;
   action: ComputerAction;
@@ -43,6 +46,8 @@ export interface RuntimeTools {
 export interface RuntimeHostToolRequest {
   operationId: string;
   runOperationId: string;
+  subagentId?: string;
+  subagentOperationId?: string;
   toolCallId?: string;
   name: string;
   arguments: Record<string, unknown>;
@@ -62,6 +67,19 @@ export interface RuntimeMessage {
   kind?: 'progress' | 'final';
   createdAt?: string;
 }
+export type RuntimeSubagent = {
+  id: string;
+  name: string;
+  task: string;
+  parentOperationId: string;
+  parentSubagentId?: string;
+  operationId: string;
+  status: 'queued' | 'running' | 'waiting_approval' | 'waiting_connection' | 'completed' | 'failed' | 'cancelled';
+  createdAt: string;
+  updatedAt: string;
+  result?: string;
+  error?: string;
+};
 /** Current host metadata only: never commands, arguments, results, or credentials. */
 export interface RuntimeApprovalSummary {
   id: string;
@@ -83,6 +101,8 @@ export interface PiRuntimeOptions<Env extends object> {
   getApprovalContext?(): Promise<RuntimeApprovalContext>;
   tools: RuntimeTools;
   onEvent?(event: RuntimeEvent): void | Promise<void>;
+  /** Admit an attributed, deduplicated parent continuation through host run policy. */
+  onSubagentMessage?(input: { subagentId: string; parentOperationId: string; operationId: string; text: string }): Promise<void>;
   /** Wake the host's durable input outbox; attempts and backoff remain host-owned. */
   onAdmissionRetry?(operationId: string): Promise<void>;
   defaultModel?: string;
@@ -106,6 +126,10 @@ export interface AgentRuntime {
   cancel(operationId?: string): Promise<boolean>;
   operation(operationId: string): Promise<RuntimeOperation>;
   messages(): Promise<RuntimeMessage[]>;
+  subagents(): Promise<RuntimeSubagent[]>;
+  subagentMessages(id: string): Promise<RuntimeMessage[]>;
+  sendSubagent(id: string, text: string, input: { operationId: string }): Promise<RuntimeReceipt>;
+  cancelSubagent(id: string): Promise<boolean>;
   dispose(): Promise<void>;
   /** Permanently fence new work and await quiescence before host storage deletion.
    * Rejects if shutdown exceeds its bounded wait; retain the tombstone and retry. */

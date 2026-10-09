@@ -11,6 +11,9 @@ function tool(name:string,description:string,properties:Record<string,unknown>,r
   return {name,description,inputSchema:{type:'object',properties,required,additionalProperties:false}};
 }
 export const hostTools:HostToolDefinition[] = [
+  tool('list_bots','List the owner’s persistent named bots and their IDs, so you can choose a recipient for send_to_bot.',{},[]),
+  tool('create_bot','Create a persistent named bot. Requires this bot’s Allow named agents setting. The new bot starts with computer approval required and named-agent creation disabled. Use a temporary subagent for one-off work.',{name:text,instructions:text},['name']),
+  tool('send_to_bot','Send a task or message asynchronously to another named bot. Returns a durable delegation receipt; its result is delivered to this conversation when ready. Use list_bots for IDs. Do not resend while waiting. Delegation paths cannot revisit a bot.',{botId:text,text},['botId','text']),
   tool('load_skill','Load reusable task instructions. Skills do not grant permissions.',{name:{type:'string',enum:['github-development','workspace-apps']}},['name']),
   tool('github_connect','Connect GitHub to the Timber account, shared by all bots, without choosing a repository: call with {}. The user chooses accessible repositories in GitHub. Optionally supply repository and permission to verify access for a repository task; use write for push/PR and read for inspection. Never require a repository just to connect an account.',{repository:text,permission:{type:'string',enum:['read','write']}},[]),
   tool('github_list_repositories','List repositories visible through the Timber account’s shared GitHub integration. Connects the account inline if needed; no repository required. Returns up to 100 per page, with nextPage when more exist. Repository selection and permissions come from the GitHub installation and are shared by the owner’s bots.',{page:{type:'integer',minimum:1,maximum:10000}},[]),

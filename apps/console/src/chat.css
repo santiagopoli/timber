@@ -227,3 +227,20 @@
 @media(prefers-reduced-motion:reduce){.timber-spinner{animation:none}.timber-chat *{scroll-behavior:auto;transition:none!important}}
 
 .timber-save-warning{color:#bd9e65;font-size:12px;line-height:1.6;overflow-wrap:anywhere}@media(prefers-color-scheme:light){.timber-save-warning{color:#866316}}
+.timber-composer-wrap{position:relative}
+.timber-mention-menu{position:absolute;z-index:30;bottom:calc(100% - 6px);left:16px;right:16px;max-height:290px;overflow:auto;padding:7px;background:var(--surface);border:1px solid var(--line);border-radius:14px;box-shadow:0 12px 40px #0003}
+.timber-mention-heading{display:block;padding:5px 8px;color:var(--muted);font-size:11px}
+.timber-mention-menu button{display:flex;width:100%;align-items:center;gap:10px;padding:10px;background:transparent;border:0;border-radius:8px;text-align:left;min-height:48px;color:var(--ink)}
+.timber-mention-menu button[aria-selected=true],.timber-mention-menu button:hover{background:var(--soft)}
+.timber-mention-menu button>span:last-child{min-width:0;display:flex;flex-direction:column;gap:3px}
+.timber-mention-menu strong{font-size:13px;font-weight:600}
+.timber-mention-menu small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:11px;max-width:100%}
+.timber-selected-mentions{display:flex;gap:6px;flex-wrap:wrap;padding:0 4px 8px}
+.timber-selected-mentions>span{display:inline-flex;align-items:center;gap:7px;background:var(--soft);border:1px solid var(--line);border-radius:20px;padding:3px 4px 3px 10px;font-size:11px;color:var(--ink)}
+.timber-selected-mentions button{background:transparent;border:0;padding:0;width:24px;min-width:24px;min-height:24px;color:var(--muted)}
+.timber-agent-source button{background:transparent;border:0;color:inherit;padding:0;min-height:24px;text-decoration:underline;font-size:12px}
+.timber-chat-agents{display:flex;gap:6px;flex-shrink:0;overflow:auto;max-width:100%;padding:6px 14px;border-bottom:1px solid var(--line);scrollbar-width:thin}
+.timber-chat-agents>button{display:flex;align-items:center;gap:6px;flex:none;white-space:nowrap;min-height:30px;padding:4px 8px;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--muted);font-size:11px}
+.timber-chat-agents svg{height:13px;width:13px}
+.timber-chat-agents .status{font-size:10px;padding:1px 5px}
+@media(max-width:760px){.timber-mention-menu{left:10px;right:10px}.timber-selected-mentions button{min-height:32px;min-width:32px}.timber-chat-agents>button{min-height:40px}}

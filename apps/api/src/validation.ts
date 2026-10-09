@@ -37,15 +37,16 @@ export function operationId(value:unknown):string {
   if(typeof value!=="string" || !OPERATION_ID.test(value)) invalid("operationId must be 1 to 128 letters, numbers, dots, colons, hyphens or underscores.");
   return value as string;
 }
-export function parseMessage(value:unknown):{text:string;operationId:string} {
+export function parseMessage(value:unknown):{text:string;operationId:string;mentions?:string[]} {
   const data=object(value);
   const text=string(data.text,"text",32_000);
   if(!text.trim()) invalid("text cannot be blank.");
-  return {text,operationId:operationId(data.operationId)};
+  if(data.mentions!==undefined && (!Array.isArray(data.mentions) || data.mentions.length>8 || data.mentions.some(id=>typeof id!=="string" || !UUID.test(id)) || new Set(data.mentions).size!==data.mentions.length)) invalid("mentions must contain at most eight unique bot IDs.");
+  return {text,operationId:operationId(data.operationId),...(data.mentions===undefined?{}:{mentions:data.mentions as string[]})};
 }
-export function parseBotInput(value:unknown,patch=false):{name?:string;instructions?:string;model?:string;computerApprovalMode?:ComputerApprovalMode} {
+export function parseBotInput(value:unknown,patch=false):{name?:string;instructions?:string;model?:string;computerApprovalMode?:ComputerApprovalMode;allowNamedAgents?:boolean} {
   const data=object(value);
-  const output:{name?:string;instructions?:string;model?:string;computerApprovalMode?:ComputerApprovalMode}={};
+  const output:{name?:string;instructions?:string;model?:string;computerApprovalMode?:ComputerApprovalMode;allowNamedAgents?:boolean}={};
   if(data.name!==undefined || !patch) {
     output.name=string(data.name,"name",80).trim();
     if(!output.name) invalid("name cannot be blank.");
@@ -60,7 +61,11 @@ export function parseBotInput(value:unknown,patch=false):{name?:string;instructi
     if(data.computerApprovalMode!=="ask" && data.computerApprovalMode!=="automatic") invalid("computerApprovalMode must be ask or automatic.");
     output.computerApprovalMode=data.computerApprovalMode;
   }
-  if(patch && !Object.keys(output).length) invalid("Provide name, instructions or computerApprovalMode.");
+  if(data.allowNamedAgents!==undefined) {
+    if(typeof data.allowNamedAgents!=="boolean") invalid("allowNamedAgents must be a boolean.");
+    output.allowNamedAgents=data.allowNamedAgents;
+  }
+  if(patch && !Object.keys(output).length) invalid("Provide name, instructions, computerApprovalMode or allowNamedAgents.");
   return output;
 }
 function finite(value:unknown,name:string,min:number,max:number):number {

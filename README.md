@@ -25,6 +25,8 @@ other engines can implement these boundaries without changing bot identity.
 ## Implemented
 
 - Create, rename and delete bots; edit instructions; persistent conversation per bot.
+- Native Pi subagents with separate conversations, visible progress, messaging and cancellation.
+- Asynchronous delegation between named bots, explicit `@` recipients and optional bot-created named agents.
 - Durable asynchronous runs with streamed events, reconnect cursors and cancellation.
 - Paginated run history with active runs returned independently of the history page.
 - Replaceable agent engine, initially the durable Pi harness with `gpt-6.1-sol`
@@ -108,11 +110,46 @@ tests simulate keyboard resizing and panning on phone and iPad layouts, includin
 multiline drafts and fullscreen. They do not replace a physical iOS device check.
 
 This is a single-owner development MVP. There is no multi-user login, native iOS
-client, inter-bot delegation, routine scheduling, Hermes adapter, local execution
+client, routine scheduling, Hermes adapter, local execution
 yet. Live desktop viewing/control and a Files/Git explorer are available in the
 browser console. It is a test client, not the intended
 product interface. Packages and environment variables retain the internal
 `@botspace/*` and `BOTSPACE_*` names.
+
+## Bots and subagents
+
+Ask a bot to delegate work to temporary subagents. Pi creates each with a separate
+conversation and a concrete task. They share the bot's computer, files, model and
+computer permission, so agents working on the same project should coordinate file
+ownership. The **Agents** panel lists their status and parent relationships. Open
+an agent to read its public conversation, send a follow-up or stop it. Completed
+and failed agents can receive follow-ups; a cancelled agent stays cancelled.
+Private model reasoning is never displayed.
+
+Agents can exchange messages, contact their parent and wait for another agent's
+result. There can be eight active temporary agents per bot, nested up to three
+levels. They use Pi's durable conversations and tasks, so reloading the console
+does not stop them. A parent finishing its answer does not cancel its remaining
+agents; explicitly stopping a task cancels its subagents too. Temporary agents
+remain inspectable in their owning bot's history and do not appear as independent
+bots or receive a separate computer.
+
+Named bots can send work to each other while keeping their own conversations,
+computers and approval settings. In a conversation, type `@`, select another bot
+and send the message. Selected recipients appear above the prompt; each receives
+the submitted message, and its result returns to the original conversation with
+its source identified. Typing a name without selecting it does not send a task.
+The **Agents → Bot collaboration** list shows incoming and outgoing delegation
+status and links to the target bot. Delivery survives reconnects and deduplicates
+retries; delegation paths cannot revisit a bot and are limited to four hops and
+eight pending deliveries per source bot.
+
+Enable **Allow creating named agents** in a bot's configuration to let that bot create
+persistent named bots. The setting is off by default. A newly created bot uses
+the creator's model, starts with **Ask for each action**, and has named-agent
+creation disabled. Temporary subagents and messages to existing bots do not need
+this setting. Deleting a creator does not delete the named bots it previously
+created; cancelling or deleting a source stops its outstanding delegated tasks.
 
 ## Task execution limits
 

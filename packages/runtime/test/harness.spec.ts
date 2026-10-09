@@ -3,6 +3,7 @@ import { abortAllDurableObjects, reset, runDurableObjectAlarm, runInDurableObjec
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import type { HarnessProbe } from './worker.js';
 import { createBudget } from '../src/budget.js';
+import { PiHarness } from 'agents/harness/pi';
 let probeId: string;
 beforeEach(() => { probeId = crypto.randomUUID(); });
 const request = (path: string, input?: unknown) => exports.default.fetch(`https://test${path}`, { headers: { 'content-type': 'application/json', 'x-probe-id': probeId }, ...(input ? { method: 'POST', body: JSON.stringify(input) } : {}) });
@@ -14,6 +15,200 @@ async function configureLimits(limits: { maxGenerations?: number; maxToolCalls?:
   });
   await abortAllDurableObjects();
 }
+it('runs a visible temporary Pi conversation, attributes its tools and keeps its context across eviction', async () => {
+  const namespace = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE;
+  let stub = namespace.getByName(probeId);
+  await request('/submit', { text: 'request-subagent', operationId: 'parent-with-child' });
+  await request('/wait?id=parent-with-child');
+  await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents())[0]?.status)).toBe('completed');
+  const child = await runInDurableObject(stub, async (instance, state) => {
+    const agents = await instance.runtime.subagents();
+    expect(agents).toHaveLength(1);
+    expect(agents[0]).toMatchObject({ name: 'Reader', parentOperationId: 'parent-with-child', status: 'completed', result: 'Hello from the real Pi harness.' });
+    const tools = state.storage.sql.exec<{ input: string }>('SELECT input FROM tool_calls').toArray().map(row => JSON.parse(row.input));
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({ runOperationId: 'parent-with-child', subagentId: agents[0]!.id, subagentOperationId: agents[0]!.operationId, action: { type: 'readFile' } });
+    const root = await instance.runtime.messages();
+    expect(root.filter(message => message.role === 'user').map(message => message.text)).toEqual(['request-subagent']);
+    const messages = await instance.runtime.subagentMessages(agents[0]!.id);
+    expect(messages.filter(message => message.role === 'user').map(message => message.text)).toEqual(['child-fixture-read']);
+    const events = state.storage.sql.exec<{ event: string }>('SELECT event FROM projected').toArray().map(row => JSON.parse(row.event));
+    expect(events).toContainEqual(expect.objectContaining({ type: 'subagent.created', operationId: 'parent-with-child' }));
+    expect(events).toContainEqual(expect.objectContaining({ type: 'subagent.tool.completed', data: expect.objectContaining({ subagentId: agents[0]!.id, status: 'completed' }) }));
+    return agents[0]!;
+  });
+  await abortAllDurableObjects();
+  stub = namespace.getByName(probeId);
+  await runInDurableObject(stub, async instance => {
+    expect((await instance.runtime.subagents())[0]).toMatchObject({ id: child.id, status: 'completed' });
+    const input = { operationId: 'child-followup' };
+    expect(await instance.runtime.sendSubagent(child.id, 'child-fixture-message', input)).toMatchObject({ accepted: true });
+    expect(await instance.runtime.sendSubagent(child.id, 'child-fixture-message', input)).toMatchObject({ accepted: false });
+  });
+  await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents())[0]?.status)).toBe('completed');
+  await runInDurableObject(stub, async (instance, state) => {
+    expect((await instance.runtime.subagentMessages(child.id)).filter(message => message.role === 'user')).toHaveLength(2);
+    expect(state.storage.sql.exec('SELECT input FROM tool_calls').toArray()).toHaveLength(1);
+  });
+});
+it('pauses and resumes the child alone for approval, then cascades parent cancellation', async () => {
+  const stub = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE.getByName(probeId);
+  await request('/submit', { text: 'request-subagent child-exec', operationId: 'parent-approval-child' });
+  await request('/wait?id=parent-approval-child');
+  await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents())[0]?.status)).toBe('waiting_approval');
+  await request('/host-context', { mode: 'automatic' });
+  const child = await runInDurableObject(stub, async instance => {
+    const child = (await instance.runtime.subagents())[0]!;
+    await instance.runtime.sendSubagent(child.id, 'The recorded action was approved and executed. Continue from its result.', { operationId: 'child-approved' });
+    return child;
+  });
+  await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents())[0]?.status)).toBe('completed');
+  await runInDurableObject(stub, async instance => {
+    await instance.runtime.cancel('parent-approval-child');
+    expect((await instance.runtime.subagents())[0]?.status).toBe('cancelled');
+    await expect(instance.runtime.sendSubagent(child.id, 'late message', { operationId: 'late-child-message' })).rejects.toThrow('cancelled');
+  });
+});
+it('charges child generations to the durable parent budget', async () => {
+  await configureLimits({ maxGenerations: 1 });
+  const stub = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE.getByName(probeId);
+  await request('/submit', { text: 'request-subagent', operationId: 'limited-parent' });
+  await request('/wait?id=limited-parent');
+  await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents())[0]?.status)).toBe('failed');
+  await runInDurableObject(stub, (_instance, state) => {
+    expect(state.storage.sql.exec('SELECT input FROM calls').toArray()).toHaveLength(1);
+    expect(state.storage.sql.exec('SELECT input FROM tool_calls').toArray()).toHaveLength(0);
+    expect(state.storage.sql.exec('SELECT operation_id FROM botspace_runtime_budget WHERE kind=\'generation\'').toArray()).toEqual([{ operation_id: 'limited-parent' }]);
+  });
+});
+it('queues a child followup without changing its active tool attribution', async () => {
+  const stub = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE.getByName(probeId);
+  await runInDurableObject(stub, instance => { instance.heldTool = new Promise(resolve => { instance.releaseHeldTool = resolve; }); });
+  try {
+    await request('/submit', { text: 'request-subagent', operationId: 'parent-queued-child' });
+    await request('/wait?id=parent-queued-child');
+    await expect.poll(() => runInDurableObject(stub, (_instance, state) => state.storage.sql.exec('SELECT id FROM tool_calls').toArray().length)).toBe(1);
+    await runInDurableObject(stub, async instance => {
+      const before = (await instance.runtime.subagents())[0]!;
+      await instance.runtime.sendSubagent(before.id, 'child-fixture-message', { operationId: 'queued-child-followup' });
+      expect((await instance.runtime.subagents())[0]).toMatchObject({ operationId: before.operationId, status: 'running' });
+      await expect(instance.runtime.sendSubagent(before.id, 'conflicting text', { operationId: 'queued-child-followup' })).rejects.toThrow('another subagent message');
+      instance.releaseHeldTool?.();
+    });
+    await expect.poll(() => runInDurableObject(stub, async instance => {
+      const child = (await instance.runtime.subagents())[0];
+      return child?.operationId === 'queued-child-followup' && child.status;
+    })).toBe('completed');
+  } finally { await runInDurableObject(stub, instance => instance.releaseHeldTool?.()); }
+});
+it('recovers an in-flight child without repeating an unsafe computer action', async () => {
+  const namespace = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE;
+  let stub = namespace.getByName(probeId);
+  await request('/host-context', { mode: 'automatic' });
+  await runInDurableObject(stub, instance => { instance.heldTool = new Promise(() => {}); });
+  await request('/submit', { text: 'request-subagent child-exec', operationId: 'parent-recovery-child' });
+  await request('/wait?id=parent-recovery-child');
+  await expect.poll(() => runInDurableObject(stub, (_instance, state) => state.storage.sql.exec('SELECT id FROM tool_calls').toArray().length)).toBe(1);
+  await abortAllDurableObjects();
+  stub = namespace.getByName(probeId);
+  await runInDurableObject(stub, (_instance, state) => { state.storage.sql.exec("UPDATE cf_agents_jobs SET time=0 WHERE capability IN ('pi-harness','botspace-subagents')"); });
+  await runDurableObjectAlarm(stub);
+  await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents())[0]?.status)).toBe('completed');
+  await runInDurableObject(stub, (_instance, state) => { expect(state.storage.sql.exec('SELECT id FROM tool_calls').toArray()).toHaveLength(1); });
+});
+it('bounds recursive temporary delegation at three levels', async () => {
+  const stub = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE.getByName(probeId);
+  await request('/submit', { text: 'request-subagent nested', operationId: 'nested-parent' });
+  await request('/wait?id=nested-parent');
+  await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents()).length)).toBe(3);
+  await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents()).every(agent => agent.status === 'completed'))).toBe(true);
+  await runInDurableObject(stub, async instance => {
+    const agents = await instance.runtime.subagents();
+    expect(agents.every(agent => agent.parentOperationId === 'nested-parent')).toBe(true);
+    expect(agents.filter(agent => agent.parentSubagentId)).toHaveLength(2);
+  });
+});
+it('bounds live temporary agents and releases their slots only after cancellation or completion', async () => {
+  const stub = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE.getByName(probeId);
+  await runInDurableObject(stub, instance => { instance.heldTool = new Promise(resolve => { instance.releaseHeldTool = resolve; }); });
+  try {
+    for (let index = 0; index < 9; index++) {
+      await request('/submit', { text: 'request-subagent', operationId: `parent-cap-${index}` });
+      await request(`/wait?id=parent-cap-${index}`);
+    }
+    await runInDurableObject(stub, async instance => {
+      expect(await instance.runtime.subagents()).toHaveLength(8);
+      instance.releaseHeldTool?.();
+    });
+    await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents()).every(agent => agent.status === 'completed'))).toBe(true);
+  } finally { await runInDurableObject(stub, instance => instance.releaseHeldTool?.()); }
+});
+it('delivers sibling messages and lets the root message, wait for and cancel a prior task’s child', async () => {
+  const stub = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE.getByName(probeId);
+  await request('/submit', { text: 'request-subagent-peers', operationId: 'peer-parent' });
+  await request('/wait?id=peer-parent');
+  await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents()).length)).toBe(2);
+  const target = await runInDurableObject(stub, async instance => (await instance.runtime.subagents()).find(agent => agent.name === 'Reader')!);
+  await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagentMessages(target.id)).filter(message => message.role === 'user').length)).toBe(2);
+  await runInDurableObject(stub, async instance => {
+    expect(await instance.runtime.subagentMessages(target.id)).toContainEqual(expect.objectContaining({ role: 'user', text: 'Message from Messenger:\nA public coordination message.' }));
+  });
+  for (const action of ['message', 'wait', 'cancel']) {
+    await request('/submit', { text: `request-${action}-existing:${target.id}`, operationId: `later-root-${action}` });
+    expect(await (await request(`/wait?id=later-root-${action}`)).json()).toMatchObject({ status: 'done' });
+  }
+  await runInDurableObject(stub, async instance => {
+    expect((await instance.runtime.subagents()).find(agent => agent.id === target.id)?.status).toBe('cancelled');
+    expect(await instance.runtime.subagentMessages(target.id)).toContainEqual(expect.objectContaining({ role: 'user', text: 'Message from parent:\nA public coordination message.' }));
+  });
+});
+it('durably retries a rejected parent report across eviction without repeating child work', async () => {
+  const namespace = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE;
+  let stub = namespace.getByName(probeId);
+  await runInDurableObject(stub, (_instance, state) => { state.storage.sql.exec('INSERT INTO config(key,value) VALUES(?,?)', 'failChildReportOnce', 'true'); });
+  await request('/submit', { text: 'request-subagent', operationId: 'parent-report-retry' });
+  await request('/wait?id=parent-report-retry');
+  await expect.poll(() => runInDurableObject(stub, (_instance, state) => state.storage.sql.exec('SELECT id FROM child_report_attempts').toArray().length)).toBe(1);
+  const before = await runInDurableObject(stub, (_instance, state) => ({
+    calls: state.storage.sql.exec('SELECT id FROM calls').toArray().length,
+    tools: state.storage.sql.exec('SELECT id FROM tool_calls').toArray().length,
+  }));
+  await abortAllDurableObjects();
+  stub = namespace.getByName(probeId);
+  await runInDurableObject(stub, (_instance, state) => { state.storage.sql.exec("UPDATE cf_agents_jobs SET time=0 WHERE capability IN ('pi-harness','botspace-subagents')"); });
+  await runDurableObjectAlarm(stub);
+  await expect.poll(() => runInDurableObject(stub, (_instance, state) => state.storage.sql.exec('SELECT id FROM child_reports').toArray().length), { timeout: 5_000 }).toBe(1);
+  await runInDurableObject(stub, (_instance, state) => {
+    const attempts = state.storage.sql.exec<{input:string}>('SELECT input FROM child_report_attempts').toArray().map(row => JSON.parse(row.input));
+    expect(attempts).toHaveLength(2);
+    expect(attempts[0].operationId).toMatch(/^subagent-report:[a-f0-9]{64}$/);
+    expect(attempts[1]).toEqual(attempts[0]);
+    expect(state.storage.sql.exec('SELECT id FROM calls').toArray()).toHaveLength(before.calls);
+    expect(state.storage.sql.exec('SELECT id FROM tool_calls').toArray()).toHaveLength(before.tools);
+  });
+});
+it('retries a transient native child admission failure with the same durable input', async () => {
+  const original = PiHarness.prototype.enqueue;
+  const admissions: string[] = [];
+  PiHarness.prototype.enqueue = async function(session, input, options) {
+    if (session !== '1') {
+      admissions.push(options.operationId!);
+      if (admissions.length === 1) throw new Error('Fixture child admission failed before receipt');
+    }
+    return original.call(this, session, input, options);
+  };
+  const stub = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE.getByName(probeId);
+  try {
+    await request('/submit', { text: 'request-subagent', operationId: 'parent-admission-retry' });
+    await request('/wait?id=parent-admission-retry');
+    await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents())[0]?.status), { timeout: 5_000 }).toBe('completed');
+    expect(admissions).toHaveLength(2);
+    expect(admissions[1]).toBe(admissions[0]);
+    await runInDurableObject(stub, (_instance, state) => {
+      expect(state.storage.sql.exec('SELECT id FROM tool_calls').toArray()).toHaveLength(1);
+    });
+  } finally { PiHarness.prototype.enqueue = original; }
+});
 it('retries a transient shutdown failure without reopening admission', async () => {
   const stub = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE.getByName(probeId);
   await request('/submit', { text: 'hello', operationId: 'before-deletion' });

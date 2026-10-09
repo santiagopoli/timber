@@ -8,6 +8,7 @@ export interface ToolBridge {
   tools: RuntimeTools;
   imageInputSupported?(): Promise<boolean>;
   operationForCall(api: ToolExecutionApi, context: Context): Promise<string>;
+  childForCall?(api: ToolExecutionApi, context: Context): Promise<{ subagentId: string; subagentOperationId: string } | undefined>;
   consume(runOperationId: string, kind: 'tool', itemId: string): void;
   paused?(runOperationId: string): RuntimePause | undefined;
   pause?(runOperationId: string, pending: RuntimePause): void;
@@ -33,7 +34,9 @@ async function executeBridgeTool(
 ): Promise<ToolExecutionResult> {
   const runOperationId = await bridge.operationForCall(api, context);
   const operationId = await computerToolOperationId(String(api.taskId), api.callId);
-  const paused = bridge.paused?.(runOperationId);
+  const child = await bridge.childForCall?.(api, context);
+  const pauseOperationId = child?.subagentOperationId ?? runOperationId;
+  const paused = bridge.paused?.(pauseOperationId);
   if (paused) return { content: [{ type: 'text', text: JSON.stringify(paused) }], control: { terminate: true } };
   try {
     bridge.consume(runOperationId, 'tool', operationId);
@@ -47,9 +50,9 @@ async function executeBridgeTool(
   }
   const signal = context.abortSignal ?? new AbortController().signal;
   signal.throwIfAborted();
-  const result = await dispatch({ operationId, runOperationId, toolCallId: api.callId, signal });
+  const result = await dispatch({ operationId, runOperationId, ...child, toolCallId: api.callId, signal });
   if (result.status === 'pending_approval' || result.status === 'pending_connection') {
-    bridge.pause?.(runOperationId, result);
+    bridge.pause?.(pauseOperationId, result);
     return {
       content: [{ type: 'text', text: JSON.stringify(result) }],
       // Native Pi durable termination: no unbounded promise and no repeated model requests.

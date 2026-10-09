@@ -75,6 +75,39 @@ roundtrips, input deduplication after a hard object restart, approval and connec
 output limits, incomplete streams, usage failures, optional model-loop budgets,
 and tasks exceeding the former count caps across a hard restart.
 
+## Temporary agents
+
+`spawn_subagent`, `list_subagents`, `send_subagent_message`, `wait_subagent` and
+`cancel_subagent` use real Pi conversations. A native background anchor owns each
+child, and native durable delivery tasks submit its work and report public answers
+back through the host's `onSubagentMessage` callback. PiHarness schedules the child
+session before admission; a separate lifecycle wake covers the gap before delivery.
+Spawning and messaging are deduplicated in the same native transaction as their
+delivery tasks. Each child has a fresh transcript and inherits the bot's model,
+instructions and tools. Agents share the bot's computer and must coordinate writes.
+Transient child admission and parent-report failures retry the same durable input
+up to five attempts with 1/2/4/8-second backoff. Exhausted admission becomes a
+visible failure; an exhausted report leaves the result in the child's conversation
+and emits `subagent.report_failed`. Restarting never repeats a completed tool.
+
+The host protocol exposes `subagents()`, `subagentMessages(id)`,
+`sendSubagent(id,text,{operationId})` and `cancelSubagent(id)`. Normalized
+`subagent.created`, `subagent.updated`, `subagent.message` and tool activity events
+keep native payloads and reasoning private. Child tools carry `subagentId` and
+`subagentOperationId` alongside the original parent `runOperationId`, so the host
+can associate approvals, service connections and child runs without mixing their
+transcripts. A child approval pauses only its native input; the host resumes that
+child with a new durable input after the decision.
+
+At most eight children may be active, including approval/connection waits, and
+delegation is limited to three levels. Generation and tool accounting is shared
+with the original parent task and survives eviction. A completed parent leaves
+its children running. Explicit parent cancellation cancels its descendants;
+cancelled children cannot restart. Completed or failed children can receive a new
+message. Followups queue without replacing the attribution of an active child
+tool. Children can message peers in the same task or address their parent with
+`targetId: "parent"`. Public results are also retained in each child conversation.
+
 Protocol references: [ChatGPT inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)
 and [preview requirements](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations).
 
@@ -82,6 +115,6 @@ and [preview requirements](https://developers.openai.com/siwc/token-sharing-open
 the main API test suite. Cloudflare `abortAllDurableObjects` and storage resets
 can print workerd teardown exceptions during tests; assertions determine result.
 
-This package does not implement Hermes, delegation, routine scheduling, native
+This package does not implement Hermes, routine scheduling, native
 iOS, local execution, or a secrets-entry UI. Its host interfaces leave those
 separate from the Pi integration.

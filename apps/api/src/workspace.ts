@@ -3,17 +3,22 @@ import type { Bot } from "@botspace/contracts";
 import type { Env } from "./env";
 import { ApiError, errorResponse, json } from "./errors";
 import { body, parseBotInput, UUID } from "./validation";
+import { AgentCoordinator } from "./agent-coordination";
 
 export class WorkspaceDO extends DurableObject<Env> {
   private deleting=new Map<string,Promise<void>>();
+  private agents:AgentCoordinator;
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx,env);
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS bots (id TEXT PRIMARY KEY, data TEXT NOT NULL)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS bot_deletions (id TEXT PRIMARY KEY,completed INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL)");
+    this.agents=new AgentCoordinator(ctx,env,()=>this.rearmDeletion());
   }
   private async rearmDeletion():Promise<void> {
     const next=this.ctx.storage.sql.exec<{next_at:number}>("SELECT next_at FROM bot_deletions WHERE completed=0 ORDER BY next_at LIMIT 1").toArray()[0];
-    if(next) await this.ctx.storage.setAlarm(Math.max(Date.now(),next.next_at));
+    const agentTime=this.agents.nextAlarm();
+    const nextAt=Math.min(next?.next_at??Infinity,agentTime??Infinity);
+    if(Number.isFinite(nextAt)) await this.ctx.storage.setAlarm(Math.max(Date.now(),nextAt));
     else await this.ctx.storage.deleteAlarm();
   }
   private cleanup(id:string):Promise<void> {
@@ -45,7 +50,7 @@ export class WorkspaceDO extends DurableObject<Env> {
   }
   async alarm():Promise<void> {
     const due=this.ctx.storage.sql.exec<{id:string}>("SELECT id FROM bot_deletions WHERE completed=0 AND next_at<=? ORDER BY next_at LIMIT 8",Date.now()).toArray();
-    await Promise.allSettled(due.map(row=>this.cleanup(row.id)));
+    await Promise.allSettled([...due.map(row=>this.cleanup(row.id)),this.agents.alarm()]);
     await this.rearmDeletion();
   }
   private async deleteBot(id:string):Promise<Response> {
@@ -56,6 +61,7 @@ export class WorkspaceDO extends DurableObject<Env> {
       this.ctx.storage.transactionSync(()=>{
         this.ctx.storage.sql.exec("INSERT INTO bot_deletions(id,next_at) VALUES(?,?)",id,Date.now());
         this.ctx.storage.sql.exec("DELETE FROM bots WHERE id=?",id);
+        this.agents.forgetBot(id);
       });
     }
     // Fence is durable before cleanup and is also the authorization record for
@@ -69,6 +75,7 @@ export class WorkspaceDO extends DurableObject<Env> {
   async fetch(request:Request):Promise<Response> {
     try {
       const path=new URL(request.url).pathname;
+      if(path.startsWith("/agents/")) return await this.agents.fetch(request);
       const id=path.slice(1);
       if(path==="/" && request.method==="GET") {
         const bots=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots ORDER BY rowid DESC").toArray().map(row=>JSON.parse(row.data));
@@ -77,7 +84,7 @@ export class WorkspaceDO extends DurableObject<Env> {
       if(path==="/" && request.method==="POST") {
         const input=parseBotInput(await body(request));
         const now=new Date().toISOString();
-        const bot:Bot={id:crypto.randomUUID(),name:input.name!,instructions:input.instructions??"",model:input.model??this.env.BOTSPACE_DEFAULT_MODEL??"gpt-6.1-sol",runtime:"pi",computerApprovalMode:input.computerApprovalMode??"ask",createdAt:now,updatedAt:now};
+        const bot:Bot={id:crypto.randomUUID(),name:input.name!,instructions:input.instructions??"",model:input.model??this.env.BOTSPACE_DEFAULT_MODEL??"gpt-6.1-sol",runtime:"pi",computerApprovalMode:input.computerApprovalMode??"ask",allowNamedAgents:input.allowNamedAgents??false,createdAt:now,updatedAt:now};
         this.ctx.storage.sql.exec("INSERT INTO bots (id,data) VALUES (?,?)",bot.id,JSON.stringify(bot));
         return json({bot},201);
       }

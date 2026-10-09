@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { responsesFixture } from "../../packages/runtime/test/responses-fixture";
 import { BotDO as ProductionBotDO } from "../../apps/api/src/bot";
 import type { Env } from "../../apps/api/src/env";
+import { nativeSubagentFixture } from "./subagent-fixture";
 
 // Actual API, BotDO, registry, Pi lifecycle and SQLite. Only the external model
 // transport and computer effect provider are deterministic test doubles.
@@ -23,6 +24,8 @@ export class ChatGPTFixture extends DurableObject {
     this.ctx.storage.sql.exec("INSERT INTO inference_calls(input) VALUES(?)",JSON.stringify(input));
     const lastUser=input.input.filter(item=>item.role==="user").at(-1);
     if(inferenceFixtureControl.gate && JSON.stringify(lastUser).includes(inferenceFixtureControl.matches??"")) await inferenceFixtureControl.gate;
+    const subagent=nativeSubagentFixture(input.input);
+    if(subagent) return subagent;
     if(JSON.stringify(lastUser).includes('request-github-connect')) {
       const item={type:'function_call',id:'fc_github_fixture',call_id:'call_github_fixture',namespace:'timber_computer',name:'call_tool',arguments:JSON.stringify({name:'github_connect',arguments:{repository:'owner/private',permission:'write'}}),status:'completed'};
       const response={id:'resp_github_fixture',object:'response',status:'completed',output:[item],usage:{input_tokens:10,output_tokens:8,total_tokens:18}};

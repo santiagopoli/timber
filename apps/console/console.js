@@ -1,5 +1,7 @@
 import './src/styles.css';
 import { mountChat, mountToolActivity } from './src/chat.tsx';
+import { mountAgents } from './src/agents.tsx';
+import { hasBotMention } from './src/mentions.ts';
 import { createDesktopViewer } from './src/desktop.ts';
 import { mountWorkspaceExplorer } from './src/workspace.tsx';
 import './src/layout.css';
@@ -10,18 +12,19 @@ import './src/layout.css';
   const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
   const guiActions = new Set(['navigate', 'click', 'move', 'doubleClick', 'drag', 'type', 'key', 'scroll']);
   const removedBots = new Set(), deletionPending = new Map();
-  const drafts = new Map(), pendingMessages = new Map(), pendingActions = new Map(), computerPending = new Map(), stopping = new Set(), approvalWork = new Map(), approvalFeedback = new Map(), connectionWork = new Map(), appWork = new Map();
+  const drafts = new Map(), draftMentions = new Map(), pendingMessages = new Map(), pendingActions = new Map(), computerPending = new Map(), stopping = new Set(), approvalWork = new Map(), approvalFeedback = new Map(), connectionWork = new Map(), appWork = new Map();
   let authenticated = false, bots = [], selected = null, currentRun = null, generation = 0, authSession = 0;
   let sessionController = new AbortController(), streamController, refreshTimer, progressTimer, computerStatusTimer;
   let computerStatusRequest = 0, currentPanel = 'conversation', workspaceExpanded = false, desktopFullscreen = false;
   const wideLayout = matchMedia('(min-width: 761px)'), tabletLayout = matchMedia('(max-width: 1099px)');
-  const panelNames = ['conversation', 'computer', 'files', 'apps', 'runs', 'activity'];
+  const panelNames = ['conversation', 'computer', 'files', 'apps', 'agents', 'runs', 'activity'];
   let preferences = {};
   try {preferences = JSON.parse(localStorage.getItem('timber.layout') || '{}') || {};} catch {}
   let botsCollapsed = typeof preferences.botsCollapsed === 'boolean' ? preferences.botsCollapsed : tabletLayout.matches;
   let lastWorkspacePanel = panelNames.includes(preferences.workspacePanel) && preferences.workspacePanel !== 'conversation' ? preferences.workspacePanel : 'computer';
   const saveLayout = () => {preferences = {botsCollapsed, workspacePanel: lastWorkspacePanel, workspaceOpen: currentPanel !== 'conversation'}; try {localStorage.setItem('timber.layout', JSON.stringify(preferences));} catch {}};
   const streamedMessages = new Map();
+  let subagents = [], delegations = [], agentEvents = [], agentsLoading = false, agentsError = '', agentsRequest = 0, agentsRevision = 0, selectedAgentId = null, agentsTimer;
   let messages = [], approvals = [], connections = [], workspaceApps = [], connectionsRequest = 0, appsRequest = 0, runs = new Map(), activeRunIds = new Set(), nextCursor = null, olderPagesLoaded = false, loadingOlderRuns = false, runFilter = null, runRevision = 0, runsRequest = 0, messagesRequest = 0, approvalsRequest = 0;
   let cursor = 0, boundary = '', events = [], streamDrafts = new Map(), chatLoading = false, focusApproval = 0, screenUrl = null, artifact = null, directoryPath = '.';
   let chatGPTConnected = false, chatGPTBusy = false, chatGPTAccount = null, editBotId = null, deleteTarget = null, deleteBusy = false, sendBusy = new Set();
@@ -34,14 +37,16 @@ import './src/layout.css';
   const statusBadge = (status) => { const node = el('span', 'status', statusLabel(status)); node.dataset.status = status; return node; };
   const validView = (version) => version === generation && authenticated;
   const chat = mountChat($('chat-root'), {
-    onDraft: (botId, text) => { if (selected?.id === botId && authenticated) { drafts.set(botId, text); renderMessages(); } },
-    onSend: (botId, text) => { void sendMessage(botId, text); },
+    onDraft: (botId, text, mentions) => { if (selected?.id === botId && authenticated) { drafts.set(botId, text); draftMentions.set(botId, (mentions || draftMentions.get(botId) || []).filter(id => bots.some(bot => bot.id === id && hasBotMention(text, bot.name)))); renderMessages(); } },
+    onSend: (botId, text, mentions) => { void sendMessage(botId, text, undefined, mentions); },
+    onOpenBot: openAgentBot,
+    onOpenAgents: openAgents,
     onRetry: (botId, operationId) => {
       if (selected?.id !== botId || !authenticated) return;
       const run = [...runs.values()].find(item => item.operationId === operationId && item.status === 'queued' && item.error?.includes('Retry this message'));
       const message = run && messages.find(item => item.role === 'user' && item.runId === run.id);
       const delivery = pendingMessages.get(operationId);
-      if (run && (message || delivery?.botId === botId)) { void retryAdmission(botId, run, message?.text || delivery.text); return; }
+      if (run && (message || delivery?.botId === botId)) { void retryAdmission(botId, run, message?.text || delivery.text, message?.mentions || delivery?.mentions); return; }
       if (delivery?.botId === botId) void sendMessage(botId, delivery.text, operationId);
     },
     onDecision: (botId, approvalId, decision, allowComputer) => { if (selected?.id !== botId) return; const approval = approvals.find(item => item.id === approvalId); if (approval) void decideApproval(botId, approval, decision, allowComputer); },
@@ -49,6 +54,29 @@ import './src/layout.css';
     onStop: (botId, runId) => { if (selected?.id === botId) void guarded(() => cancelRun(runId)); },
     onConnect: (botId, requestId) => { if (selected?.id === botId) void connectGitHub(botId, requestId); },
   }, loadArtifact);
+  const agentsView = mountAgents($('agents-root'), {
+    request: (botId, path, options) => request(`${botPath(botId)}${path}`, options),
+    onSelect: id => {selectedAgentId = id;renderAgents();syncAgentHash();},
+    onRefresh: () => void loadAgents(),
+    onOpenBot: openAgentBot,
+  });
+  function openAgents(id) {
+    selectedAgentId=id || null;
+    const open=()=>{showPanel('agents');renderAgents();syncAgentHash();};
+    if(document.fullscreenElement) void document.exitFullscreen().then(open).catch(open);else open();
+  }
+  async function openAgentBot(botId) {
+    if (!bots.some(item => item.id === botId)) await guarded(loadBots);
+    const bot = bots.find(item => item.id === botId);
+    if (bot) {showPanel('conversation');void guarded(() => selectBot(bot));}
+    else showError(new Error('This bot is no longer available.'));
+  }
+  function syncAgentHash() {
+    if (!selected) return;
+    const hash = new URLSearchParams({bot: selected.id});
+    if (selectedAgentId && currentPanel === 'agents') hash.set('agent', selectedAgentId);
+    history.replaceState(null, '', `${location.pathname}${location.search}#${hash}`);
+  }
   const activity = mountToolActivity($('activity-tools'), loadArtifact);
   async function loadArtifact(botId, artifactId, signal) {
     if (!authenticated || selected?.id !== botId) throw new DOMException('The bot changed.', 'AbortError');
@@ -122,9 +150,9 @@ import './src/layout.css';
   }
   function disconnect(message = '') {
     desktop.disconnect(); workspace.clear();
-    stopComputerStatus(); generation++; authSession++; authenticated = false; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
+    stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];selectedAgentId=null; generation++; authSession++; authenticated = false; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
     selected = null; currentRun = null; bots = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
-    removedBots.clear(); deletionPending.clear(); deleteTarget = null; deleteBusy = false; editBotId = null; drafts.clear(); pendingMessages.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); connectionWork.clear(); appWork.clear(); closeDialogs(); clearScreen();
+    removedBots.clear(); deletionPending.clear(); deleteTarget = null; deleteBusy = false; editBotId = null; drafts.clear(); draftMentions.clear(); pendingMessages.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); connectionWork.clear(); appWork.clear(); closeDialogs(); clearScreen();
     chatGPTConnected = false; chatGPTAccount = null; chatGPTBusy = false;
     chat.clear(); activity.clear(); $('toggle-bots').hidden = true;
     for (const id of ['activity-list', 'bot-list', 'run-list', 'file-list', 'workspace-app-list']) $(id).replaceChildren();
@@ -154,7 +182,7 @@ import './src/layout.css';
       button.addEventListener('click', () => openDelete(pending)); $('bot-list').append(button);
     }
   }
-  async function loadBots() { const session = authSession, result = await request('/v1/bots'); if (session !== authSession) return; bots = result.bots.filter(bot => !removedBots.has(bot.id)); renderBots(); }
+  async function loadBots() { const session = authSession, result = await request('/v1/bots'); if (session !== authSession) return; bots = result.bots.filter(bot => !removedBots.has(bot.id)); renderBots(); renderMessages();renderAgents(); }
   function updateBotHeader() { $('selected-name').textContent = selected.name; $('selected-avatar').textContent = selected.name.slice(0, 1).toUpperCase(); $('selected-model').textContent = `${selected.runtime} · ${selected.model}`; $('selected-computer-mode').textContent = selected.computerApprovalMode === 'automatic' ? 'Computer · Use authorized' : 'Computer · Ask for each action'; }
   function chosenHash() { const value = new URLSearchParams(location.hash.slice(1)).get('bot'); return /^[a-f\d-]{36}$/i.test(value || '') ? value : null; }
   async function selectBot(bot, {replace = false} = {}) {
@@ -168,18 +196,18 @@ import './src/layout.css';
     }
     desktop.disconnect(); workspace.clear();
     if (!$('panel-files').hidden) workspace.setBot(bot.id);
-    stopComputerStatus(); generation++; const version = generation; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
+    stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];selectedAgentId = chosenHash() === bot.id ? new URLSearchParams(location.hash.slice(1)).get('agent') : null;agentsLoading=true;agentsError=''; generation++; const version = generation; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
     selected = bot; chatLoading = true; currentRun = null; cursor = 0; boundary = ''; events = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs = new Map(); activeRunIds = new Set(); streamDrafts = new Map(); nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; runFilter = null; runRevision = 0;
     $('refresh-apps').disabled = false; $('refresh-apps').textContent = 'Refresh';
     history[replace ? 'replaceState' : 'pushState'](null, '', `${location.pathname}${location.search}#bot=${encodeURIComponent(bot.id)}`);
-    $('empty').hidden = true; $('bot-workspace').hidden = false; updateBotHeader(); renderBots(); renderApps();
+    $('empty').hidden = true; $('bot-workspace').hidden = false; updateBotHeader(); renderBots(); renderApps();renderAgents();syncAgentHash();if(selectedAgentId)showPanel('agents');
     for (const id of ['activity-list', 'run-list']) $(id).replaceChildren();
     $('app-count').textContent = '0'; $('apps-feedback').textContent = ''; $('event-count').textContent = '0';
     $('computer-result').textContent = 'No actions yet.'; $('result-details').hidden = true; $('computer-warning').hidden = true;
     $('computer-status').textContent = 'Checking…'; $('file-path').value = '.'; directoryPath = '.';
     $('file-content').value = ''; $('type-text').value = ''; $('file-list').replaceChildren(el('p', 'hint', 'No files loaded'));
     $('app-error').textContent = ''; $('approval-shortcut').hidden = true; renderCurrentRun(); renderStreamDraft(); renderProgress();
-    try { await Promise.all([loadMessages(version), loadRuns(version), loadApprovals(version), loadConnections(version), loadApps(version)]); }
+    try { await Promise.all([loadMessages(version), loadRuns(version), loadApprovals(version), loadConnections(version), loadApps(version), loadAgents(version)]); }
     finally { if (validView(version)) { chatLoading = false; renderMessages(); startStream(); if (!$('panel-computer').hidden) void guarded(computerStatus); } }
   }
   function effectiveApprovals() {
@@ -196,7 +224,7 @@ import './src/layout.css';
       if (run) {
         const newlyAccepted = delivery.state !== 'accepted';
         delivery.runId = run.id; delivery.runStatus = run.status; delivery.state = 'accepted'; delete delivery.error;
-        if (newlyAccepted && (drafts.get(delivery.botId) || '').trim() === delivery.text) drafts.delete(delivery.botId);
+        if (newlyAccepted && (drafts.get(delivery.botId) || '').trim() === delivery.text) {drafts.delete(delivery.botId);draftMentions.delete(delivery.botId);}
       }
       if (delivery.runId && messages.some(message => message.role === 'user' && message.runId === delivery.runId)) pendingMessages.delete(operationId);
     }
@@ -207,34 +235,55 @@ import './src/layout.css';
     $('approval-count').textContent = String(pending.length); $('approval-shortcut').hidden = !pending.length;
     const stream = [...streamDrafts.entries()].find(([id, text]) => text && activeRunIds.has(id) && !terminal.has(runs.get(id)?.status) && (!runFilter || id === runFilter));
     const model = { bot: selected, messages, runs: [...runs.values()], approvals: visibleApprovals, connections: connections.map(item => ({...item, ...connectionWork.get(`${selected.id}:${item.id}`)})), events: events.map(event => ({...event, data: redact(event.data)})),
-      deliveries: [...pendingMessages.values()].filter(delivery => delivery.botId === selected.id).map(delivery => ({...delivery})), draft: drafts.get(selected.id) || '', sending: sendBusy.has(selected.id), loading: chatLoading,
+      deliveries: [...pendingMessages.values()].filter(delivery => delivery.botId === selected.id).map(delivery => ({...delivery})), draft: drafts.get(selected.id) || '', mentionBots: bots, subagents, delegations, draftMentions: draftMentions.get(selected.id) || [], sending: sendBusy.has(selected.id), loading: chatLoading,
       currentRun, runFilter, focusApproval, stream: stream ? {runId: stream[0], text: stream[1]} : null, feedback: approvalFeedback.get(selected.id) };
     chat.update(model); activity.update({...model, runFilter: null});
   }
-  async function sendMessage(botId, rawText, retryOperationId) {
+  function renderAgents() {
+    if (!selected || !authenticated) return;
+    $('agent-count').textContent = String(subagents.length);
+    agentsView.update({botId:selected.id,botName:selected.name,agents:subagents,namedAgents:bots.filter(bot=>bot.createdByBotId===selected.id),delegations,loading:agentsLoading,error:agentsError,selectedAgentId,revision:agentsRevision,events:agentEvents});
+  }
+  async function loadAgents(version = generation) {
+    const id = selected?.id, sequence = ++agentsRequest;
+    if (!id || !authenticated) return;
+    clearTimeout(agentsTimer);
+    try {
+      const [temporary, named] = await Promise.all([request(`${botPath(id)}/agents`),request(`${botPath(id)}/delegations`)]);
+      if (!validView(version) || sequence !== agentsRequest) return;
+      subagents = temporary.agents;delegations = named.delegations;agentsLoading=false;agentsError='';agentsRevision++;
+      renderAgents();renderMessages();
+    } catch(error) {
+      if (!validView(version) || sequence !== agentsRequest || error.name === 'AbortError') return;
+      agentsLoading=false;agentsError=errorText(error);renderAgents();
+    } finally {
+      if (validView(version) && sequence === agentsRequest && (currentPanel === 'agents' || subagents.some(agent => !terminal.has(agent.status)) || delegations.some(task => !terminal.has(task.status)))) agentsTimer=setTimeout(() => void loadAgents(version),3000);
+    }
+  }
+  async function sendMessage(botId, rawText, retryOperationId, mentions = []) {
     const text = rawText.trim(); if (!authenticated || selected?.id !== botId || !text || sendBusy.has(botId)) return;
     const session = authSession;
-    const previous = retryOperationId ? pendingMessages.get(retryOperationId) : [...pendingMessages.values()].find(item => item.botId === botId && item.text === text && ['unknown', 'rejected'].includes(item.state));
+    const previous = retryOperationId ? pendingMessages.get(retryOperationId) : [...pendingMessages.values()].find(item => item.botId === botId && item.text === text && JSON.stringify(item.mentions || []) === JSON.stringify(mentions) && ['unknown', 'rejected'].includes(item.state));
     if (previous && (previous.botId !== botId || previous.text !== text || previous.state === 'accepted' || previous.state === 'sending')) return;
-    const delivery = previous || { botId, operationId: crypto.randomUUID(), text, createdAt: new Date().toISOString() };
+    const delivery = previous || { botId, operationId: crypto.randomUUID(), text, mentions: [...new Set(mentions)], createdAt: new Date().toISOString() };
     delivery.state = 'sending'; delete delivery.error; pendingMessages.set(delivery.operationId, delivery); sendBusy.add(botId); renderMessages();
     try {
-      const {run} = await request(`${botPath(botId)}/messages`, {method: 'POST', body: {text, operationId: delivery.operationId}});
+      const {run} = await request(`${botPath(botId)}/messages`, {method: 'POST', body: {text, operationId: delivery.operationId, ...(delivery.mentions?.length ? {mentions: delivery.mentions} : {})}});
       if (session !== authSession) return;
       if (!run || typeof run.id !== 'string' || !run.id || run.botId !== botId || run.operationId !== delivery.operationId || !['queued', 'running', 'waiting_approval', 'waiting_connection', ...terminal].includes(run.status)) throw new Error('The server acknowledgment could not be verified. Your message may have been accepted. Retry sending to check the same request safely.');
       delivery.state = 'accepted'; delivery.runId = run.id; delivery.runStatus = run.status;
-      if ((drafts.get(botId) || '').trim() === text) drafts.delete(botId);
+      if ((drafts.get(botId) || '').trim() === text) {drafts.delete(botId);draftMentions.delete(botId);}
       if (selected?.id === botId) { mergeRun(run); if (!terminal.has(run.status)) activeRunIds.add(run.id); runRevision++; runFilter = null; reconcileDeliveries([run]); renderRuns(); scheduleRefresh(generation); }
     } catch (error) {
       if (session !== authSession || error.name === 'AbortError' || delivery.runId) return;
       delivery.state = !error.status || error.status >= 500 ? 'unknown' : 'rejected'; delivery.error = errorText(error); delivery.canRetry = !error.status || error.status >= 500 || error.status === 429;
     } finally { if (session === authSession) { sendBusy.delete(botId); if (selected?.id === botId) renderMessages(); } }
   }
-  async function retryAdmission(botId, run, text) {
+  async function retryAdmission(botId, run, text, mentions) {
     if (!authenticated || selected?.id !== botId || sendBusy.has(botId)) return;
     const session = authSession; sendBusy.add(botId); renderMessages();
     try {
-      const result = await request(`${botPath(botId)}/messages`, {method: 'POST', body: {text, operationId: run.operationId}});
+      const result = await request(`${botPath(botId)}/messages`, {method: 'POST', body: {text, operationId: run.operationId, ...(mentions?.length ? {mentions} : {})}});
       if (session !== authSession) return;
       if (result.run?.id !== run.id || result.run.botId !== botId || result.run.operationId !== run.operationId || !['queued', 'running', 'waiting_approval', 'waiting_connection', ...terminal].includes(result.run.status)) throw new Error('Delivery retry was not confirmed. Inspect this run before trying again.');
       if (selected?.id === botId) {mergeRun(result.run); reconcileDeliveries([result.run]); renderRuns(); scheduleRefresh(generation);}
@@ -263,7 +312,7 @@ import './src/layout.css';
   }
   const sortedRuns = () => [...runs.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   function renderCurrentRun() {
-    const active = sortedRuns().filter((run) => activeRunIds.has(run.id) && !terminal.has(run.status));
+    const active = sortedRuns().filter((run) => !run.subagentId && activeRunIds.has(run.id) && !terminal.has(run.status));
     currentRun = active.find((run) => run.status === 'running') || active.find((run) => ['waiting_approval', 'waiting_connection'].includes(run.status)) || active[0] || null;
     $('run-status').textContent = currentRun ? statusLabel(currentRun.status) : 'Ready'; $('run-status').dataset.status = currentRun?.status || 'ready';
     $('run-status').hidden = !currentRun;
@@ -278,8 +327,9 @@ import './src/layout.css';
     for (const run of ordered) {
       const card = el('article', 'run-card'); card.dataset.runId = run.id;
       const top = el('div', 'run-top'); top.append(statusBadge(run.status), el('time', 'run-date', date(run.createdAt)), el('span', 'spacer'), el('span', 'run-id', run.id.slice(0, 8))); card.append(top);
+      if (run.subagentId) card.append(el('p','hint',`Subagent · ${subagents.find(agent=>agent.id===run.subagentId)?.name || run.subagentId}`));
       if (run.error) card.append(el('p', 'error', run.error));
-      const controls = el('div', 'row'); const view = el('button', 'quiet', 'View messages'); view.type = 'button'; view.addEventListener('click', () => { runFilter = run.id; showPanel('conversation'); renderMessages(); renderStreamDraft(); }); controls.append(view);
+      const controls = el('div', 'row'); const view = el('button', 'quiet', run.subagentId ? 'View agent' : 'View messages'); view.type = 'button'; view.addEventListener('click', () => { if(run.subagentId){openAgents(run.subagentId);return;} runFilter = run.id; showPanel('conversation'); renderMessages(); renderStreamDraft(); }); controls.append(view);
       if (!terminal.has(run.status)) { const stop = el('button', 'quiet', stopping.has(run.id) ? 'Stopping…' : 'Stop run'); stop.type = 'button'; stop.dataset.runCancel = run.id; stop.disabled = stopping.has(run.id); stop.addEventListener('click', () => guarded(() => cancelRun(run.id))); controls.append(stop); }
       card.append(controls); $('run-list').append(card);
     }
@@ -501,7 +551,7 @@ import './src/layout.css';
     catch (error) {if (session === authSession && error.name !== 'AbortError') $('github-error').textContent = errorText(error);}
     finally {if (session === authSession) $('disconnect-github').disabled = false;}
   }
-  function scheduleRefresh(version) { clearTimeout(refreshTimer); refreshTimer = setTimeout(() => { if (validView(version)) void guarded(() => Promise.all([loadMessages(version), loadRuns(version), loadApprovals(version), loadConnections(version), loadApps(version)])); }, 300); }
+  function scheduleRefresh(version) { clearTimeout(refreshTimer); refreshTimer = setTimeout(() => { if (validView(version)) void guarded(() => Promise.all([loadMessages(version), loadRuns(version), loadApprovals(version), loadConnections(version), loadApps(version), loadAgents(version)])); }, 300); }
   function redact(value, key = '') {
     if (/token|secret|password|authorization|credential/i.test(key)) return '[hidden]';
     if (Array.isArray(value)) return value.map((item) => redact(item));
@@ -515,7 +565,9 @@ import './src/layout.css';
     cursor = event.id;
     // Actions belong to the conversation, including after a task completes.
     // Only the separate diagnostic log is capped; SSE replay restores history.
-    if (['tool.started', 'tool.completed', 'run.retrying'].includes(event.type)) events.push(event);
+    if (['tool.started', 'tool.completed', 'run.retrying'].includes(event.type) && !event.data.subagentId) events.push(event);
+    if (event.data.subagentId && (event.type.startsWith('subagent.') || ['tool.started','tool.completed'].includes(event.type))) {agentEvents.push({...event,type:event.type.startsWith('subagent.')?event.type:`subagent.${event.type}`,data:redact(event.data)});renderAgents();}
+    if (event.type === 'bot.created' || event.type === 'agent.bot_created' || event.type === 'tool.completed' && event.data.toolName === 'create_bot') void guarded(loadBots);
     const row = el('article', 'event'), title = el('div', 'event-title'); title.append(el('span', '', event.type.replaceAll('.', ' · ')), el('span', 'muted', `#${event.id} · ${time(event.createdAt)}`));
     const detail = el('details'); detail.append(el('summary', '', 'Event details')); const serialized = JSON.stringify(redact(event.data), null, 2); detail.append(el('pre', '', serialized.length > 8000 ? `${serialized.slice(0, 8000)}\n…` : serialized)); row.append(title, detail); $('activity-list').prepend(row); while ($('activity-list').children.length > 200) $('activity-list').lastElementChild.remove();
     $('event-count').textContent = String($('activity-list').children.length);
@@ -673,8 +725,8 @@ import './src/layout.css';
     $('edit-dialog').close(); renderDeleteControls(); $('delete-dialog').showModal(); $('cancel-delete-bot').focus();
   }
   function forgetBot(id) {
-    if (selected?.id === id) { desktop.disconnect(); workspace.clear(); }
-    removedBots.add(id); bots = bots.filter(bot => bot.id !== id); drafts.delete(id); sendBusy.delete(id); approvalFeedback.delete(id); computerPending.delete(id);
+    if (selected?.id === id) { desktop.disconnect(); workspace.clear();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];selectedAgentId=null; }
+    removedBots.add(id); bots = bots.filter(bot => bot.id !== id); drafts.delete(id); draftMentions.delete(id); sendBusy.delete(id); approvalFeedback.delete(id); computerPending.delete(id);
     for (const [key, message] of pendingMessages) if (message.botId === id) pendingMessages.delete(key);
     for (const map of [pendingActions, approvalWork, connectionWork, appWork]) for (const key of map.keys()) if (key.startsWith(`${id}:`)) map.delete(key);
     if (editBotId === id) {editBotId = null; $('edit-form').reset(); $('edit-dialog').close();}
@@ -743,7 +795,7 @@ import './src/layout.css';
     }
     $('more-panels').setAttribute('aria-label', wideLayout.matches ? 'More options' : 'Open workspace');
     $('more-panels').title = wideLayout.matches ? 'More options' : 'Open workspace';
-    $('current-panel').textContent = ({computer:'Computer',files:'Files',apps:'Apps',runs:'Runs',activity:'Activity'})[currentPanel] || '';
+    $('current-panel').textContent = ({computer:'Computer',files:'Files',apps:'Apps',agents:'Agents',runs:'Runs',activity:'Activity'})[currentPanel] || '';
     $('current-panel').hidden = !open || docked;
     $('back-to-chat').hidden = !open || docked;
     desktop.setActive(currentPanel === 'computer');
@@ -756,13 +808,14 @@ import './src/layout.css';
     else workspaceExpanded = false;
     $('panel-menu').open = false;
     $('panel-menu').dataset.active = String(['runs', 'activity'].includes(name));
-    renderLayout(); saveLayout();
+    renderLayout(); saveLayout(); syncAgentHash();
     if (focus) $('more-panels').focus();
     if (name === 'files' && selected) workspace.setBot(selected.id);
     if (name !== 'computer') stopComputerStatus();
     if (name === 'computer' && selected) void guarded(computerStatus);
     if (name === 'runs' && selected) void guarded(() => loadRuns());
     if (name === 'apps' && selected) void guarded(() => loadApps());
+    if (name === 'agents' && selected) void loadAgents();
   }
   function toggleBots() {botsCollapsed = !botsCollapsed; renderLayout(); saveLayout();}
   function bindForm(id, fn) { $(id).addEventListener('submit', (event) => { event.preventDefault(); void guarded(fn); }); }
@@ -787,9 +840,11 @@ import './src/layout.css';
     $('connection').textContent = 'Connected'; $('empty').hidden = false; $('bot-workspace').hidden = true;
     void chatGPTTask(loadChatGPT);
     const bot = bots.find(item => item.id === chosenHash()) || (!matchMedia('(max-width: 760px)').matches ? bots[0] : null);
+    // Restore layout before the workspace becomes interactive. Late initial reads
+    // must not close a menu or change the panel the user has already opened.
+    showPanel(bot && new URLSearchParams(location.hash.slice(1)).get('agent') ? 'agents' : preferences.workspaceOpen === true && wideLayout.matches ? lastWorkspacePanel : 'conversation');
     if (bot) await guarded(() => selectBot(bot, {replace: true}));
     else {botsCollapsed = false; showBotList(false);}
-    showPanel(preferences.workspaceOpen === true && wideLayout.matches ? lastWorkspacePanel : 'conversation');
   }
   function showBotList(updateHistory = true) {
     document.body.dataset.mobileView = 'bots';
@@ -842,13 +897,13 @@ import './src/layout.css';
   });
   $('create-form').addEventListener('submit', async (event) => {
     event.preventDefault(); const button = event.submitter || event.currentTarget.querySelector('[type=submit]'); button.disabled = true; $('create-error').textContent = '';
-    try { const { bot } = await request('/v1/bots', { method: 'POST', body: { name: $('bot-name').value.trim(), instructions: $('bot-instructions').value.trim(), model: $('bot-model').value, computerApprovalMode: $('bot-computer-approval-mode').value } }); $('create-form').reset(); $('bot-dialog').close(); $('bot-search').value = ''; bots = [bot, ...bots.filter((item) => item.id !== bot.id)]; renderBots(); await guarded(() => selectBot(bot)); }
+    try { const { bot } = await request('/v1/bots', { method: 'POST', body: { name: $('bot-name').value.trim(), instructions: $('bot-instructions').value.trim(), model: $('bot-model').value, computerApprovalMode: $('bot-computer-approval-mode').value, allowNamedAgents: $('bot-allow-named-agents').checked } }); $('create-form').reset(); $('bot-dialog').close(); $('bot-search').value = ''; bots = [bot, ...bots.filter((item) => item.id !== bot.id)]; renderBots(); await guarded(() => selectBot(bot)); }
     catch (error) { if (authenticated) $('create-error').textContent = errorText(error); } finally { button.disabled = false; }
   });
-  $('edit-bot').addEventListener('click', () => { if (!selected) return; if ($('panel-menu')) $('panel-menu').open = false; editBotId = selected.id; $('edit-name').value = selected.name; $('edit-instructions').value = selected.instructions; $('edit-computer-approval-mode').value = selected.computerApprovalMode === 'automatic' ? 'automatic' : 'ask'; $('edit-error').textContent = ''; $('edit-dialog').showModal(); $('edit-name').focus(); });
+  $('edit-bot').addEventListener('click', () => { if (!selected) return; if ($('panel-menu')) $('panel-menu').open = false; editBotId = selected.id; $('edit-name').value = selected.name; $('edit-instructions').value = selected.instructions; $('edit-computer-approval-mode').value = selected.computerApprovalMode === 'automatic' ? 'automatic' : 'ask'; $('edit-allow-named-agents').checked = selected.allowNamedAgents === true; $('edit-error').textContent = ''; $('edit-dialog').showModal(); $('edit-name').focus(); });
   $('edit-form').addEventListener('submit', async (event) => {
     event.preventDefault(); const button = event.submitter || event.currentTarget.querySelector('[type=submit]'), id = editBotId; if (!id) return; button.disabled = true; $('edit-error').textContent = '';
-    try { const { bot } = await request(botPath(id), { method: 'PATCH', body: { name: $('edit-name').value.trim(), instructions: $('edit-instructions').value.trim(), computerApprovalMode: $('edit-computer-approval-mode').value } }); bots = bots.map((item) => item.id === bot.id ? bot : item); if (selected?.id === bot.id) { selected = bot; updateBotHeader(); renderMessages(); renderApprovals(); } renderBots(); $('edit-dialog').close(); }
+    try { const { bot } = await request(botPath(id), { method: 'PATCH', body: { name: $('edit-name').value.trim(), instructions: $('edit-instructions').value.trim(), computerApprovalMode: $('edit-computer-approval-mode').value, allowNamedAgents: $('edit-allow-named-agents').checked } }); bots = bots.map((item) => item.id === bot.id ? bot : item); if (selected?.id === bot.id) { selected = bot; updateBotHeader(); renderMessages(); renderApprovals(); } renderBots(); $('edit-dialog').close(); }
     catch (error) { if (authenticated) $('edit-error').textContent = errorText(error); } finally { button.disabled = false; }
   });
   $('delete-bot').addEventListener('click', () => {const bot = bots.find(item => item.id === editBotId); if (bot) openDelete(bot);});
@@ -860,7 +915,7 @@ import './src/layout.css';
   $('approval-shortcut').addEventListener('click', () => { runFilter = null; focusApproval++; showPanel('conversation'); renderMessages(); });
   const tabs = [...document.querySelectorAll('[data-panel]')];
   tabs.forEach((button, index) => {button.addEventListener('click', () => showPanel(button.dataset.panel)); button.addEventListener('keydown', event => {if (!button.closest('#panel-menu')) return; const menuTabs = tabs.filter(tab => tab.closest('#panel-menu')); index = menuTabs.indexOf(button); let next; if (event.key === 'ArrowDown') next = (index + 1) % menuTabs.length; if (event.key === 'ArrowUp') next = (index + menuTabs.length - 1) % menuTabs.length; if (event.key === 'Home') next = 0; if (event.key === 'End') next = menuTabs.length - 1; if (next !== undefined) {event.preventDefault(); menuTabs[next].focus();}});});
-  $('refresh-history').addEventListener('click', () => guarded(() => Promise.all([loadMessages(), loadRuns(), loadApprovals(), loadConnections(), loadApps()]))); $('reconnect-stream').addEventListener('click', startStream);
+  $('refresh-history').addEventListener('click', () => guarded(() => Promise.all([loadMessages(), loadRuns(), loadApprovals(), loadConnections(), loadApps(), loadAgents()]))); $('reconnect-stream').addEventListener('click', startStream);
   $('refresh-computer').addEventListener('click', () => guarded(computerStatus)); $('take-screenshot').addEventListener('click', () => guarded(() => computerAction({ type: 'screenshot' })));
   $('checkpoint').addEventListener('click', () => guarded(() => computerAction({ type: 'checkpoint' }))); $('suspend-computer').addEventListener('click', () => guarded(suspendComputer));
   $('click-mode').addEventListener('change', () => document.querySelector('.screen').classList.toggle('click-enabled', $('click-mode').checked));

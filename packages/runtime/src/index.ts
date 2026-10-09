@@ -1,8 +1,8 @@
 import { createAssistantMessageEventStream, type AssistantMessage } from '@earendil-works/pi-ai';
 import { createModels } from '@earendil-works/pi-ai/models';
 import {
-  createRegistry, Harness, LiveDoc, ROOT_CONVERSATION_ID,
-  type AgentEvent, type AgentEventStream, type HookApi, type Storage, type SubmissionId,
+  createRegistry, Harness, LiveDoc, ProviderDoc, ROOT_CONVERSATION_ID,
+  type AgentEvent, type AgentEventStream, type ConversationId, type HookApi, type Storage, type SubmissionId,
 } from '@earendil-works/pi-durable';
 import { PiHarness, type PiHarnessContext } from 'agents/harness/pi';
 import { Lifecycle, LifecycleCapability, type LifecycleJobContext } from 'agents/lifecycle';
@@ -11,9 +11,10 @@ import { classifyFailure, normalizeEntries, textContent, toolCompletion } from '
 import { computerToolOperationId, computerTools, hostTools, type ToolBridge } from './tools.js';
 import { CHATGPT_MODEL, chatgptModel, createChatGPTProvider } from './chatgpt.js';
 import { createBudget } from './budget.js';
+import { createSubagents } from './subagents.js';
 import type { AgentRuntime, RuntimePause, PiRuntimeOptions, RuntimeApprovalSummary, RuntimeEvent, RuntimeMessage, RuntimeOperation, RuntimeOperationResult, RuntimeReceipt } from './types.js';
 
-export type { AgentRuntime, RuntimeOperation, RuntimeOperationResult, RuntimeReceipt, RuntimePendingOperation, PendingApproval, PendingConnection, RuntimePause, HostToolDefinition, RuntimeHostToolRequest, PiRuntimeOptions, RuntimeEvent, RuntimeMessage, RuntimeToolRequest, RuntimeToolResult, RuntimeTools, RuntimeApprovalSummary, RuntimeApprovalContext } from './types.js';
+export type { AgentRuntime, RuntimeOperation, RuntimeOperationResult, RuntimeReceipt, RuntimePendingOperation, PendingApproval, PendingConnection, RuntimePause, HostToolDefinition, RuntimeHostToolRequest, PiRuntimeOptions, RuntimeEvent, RuntimeMessage, RuntimeSubagent, RuntimeToolRequest, RuntimeToolResult, RuntimeTools, RuntimeApprovalSummary, RuntimeApprovalContext } from './types.js';
 export { normalizeEntries, textContent } from './normalize.js';
 export { createBudget, parseRuntimeLimit } from './budget.js';
 export const DEFAULT_MODEL = CHATGPT_MODEL;
@@ -58,6 +59,8 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
     return undefined;
   };
   const operationForCall = async (api: HookApi, context: PiHarnessContext['context']): Promise<string> => {
+    const child = await subagents.forConversation(api.conversationId);
+    if (child) return child.parentOperationId;
     const previous = await api.memo<string>('botspace.operationId', context);
     if (previous) return previous;
     const live = await api.snapshot(LiveDoc, api.conversationId, context);
@@ -66,6 +69,30 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
       if (submission?.requestId) return api.memo('botspace.operationId', submission.requestId, context);
     }
     throw new Error('Tool or generation has no durable originating operation');
+  };
+
+  const subagents = createSubagents({
+    native: () => native, harness: () => harness, storage: () => storage, context: () => background,
+    assertActive, emit, operationForCall, consume, paused, onMessage: options.onSubagentMessage,
+    scheduleWake: () => subagentWakes.schedule(),
+  });
+  const providerConversations = new Map<string, ConversationId>();
+  const providerConversation = async (sessionId?: string): Promise<ConversationId> => {
+    if (!sessionId) throw new Error('Model request has no durable conversation identity');
+    const cached = providerConversations.get(sessionId);
+    if (cached) return cached;
+    let cursor: Parameters<Storage['scanConversations']>[2];
+    do {
+      const page = await storage.scanConversations({}, 100, cursor, background);
+      for (const conversation of page.items) {
+        const provider = await native.snapshot(ProviderDoc, conversation.id, background);
+        if (provider) providerConversations.set(provider.sessionId, conversation.id);
+      }
+      cursor = page.next;
+    } while (cursor);
+    const id = providerConversations.get(sessionId);
+    if (!id) throw new Error('Model request has no durable conversation identity');
+    return id;
   };
 
   const harness = new PiHarness({
@@ -82,11 +109,14 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
             let policyBlocked = true;
             try {
               assertActive();
-              const live = await native.snapshot(LiveDoc, ROOT_CONVERSATION_ID, background);
+              const conversationId = await providerConversation(streamOptions?.sessionId);
+              const live = await native.snapshot(LiveDoc, conversationId, background);
               const operationId = live?.run ? await resolveInputs(live.run.inputs) : undefined;
               if (!operationId || !live?.run) throw new Error('Model request has no durable originating operation');
               if (paused(operationId)) throw new Error('Run is paused awaiting a host decision or connection');
-              consume(operationId, 'generation', String(live.run.taskId));
+              const child = await subagents.forConversation(conversationId);
+              if (child?.status === 'cancelled') throw new Error('Subagent was cancelled');
+              consume(child?.parentOperationId ?? operationId, 'generation', String(live.run.taskId));
               assertActive();
               policyBlocked = false;
               const upstream = provider.streamSimple(model, context, {
@@ -127,12 +157,22 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
             call: request => { assertActive(); return options.tools.call!(request); },
           } satisfies Pick<NonNullable<ToolBridge['tools']>, 'catalog' | 'call'> : {}),
         }, operationForCall, consume, paused, pause,
+        childForCall: async (api, context) => {
+          const child = await subagents.forConversation(api.conversationId);
+          if (!child) return undefined;
+          if (child.status === 'cancelled') throw new Error('Subagent was cancelled');
+          const live = await api.snapshot(LiveDoc, api.conversationId, context);
+          const operationId = live?.run ? await resolveInputs(live.run.inputs) : undefined;
+          if (!operationId) throw new Error('Subagent tool has no durable originating input');
+          return { subagentId: child.id, subagentOperationId: operationId };
+        },
         imageInputSupported: async () => resolveModel((await options.getBot()).model).input.includes('image'),
       };
       registry.install({
         name: 'botspace',
-        sections: [{ key: 'preamble', tag: false, render: async () => {
+        sections: [{ key: 'preamble', tag: false, render: async input => {
           const bot = await options.getBot();
+          const child = await subagents.forConversation(input.conversationId);
           let approvalSnapshot = 'Current host approval status is unavailable. Do not infer current status from historical tool results.';
           if (options.getApprovalContext) {
             try {
@@ -144,9 +184,10 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
             }
           }
           return [
-            `You are ${bot.name}, a persistent named bot in Botspace.`,
+            child ? `You are ${child.name}, a temporary subagent of ${bot.name}. Complete your assigned task and coordinate with your parent.` : `You are ${bot.name}, a persistent named bot in Botspace.`,
             bot.instructions,
             'You own one ongoing conversation. Preserve useful context across tasks.',
+            'Use spawn_subagent to delegate concrete tasks to temporary agents with separate contexts. They share your computer; assign separate files and coordinate edits. Use list_subagents, send_subagent_message, wait_subagent and cancel_subagent to coordinate. Temporary agents are visible to the user. Named persistent bots are separate host capabilities discoverable through list_tools.',
             'Your computer is a reusable cloud Linux desktop. Files belong under /workspace.',
             'Use only the provided tools. Never invent tool results or claim an action succeeded without its result.',
             'After a tool result, continue the task: inspect failures, make a safe corrective attempt when appropriate, and provide a visible final answer describing the outcome. A successful tool call alone is not a final answer. Never leave the user waiting for a follow-up prompt to hear what happened.',
@@ -173,7 +214,8 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
             'An interrupted action has an unknown outcome. Inspect before deciding whether to request another attempt.',
           ].filter(Boolean).join('\n');
         } }],
-        tools: [...computerTools(bridge), ...hostTools(bridge)],
+        tools: [...computerTools(bridge), ...hostTools(bridge), ...subagents.tools()],
+        tasks: subagents.tasks,
       });
       native = await Harness.open(context.storage, {
         models, registry,
@@ -287,6 +329,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
       eventStream.start(async events => {
         for (const event of events) await processEvent(event);
       });
+      await subagents.start();
     }
   }
   class AdmissionRetries extends LifecycleCapability {
@@ -310,7 +353,20 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
     }
   }
   const admissionRetries = new AdmissionRetries();
-  const lifecycle = Lifecycle.install(options.owner).use(harness).use(new Projection()).use(admissionRetries);
+  class SubagentWakes extends LifecycleCapability {
+    constructor() { super('botspace-subagents'); }
+    async schedule() {
+      assertActive();
+      await this.lifecycle.jobs.push({ id: 'botspace:subagent-deliveries', fn: 'wake', time: Date.now() + 1_000, singleflight: true });
+    }
+    async onJob() {
+      if (destroyed) return;
+      native.resume();
+      if (await subagents.hasDeliveries()) return { rescheduleAt: Date.now() + 5_000 };
+    }
+  }
+  const subagentWakes = new SubagentWakes();
+  const lifecycle = Lifecycle.install(options.owner).use(harness).use(new Projection()).use(admissionRetries).use(subagentWakes);
 
   const destroy = (): Promise<void> => {
     if (!shutdown) {
@@ -320,6 +376,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
       const attempt = (async () => {
         await lifecycle.disableAlarms();
         await eventStream?.stop();
+        await subagents.stop();
         if (native && !nativeAborted) {
           const conversation = await native.conversation(ROOT_CONVERSATION_ID, background);
           await conversation?.abort(background, { background: true });
@@ -358,7 +415,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
       return { operationId, status, ...(text === undefined ? {} : { text }), ...(kind ? { kind } : {}), ...(reason === undefined ? {} : { reason }) };
     },
     async pending() { assertActive(); return (await harness.pending({ session: '1' })).map(({ operationId, status }) => ({ operationId, status })); },
-    async cancel(operationId?: string) { assertActive(); return harness.abort({ operationId }); },
+    async cancel(operationId?: string) { assertActive(); await subagents.cancelParent(operationId); return harness.abort({ operationId }); },
     async operation(operationId: string): Promise<RuntimeOperation> {
       assertActive();
       const pending = (await harness.pending({ session: '1' })).find(item => item.operationId === operationId);
@@ -369,7 +426,11 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
       return { operationId, status: result.reason === 'not_found' ? 'missing' : result.status, ...(result.text === undefined ? {} : { text: result.text }), ...(kind ? { kind } : {}), ...(result.reason === undefined ? {} : { reason: result.reason }) };
     },
     async messages(): Promise<RuntimeMessage[]> { assertActive(); return normalizeEntries(await harness.messages()); },
-    async dispose() { if (shutdown) return shutdown; await eventStream?.stop(); await harness.dispose(); },
+    async subagents() { assertActive(); await harness.pi(); return subagents.list(); },
+    async subagentMessages(id) { assertActive(); await harness.pi(); return subagents.messages(id); },
+    async sendSubagent(id, text, input) { assertActive(); await harness.pi(); return subagents.send(id, text, input); },
+    async cancelSubagent(id) { assertActive(); await harness.pi(); return subagents.cancel(id); },
+    async dispose() { if (shutdown) return shutdown; await eventStream?.stop(); await subagents.stop(); await harness.dispose(); },
     destroy,
   };
 }

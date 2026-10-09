@@ -1719,3 +1719,143 @@ for (const width of [390,820]) test(`focused composer follows the keyboard viewp
     assert.equal(await page.locator('#edit-name').evaluate(node=>document.activeElement===node),true,'a modal field stays focused and its dialog fits above the keyboard');
   },{viewport:{width,height:844},isMobile:true,hasTouch:true,colorScheme:'dark'});
 });
+
+test('named agents permission defaults off and persists through bot editing and creation', async () => {
+  await withPage(async ({page,state,login}) => {
+    await login(); await openBotEditor(page);
+    assert.equal(await page.locator('#edit-allow-named-agents').isChecked(), false);
+    await page.locator('#edit-allow-named-agents').check();await page.locator('#edit-form [type=submit]').click();
+    await page.locator('#edit-dialog').waitFor({state:'hidden'});
+    assert.equal(state.bots.find(bot=>bot.id===BOT_A).allowNamedAgents,true);
+    await page.reload();await page.locator('#message').waitFor();await openBotEditor(page);
+    assert.equal(await page.locator('#edit-allow-named-agents').isChecked(),true);
+    await page.locator('[data-close-dialog="edit-dialog"]').first().click();await page.locator('#new-bot').click();
+    assert.equal(await page.locator('#bot-allow-named-agents').isChecked(),false);
+    await page.locator('#bot-name').fill('Lead');await page.locator('#bot-allow-named-agents').check();await page.locator('#create-form [type=submit]').click();
+    await until(page,'#selected-name','Lead');assert.equal(state.bots.find(bot=>bot.name==='Lead').allowNamedAgents,true);
+  });
+});
+
+test('bot mentions select explicit IDs with spaces and duplicate names and remove edited recipients', async () => {
+  await withPage(async ({page,state,login}) => {
+    state.bots.find(bot=>bot.id===BOT_B).name='Code Reviewer';
+    const duplicate={...state.bots[1],id:'10000000-0000-4000-8000-000000000088'};state.bots.push(duplicate);
+    await login();await page.locator('#message').fill('@Code');
+    await page.locator(`[data-mention-bot="${BOT_B}"]`).waitFor();
+    assert.match(await page.locator(`[data-mention-bot="${BOT_B}"]`).innerText(),new RegExp(BOT_B.slice(-8)));
+    await page.locator(`[data-mention-bot="${BOT_B}"]`).click();
+    assert.equal(await page.locator('#message').inputValue(),'@Code Reviewer ');
+    await page.locator('#message').pressSequentially('please review this');await sendMessage(page);
+    await page.waitForFunction(()=>!document.querySelector('#message').value);
+    assert.deepEqual(sentMessages(state,BOT_A).at(-1).body.mentions,[BOT_B]);
+    await page.locator('#message').fill('@Code');await page.locator(`[data-mention-bot="${duplicate.id}"]`).click();
+    await page.locator('#message').fill('@Code ReviewerExtra please check');
+    assert.equal(await page.locator('.timber-selected-mentions').count(),0,'extending the selected name removes its recipient instead of sending to the old bot');
+    await page.locator('#message').fill('Different request without a mention');
+    assert.equal(await page.locator('.timber-selected-mentions').count(),0);await sendMessage(page);
+    await page.waitForFunction(()=>!document.querySelector('#message').value);
+    assert.equal(sentMessages(state,BOT_A).at(-1).body.mentions,undefined);
+  });
+});
+
+test('bot mention keyboard selection and unknown-delivery retry retain identical recipients and operation ID', async () => {
+  await withPage(async ({page,state,login}) => {
+    await login();let rejected=false;const submissions=[];
+    await page.route(`**/v1/bots/${BOT_A}/messages`,async route=>{
+      if(route.request().method()!=='POST') return route.continue();
+      submissions.push(route.request().postDataJSON());
+      if(!rejected){rejected=true;return route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:{code:'unavailable',message:'Temporary connection issue.'}})});}
+      return route.continue();
+    });
+    await page.locator('#message').fill('@Lin');await page.locator('#message').press('Enter');
+    assert.equal(await page.locator('#message').inputValue(),'@Linus ');
+    await page.locator('#message').pressSequentially('check this');await sendMessage(page);
+    await page.getByRole('button',{name:'Retry sending',exact:true}).click();
+    await page.waitForFunction(()=>!document.querySelector('#message').value);
+    assert.equal(submissions.length,2);assert.deepEqual(submissions[0],submissions[1]);assert.deepEqual(submissions[1].mentions,[BOT_B]);
+    assert.equal(state.messages.get(BOT_A).filter(message=>message.text==='@Linus check this').length,1);
+  });
+});
+
+for (const viewport of [{width:1440,height:1050},{width:390,height:844}]) test(`temporary agents show conversations, messages, cancellation and reload persistence at ${viewport.width}px`, async () => {
+  await withPage(async ({page,state,login}) => {
+    const stamp=new Date().toISOString(),agent={id:'child-research',name:'Researcher',task:'Review the project architecture',parentOperationId:'parent-operation',operationId:'child-operation',status:'running',createdAt:stamp,updatedAt:stamp};
+    state.agents.set(BOT_A,[agent]);state.agentMessages.set(agent.id,[{id:'child-response',role:'assistant',text:'The architecture review is underway.',createdAt:stamp}]);
+    state.runs.set(BOT_A,[{id:'child-run',botId:BOT_A,operationId:agent.operationId,subagentId:agent.id,parentRunId:'parent-run',status:'running',createdAt:stamp,updatedAt:stamp}]);
+    await login();assert.equal(await page.locator('#run-status').isVisible(),false,'child activity has its own status and does not replace the parent header');await page.locator('[data-chat-agent="child-research"]').click();
+    await page.locator('[data-agent-detail="child-research"]').waitFor();await page.getByText('The architecture review is underway.',{exact:true}).waitFor();
+    await page.locator('#agent-message').fill('Also review persistence');await page.getByRole('button',{name:'Send message to Researcher',exact:true}).click();
+    await page.getByText('Also review persistence',{exact:true}).waitFor();
+    assert.equal(state.agentMessageOperations.size,1);assert.equal(new URL(page.url()).hash.includes('agent=child-research'),true);
+    state.emit(BOT_A,'subagent.tool.completed',{subagentId:agent.id,toolCallId:'child-tool',toolName:'read_file',result:{status:'completed',output:'Public tool result'}});
+    await page.locator('.timber-agent-activity summary').click();await page.getByText('Public tool result',{exact:true}).waitFor();
+    state.emit(BOT_A,'tool.completed',{subagentId:agent.id,operationId:'child-effect',toolCallId:'child-tool',toolName:'read_file',result:{status:'completed',output:'Public tool result'}});
+    await page.locator('.timber-agent-activity summary').filter({hasText:'Tool activity · 1'}).waitFor();
+    assert.equal(await page.locator('#messages [data-tool-row]').count(),0,'child tool output never appears as a parent tool');
+    await page.reload();await page.locator('[data-agent-detail="child-research"]').waitFor();await page.getByText('Also review persistence',{exact:true}).waitFor();
+    await page.getByRole('button',{name:'Stop agent',exact:true}).click();
+    await page.locator('.timber-agent-detail-heading [data-status="cancelled"]').waitFor();
+    assert.equal(await page.locator('#agent-message').count(),0,'cancelled agents retain history without accepting more work');
+    const box=await page.locator('#agents-root').boundingBox();assert.ok(box && box.x>=0 && box.x+box.width<=viewport.width+1);
+    await page.getByRole('button',{name:'Back to agents',exact:true}).click();await page.locator('[data-agent-id="child-research"]').waitFor();
+    assert.equal(agent.status,'cancelled');
+  },{viewport,...(viewport.width<760?{isMobile:true,hasTouch:true}:{})});
+});
+
+test('bot collaboration shows source identity and opens the target conversation', async () => {
+  await withPage(async ({page,state,login}) => {
+    state.bots.find(bot=>bot.id===BOT_B).createdByBotId=BOT_A;
+    const stamp=new Date().toISOString();state.delegations.set(BOT_A,[{id:'delegation-one',sourceBotId:BOT_A,sourceBotName:'Ada',sourceRunId:'source-run',targetBotId:BOT_B,targetBotName:'Linus',path:[BOT_A,BOT_B],status:'completed',createdAt:stamp,updatedAt:stamp}]);
+    state.messages.get(BOT_A).push({id:'collaboration-result',botId:BOT_A,role:'user',text:'The software review is complete.',provenance:{kind:'delegation_result',sourceBotId:BOT_B,sourceBotName:'Linus',delegationId:'delegation-one'},createdAt:stamp});
+    await login();await page.locator('[data-message-id="collaboration-result"] .timber-agent-source').filter({hasText:'Linus'}).waitFor();
+    await openPanel(page,'agents');await page.locator('[data-delegation-id="delegation-one"]').waitFor();
+    await page.locator(`[data-named-agent="${BOT_B}"]`).filter({hasText:'Persistent bot'}).waitFor();
+    await page.getByRole('button',{name:'Open Linus',exact:true}).click();await until(page,'#selected-name','Linus');
+  });
+});
+
+test('agent controls and mention selection remain available in expanded computer chat', async () => {
+  await withPage(async ({page,state,login}) => {
+    const stamp=new Date().toISOString();state.agents.set(BOT_A,[{id:'child-docked',name:'Reviewer',task:'Review changes',parentOperationId:'parent',operationId:'child',status:'running',createdAt:stamp,updatedAt:stamp}]);
+    state.agentMessages.set('child-docked',[{id:'docked-message',role:'assistant',text:'Review in progress.',createdAt:stamp}]);
+    await login();await openPanel(page,'computer');await page.locator('#expand-workspace').click();
+    await page.locator('#desktop-chat-dock #message').waitFor();await page.locator('#message').fill('@Lin');
+    await page.locator(`[data-mention-bot="${BOT_B}"]`).waitFor();await page.locator('#message').press('Enter');
+    await page.locator('#desktop-chat-dock .timber-selected-mentions').filter({hasText:'Linus'}).waitFor();
+    await page.locator('#desktop-chat-dock .timber-mini-agents').click();await page.locator('#panel-agents').waitFor();
+    await page.locator('[data-agent-id="child-docked"]').click();await page.getByText('Review in progress.',{exact:true}).waitFor();
+    await page.locator('#close-workspace').click();await page.locator('#message').waitFor();
+    assert.equal(await page.locator('#message').inputValue(),'@Linus ');
+    assert.match(await page.locator('.timber-selected-mentions').innerText(),/Linus/);
+  });
+});
+
+test('initial conversation refresh cannot close an already opened workspace menu', async () => {
+  await withPage(async ({page,state,login}) => {
+    let release;state.readsGate=new Promise(resolve=>{release=resolve;});
+    try {
+      await login({selectFirstBot:false});await page.locator('#bot-workspace').waitFor();
+      await page.locator('#panel-menu > summary').click();
+      assert.equal(await page.locator('#panel-menu').evaluate(menu=>menu.open),true);
+      state.readsGate=null;release();await page.locator('#stream-state').filter({hasText:'Live'}).waitFor({state:'attached'});
+      assert.equal(await page.locator('#panel-menu').evaluate(menu=>menu.open),true,'a late initial snapshot preserves the user’s open menu');
+      await page.locator('#tab-computer').click();await page.locator('#panel-computer').waitFor();
+    } finally {release();}
+  });
+});
+
+test('undelivered subagent reports remain visible after reload without changing saved success', async () => {
+  await withPage(async ({page,state,login}) => {
+    const stamp=new Date().toISOString(),agentId='child-report';
+    state.agents.set(BOT_A,[{id:agentId,name:'Researcher',task:'Review persistence',parentOperationId:'parent',operationId:'child',status:'completed',result:'The review is complete.',createdAt:stamp,updatedAt:stamp}]);
+    state.agentMessages.set(agentId,[{id:'saved-result',role:'assistant',text:'The review is complete.',createdAt:stamp}]);
+    await login();await page.locator(`[data-chat-agent="${agentId}"]`).click();await page.getByText('The review is complete.',{exact:true}).waitFor();
+    const message='The subagent result is saved, but its parent could not be notified.';
+    state.emit(BOT_A,'subagent.report_failed',{subagentId:agentId,errorCode:'parent_report_failed',message});
+    await page.locator(`[data-agent-report-error="${agentId}"]`).filter({hasText:message}).waitFor();
+    assert.equal(await page.locator('.timber-agent-detail-heading [data-status="completed"]').count(),1);
+    await page.reload();await page.locator(`[data-agent-report-error="${agentId}"]`).filter({hasText:message}).waitFor();
+    await page.getByText('The review is complete.',{exact:true}).waitFor();
+    assert.equal(await page.locator('.timber-agent-detail-heading [data-status="completed"]').count(),1,'notification failure does not mislabel the completed subagent task');
+  });
+});

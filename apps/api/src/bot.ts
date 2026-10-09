@@ -1,7 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
-import type { Approval, Bot, BotEvent, ComputerAction, ComputerResult, ComputerStatus, ConnectionRequest, Message, Run, RunPage, RunStatus } from "@botspace/contracts";
+import type { AgentDelegation, Approval, Bot, BotEvent, ComputerAction, ComputerResult, ComputerStatus, ConnectionRequest, Message, MessageProvenance, Run, RunDelegation, RunPage, RunStatus } from "@botspace/contracts";
 import { createCloudComputerProvider, touchCloudComputer, suspendCloudComputer, deleteCloudComputer, ComputerProviderError } from "@botspace/computer";
-import { createPiRuntime, parseRuntimeLimit, type AgentRuntime, type RuntimeApprovalContext, type RuntimeApprovalSummary, type RuntimeToolResult, type RuntimeHostToolRequest } from "@botspace/runtime";
+import { createPiRuntime, parseRuntimeLimit, type AgentRuntime, type RuntimeApprovalContext, type RuntimeApprovalSummary, type RuntimeToolResult, type RuntimeHostToolRequest, type RuntimeSubagent } from "@botspace/runtime";
+import { agentCoordinatorRequest } from "./agent-coordination";
 import { hostTools, validateHostArguments, githubDevelopmentSkill, workspaceAppsSkill } from "./host-tools";
 import { WorkspaceApps } from "./workspace-apps";
 import { computerActivityInput, hostActivityInput } from "./tool-activity";
@@ -11,7 +12,8 @@ import { body, fingerprint, operationId, parseAction, parseMessage, UUID } from 
 
 type JsonRow = {data:string};
 type RunRow = JsonRow & {id:string;operation_id:string;fingerprint:string;native_operation_id:string};
-type Submission = {operation_id:string;run_id:string;text:string;admitted:number};
+type Submission = {operation_id:string;run_id:string;text:string;admitted:number;subagent_id?:string|null};
+type MentionDelivery = {operation_id:string;run_id:string;target_id:string;text:string;attempts:number};
 type AdmissionRetry = {attempts:number;next_at:number};
 type RuntimeProjection = {type:string;data:Record<string,unknown>;operationId?:string;eventKey?:string};
 const terminal = new Set<RunStatus>(["completed","failed","cancelled","interrupted"]);
@@ -27,6 +29,7 @@ export class BotDO extends DurableObject<Env> {
   private runtime!:AgentRuntime;
   private computer:ReturnType<typeof createCloudComputerProvider>;
   private admitting=new Map<string,Promise<void>>();
+  private mentioning=new Map<string,Promise<void>>();
   private observing=new Set<string>();
   private recovering?:Promise<void>;
   private reconcilingConnections?:Promise<void>;
@@ -59,7 +62,10 @@ export class BotDO extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS approvals_status_expiry_idx ON approvals (json_extract(data,'$.status'),json_extract(data,'$.expiresAt'));
       CREATE TABLE IF NOT EXISTS connections (id TEXT PRIMARY KEY, operation_id TEXT UNIQUE NOT NULL, fingerprint TEXT NOT NULL, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, source_key TEXT UNIQUE, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS mention_deliveries (operation_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,target_id TEXT NOT NULL,text TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS cancelled_agent_inputs (operation_id TEXT PRIMARY KEY);
     `);
+    if(!ctx.storage.sql.exec<{name:string}>("PRAGMA table_info(submissions)").toArray().some(column=>column.name==="subagent_id")) ctx.storage.sql.exec("ALTER TABLE submissions ADD COLUMN subagent_id TEXT");
     this.runtime=createPiRuntime({
       owner:this,
       storage:ctx.storage,
@@ -75,6 +81,7 @@ export class BotDO extends DurableObject<Env> {
       getBot:async()=>this.currentBot(),
       getApprovalContext:async()=>this.approvalContext(),
       onAdmissionRetry:async(operationId)=>this.admit(operationId),
+      onSubagentMessage:async(input)=>this.receiveSubagentMessage(input),
       tools:{
         execute:async(input)=>this.executeTool(input),
         catalog:async()=>hostTools,
@@ -178,8 +185,9 @@ export class BotDO extends DurableObject<Env> {
       ? this.ctx.storage.sql.exec<PageRow>("SELECT rowid AS cursor,data FROM runs ORDER BY rowid DESC LIMIT ?",limit+1).toArray()
       : this.ctx.storage.sql.exec<PageRow>("SELECT rowid AS cursor,data FROM runs WHERE rowid<? ORDER BY rowid DESC LIMIT ?",before,limit+1).toArray();
     const page=rows.slice(0,limit);
-    // Active runs can be older than the requested page. Admission permits at most 16.
-    const activeRows=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM runs WHERE json_extract(data,'$.status') IN ('queued','running','waiting_approval','waiting_connection') ORDER BY rowid DESC LIMIT 16").toArray();
+    // Native children also project inputs here. Include every active input so
+    // pagination/reconnection cannot hide an older parent or pending approval.
+    const activeRows=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM runs WHERE json_extract(data,'$.status') IN ('queued','running','waiting_approval','waiting_connection') ORDER BY rowid DESC").toArray();
     return {
       runs:page.map(row=>JSON.parse(row.data) as Run),
       activeRuns:activeRows.map(row=>JSON.parse(row.data) as Run),
@@ -242,6 +250,14 @@ export class BotDO extends DurableObject<Env> {
 
   private async project(event:RuntimeProjection):Promise<void> {
     if(this.deleted) return;
+    if(event.type.startsWith("subagent.")) {
+      const agent=event.data.subagent as RuntimeSubagent|undefined;
+      const child=agent?.id?this.recordSubagent(agent):undefined;
+      if(agent?.status==="cancelled") this.fenceSubagent(agent.id);
+      const row=child?this.getRunRow(child.id):typeof event.data.subagentId==="string"?this.childRun(event.data.subagentId):undefined;
+      this.emit(event.type,event.data,row?.id,event.eventKey?`runtime:${event.eventKey}`:undefined);
+      return;
+    }
     const row=event.operationId?this.findRun(event.operationId):undefined;
     // Native snapshots replay committed progress after a restart without a run
     // attribution. Stable native IDs deduplicate both live and snapshot paths.
@@ -300,12 +316,82 @@ export class BotDO extends DurableObject<Env> {
     else {const failure=this.operationFailure(reason);this.updateStatus(run.id,failure.status,failure.error);}
   }
 
-  private async createRun(input:{text:string;operationId:string}):Promise<Run> {
+  private childRun(id:string):RunRow|undefined {
+    return this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs WHERE json_extract(data,'$.subagentId')=? ORDER BY rowid DESC LIMIT 1",id).toArray()[0];
+  }
+  /** Child sessions retain an independent host run so approvals, tools and named
+   * delegation can continue after the parent has returned its first answer. */
+  private recordSubagent(agent:RuntimeSubagent):Run {
+    this.active();
+    const existing=this.findRun(agent.operationId);
+    if(existing) {
+      const run=JSON.parse(existing.data) as Run;
+      if(terminal.has(run.status)) return run;
+      if(existing.native_operation_id!==agent.operationId) return run;
+      this.ctx.storage.sql.exec("INSERT OR IGNORE INTO submissions(operation_id,run_id,text,admitted,subagent_id) VALUES(?,?,?,1,?)",agent.operationId,run.id,agent.task,agent.id);
+      this.ctx.storage.sql.exec("UPDATE runs SET native_operation_id=? WHERE id=?",agent.operationId,run.id);
+      const status=this.hasPendingApproval(run.id)?"waiting_approval":this.hasPendingConnection(run.id)?"waiting_connection":agent.status;
+      this.updateStatus(run.id,status,agent.error);
+      return this.getRun(run.id);
+    }
+    const parent=this.findRun(agent.parentOperationId);
+    if(!parent) throw new ApiError(409,"run_not_found","Subagent has no parent run.");
+    const source=JSON.parse(parent.data) as Run;
+    const run:Run={id:crypto.randomUUID(),botId:source.botId,operationId:`subagent:${agent.operationId}`,subagentId:agent.id,parentRunId:source.id,...(source.delegation?{delegation:source.delegation}:{}),status:source.status==="cancelled"?"cancelled":agent.status,createdAt:agent.createdAt,updatedAt:agent.updatedAt};
+    this.ctx.storage.transactionSync(()=>{
+      this.ctx.storage.sql.exec("INSERT INTO runs(id,operation_id,fingerprint,native_operation_id,data) VALUES(?,?,?,?,?)",run.id,run.operationId,run.operationId,agent.operationId,JSON.stringify(run));
+      this.ctx.storage.sql.exec("INSERT OR IGNORE INTO submissions(operation_id,run_id,text,admitted,subagent_id) VALUES(?,?,?,1,?)",agent.operationId,run.id,agent.task,agent.id);
+      this.emit("run.updated",{run},run.id,`created:${run.id}`);
+    });
+    return run;
+  }
+  private async childToolInput<T extends {runOperationId:string;subagentId?:string;subagentOperationId?:string}>(input:T):Promise<T> {
+    if(!input.subagentId) return input;
+    const agent=(await this.runtime.subagents()).find(item=>item.id===input.subagentId);
+    if(!agent || agent.status==="cancelled" || !input.subagentOperationId) throw new ApiError(409,"agent_inactive","The subagent input is no longer active.");
+    // A follow-up may already be durably queued while the current tool returns.
+    // Its receipt must not invalidate the input that actually owns this call.
+    if(!this.findRun(input.subagentOperationId)) this.recordSubagent({...agent,operationId:input.subagentOperationId,status:"running"});
+    return {...input,runOperationId:input.subagentOperationId};
+  }
+  private async validateMentions(mentions:string[]):Promise<void> {
+    const registry=this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName("owner"));
+    for(const id of mentions) {
+      if(id===this.bot().id) throw new ApiError(400,"self_mention","Mention another bot.");
+      const response=await registry.fetch(`https://workspace/${id}`);
+      if(!response.ok) throw new ApiError(response.status===404?404:503,"mention_unavailable","A mentioned bot is no longer available.");
+    }
+  }
+  private dispatchMention(id:string):Promise<void> {
+    const previous=this.mentioning.get(id);if(previous) return previous;
+    const work=(async()=>{
+      const delivery=this.ctx.storage.sql.exec<MentionDelivery>("SELECT * FROM mention_deliveries WHERE operation_id=?",id).toArray()[0];
+      if(!delivery || delivery.attempts>=maxAdmissionAttempts || this.deleted) return;
+      const run=this.getRun(delivery.run_id);
+      if(run.status==="cancelled") {this.ctx.storage.sql.exec("DELETE FROM mention_deliveries WHERE operation_id=?",id);return;}
+      try {
+        const value=await agentCoordinatorRequest<{delegation:AgentDelegation}>(this.env,"/agents/send",{sourceBotId:run.botId,sourceRunId:run.id,operationId:id,targetBotId:delivery.target_id,text:delivery.text,kind:"mention"});
+        if(this.deleted) return;
+        this.ctx.storage.sql.exec("DELETE FROM mention_deliveries WHERE operation_id=?",id);
+        this.emit("delegation.updated",value,run.id,`mention:${id}`);
+      } catch {
+        if(this.deleted) return;
+        const attempts=delivery.attempts+1;
+        this.ctx.storage.sql.exec("UPDATE mention_deliveries SET attempts=? WHERE operation_id=?",attempts,id);
+        if(attempts<maxAdmissionAttempts) await this.runtime.scheduleAdmissionRetry(id,1000*2**(attempts-1));
+        else this.addMessage({id:crypto.randomUUID(),botId:run.botId,runId:run.id,role:"system",text:"A mentioned bot could not receive this message. Check its conversation before sending a new message.",createdAt:timestamp()},`mention-failed:${id}`);
+      }
+    })().finally(()=>this.mentioning.delete(id));
+    this.mentioning.set(id,work);return work;
+  }
+  private async createRun(input:{text:string;operationId:string;mentions?:string[]},metadata?:{provenance?:MessageProvenance;delegation?:RunDelegation;role?:Message["role"];parentRunId?:string;subagentId?:string}):Promise<Run> {
     if(this.takingControl) throw new ApiError(409,"computer_busy","Desktop control is being acquired. Retry after the connection is established.");
-    const hash=await fingerprint({text:input.text});
+    const hash=await fingerprint({text:input.text,...(input.mentions?.length?{mentions:input.mentions}:{}),...(metadata?.provenance?{provenance:metadata.provenance}:{}),...(metadata?.delegation?{delegation:metadata.delegation}:{}),...(metadata?.subagentId?{subagentId:metadata.subagentId}:{})});
     if(this.takingControl) throw new ApiError(409,"computer_busy","Desktop control is being acquired. Retry after the connection is established.");
     this.active();
-    if(input.operationId.startsWith("approval:") || input.operationId.startsWith("delegate:") || input.operationId.startsWith("connection:")) throw new ApiError(400,"reserved_operation_id","This operationId prefix is reserved.");
+    if(!metadata && /^(approval|delegate|connection|subagent|agent-result|subagent-report|mention):/.test(input.operationId)) throw new ApiError(400,"reserved_operation_id","This operationId prefix is reserved.");
+    if(this.ctx.storage.sql.exec("SELECT operation_id FROM cancelled_agent_inputs WHERE operation_id=?",input.operationId).toArray().length) throw new ApiError(409,"run_cancelled","This delegated input has been cancelled.");
+    if(metadata?.parentRunId && this.getRun(metadata.parentRunId).status==="cancelled") throw new ApiError(409,"run_cancelled","The parent task has been cancelled.");
     const existing=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs WHERE operation_id=?",input.operationId).toArray()[0];
     if(existing) {
       if(existing.fingerprint!==hash) throw new ApiError(409,"idempotency_conflict","operationId was already used with different input.");
@@ -320,25 +406,101 @@ export class BotDO extends DurableObject<Env> {
         });
       }
       await this.admit(existing.native_operation_id);
+      for(const delivery of this.ctx.storage.sql.exec<MentionDelivery>("SELECT * FROM mention_deliveries WHERE run_id=?",existing.id).toArray()) await this.dispatchMention(delivery.operation_id);
       return this.getRun(existing.id);
     }
+    await this.validateMentions(input.mentions??[]);
+    this.active();
+    // Registry validation yielded; serialize duplicate submissions by checking
+    // the durable receipt again before the transaction.
+    if(this.ctx.storage.sql.exec("SELECT id FROM runs WHERE operation_id=?",input.operationId).toArray().length) return this.createRun(input,metadata);
+    if(this.ctx.storage.sql.exec("SELECT operation_id FROM cancelled_agent_inputs WHERE operation_id=?",input.operationId).toArray().length) throw new ApiError(409,"run_cancelled","This delegated input has been cancelled.");
+    if(metadata?.parentRunId && this.getRun(metadata.parentRunId).status==="cancelled") throw new ApiError(409,"run_cancelled","The parent task has been cancelled.");
     if(this.suspending) throw new ApiError(409,"computer_busy","The computer is being suspended. Retry after it stops.");
     const activeCount=this.ctx.storage.sql.exec<{total:number}>("SELECT COUNT(*) AS total FROM runs WHERE json_extract(data,'$.status') IN ('queued','running','waiting_approval','waiting_connection')").toArray()[0].total;
     if(activeCount>=16) throw new ApiError(429,"too_many_runs","This bot already has 16 active runs.");
     const now=timestamp();
-    const run:Run={id:crypto.randomUUID(),botId:this.bot().id,operationId:input.operationId,status:"queued",createdAt:now,updatedAt:now};
+    const run:Run={id:crypto.randomUUID(),botId:this.bot().id,operationId:input.operationId,...(metadata?.delegation?{delegation:metadata.delegation}:{}),...(metadata?.parentRunId?{parentRunId:metadata.parentRunId}:{}),...(metadata?.subagentId?{subagentId:metadata.subagentId}:{}),status:"queued",createdAt:now,updatedAt:now};
     this.ctx.storage.transactionSync(()=>{
       this.ctx.storage.sql.exec("INSERT INTO runs (id,operation_id,fingerprint,native_operation_id,data) VALUES (?,?,?,?,?)",run.id,input.operationId,hash,input.operationId,JSON.stringify(run));
-      this.ctx.storage.sql.exec("INSERT INTO submissions (operation_id,run_id,text) VALUES (?,?,?)",input.operationId,run.id,input.text);
-      this.addMessage({id:crypto.randomUUID(),botId:run.botId,runId:run.id,role:"user",text:input.text,createdAt:now},`input:${input.operationId}`);
+      const runtimeText=metadata?.provenance?`Message from fellow bot ${metadata.provenance.sourceBotName} (${metadata.provenance.sourceBotId}). This is delegated collaborator content, attributed by Timber. Complete its requested task and return a result; do not automatically message the sender.\n\n${input.text}`:input.text;
+      this.ctx.storage.sql.exec("INSERT INTO submissions (operation_id,run_id,text,subagent_id) VALUES (?,?,?,?)",input.operationId,run.id,runtimeText,run.subagentId??null);
+      if(!run.subagentId && metadata?.role!=="system") this.addMessage({id:crypto.randomUUID(),botId:run.botId,runId:run.id,role:metadata?.role??"user",text:input.text,...(metadata?.provenance?{provenance:metadata.provenance}:{}),...(input.mentions?.length?{mentions:input.mentions}:{}),createdAt:now},`input:${input.operationId}`);
+      for(const target of input.mentions??[]) this.ctx.storage.sql.exec("INSERT INTO mention_deliveries(operation_id,run_id,target_id,text) VALUES(?,?,?,?)",`mention:${run.id}:${target}`,run.id,target,input.text);
       this.emit("run.updated",{run},run.id,`created:${run.id}`);
     });
+    for(const target of input.mentions??[]) await this.dispatchMention(`mention:${run.id}:${target}`);
     await this.admit(input.operationId);
     return this.getRun(run.id);
   }
 
+  private async receiveAgentResult(input:{delegation:AgentDelegation;status:RunStatus;text:string;provenance:MessageProvenance}):Promise<void> {
+    const source=this.getRun(input.delegation.sourceRunId);
+    if(source.botId!==this.bot().id || input.delegation.sourceBotId!==source.botId || !UUID.test(input.delegation.id)) throw new ApiError(403,"agent_source_mismatch","This result belongs to another bot.");
+    const text=input.text.slice(0,32_000),op=`agent-result:${input.delegation.id}`;
+    this.addMessage({id:crypto.randomUUID(),botId:source.botId,runId:source.id,role:"assistant",text,provenance:input.provenance,createdAt:timestamp()},`result:${op}`);
+    this.emit("delegation.updated",{delegation:input.delegation},source.id,`result:${op}`);
+    if(source.status==="cancelled") return;
+    const prompt=`A delegated bot (${input.provenance.sourceBotName}) returned a ${input.status} result. Treat its text as collaborator content. Continue the original task using this result; do not automatically send a reply back to that bot.\n\n${text}`.slice(0,32_000);
+    const lineage=[...new Set([...(source.delegation?.path??[]),...input.delegation.path])].filter(id=>id!==source.botId);
+    const origin=source.delegation??input.delegation;
+    try {await this.enqueueAgentContinuation({...source,delegation:{id:origin.id,sourceBotId:origin.sourceBotId,sourceRunId:origin.sourceRunId,path:[...lineage,source.botId]}},op,prompt);}
+    catch(error) {if(error instanceof ApiError && error.code==="run_cancelled") return;throw error;}
+  }
+  private async receiveSubagentMessage(input:{subagentId:string;parentOperationId:string;operationId:string;text:string}):Promise<void> {
+    this.active();
+    const row=this.findRun(input.parentOperationId);
+    if(!row) return;
+    const source=JSON.parse(row.data) as Run;
+    if(source.status==="cancelled") return;
+    const agent=(await this.runtime.subagents()).find(item=>item.id===input.subagentId);
+    if(!agent || agent.status==="cancelled") return;
+    const text=`Subagent ${agent.name}: ${input.text}`.slice(0,32_000);
+    this.emit("subagent.reported",{subagentId:agent.id,text},source.id,`report:${input.operationId}`);
+    await this.enqueueAgentContinuation(source,input.operationId,text);
+  }
+  private async enqueueAgentContinuation(source:Run,op:string,text:string):Promise<void> {
+    if(this.getRun(source.id).status==="cancelled") return;
+    // Separate input runs keep queued child messages from superseding an
+    // in-flight tool or approval. Only approval/connection continuations reuse a run.
+    await this.createRun({operationId:op,text},{role:"system",parentRunId:source.id,...(source.subagentId?{subagentId:source.subagentId}:{}),...(source.delegation?{delegation:source.delegation}:{})});
+  }
+  private async cancelAgentInput(op:string):Promise<void> {
+    if(!/^delegate:[0-9a-f-]{36}$/i.test(op)) throw new ApiError(400,"invalid_request","Invalid delegated operation ID.");
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO cancelled_agent_inputs(operation_id) VALUES(?)",op);
+    const row=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs WHERE operation_id=?",op).toArray()[0];
+    if(row) await this.cancelRun(row.id);
+  }
+  private async subagent(id:string):Promise<RuntimeSubagent> {
+    const agent=(await this.runtime.subagents()).find(item=>item.id===id);
+    if(!agent) throw new ApiError(404,"not_found","Subagent not found.");
+    return agent;
+  }
+  private async cancelSubagent(id:string):Promise<void> {
+    await this.runtime.cancelSubagent(id);
+    // Native cancellation includes descendants and queued messages. Fence every
+    // corresponding host input, including approvals belonging to earlier turns.
+    const cancelled=(await this.runtime.subagents()).filter(agent=>agent.status==="cancelled");
+    for(const agent of cancelled) this.fenceSubagent(agent.id);
+  }
+  private fenceSubagent(id:string):void {
+    for(const row of this.ctx.storage.sql.exec<{id:string}>("SELECT id FROM runs WHERE json_extract(data,'$.subagentId')=?",id).toArray()) this.fenceRun(row.id);
+  }
+  private fenceRun(id:string):void {
+    this.updateStatus(id,"cancelled");
+    for(const row of this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM approvals WHERE json_extract(data,'$.runId')=? AND json_extract(data,'$.status')='pending'",id).toArray()) {
+      const approval=JSON.parse(row.data) as Approval;
+      approval.status="denied";this.saveApproval(approval);this.emit("approval.updated",{approval},id);
+    }
+    for(const row of this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM connections WHERE json_extract(data,'$.runId')=? AND json_extract(data,'$.status')='pending'",id).toArray()) {
+      const connection=JSON.parse(row.data) as ConnectionRequest;
+      connection.status="cancelled";this.saveConnection(connection);this.emit("connection.updated",{connection},id);
+    }
+  }
+
   /** This outbox only admits durable inputs. Pi owns all execution and tool recovery. */
   private admit(nativeOperationId:string):Promise<void> {
+    if(nativeOperationId.startsWith("mention:")) return this.dispatchMention(nativeOperationId);
     const existing=this.admitting.get(nativeOperationId);
     if(existing) return existing;
     const operation=this.admitOnce(nativeOperationId).finally(()=>this.admitting.delete(nativeOperationId));
@@ -355,14 +517,15 @@ export class BotDO extends DurableObject<Env> {
     if(!submission.admitted && retry && (retry.attempts>=maxAdmissionAttempts || retry.next_at>Date.now())) return;
     try {
       if(!submission.admitted) {
-        await this.runtime.submit(submission.text,{operationId:nativeOperationId});
+        if(submission.subagent_id) await this.runtime.sendSubagent(submission.subagent_id,submission.text,{operationId:nativeOperationId});
+        else await this.runtime.submit(submission.text,{operationId:nativeOperationId});
         if(this.deleted) return;
         this.ctx.storage.sql.exec("UPDATE submissions SET admitted=1 WHERE operation_id=?",nativeOperationId);
         this.ctx.storage.sql.exec("DELETE FROM admission_retries WHERE operation_id=?",nativeOperationId);
         const current=this.getRunRow(run.id),latest=JSON.parse(current.data) as Run;
         if(current.native_operation_id===nativeOperationId && latest.status==="queued" && [admissionPending,admissionExhausted].includes(latest.error??"")) this.updateStatus(run.id,"queued");
       }
-      this.observe(nativeOperationId);
+      if(!submission.subagent_id) this.observe(nativeOperationId);
     } catch {
       // Admission may settle after an approval replaced this native input or the
       // user cancelled it. A stale failure cannot terminate the newer input.
@@ -370,7 +533,7 @@ export class BotDO extends DurableObject<Env> {
       // A lost receipt does not mean Pi rejected the input. Reconcile its durable
       // record before retrying the same idempotent input; never restart a tool.
       let known:Awaited<ReturnType<AgentRuntime["operation"]>>|undefined;
-      try {known=await this.runtime.operation(nativeOperationId);} catch {/* Keep delivery unconfirmed. */}
+      try {if(!submission.subagent_id) known=await this.runtime.operation(nativeOperationId);} catch {/* Keep delivery unconfirmed. */}
       if(!this.canAdmit(nativeOperationId,run.id)) return;
       if(known && known.status!=="missing") {
         this.ctx.storage.sql.exec("UPDATE submissions SET admitted=1 WHERE operation_id=?",nativeOperationId);
@@ -407,6 +570,7 @@ export class BotDO extends DurableObject<Env> {
     if(this.recovering) return this.recovering;
     this.recovering=(async()=>{
       await this.reconcileConnections();
+      for(const delivery of this.ctx.storage.sql.exec<MentionDelivery>("SELECT * FROM mention_deliveries WHERE attempts<?",maxAdmissionAttempts).toArray()) await this.dispatchMention(delivery.operation_id);
       const rows=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs").toArray();
       for(const row of rows) {
         const run=JSON.parse(row.data) as Run;
@@ -430,8 +594,9 @@ export class BotDO extends DurableObject<Env> {
     }
     return undefined;
   }
-  private async executeTool(input:{operationId:string;runOperationId:string;toolCallId?:string;action:ComputerAction;signal?:AbortSignal}):Promise<RuntimeToolResult> {
+  private async executeTool(input:{operationId:string;runOperationId:string;subagentId?:string;subagentOperationId?:string;toolCallId?:string;action:ComputerAction;signal?:AbortSignal}):Promise<RuntimeToolResult> {
     this.active();
+    input=await this.childToolInput(input);
     const row=this.findRun(input.runOperationId);
     if(!row) throw new ApiError(409,"run_not_found","Tool has no active run.");
     const run=JSON.parse(row.data) as Run;
@@ -449,7 +614,7 @@ export class BotDO extends DurableObject<Env> {
     const concurrentDecision=this.existingToolDecision(input.operationId,hash);
     if(concurrentDecision) return concurrentDecision;
     if(automatic.has(action.type) || bot.computerApprovalMode==="automatic") {
-      const activity={...(input.toolCallId?{toolCallId:input.toolCallId}:{}),actionType:action.type,input:computerActivityInput(action)};
+      const activity={...(input.subagentId?{subagentId:input.subagentId}:{}),...(input.toolCallId?{toolCallId:input.toolCallId}:{}),actionType:action.type,input:computerActivityInput(action)};
       this.startTool(input.operationId,activity,run.id);
       const result=await this.computer.exec(run.botId,input.operationId,action);
       this.emit("tool.completed",{operationId:input.operationId,...activity,result},run.id,`tool:${input.operationId}`);
@@ -549,7 +714,7 @@ export class BotDO extends DurableObject<Env> {
       const exists=this.ctx.storage.sql.exec("SELECT operation_id FROM submissions WHERE operation_id=?",nativeOperationId).toArray().length;
       if(exists) return;
       const text=`${connection.repository?`GitHub is now connected to your Timber account. This task requested ${connection.repository} (${connection.permission}).`:"GitHub is now connected to the Timber account and available to its bots. Use github_list_repositories to discover repositories authorized in the installation; use the access and permissions granted by GitHub."} Continue the original task. The tool that requested access was NOT executed. You may issue that operation now. Do not repeat previously completed effects. Use the host GitHub tools; credentials are managed by the host.`;
-      this.ctx.storage.sql.exec("INSERT INTO submissions(operation_id,run_id,text) VALUES(?,?,?)",nativeOperationId,run.id,text);
+      this.ctx.storage.sql.exec("INSERT INTO submissions(operation_id,run_id,text,subagent_id) VALUES(?,?,?,?)",nativeOperationId,run.id,text,run.subagentId??null);
       this.ctx.storage.sql.exec("UPDATE runs SET native_operation_id=? WHERE id=?",nativeOperationId,run.id);
       this.updateStatus(run.id,'queued');continuation=nativeOperationId;
     });
@@ -558,6 +723,7 @@ export class BotDO extends DurableObject<Env> {
   }
   private async executeHostTool(input:RuntimeHostToolRequest):Promise<RuntimeToolResult> {
     this.active();
+    input=await this.childToolInput(input);
     validateHostArguments(input.name,input.arguments);
     const row=this.findRun(input.runOperationId);
     if(!row) throw new ApiError(409,'run_not_found','Tool has no active run.');
@@ -571,11 +737,23 @@ export class BotDO extends DurableObject<Env> {
       const repository=args.repository.toLowerCase();
       if(!/^[a-z0-9][a-z0-9-]{0,38}\/[a-z0-9._-]{1,100}$/.test(repository) || repository.endsWith('/.') || repository.endsWith('/..')) throw new ApiError(400,'invalid_repository','Use a GitHub repository in owner/name format.');
     }
-    const activity={...(input.toolCallId?{toolCallId:input.toolCallId}:{}),toolName:input.name,input:hostActivityInput(input.name,args)};
+    const activity={...(input.subagentId?{subagentId:input.subagentId}:{}),...(input.toolCallId?{toolCallId:input.toolCallId}:{}),toolName:input.name,input:hostActivityInput(input.name,args)};
     this.startTool(input.operationId,activity,run.id);
     const completed=(value:unknown):ComputerResult=>({operationId:input.operationId,status:'completed',output:typeof value==='string'?value:JSON.stringify(value)});
     let result:ComputerResult;
-    if(input.name==='load_skill') result=completed(args.name==='github-development'?githubDevelopmentSkill:workspaceAppsSkill);
+    if(input.name==='list_bots') {
+      const registry=this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName("owner"));
+      const response=await registry.fetch("https://workspace/");
+      if(!response.ok) throw new ApiError(503,"bots_unavailable","Bots could not be listed.");
+      const {bots}=await response.json<{bots:Bot[]}>();
+      result=completed({bots:bots.map(({id,name,createdByBotId})=>({id,name,...(createdByBotId?{createdByBotId}:{})}))});
+    } else if(input.name==='create_bot') {
+      const value=await agentCoordinatorRequest<{bot:Bot}>(this.env,"/agents/create",{sourceBotId:run.botId,sourceRunId:run.id,operationId:input.operationId,name:args.name,instructions:args.instructions});
+      this.emit("agent.named.created",{bot:{id:value.bot.id,name:value.bot.name}},run.id,`named:${input.operationId}`);result=completed(value);
+    } else if(input.name==='send_to_bot') {
+      const value=await agentCoordinatorRequest<{delegation:AgentDelegation}>(this.env,"/agents/send",{sourceBotId:run.botId,sourceRunId:run.id,operationId:input.operationId,targetBotId:args.botId,text:args.text});
+      this.emit("delegation.updated",value,run.id,`delegation:${input.operationId}`);result=completed(value);
+    } else if(input.name==='load_skill') result=completed(args.name==='github-development'?githubDevelopmentSkill:workspaceAppsSkill);
     else if(input.name==='publish_app') {
       const app=await this.apps().publish({name:args.name as string,port:args.port as number,operationId:input.operationId});
       this.emit('workspace.app.updated',{app},run.id);result=completed(app);
@@ -676,7 +854,8 @@ export class BotDO extends DurableObject<Env> {
     const approval=JSON.parse(row.data) as Approval;
     // Recovery can hold an older snapshot. A terminal decision is immutable.
     if(approval.status!=="executing") return;
-    const activity={...(approval.toolCallId?{toolCallId:approval.toolCallId}:{}),actionType:approval.action.type,input:computerActivityInput(approval.action)};
+    const agentId=this.getRun(approval.runId).subagentId;
+    const activity={...(agentId?{subagentId:agentId}:{}),...(approval.toolCallId?{toolCallId:approval.toolCallId}:{}),actionType:approval.action.type,input:computerActivityInput(approval.action)};
     this.startTool(approval.operationId,activity,approval.runId);
     let result:ComputerResult;
     let providerDiagnostic:string|undefined;
@@ -716,24 +895,19 @@ export class BotDO extends DurableObject<Env> {
     const text=approval.status==="denied"
       ? `The user denied action ${approval.id}. Do not execute it. Explain or continue using allowed alternatives.`
       : `The user approved action ${approval.id}. The platform already executed exactly the stored action. Do not repeat it. Result: ${JSON.stringify(approval.result)}. Continue the original task.`;
-    this.ctx.storage.sql.exec("INSERT INTO submissions (operation_id,run_id,text) VALUES (?,?,?)",nativeOperationId,run.id,text);
+    this.ctx.storage.sql.exec("INSERT INTO submissions (operation_id,run_id,text,subagent_id) VALUES (?,?,?,?)",nativeOperationId,run.id,text,run.subagentId??null);
     this.ctx.storage.sql.exec("UPDATE runs SET native_operation_id=? WHERE id=?",nativeOperationId,run.id);
     this.updateStatus(run.id,"queued");
     return nativeOperationId;
   }
   private async cancelRun(id:string):Promise<Run> {
     const row=this.getRunRow(id),run=JSON.parse(row.data) as Run;
-    if(terminal.has(run.status)) return run;
-    this.updateStatus(id,"cancelled");
-    const pending=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM approvals").toArray().map(row=>JSON.parse(row.data) as Approval);
-    for(const approval of pending) if(approval.runId===id && approval.status==="pending") {
-      approval.status="denied";this.saveApproval(approval);this.emit("approval.updated",{approval},id);
-    }
-    for(const row of this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM connections WHERE json_extract(data,'$.runId')=? AND json_extract(data,'$.status')='pending'",id).toArray()) {const connection=JSON.parse(row.data) as ConnectionRequest; if(connection.status==="pending") {
-      connection.status="cancelled";this.saveConnection(connection);this.emit("connection.updated",{connection},id);
-    }
-    }
-    await this.runtime.cancel(row.native_operation_id);
+    this.fenceRun(id);
+    if(run.subagentId) await this.cancelSubagent(run.subagentId);
+    else await this.runtime.cancel(row.native_operation_id);
+    // Completion/failure does not end background work. A later Stop still fences
+    // all descendant host inputs and their approvals, including result turns.
+    for(const child of this.ctx.storage.sql.exec<{id:string}>("SELECT id FROM runs WHERE json_extract(data,'$.parentRunId')=?",id).toArray()) await this.cancelRun(child.id);
     return this.getRun(id);
   }
 
@@ -820,6 +994,35 @@ export class BotDO extends DurableObject<Env> {
       }
       this.configure(request);
       this.ctx.waitUntil(this.recover());
+      if(["/agent-messages","/agent-results","/agent-cancel"].includes(path)) {
+        if(request.headers.get("x-timber-internal")!=="agents" || request.method!=="POST") throw new ApiError(403,"internal_only","This agent route is internal.");
+        const input=await body(request);
+        if(path==="/agent-cancel") {await this.cancelAgentInput(String(input.operationId));return json({cancelled:true});}
+        if(path==="/agent-results") {await this.receiveAgentResult(input as unknown as Parameters<BotDO["receiveAgentResult"]>[0]);return json({received:true});}
+        const parsed=parseMessage(input);
+        const provenance=input.provenance as MessageProvenance,delegation=input.delegation as RunDelegation;
+        if(!provenance || !delegation || !UUID.test(delegation.id) || !UUID.test(delegation.sourceBotId) || !UUID.test(delegation.sourceRunId) || !Array.isArray(delegation.path) || delegation.path.at(-1)!==this.bot().id || parsed.operationId!==`delegate:${delegation.id}`) throw new ApiError(400,"invalid_request","Invalid delegated input.");
+        return json({run:await this.createRun(parsed,{provenance,delegation})},202);
+      }
+      if(path==="/agents" && request.method==="GET") return json({agents:await this.runtime.subagents()});
+      if(path==="/delegations" && request.method==="GET") return json(await agentCoordinatorRequest(this.env,`/agents/tasks?botId=${this.bot().id}`,undefined,"GET"));
+      const agentRoute=/^\/agents\/([^/]+)\/(messages|cancel)$/.exec(path);
+      if(agentRoute) {
+        const id=decodeURIComponent(agentRoute[1]);await this.subagent(id);
+        if(agentRoute[2]==="messages" && request.method==="GET") return json({messages:await this.runtime.subagentMessages(id)});
+        if(agentRoute[2]==="messages" && request.method==="POST") {
+          const input=parseMessage(await body(request));
+          if(input.mentions?.length || /^(approval|delegate|connection|subagent|agent-result|subagent-report|mention):/.test(input.operationId)) throw new ApiError(400,"invalid_request","Use an independent operation ID for the subagent message.");
+          const agent=await this.subagent(id),parent=this.findRun(agent.parentOperationId);
+          if(agent.status==="cancelled" || !parent) throw new ApiError(409,"agent_inactive","This subagent is no longer active.");
+          const run=await this.createRun(input,{subagentId:id,parentRunId:parent.id});
+          return json({run,receipt:{operationId:input.operationId,accepted:true}},202);
+        }
+        if(agentRoute[2]==="cancel" && request.method==="POST") {
+          await this.cancelSubagent(id);
+          return json({agent:await this.subagent(id)});
+        }
+      }
       if(path==="/connections" && request.method==="GET") {await this.reconcileConnections();return json({connections:this.listConnections()});}
       const connect=/^\/connections\/([^/]+)\/connect$/.exec(path);
       if(connect && request.method==="POST") return json(await this.startConnection(connect[1]));

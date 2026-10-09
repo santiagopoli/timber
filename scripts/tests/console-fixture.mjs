@@ -22,7 +22,7 @@ function png() {
   return Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]), chunk('IHDR', header), chunk('IDAT', deflateSync(pixels)), chunk('IEND', Buffer.alloc(0))]);
 }
 const image = png();
-const consoleRoot = fileURLToPath(new URL('../../apps/console/dist/', import.meta.url));
+const consoleRoot = process.env.CONSOLE_DIST ? resolve(process.env.CONSOLE_DIST) : fileURLToPath(new URL('../../apps/console/dist/', import.meta.url));
 const assetTypes = new Map([['.html', 'text/html'], ['.js', 'text/javascript'], ['.css', 'text/css'], ['.svg', 'image/svg+xml'], ['.png', 'image/png'], ['.woff', 'font/woff'], ['.woff2', 'font/woff2'], ['.ttf', 'font/ttf'], ['.wasm', 'application/wasm']]);
 export async function createConsoleFixture({port = 0} = {}) {
   // Exercise the same bundled React island and asset graph that is deployed.
@@ -39,6 +39,7 @@ export async function createConsoleFixture({port = 0} = {}) {
       {id: 'message-one', botId: BOT_A, role: 'user', text: 'Organize the research notes and prepare a summary.', createdAt: date},
       {id: 'message-two', botId: BOT_A, role: 'assistant', text: 'The notes are ready. **Three themes** stood out:\n\n- Persistent conversations\n- Reusable computers\n- Portable workspaces\n\n```sh\ncat notes/summary.md\n```', createdAt: date},
     ]], [BOT_B, []]]),
+    agents: new Map([[BOT_A, []], [BOT_B, []]]), agentMessages: new Map(), agentMessageOperations: new Map(), delegations: new Map([[BOT_A, []], [BOT_B, []]]),
     connections: new Map([[BOT_A, []], [BOT_B, []]]), apps: new Map([[BOT_A, []], [BOT_B, []]]), runs: new Map([[BOT_A, []], [BOT_B, []]]), approvals: new Map([[BOT_A, []], [BOT_B, []]]), nextEventId: 0,
   };
   state.deliver = event => {for (const stream of state.streams) if (stream.botId === event.botId) stream.response.write(`id: ${event.id}\ndata: ${JSON.stringify(event)}\n\n`);};
@@ -125,11 +126,11 @@ export async function createConsoleFixture({port = 0} = {}) {
         if (typeof body.text !== 'string' || !body.text.trim() || typeof body.operationId !== 'string' || !body.operationId) return json({error: {code: 'invalid_request', message: 'text and operationId are required.'}}, 400);
         const key = `${id}:${body.operationId}`, previous = state.messageOperations.get(key);
         if (previous) {
-          if (previous.text !== body.text) return json({error: {code: 'operation_conflict', message: 'This operation ID belongs to another message.'}}, 409);
+          if (previous.text !== body.text || JSON.stringify(previous.mentions || []) !== JSON.stringify(body.mentions || [])) return json({error: {code: 'operation_conflict', message: 'This operation ID belongs to another message.'}}, 409);
           return json({run: previous.run}, 202);
         }
         const run = {id: randomUUID(), botId: id, operationId: body.operationId, status: 'queued', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()};
-        state.messageOperations.set(key, {run, text: body.text}); state.runs.get(id).unshift(run); state.messages.get(id).push({id: randomUUID(), botId: id, runId: run.id, role: 'user', text: body.text, createdAt: run.createdAt});
+        state.messageOperations.set(key, {run, text: body.text, mentions: body.mentions}); state.runs.get(id).unshift(run); state.messages.get(id).push({id: randomUUID(), botId: id, runId: run.id, role: 'user', text: body.text, mentions: body.mentions, createdAt: run.createdAt});
         if (state.messageResponseGates.has(id)) await state.messageResponseGates.get(id);
         return json({run}, 202);
       }
@@ -138,6 +139,19 @@ export async function createConsoleFixture({port = 0} = {}) {
         return json({runs: all.slice(offset, offset + limit), activeRuns: all.filter(run => active.has(run.status)), nextCursor: offset + limit < all.length ? String(offset + limit) : null});
       }
       if (tail.startsWith('/runs/')) {const run = state.runs.get(id).find(run => run.id === tail.split('/')[2]); if (!run) return json({}, 404); if (tail.endsWith('/cancel')) {run.status = 'cancelled'; run.updatedAt = new Date().toISOString();} return json({run});}
+      if (tail === '/agents') return json({agents: state.agents.get(id) || []});
+      if (tail === '/delegations') return json({delegations: state.delegations.get(id) || []});
+      if (/^\/agents\/[^/]+\/messages$/.test(tail)) {
+        const agentId = tail.split('/')[2];
+        if (request.method === 'GET') return json({messages: state.agentMessages.get(agentId) || []});
+        const key = `${id}:${agentId}:${body.operationId}`;
+        if (!state.agentMessageOperations.has(key)) {
+          state.agentMessageOperations.set(key, body);
+          state.agentMessages.set(agentId, [...state.agentMessages.get(agentId) || [], {id:randomUUID(),botId:id,role:'user',text:body.text,createdAt:new Date().toISOString()}]);
+        }
+        return json({accepted:true},202);
+      }
+      if (/^\/agents\/[^/]+\/cancel$/.test(tail)) {const agent=(state.agents.get(id)||[]).find(item=>item.id===tail.split('/')[2]);if(agent)agent.status='cancelled';return json({agent});}
       if (tail === '/connections') return json({connections: state.connections.get(id)});
       if (/^\/connections\/[^/]+\/connect$/.test(tail)) {if (state.connectionGate) await state.connectionGate; return json({url: `http://127.0.0.1:${server.address().port}/github-connect`});}
       if (tail === '/apps') return json({apps: state.apps.get(id)});

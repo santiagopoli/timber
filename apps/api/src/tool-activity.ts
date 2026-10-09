@@ -62,6 +62,9 @@ const hostFields: Record<string, readonly string[]> = {
   publish_app: ['name', 'port'],
   list_apps: [],
   remove_app: ['appId'],
+  list_bots: [],
+  create_bot: ['name'],
+  send_to_bot: ['botId'],
 };
 
 export function hostActivityInput(name: string, args: Record<string, unknown>): DisplayInput {

@@ -45,9 +45,9 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
 - POST /v1/connections/chatgpt/verify performs one small real inference and only
   returns {ok:true,model} after response.completed.
 - GET /v1/bots -> {bots:Bot[]}
-- POST /v1/bots {name,instructions?,model?,computerApprovalMode?} -> 201 {bot:Bot}
+- POST /v1/bots {name,instructions?,model?,computerApprovalMode?,allowNamedAgents?} -> 201 {bot:Bot}
 - GET /v1/bots/:id -> {bot:Bot}
-- PATCH /v1/bots/:id {name?,instructions?,computerApprovalMode?} -> {bot:Bot}
+- PATCH /v1/bots/:id {name?,instructions?,computerApprovalMode?,allowNamedAgents?} -> {bot:Bot}
 - DELETE /v1/bots/:id -> 200 {botId,deleted:true}. Repeated deletion of the same
   known bot is idempotent; an unknown ID returns 404. Registry access is removed
   before cleanup. The agent and computer are stopped before their data and R2
@@ -60,7 +60,7 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   assistant commentary accompanying native tool calls; it is durably deduplicated
   by its native message identity. Final answers retain operation-based deduplication.
   Messages without kind remain ordinary messages for backward compatibility.
-- POST /v1/bots/:id/messages {text,operationId} -> 202 {run:Run}
+- POST /v1/bots/:id/messages {text,operationId,mentions?:string[]} -> 202 {run:Run}
   The receipt confirms durable storage of the user input. A busy bot processes
   subsequent inputs in order. Transient engine admission failures stay queued
   with a fixed diagnostic and retry through the shared Lifecycle alarm using the
@@ -78,9 +78,12 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   Pass `nextCursor` unchanged as `before` for the next older page; null means no
   older page remains. New runs inserted between requests do not shift older pages.
   `activeRuns` independently contains all admitted queued/running/waiting_approval/waiting_connection
-  runs (at most 16), newest-created first, even if absent from the requested page;
+  runs, newest-created first, even if absent from the requested page;
   it can overlap `runs`. Listing makes no new inference calls beyond the existing
   recovery of already accepted runs. Authentication and bot membership checks apply.
+  HTTP task admission permits at most 16 active host runs. Native child inputs are
+  projected separately and may increase that total; `activeRuns` is never truncated
+  to the admission limit. Temporary agents retain their independent eight-agent cap.
 - GET /v1/bots/:id/runs/:runId -> {run:Run}
 - POST /v1/bots/:id/runs/:runId/cancel -> {run:Run}
 - GET /v1/bots/:id/events?after=cursor -> SSE id, event=event, JSON BotEvent.
@@ -249,11 +252,124 @@ bootstrap package installation. Image preparation occurs at deployment; existing
 running computers retain their image until the next natural start.
 
 ## Delegation
-Not implemented in this milestone. Future send_to_bot should use bounded
-asynchronous task submission with source bot/run id,
-deduplicated operation id and depth cap. Bot identity preserved, all target ids checked
-in registry. Can be followup if other core loop critical paths aren't yet complete,
-but document explicitly instead of a fake tool.
+### Temporary Pi subagents
+The runtime uses native Pi conversations and durable tasks for temporary agents.
+Each starts with a fresh transcript, inherits the owning bot's model, instructions
+and tool policy, and receives its own name and task. It shares the bot's computer
+and workspace; it does not create a registry bot or another container. Native
+conversation and task IDs remain internal. Public `Subagent` metadata includes an
+ID, name, task, parent operation, optional parent subagent, current operation,
+status, timestamps and public result/error.
+
+Pi exposes `spawn_subagent {name,task}`, `list_subagents {}`,
+`send_subagent_message {targetId,text}`, `wait_subagent {subagentId}` and
+`cancel_subagent {subagentId}`. A child may use `targetId:"parent"`; other temporary
+agents are addressed by their visible IDs. Messages queue as durable inputs and
+start a new turn if the recipient is idle. Initial successful task results return
+to the parent automatically; peer-to-peer messages do not create automatic reply
+loops. Wait returns immediately for an approval or connection wait so the host can
+present that decision. There are at most eight active agents per bot and three
+levels of nesting. Model generations and tool calls share the originating parent
+operation's optional budgets; spawning does not reset those counters.
+
+An agent's conversation is owned by a native background task and its submissions
+and result delivery use native durable tasks. Parent completion leaves background
+work running. Explicit cancellation cascades to descendants; a cancelled agent is
+permanently fenced. Completed or failed agents can accept explicit follow-up
+messages. Bot deletion stops all of its temporary agents before deleting storage.
+Public histories remain inspectable after task completion and recovery. Fresh
+computer actions always pass through the owning bot's current host policy, and
+child approvals/connections remain attached to the child run. A host continuation
+resumes the child that requested the decision.
+Admission and automatic parent notification retry transient failures with stable
+operation IDs. If parent notification exhausts retries, the result remains in the
+child conversation and the Agents view shows a delivery notice.
+
+- GET /v1/bots/:id/agents -> {agents:Subagent[]}.
+- GET /v1/bots/:id/agents/:agentId/messages -> {messages}; public messages include
+  `id`, `role`, `text`, optional `kind` and optional `createdAt`.
+- POST /v1/bots/:id/agents/:agentId/messages {text,operationId} submits a durable
+  follow-up and returns 202 {run,receipt:{operationId,accepted:true}}. Text is
+  bounded to 32,000 characters; model-initiated peer messages are limited to 20,000.
+- POST /v1/bots/:id/agents/:agentId/cancel -> {agent}; cancels that agent and its
+  descendants.
+
+All routes require owner authentication and registry membership. Agent IDs are
+resolved only inside the selected bot. `Run.subagentId` and `Run.parentRunId` link
+child execution to the ordinary durable run/approval projection. Each child input
+has its own host run. Only approval and connection continuations reuse that input's
+run; queueing a follow-up does not supersede an in-flight tool or its approval.
+Parent result notifications create separate continuation runs linked through
+`parentRunId`, so cancelling the originating task also fences those continuations.
+Subagent events
+carry explicit attribution; child text and tool events cannot complete the parent's
+run or appear as the parent's final answer. Only public message text, status and
+safe activity are exposed; native reasoning is never returned in these transcripts.
+
+### Persistent named bots
+`list_bots`, `create_bot` and `send_to_bot` are host capabilities discovered through
+Pi's `list_tools` and invoked through `call_tool`. Each named bot retains its own
+identity, conversation and computer. The single owner's connected services remain
+host-owned; delegation does not copy credentials or another bot's workspace.
+
+`Bot.allowNamedAgents` is a strict boolean, defaulting to false for new and legacy
+bots. The owner may change it through bot configuration. Only `create_bot` requires
+this permission; messaging existing bots and temporary subagents do not. Creation
+checks the current registry permission and persists the new bot and operation
+receipt atomically. A bot-created named agent inherits the source model, records
+`createdByBotId`, starts with `computerApprovalMode:"ask"` and has
+`allowNamedAgents:false`. It does not inherit standing computer authorization.
+Replaying a completed creation returns its existing identity even after permission
+revocation; replaying after that child was deleted returns 404 and never recreates it.
+
+`send_to_bot {botId,text}` durably queues a task and returns immediately with an
+`AgentDelegation` receipt. Registry membership is checked for both bots. The target
+receives a normal queued run, preserving its identity and approval policy. Inputs
+carry `Message.provenance` with `kind:"bot"|"mention"`, source bot ID/name, source
+run ID and delegation ID. The target `Run.delegation` records the source and complete
+bot-ID path. Source identity comes from the active host run, not model-supplied
+attribution. Paths allow at most four hops and cannot revisit a bot; each source bot
+has at most eight pending delegations.
+
+WorkspaceDO keeps a durable outbox beside the bot registry. Submission uses a stable
+`delegate:<delegationId>` operation ID, so retries and lost receipts do not create a
+second target run. A completed target run returns its public final answer, or its
+safe terminal diagnostic, to the source with `kind:"delegation_result"` provenance.
+The source and target runs remain separately addressable. Result continuations
+retain the visited bot IDs in their delegation path, preventing automatic task
+echoes back to a bot already contacted in that path. A fresh user request starts
+with a new path. Request and result text
+are bounded to 32,000 characters. Transport delivery has five attempts with
+1/2/4/8-second backoff; this retries input delivery, never completed computer effects.
+Observation polls queued/running work every three seconds and host waits every
+15 seconds. A delegation still active after 24 hours is cancelled with a visible
+failure. Exhausted result delivery retains an error in the delegation record rather
+than claiming that the source received it.
+Exhausted submission or observation retries request cancellation of the exact
+target operation before reporting the uncertain delivery outcome. A missing target
+is a visible terminal failure. A cancellation request remains pending until the
+target acknowledges it.
+
+Cancelling the source run or deleting its bot requests cancellation of the exact
+delegated target operation. A target cancellation tombstone fences a late or lost
+submission receipt, so cancellation does not depend on knowing the target run ID.
+Cancellation delivery retries until acknowledged, with backoff capped at one
+minute. Source deletion removes task text, result text and names from its outbox,
+retaining only the cancellation identities until cleanup finishes. Other work in
+the target bot and named bots previously created by the source remain independent.
+
+- GET /v1/bots/:id/delegations -> {delegations:AgentDelegation[]}; latest 100 incoming
+  or outgoing records, including target run ID, status and available diagnostics.
+
+### Mentions
+`POST /v1/bots/:id/messages` accepts `mentions`, at most eight distinct bot UUIDs.
+The console's `@` menu selects explicit recipient IDs and displays recipient chips;
+typing a name without selecting a recipient does not dispatch a task. Duplicate
+names remain distinguishable by ID. Each selected recipient receives the submitted
+message through the same durable delegation outbox. Transcript messages retain
+`mentions` and source provenance. Client retries keep the original operation ID,
+text and recipient list. Removing the selected name from a draft removes that
+recipient; a plain `@` string never grants authority to choose a different bot.
 
 
 ## Host tools and GitHub connection

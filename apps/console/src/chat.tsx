@@ -14,6 +14,7 @@ import type { ChatApproval, ChatCallbacks, ChatModel, ChatConnection, MessageDel
 import {ActivityCode, ActivityOutput, activityIdentity, outputFormat} from './activity-content';
 import {ArtifactPreview, ArtifactProvider, type ArtifactLoader} from './artifact-preview';
 import './chat.css';
+import {hasBotMention} from './mentions';
 
 const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
 const timestamp = (value?: string) => value ? Date.parse(value) || 0 : 0;
@@ -55,13 +56,13 @@ function CopyMessage({ text, kind = 'message', createdAt }: { text: string; kind
   </MessageActions>;
 }
 
-function ApprovalEntry({ approval, current, automatic, callbacks }: { approval: ChatApproval; current: boolean; automatic: boolean; callbacks: ChatCallbacks }) {
+function ApprovalEntry({ approval, current, automatic, callbacks, agentName }: { approval: ChatApproval; current: boolean; automatic: boolean; callbacks: ChatCallbacks; agentName?:string }) {
   const pending = approval.status === 'pending';
   const executing = approval.status === 'executing' || approval.status === 'approved';
   const title = pending ? `Approval required · ${approval.action.type}` : approval.status === 'interrupted' ? `Interrupted action · ${approval.action.type}` : `${label(approval.status).replace(/^./, character => character.toUpperCase())} action · ${approval.action.type}`;
   const content = <Tool open className="timber-approval-tool">
     <ToolContent className="timber-approval-content">
-      <div className="timber-approval-heading"><ShieldCheckIcon aria-hidden="true" /><strong>{title}</strong><time>{time(approval.createdAt)}</time></div>
+      <div className="timber-approval-heading"><ShieldCheckIcon aria-hidden="true" /><strong>{agentName ? `${agentName} · ${title}` : title}</strong><time>{time(approval.createdAt)}</time></div>
       <pre className="timber-action"><code>{actionText(approval)}</code></pre>
       {pending && <Confirmation approval={{id: approval.id}} state="approval-requested" className="timber-confirmation">
         <ConfirmationActions className="timber-approval-actions">
@@ -105,7 +106,7 @@ function TaskOutcome({model, run, callbacks}: {model:ChatModel;run:ChatModel['ru
   return <article className="timber-task-outcome" data-run-outcome={run.id} role="status">
     <div className="timber-task-outcome-heading"><CircleAlertIcon aria-hidden="true"/><span>{run.status==='cancelled' ? 'Task stopped' : 'Response interrupted'}</span></div>
     {run.error && <p>{run.error}</p>}
-    {canContinue && <Button type="button" variant="outline" size="sm" disabled={model.sending || model.runs.some(item=>!terminal.has(item.status))} onClick={()=>callbacks.onSend(model.bot.id, `Continue this task:\n\n${bounded(request.text,6000)}\n\nUse the results already recorded in this conversation. Check the last outcome before taking another action; do not repeat completed work. Explain the result or any remaining blocker.`)}>Continue</Button>}
+    {canContinue && <Button type="button" variant="outline" size="sm" disabled={model.sending || model.runs.some(item=>!item.subagentId && !terminal.has(item.status))} onClick={()=>callbacks.onSend(model.bot.id, `Continue this task:\n\n${bounded(request.text,6000)}\n\nUse the results already recorded in this conversation. Check the last outcome before taking another action; do not repeat completed work. Explain the result or any remaining blocker.`)}>Continue</Button>}
   </article>;
 }
 
@@ -140,7 +141,7 @@ type TimelineEntry = { key: string; at: number; order: number; node: ReactNode; 
 type ToolActivity = { key: string; runId?: string; at: number; name: string; aliases: Set<string>; returned: boolean; status?: string; result?: {status?: string; output?: string; error?: string; exitCode?: number; artifactId?: string}; data: Record<string, unknown> };
 type ActivityStep = {at: number; key: string; tool: ToolActivity};
 type ActivityModel = Pick<ChatModel, 'bot' | 'events' | 'runs' | 'approvals' | 'runFilter'>;
-const toolNames: Record<string, string> = {exec: 'Run command', read_file: 'Read file', readFile: 'Read file', write_file: 'Write file', writeFile: 'Write file', list_files: 'Browse files', listFiles: 'Browse files', desktop_screenshot: 'Capture desktop', screenshot: 'Capture desktop', browser_navigate: 'Open', navigate: 'Open', desktop_click: 'Click', click: 'Click', desktop_move: 'Move pointer', move: 'Move pointer', desktop_double_click: 'Double click', doubleClick: 'Double click', desktop_drag: 'Drag', drag: 'Drag', desktop_type: 'Type text', type: 'Type text', desktop_key: 'Press', key: 'Press', desktop_scroll: 'Scroll', scroll: 'Scroll', checkpoint: 'Save workspace', github_clone: 'Clone', gitClone: 'Clone', github_push: 'Push', gitPush: 'Push', github_connect: 'Connect GitHub', github_create_pull_request: 'Create pull request', github_list_pull_requests: 'List pull requests', github_list_repositories: 'List repositories', load_skill: 'Load skill', list_tools: 'Available tools', publish_app: 'Publish app', list_apps: 'List apps', remove_app: 'Remove app'};
+const toolNames: Record<string, string> = {exec: 'Run command', read_file: 'Read file', readFile: 'Read file', write_file: 'Write file', writeFile: 'Write file', list_files: 'Browse files', listFiles: 'Browse files', desktop_screenshot: 'Capture desktop', screenshot: 'Capture desktop', browser_navigate: 'Open', navigate: 'Open', desktop_click: 'Click', click: 'Click', desktop_move: 'Move pointer', move: 'Move pointer', desktop_double_click: 'Double click', doubleClick: 'Double click', desktop_drag: 'Drag', drag: 'Drag', desktop_type: 'Type text', type: 'Type text', desktop_key: 'Press', key: 'Press', desktop_scroll: 'Scroll', scroll: 'Scroll', checkpoint: 'Save workspace', github_clone: 'Clone', gitClone: 'Clone', github_push: 'Push', gitPush: 'Push', github_connect: 'Connect GitHub', github_create_pull_request: 'Create pull request', github_list_pull_requests: 'List pull requests', github_list_repositories: 'List repositories', load_skill: 'Load skill', list_tools: 'Available tools', publish_app: 'Publish app', list_apps: 'List apps', remove_app: 'Remove app', spawn_subagent:'Create subagent', list_subagents:'View subagents', send_subagent_message:'Message subagent', wait_subagent:'Wait for subagent', cancel_subagent:'Stop subagent', send_to_bot:'Message bot', create_bot:'Create named bot', list_bots:'View bots'};
 const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 // The host publishes an allowlisted input summary. Historical events may have
 // no input at all; never invent the command from its result or operation ID.
@@ -337,20 +338,20 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks): TimelineEntry[] {
   messages.forEach((message, index) => {
     // Progress is public assistant text accompanying a tool call. It belongs in
     // the transcript just like a final answer, never in a reasoning disclosure.
-    entries.push({key: `message:${message.id}`, ...messagePosition(message,index), node: <Message from={message.role === 'user' ? 'user' : 'assistant'} data-message-id={message.id} data-message-kind={message.kind} data-progress-message-id={message.kind === 'progress' ? message.id : undefined} data-run-id={message.runId} className={`timber-message timber-message-${message.role}`}>
-      {message.role !== 'user' && <div className="timber-message-meta"><span>{message.role === 'assistant' ? model.bot.name : label(message.role)}</span></div>}
+    entries.push({key: `message:${message.id}`, ...messagePosition(message,index), node: <Message from={message.role === 'user' && !message.provenance ? 'user' : 'assistant'} data-message-id={message.id} data-message-kind={message.kind} data-progress-message-id={message.kind === 'progress' ? message.id : undefined} data-run-id={message.runId} className={`timber-message timber-message-${message.role}`}>
+      {message.provenance ? <div className="timber-message-meta timber-agent-source"><button type="button" onClick={() => callbacks.onOpenBot(message.provenance!.sourceBotId)}>{message.provenance.sourceBotName}</button><span>{message.provenance.kind === 'delegation_result' ? 'returned a result' : message.provenance.kind === 'mention' ? 'mentioned this bot' : 'sent a message'}</span></div> : message.role !== 'user' && <div className="timber-message-meta"><span>{message.role === 'assistant' ? model.bot.name : label(message.role)}</span></div>}
       <MessageContent className="timber-message-content"><Response text={message.text} /></MessageContent>
       {['user', 'assistant'].includes(message.role) && <CopyMessage text={message.text} createdAt={message.createdAt} />}
       {message.role === 'user' && <MessageRunStatus model={model} runId={message.runId} callbacks={callbacks} />}
     </Message>});
   });
-  for (const approval of approvals) entries.push({key: `approval:${approval.id}`, ...afterRequest(approval.runId, timestamp(approval.createdAt)), node: <ApprovalEntry approval={approval} current={approval.id === current?.id} automatic={model.bot.computerApprovalMode === 'automatic'} callbacks={callbacks} />});
+  for (const approval of approvals) entries.push({key: `approval:${approval.id}`, ...afterRequest(approval.runId, timestamp(approval.createdAt)), node: <ApprovalEntry approval={approval} agentName={model.subagents.find(agent=>agent.id===model.runs.find(run=>run.id===approval.runId)?.subagentId)?.name} current={approval.id === current?.id} automatic={model.bot.computerApprovalMode === 'automatic'} callbacks={callbacks} />});
   for (const connection of model.connections.filter(item => !model.runFilter || item.runId === model.runFilter)) {
     entries.push({key: `connection:${connection.id}`, ...afterRequest(connection.runId, timestamp(connection.createdAt)), node: <ConnectionEntry connection={connection} callbacks={callbacks} />});
   }
   deliveries.forEach((delivery, index) => entries.push({key: `delivery:${delivery.operationId}`, at: timestamp(delivery.createdAt), order: (messages.length + index) * 2, node: <DeliveryEntry delivery={delivery} busy={model.sending} callbacks={callbacks} />}));
   for (const tool of collectTools(model)) entries.push({key:`activity:${tool.key}`, ...afterRequest(tool.runId,tool.at), node:null, tool});
-  for (const run of model.runs.filter(run=>['failed','interrupted','cancelled'].includes(run.status) && (!model.runFilter || model.runFilter===run.id))) {
+  for (const run of model.runs.filter(run=>!run.subagentId && ['failed','interrupted','cancelled'].includes(run.status) && (!model.runFilter || model.runFilter===run.id))) {
     const at = Math.max(requests.get(run.id)?.at || 0, timestamp(run.updatedAt), ...messages.filter(message=>message.runId===run.id).map(message=>timestamp(message.createdAt)), ...model.events.filter(event=>event.runId===run.id).map(event=>timestamp(event.createdAt)));
     entries.push({key:`outcome:${run.id}`,at,order:(messages.length + deliveries.length)*2+4,node:<TaskOutcome model={model} run={run} callbacks={callbacks}/>});
   }
@@ -421,6 +422,19 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
 
 function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallbacks }) {
   const textarea = useRef<HTMLTextAreaElement>(null);
+  const [caret, setCaret] = useState(model.draft.length), [mentionIndex, setMentionIndex] = useState(0), [dismissed, setDismissed] = useState(false);
+  const mentionMatch = /(?:^|\s)@([^\n@]{0,80})$/.exec(model.draft.slice(0, caret));
+  const mentionStart = mentionMatch ? caret - mentionMatch[1].length - 1 : -1;
+  const choices = !dismissed && mentionMatch ? model.mentionBots.filter(bot => bot.id !== model.bot.id && bot.name.toLocaleLowerCase().includes(mentionMatch[1].toLocaleLowerCase())).slice(0, 8) : [];
+  const selectedMentions = model.mentionBots.filter(bot => model.draftMentions.includes(bot.id) && hasBotMention(model.draft, bot.name));
+  const mentionName = (bot:ChatModel['bot']) => model.mentionBots.filter(item=>item.name===bot.name).length > 1 ? `${bot.name} · ${bot.id.slice(-8)}` : bot.name;
+  const chooseMention = (bot: ChatModel['bot']) => {
+    const insertion = `@${bot.name} `, text = model.draft.slice(0, mentionStart) + insertion + model.draft.slice(caret);
+    const nextCaret = mentionStart + insertion.length;
+    callbacks.onDraft(model.bot.id, text, [...new Set([...model.draftMentions, bot.id])]);
+    setDismissed(true); setCaret(nextCaret);
+    requestAnimationFrame(() => {textarea.current?.focus(); textarea.current?.setSelectionRange(nextCaret, nextCaret);});
+  };
   useLayoutEffect(() => {
     // Native sizing avoids briefly collapsing a focused textarea on every key.
     if (CSS.supports('field-sizing', 'content')) return;
@@ -442,19 +456,33 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
     return () => observer.disconnect();
   }, [model.draft]);
   return <div className="timber-composer-wrap">
-      <PromptInput id="message-form" className="timber-composer" maxFiles={0} onReset={event => event.preventDefault()} onSubmit={({text}) => {if (!model.sending && text.trim()) callbacks.onSend(model.bot.id, text);}}>
-        <PromptInputBody><PromptInputTextarea ref={textarea} id="message" rows={1} aria-label={`Message ${model.bot.name}`} placeholder={`Message ${model.bot.name}…`} value={model.draft} onChange={event => callbacks.onDraft(model.bot.id, event.currentTarget.value)} />
+      {choices.length > 0 && <div className="timber-mention-menu" id="bot-mentions" role="listbox" aria-label="Mention a bot">
+        <span className="timber-mention-heading">Send this message to another bot</span>
+        {choices.map((bot, index) => <button type="button" key={bot.id} id={`mention-${bot.id}`} role="option" aria-selected={index === Math.min(mentionIndex, choices.length - 1)} data-mention-bot={bot.id} onMouseDown={event => event.preventDefault()} onClick={() => chooseMention(bot)}><span className="timber-mini-avatar" aria-hidden="true">{bot.name.slice(0, 1)}</span><span><strong>{mentionName(bot)}</strong><small>{bot.instructions?.split('\n')[0] || 'Named bot'}</small></span></button>)}
+      </div>}
+      {selectedMentions.length > 0 && <div className="timber-selected-mentions" aria-label="Message recipients">{selectedMentions.map(bot => <span key={bot.id}>To {mentionName(bot)}<button type="button" aria-label={`Remove ${mentionName(bot)} recipient`} onClick={() => callbacks.onDraft(model.bot.id, model.draft, model.draftMentions.filter(id => id !== bot.id))}>×</button></span>)}</div>}
+      <PromptInput id="message-form" className="timber-composer" maxFiles={0} onReset={event => event.preventDefault()} onSubmit={({text}) => {if (!model.sending && text.trim()) callbacks.onSend(model.bot.id, text, selectedMentions.map(bot => bot.id));}}>
+        <PromptInputBody><PromptInputTextarea ref={textarea} id="message" rows={1} aria-label={`Message ${model.bot.name}`} placeholder={`Message ${model.bot.name} · @ to mention a bot`} value={model.draft}
+          aria-autocomplete="list" aria-controls={choices.length ? 'bot-mentions' : undefined} aria-expanded={choices.length > 0} aria-activedescendant={choices.length ? `mention-${choices[Math.min(mentionIndex, choices.length - 1)].id}` : undefined}
+          onChange={event => {setCaret(event.currentTarget.selectionStart);setMentionIndex(0);setDismissed(false);callbacks.onDraft(model.bot.id, event.currentTarget.value);}}
+          onSelect={event => setCaret(event.currentTarget.selectionStart)}
+          onKeyDown={event => {
+            if (!choices.length || event.nativeEvent.isComposing) return;
+            if (event.key === 'Escape') {event.preventDefault();event.stopPropagation();setDismissed(true);}
+            else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {event.preventDefault();setMentionIndex(index => (index + (event.key === 'ArrowDown' ? 1 : choices.length - 1)) % choices.length);}
+            else if (event.key === 'Enter' && !event.shiftKey || event.key === 'Tab') {event.preventDefault();chooseMention(choices[Math.min(mentionIndex, choices.length - 1)]);}
+          }} />
           <PromptInputSubmit className="timber-send" aria-label="Send message" title="Send message" disabled={model.sending || !model.draft.trim()}>{model.sending ? <LoaderCircleIcon className="timber-spinner" /> : <ArrowUpIcon />}</PromptInputSubmit>
         </PromptInputBody>
       </PromptInput>
     </div>;
 }
 
-function MiniActivity({model, historyOpen, onHistory}: {model: ChatModel; historyOpen: boolean; onHistory(value:boolean): void}) {
+function MiniActivity({model, historyOpen, onHistory, callbacks}: {model: ChatModel; historyOpen: boolean; onHistory(value:boolean): void;callbacks:ChatCallbacks}) {
   const [collapsed,setCollapsed] = useState(false);
   const tools = collectTools({...model, runFilter: null}, true).sort((a,b) => b.at - a.at);
   const active = tools.filter(tool => toolState(tool, model).running);
-  const run = model.currentRun, latestRun = [...model.runs].sort((a,b) => timestamp(b.updatedAt) - timestamp(a.updatedAt))[0];
+  const run = model.currentRun, latestRun = model.runs.filter(run=>!run.subagentId).sort((a,b) => timestamp(b.updatedAt) - timestamp(a.updatedAt))[0];
   const visible = active.length ? active.slice(0,2) : tools.filter(tool=>!run || tool.runId===run.id).slice(0,1);
   const waiting = run?.status === 'waiting_approval' || run?.status === 'waiting_connection';
   const failed = !run && latestRun && ['failed','interrupted'].includes(latestRun.status);
@@ -474,6 +502,7 @@ function MiniActivity({model, historyOpen, onHistory}: {model: ChatModel; histor
       </div>
     </div>
     {!collapsed && !historyOpen && <div className="timber-mini-body">
+      {(model.subagents.length > 0 || model.delegations.length > 0) && <button type="button" className="timber-mini-agents" onClick={() => callbacks.onOpenAgents()}><GitBranchIcon/>View {model.subagents.length + model.delegations.length} agents</button>}
       {(reply || warning || screenshot) && <div className="timber-mini-reply-row">
         <div className={`timber-mini-reply${warning?' timber-inline-error':''}`} data-mini-reply>{warning?<p>{warning}</p>:reply?<Response text={reply} streaming={Boolean(model.stream)}/>:null}</div>
         {screenshot && <ArtifactPreview key={`${model.bot.id}:${screenshot}`} botId={model.bot.id} artifactId={screenshot} compact/>}
@@ -493,9 +522,14 @@ function Chat({ model, callbacks, dockTarget }: { model: ChatModel; callbacks: C
   const composer = <Composer model={model} callbacks={callbacks}/>;
   const conversation = <Conversation className="timber-conversation" initial="instant" resize="instant"><ConversationBody model={model} callbacks={callbacks}/></Conversation>;
   return <div className="timber-chat-layout">
+    {(model.subagents.length > 0 || model.delegations.length > 0) && <div className="timber-chat-agents" aria-label="Agent collaboration">
+      <button type="button" onClick={() => callbacks.onOpenAgents()}><GitBranchIcon/>Agents <span>{model.subagents.length + model.delegations.length}</span></button>
+      {model.subagents.slice(-3).map(agent => <button type="button" key={agent.id} data-chat-agent={agent.id} onClick={() => callbacks.onOpenAgents(agent.id)}>{agent.name}<span className="status" data-status={agent.status}>{label(agent.status)}</span></button>)}
+      {model.delegations.slice(0,2).map(delegation => <button type="button" key={delegation.id} onClick={() => callbacks.onOpenAgents()}>{delegation.targetBotName}<span className="status" data-status={delegation.status}>{label(delegation.status)}</span></button>)}
+    </div>}
     {model.runFilter && <div id="run-filter" className="timber-filter"><span>Filtered by task</span><Button id="clear-run-filter" variant="ghost" size="sm" onClick={callbacks.onClearFilter}>Show all messages</Button></div>}
     {!(dockTarget && historyOpen) && conversation}
-    {dockTarget ? createPortal(<div className="timber-focus-chat"><MiniActivity model={model} historyOpen={historyOpen} onHistory={setHistoryOpen}/>{historyOpen && <div className="timber-focus-history" aria-label="Conversation history">{conversation}</div>}{composer}</div>,dockTarget) : composer}
+    {dockTarget ? createPortal(<div className="timber-focus-chat"><MiniActivity model={model} historyOpen={historyOpen} onHistory={setHistoryOpen} callbacks={callbacks}/>{historyOpen && <div className="timber-focus-history" aria-label="Conversation history">{conversation}</div>}{composer}</div>,dockTarget) : composer}
   </div>;
 }
 

@@ -1,0 +1,42 @@
+#agents-root{height:100%;min-width:0}
+#panel-agents{padding:0;min-height:0;overflow:hidden}
+.timber-agents{height:100%;overflow:auto;padding:20px;overscroll-behavior:contain}
+.timber-agents h3{font-size:13px;margin:25px 0 12px;font-weight:600}
+.timber-agent-list{display:flex;flex-direction:column;gap:10px}
+.timber-agent-card{display:flex;flex-direction:column;gap:10px;padding:14px;width:100%;min-width:0;background:var(--surface);border:1px solid var(--line);border-radius:12px;text-align:left;color:var(--ink);font-size:13px}
+button.timber-agent-card:hover{background:var(--soft)}
+.timber-agent-card-heading{display:flex;align-items:center;gap:8px;flex-wrap:wrap;width:100%}
+.timber-agent-card-heading svg{width:16px;height:16px;flex:none}
+.timber-agent-card-heading strong{flex:1;min-width:0;overflow-wrap:anywhere}
+.timber-agent-card-heading .status{margin-left:auto}
+.timber-agent-card-footer{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px;color:var(--muted);flex-wrap:wrap}
+.timber-agent-card-footer button{font-size:12px;min-height:32px;padding:4px 8px}
+.timber-agent-detail{display:flex;flex-direction:column;height:100%;min-width:0;padding:16px;gap:12px}
+.timber-agent-detail-heading{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.timber-agent-detail-heading h2{font-size:16px;margin:0;overflow-wrap:anywhere}
+.timber-agent-detail-heading p{font-size:11px;margin:3px 0 0}
+.timber-agent-detail-actions{display:flex;justify-content:flex-end;gap:8px}
+.timber-agent-detail-actions button{font-size:12px;min-height:32px;padding:5px 10px;gap:6px}
+.timber-agent-detail-actions svg{width:13px;height:13px}
+.timber-agent-messages{flex:1;min-height:80px;overflow:auto;overscroll-behavior:contain;display:flex;flex-direction:column;gap:18px;padding:12px 4px}
+.timber-agent-message{min-width:0}
+.timber-agent-message-user{padding:12px;background:var(--soft);border-radius:12px}
+.timber-agent-message .timber-message-meta{margin-bottom:7px;justify-content:space-between;flex-wrap:wrap;font-size:11px}
+.timber-agent-message .timber-markdown{font-size:13px}
+.timber-agent-composer{display:flex;align-items:flex-end;gap:8px;border:1px solid var(--line);border-radius:15px;padding:7px;background:var(--surface)}
+.timber-agent-composer textarea{resize:none;flex:1;min-width:0;min-height:48px;max-height:150px;background:transparent;border:0;box-shadow:none;padding:8px;font-size:13px}
+.timber-agent-composer button{min-height:36px;min-width:36px;padding:8px;border-radius:50%}
+.timber-agent-composer svg{width:18px;height:18px}
+.agent-permission{display:flex;align-items:center;gap:10px;margin-top:20px!important}
+.agent-permission input{width:18px;height:18px;flex:none;margin:0;padding:0;accent-color:var(--ink)}
+.timber-agent-task{font-size:12px;color:var(--muted);line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;max-height:72px;overflow:hidden}
+.timber-agent-activity{border-top:1px solid var(--line);padding-top:12px;font-size:12px}
+.timber-agent-activity summary{cursor:pointer;color:var(--muted);min-height:32px}
+.timber-agent-activity article{margin:12px 0;padding:10px;background:var(--soft);border-radius:9px}
+.timber-agent-activity pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:140px;overflow:auto;font-size:11px}
+.timber-agent-report-warning{padding:12px;border:1px solid var(--line);border-radius:10px;color:var(--muted);font-size:12px;line-height:1.5}
+.timber-agent-report-warning strong{color:var(--ink);font-size:12px}
+.timber-agent-report-warning p{margin:5px 0 0;overflow-wrap:anywhere}
+.timber-mini-agents{display:inline-flex;align-items:center;gap:6px;font-size:11px;background:transparent;border:0;color:var(--muted);min-height:28px;padding:0 4px}
+.timber-mini-agents svg{width:13px;height:13px}
+@media(max-width:760px){.timber-agents{padding:16px}.timber-agent-detail{padding:12px}.timber-agent-detail-actions button,.timber-agent-card-footer button{min-height:42px}.timber-agent-composer textarea{font-size:16px}.timber-agent-composer button{min-height:44px;min-width:44px}}
