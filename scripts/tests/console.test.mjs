@@ -748,7 +748,13 @@ test('runtime admission can be retried from a new accepted receipt before histor
     await login(); let refresh, first = true;
     state.readsGate = new Promise(resolve => {refresh = resolve;});
     await page.route(`**/v1/bots/${BOT_A}/messages`, async route => {
-      if (route.request().method() !== 'POST' || !first) return route.continue();
+      if (route.request().method() !== 'POST') return route.continue();
+      if (!first) {
+        // Restore admission only once the retry arrives: a /runs refresh must
+        // not remove canRetryAdmission between finding Retry and clicking it.
+        delete state.runs.get(BOT_A)[0].error;
+        return route.continue();
+      }
       first = false;
       const response = await route.fetch(), result = await response.json();
       result.run.error = 'Runtime admission is unavailable. Retry this message to resume the same request.';
@@ -759,7 +765,6 @@ test('runtime admission can be retried from a new accepted receipt before histor
     await until(page, '#messages [data-operation-id]', 'Queued');
     await page.getByRole('button', {name: 'Retry sending', exact: true}).waitFor();
     await page.locator('#message').fill('A new unsent draft stays mine');
-    delete state.runs.get(BOT_A)[0].error;
     const retried = page.waitForResponse(response => response.request().method() === 'POST' && response.url().endsWith('/messages'));
     await page.getByRole('button', {name: 'Retry sending', exact: true}).click(); await retried;
     assert.equal(sentMessages(state, BOT_A).length, 2);
