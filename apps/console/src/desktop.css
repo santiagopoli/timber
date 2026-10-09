@@ -71,3 +71,7 @@
 
 /* Native fullscreen owns its outer dimensions. Inset its contents instead. */
 .desktop-viewer:fullscreen{padding-top:var(--app-top,0px);padding-bottom:max(0px,calc(100dvh - var(--app-top,0px) - var(--app-height)))}
+
+/* Explicit line boxes avoid inherited body leading shifting compact labels. */
+.desktop-actions button,.desktop-keys button{display:inline-flex;align-items:center;justify-content:center;text-align:center;line-height:1.2}
+.desktop-actions button svg{display:block;flex:none}

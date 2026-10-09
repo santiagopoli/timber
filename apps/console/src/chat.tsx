@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
-import { PaperclipIcon, ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon, HistoryIcon } from 'lucide-react';
+import { PlusIcon, ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon, HistoryIcon } from 'lucide-react';
 import { useStickToBottomContext } from 'use-stick-to-bottom';
 import { defaultUrlTransform, type UrlTransform } from 'streamdown';
 import { Conversation, ConversationContent, ConversationEmptyState, ConversationScrollButton } from '@/components/ai-elements/conversation';
@@ -457,7 +457,7 @@ function ImageControls({sending,hasText,acceptedIds}: {sending:boolean;hasText:b
       <img src={file.url} alt={file.filename || 'Attached image'} />
       <button type="button" aria-label="Remove image" disabled={sending} onClick={()=>attachments.remove(file.id)}>×</button>
     </div>)}</div>
-    <Button type="button" variant="ghost" size="sm" disabled={sending} aria-label="Attach images" onClick={()=>attachments.openFileDialog()}><PaperclipIcon aria-hidden="true" />Attach images</Button>
+    <Button type="button" variant="ghost" size="icon" className="timber-attach" disabled={sending} aria-label="Attach images" title="Attach images" onClick={()=>attachments.openFileDialog()}><PlusIcon aria-hidden="true" /></Button>
     <PromptInputSubmit className="timber-send" aria-label="Send message" title="Send message" disabled={sending || (!hasText && !attachments.files.length)}>{sending ? <LoaderCircleIcon className="timber-spinner" /> : <ArrowUpIcon />}</PromptInputSubmit>
   </>;
 }
