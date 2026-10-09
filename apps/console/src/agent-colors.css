@@ -1,0 +1,15 @@
+[data-agent-color=fern]{--agent-fill:#e3eee5;--agent-ink:#28573a}
+[data-agent-color=iris]{--agent-fill:#eae5f5;--agent-ink:#584178}
+[data-agent-color=ocean]{--agent-fill:#dfeef3;--agent-ink:#27586b}
+[data-agent-color=clay]{--agent-fill:#f3e6dc;--agent-ink:#794a2b}
+[data-agent-color=rose]{--agent-fill:#f3e1e8;--agent-ink:#7d3958}
+[data-agent-color=gold]{--agent-fill:#f2edcf;--agent-ink:#6e5c1e}
+.avatar[data-agent-color],.timber-mini-avatar[data-agent-color],.timber-collaborator-avatar[data-agent-color]{background:var(--agent-fill);color:var(--agent-ink);border-color:color-mix(in srgb,var(--agent-ink) 20%,transparent)}
+.bot-info{min-width:0;flex:1}
+.bot-info small.bot-preview{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
+.bot-name-line{display:flex;align-items:center;gap:7px;min-width:0}
+.bot-name-line .bot-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.bot-activity-status{font-size:9px;color:var(--muted);margin-left:auto;flex:none;text-transform:none}
+.bot-activity-status[data-status=running],.bot-activity-status[data-status=queued]{color:var(--success)}
+.bot-activity-status[data-status=waiting_approval],.bot-activity-status[data-status=waiting_connection]{color:var(--ink)}
+@media(prefers-color-scheme:dark){[data-agent-color=fern]{--agent-fill:#273d2e;--agent-ink:#b1d9bb}[data-agent-color=iris]{--agent-fill:#393047;--agent-ink:#d0bee9}[data-agent-color=ocean]{--agent-fill:#253c45;--agent-ink:#afd6e6}[data-agent-color=clay]{--agent-fill:#463329;--agent-ink:#e8c5a9}[data-agent-color=rose]{--agent-fill:#452e39;--agent-ink:#e8b5cd}[data-agent-color=gold]{--agent-fill:#413c27;--agent-ink:#ded29a}}

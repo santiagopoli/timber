@@ -47,6 +47,10 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
 - GET /v1/bots -> {bots:Bot[]}
 - POST /v1/bots {name,instructions?,model?,computerApprovalMode?,allowNamedAgents?} -> 201 {bot:Bot}
 - GET /v1/bots/:id -> {bot:Bot}
+- GET /v1/bots/:id/summary -> {summary:{status,activeRuns,activeAgents,activeProcesses,lastMessage?}}.
+  A passive SQL-only sidebar snapshot; it does not admit work, call inference or
+  wake a computer. The latest user/assistant text is limited to 240 characters.
+  Root work, temporary agents and managed processes have independent counts.
 - PATCH /v1/bots/:id {name?,instructions?,computerApprovalMode?,allowNamedAgents?} -> {bot:Bot}
 - DELETE /v1/bots/:id -> 200 {botId,deleted:true}. Repeated deletion of the same
   known bot is idempotent; an unknown ID returns 404. Registry access is removed
@@ -58,7 +62,8 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
 - GET /v1/bots/:id/messages -> {messages:Message[]}
   Assistant messages may carry `kind: "progress" | "final"`. Progress is public
   assistant commentary accompanying native tool calls; it is durably deduplicated
-  by its native message identity. Final answers retain operation-based deduplication.
+  by its native message identity. Final answers are deduplicated by their native
+  answer entry; older answers without that identity retain operation-based deduplication.
   Messages without kind remain ordinary messages for backward compatibility.
 - PUT /v1/bots/:id/attachments/:imageId uploads raw PNG/JPEG bytes (5 MB maximum)
   under a client-generated UUID and returns `{attachment:{artifactId,mimeType,size}}`.
@@ -77,8 +82,12 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   Blob conversion uses FileReader, without weakening the console CSP.
   Image attachments with bot mentions are currently rejected, not silently omitted.
 
-  The receipt confirms durable storage of the user input. A busy bot processes
-  subsequent inputs in order. Transient engine admission failures stay queued
+  The receipt confirms durable storage of the user input. A busy named bot admits
+  subsequent inputs as native Pi steering: they join at the next completed tool
+  round, or start a new run after the current final answer. An in-flight model
+  generation or unsafe action is not aborted or replayed to admit a message.
+  New requests can create independent subagents while earlier children continue.
+  Transient engine admission failures stay queued
   with a fixed diagnostic and retry through the shared Lifecycle alarm using the
   same operation ID (five total attempts, with 1/2/4/8-second backoff). A lost
   engine receipt is reconciled against native durable state before resubmission.
@@ -174,8 +183,19 @@ an integration API with backend implementer immediately. Pi native recovery owns
 the loop; backend persists user-facing run/event projection. Runtime events need
 normalization into BotEvent; do not expose raw engine-specific formats to UI.
 
+Root submissions default to `whenBusy:"steer"`; explicit internal `followUp`
+remains available. At a safe boundary Pi places one steering input at a time.
+New generations and tools belong to the latest placed input, while durable tool
+memos keep already-started invocations attached to their original operation.
+Existing children retain their original parent and budget; children spawned for
+a later input inherit that input. Several host runs may join one native run and
+settle with one answer. Runtime completion includes `answerId` and
+`answerOperationId`, recovered from durable generation attribution, so the host
+settles every input, displays the shared answer once and assigns it to the input
+that generated it. Sending a message never invokes cancellation.
+
 ComputerProvider exports exec(botId,operationId,action), status(botId), checkpoint(botId).
-ComputerAction is a discriminated union: exec, readFile, writeFile, listFiles,
+ComputerAction is a discriminated union: exec, execPoll, execCancel, readFile, writeFile, listFiles,
 screenshot, click, move, doubleClick, drag, type, key, scroll, navigate, checkpoint.
 Cloud provider and ComputerDO concrete implementation live under packages/computer. Container HTTP
 server and image live in infra/computer. Agree export names with API agent.
@@ -189,15 +209,43 @@ images reject before journaling and never report a simulated result. They share
 the usual GUI approval policy and human-control exclusion. Pi exposes
 `desktop_move`, `desktop_double_click` and `desktop_drag`.
 
-Pi exec supplies a 120,000 ms default timeout and preserves an explicitly requested
-shorter timeout. The computer's existing HTTP exec default remains 30,000 ms for
-direct clients that omit it; its maximum is 120,000 ms. A timeout terminates the
-process group and retains the partial output and exit code. Long-running app
-servers must detach all standard streams, keep live logs outside /workspace and
-be checked separately for readiness. A shell exit code alone does not prove an
-app is responding.
+Pi `exec {command,timeoutMs?,yieldMs?}` starts a managed process with no default
+execution deadline. `timeoutMs`, when explicitly supplied, is a positive safe
+integer; there is no 120-second maximum. Its expiry terminates the process group
+and retains output and the terminal outcome. `yieldMs` is an integer from 0 to
+30,000, default 1,000; it limits how long a request waits for output and never
+terminates a process. These values have the same meaning for direct computer API
+clients and Pi tools.
 
-Checkpoint errors preserve the completed or failed command outcome. Known
+A response with `status:"running"` includes `processId`, equal to the initial
+exec operation ID. It confirms the command continues in the computer. Pi exposes
+`exec_poll {processId,yieldMs?}` and `exec_cancel {processId}`, mapped to the
+`execPoll` and `execCancel` computer actions. Each observation/cancellation has its
+own operation ID and refers to the original process ID. Polling never launches a
+command. Output is a cumulative snapshot capped at 128 KiB. Terminal states are
+`completed`, `failed`, `interrupted` and `cancelled`; running and explicit successful
+cancellation are normal tool results, not tool errors. Processes are scoped to
+their bot. Child cancellation is restricted to its own processes or descendants.
+BotDO also observes confirmed running processes through a durable ten-second
+read-only job, including after their task's final answer. `process.updated` keeps
+the conversation and sidebar current without additional model calls. Transport
+retries reuse the same observation identity; terminal states end observation.
+
+Pi marks exec and cancellation unsafe for native replay; polling is safe. A saved
+running result survives runtime recovery and directs the next call to the same
+process ID. A retry with the original exec operation ID cannot launch a second
+command. A cancellation tombstone also fences a delayed initial request. Bot/task
+cancellation keeps retrying process cancellation until the computer acknowledges
+it; a request to stop is not reported as a confirmed stop while delivery is pending.
+
+Long builds, installations and app servers can use managed sessions without
+`nohup`, shell backgrounding or a guessed short timeout. App readiness is checked
+separately; a live process alone does not prove that an app is responding. Keep
+live logs and temporary build output outside /workspace. Checkpointing waits for
+active managed commands to settle; their launch or a running receipt does not
+claim that workspace changes are durably checkpointed.
+
+Checkpoint errors preserve the completed, failed or cancelled command outcome. Known
 background-write conflicts, archive limits and nonportable files are classified
 into fixed safe diagnostics; arbitrary server responses and paths are not
 forwarded. Explicit checkpoint failure reports failed with the same safe cause.
@@ -246,8 +294,13 @@ obsolete permission; already accepted effects are not cancelled by a policy edit
 ## Storage / lifecycle
 The normal idle window is five minutes. Tool activity, active runtime events,
 explicit workspace reads, live-desktop lease renewals and successful app requests
-renew it. Passive status polling and an open chat do not. A detached server alone
-does not keep the machine awake. Idle shutdown first checkpoints, then destroys
+renew it. A managed running process is active work: a durable ten-second maintenance
+alarm observes it and renews the computer lifetime without model inference.
+Explicit checkpoint, suspend and human desktop control reject while managed
+commands are active. Terminal command checkpoints are deferred until the active
+batch finishes; one checkpoint can cover the completed batch. Passive status
+polling and an open chat do not keep the machine awake. A detached server outside
+managed execution alone does not keep it awake. Idle shutdown first checkpoints, then destroys
 the container; checkpoint failures defer shutdown and retry after one minute.
 A separate fifteen-minute infrastructure inactivity timeout is the fallback.
 Restoration brings back the checkpointed /workspace files, not process memory,
@@ -256,6 +309,12 @@ running services, desktop windows, /tmp or packages installed elsewhere.
 Workspace path /workspace, one writer via ComputerDO. Root package/tool image version
 pinned. Backend stores artifacts and directory archive in R2, metadata in DO. Unsafe
 in-progress operations after restart are interrupted; completed results deduplicated.
+Managed exec sessions retain their process IDs in ComputerDO. Eviction of that
+object reconciles the existing session and computer boot identity instead of
+reissuing exec. A control-server or container restart interrupts the old session,
+retains available output and never replays its command. Server recovery attempts
+to terminate a surviving process group only after verifying its recorded process
+identity, avoiding unrelated processes that reused the PID.
 No container per tool call. Stop only after true inactivity. Mark checkpoints durable
 only after successful upload; don't claim full live-volume persistence.
 Bootstrap desktop provisioning is bounded by a native process-group timeout
@@ -284,7 +343,11 @@ agents are addressed by their visible IDs. Messages queue as durable inputs and
 start a new turn if the recipient is idle. Initial successful task results return
 to the parent automatically; peer-to-peer messages do not create automatic reply
 loops. Wait returns immediately for an approval or connection wait so the host can
-present that decision. There are at most eight active agents per bot and three
+present that decision. A native steering input also releases `wait_subagent` with
+`{status:"yielded",reason:"new_input",subagent}`. Only that read-only observer
+ends: the child and its durable delivery keep running. The completed tool round
+then lets the parent attend to the input, including creating another child.
+There are at most eight active agents per bot and three
 levels of nesting. Model generations and tool calls share the originating parent
 operation's optional budgets; spawning does not reset those counters.
 

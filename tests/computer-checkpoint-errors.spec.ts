@@ -23,7 +23,7 @@ describe("checkpoint failures preserve known computer outcomes",()=>{
       Object.defineProperty(instance,"env",{value:{FILES:{async put(){uploads++;return {size:1};}}}});
       Object.defineProperty(instance,"container",{get:()=>({running:true,async setInactivityTimeout(){},getTcpPort(){return {async fetch(input:string){
         const path=new URL(input).pathname;
-        if(path==="/health")return Response.json({ok:true,bootId:"known",desktop:true});
+        if(path==="/health")return Response.json({ok:true,bootId:"known",desktop:true,capabilities:["execSessions"]});
         if(path==="/actions"){effects++;return Response.json({status:"completed",exitCode:0,output:"Source files created"});}
         expect(path).toBe("/checkpoint");checkpoints++;
         return recovered?new Response("x",{headers:{"content-length":"1","x-content-sha256":"0".repeat(64)}}):Response.json({error:message},{status:400});
@@ -51,7 +51,7 @@ describe("checkpoint failures preserve known computer outcomes",()=>{
     const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
     await runInDurableObject(stub,async instance=>{
       Object.defineProperty(instance,"container",{get:()=>({running:true,async setInactivityTimeout(){},getTcpPort(){return {async fetch(input:string){
-        if(new URL(input).pathname==="/health")return Response.json({ok:true,bootId:"known",desktop:true});
+        if(new URL(input).pathname==="/health")return Response.json({ok:true,bootId:"known",desktop:true,capabilities:["execSessions"]});
         return Response.json({error:"Workspace changed during checkpoint; stop background writers and retry"},{status:400});
       }};}})});
       const result=await (await instance.fetch(request(botId,"checkpoint-only",{type:"checkpoint"}))).json<ComputerResult>();
@@ -66,7 +66,7 @@ describe("checkpoint failures preserve known computer outcomes",()=>{
     await runInDurableObject(stub,async instance=>{
       Object.defineProperty(instance,"container",{get:()=>({running:true,async setInactivityTimeout(){},getTcpPort(){return {async fetch(input:string){
         const path=new URL(input).pathname;
-        if(path==="/health")return Response.json({ok:true,bootId:"known",desktop:true});
+        if(path==="/health")return Response.json({ok:true,bootId:"known",desktop:true,capabilities:["execSessions"]});
         if(path==="/actions")return Response.json({status:"failed",exitCode:-9,output:"partial install",error:"Command timed out; its process group was terminated. External effects may have occurred."});
         return Response.json({error:"Workspace changed during checkpoint; stop background writers and retry"},{status:400});
       }};}})});

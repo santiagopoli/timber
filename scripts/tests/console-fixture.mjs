@@ -119,6 +119,11 @@ export async function createConsoleFixture({port = 0} = {}) {
         return json({botId: id, deleted: true});
       }
       if (!bot || state.deletingBots.has(id)) return json({}, 404);
+      if (tail === '/summary') {
+        const activeRuns=(state.runs.get(id)||[]).filter(run=>!run.subagentId&&active.has(run.status));
+        const lastMessage=(state.messages.get(id)||[]).filter(message=>['user','assistant'].includes(message.role)).at(-1);
+        return json({summary:{status:['waiting_approval','waiting_connection','running','queued'].find(status=>activeRuns.some(run=>run.status===status))||'ready',activeRuns:activeRuns.length,activeAgents:(state.agents.get(id)||[]).filter(agent=>active.has(agent.status)).length,...(lastMessage?{lastMessage:{text:lastMessage.text.slice(0,240),createdAt:lastMessage.createdAt}}:{})}});
+      }
       if (!tail) {if (request.method === 'PATCH') {if (state.patchGate) await state.patchGate; if (state.patchError) return json({error: state.patchError}, state.patchError.status || 503); Object.assign(bot, body);} return json({bot});}
       if (tail === '/messages') {
         if (request.method === 'GET') {const snapshot = structuredClone(state.messages.get(id)); if (state.readsGate) await state.readsGate; return json({messages: snapshot});}

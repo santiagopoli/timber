@@ -52,12 +52,22 @@ jobs:
           docker run -d --name timber-image-smoke --shm-size=512m -p 127.0.0.1:8080:8080 -e BOTSPACE_COMPUTER_TOKEN="$COMPUTER_TEST_TOKEN" timber-computer:ci
           node scripts/smoke-computer.mjs
           docker exec -i timber-image-smoke python3 - < infra/computer/smoke_desktop.py
+      - name: Export the verified production image
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: docker save timber-computer:ci | gzip -1 > timber-computer.tar.gz
+      - uses: actions/upload-artifact@v4
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        with:
+          name: verified-computer-image
+          path: timber-computer.tar.gz
+          compression-level: 0
+          retention-days: 1
   deploy:
     name: Deploy production
     needs: [verify, desktop-image]
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     environment: production
     concurrency:
       group: timber-production
@@ -79,6 +89,11 @@ jobs:
           else
             echo "A newer commit is on main; this revision will not deploy."
           fi
+      - uses: actions/download-artifact@v4
+        if: steps.revision.outputs.current == 'true'
+        with:
+          name: verified-computer-image
+          path: .verified-image
       - name: Deploy API and preview gateway
         if: steps.revision.outputs.current == 'true'
         env:
@@ -96,7 +111,19 @@ jobs:
             echo "::error::Configure CLOUDFLARE_API_TOKEN or both CLOUDFLARE_API_KEY and CLOUDFLARE_EMAIL in GitHub Actions secrets."
             exit 1
           fi
+          docker load --input .verified-image/timber-computer.tar.gz
+          docker tag timber-computer:ci "timber-computer:${GITHUB_SHA}"
+          npx wrangler containers push "timber-computer:${GITHUB_SHA}" --config apps/api/wrangler.production.jsonc
+          docker image inspect "registry.cloudflare.com/${CLOUDFLARE_ACCOUNT_ID}/timber-computer:${GITHUB_SHA}" \
+            --format '{{json .RepoDigests}}' > .verified-image/digests.json
+          node scripts/pin-computer-image.mjs apps/api/wrangler.production.jsonc .verified-image/digests.json .verified-image/release.json
           npm run deploy
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.revision.outputs.current == 'true'
+        with:
+          name: production-image-reference
+          path: .verified-image/release.json
+          if-no-files-found: ignore
       - name: Check production health
         if: steps.revision.outputs.current == 'true'
         shell: bash

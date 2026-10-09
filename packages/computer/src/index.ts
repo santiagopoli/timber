@@ -14,7 +14,16 @@ export interface ComputerEnv {
   COMPUTER_BOOTSTRAP?: string;
 }
 
-interface OperationRecord { digest: string; result?: ComputerResult; }
+interface OperationRecord { digest: string; result?: ComputerResult; processId?: string; conflict?:boolean; }
+interface ExecCancellation {operationId:string;journal:boolean;}
+interface ExecSession {
+  digest: string;
+  bootId: string;
+  dispatched: boolean;
+  result: ComputerResult;
+  checkpoint: 'pending' | 'attempting' | 'done';
+  checkpointAttemptId?: string;
+}
 interface Checkpoint { id: string; key: string; size: number; sha256: string; createdAt: string; }
 interface Health { ok: boolean; bootId: string; desktop: boolean; capabilities?:string[]; }
 interface ContainerResult extends ComputerResult { artifactName?: string; }
@@ -22,6 +31,7 @@ interface GitTransport { id:string; url:string; token:string; }
 
 const IDLE_MS = 5 * 60_000;
 const SAFETY_TIMEOUT_MS = 15 * 60_000;
+const EXEC_POLL_MS = 10_000;
 const PORT = 8080;
 const BASE_CAPABILITIES = ["exec", "readFile", "writeFile", "listFiles", "checkpoint"];
 const DESKTOP_CAPABILITIES = ["screenshot", "click", "type", "key", "scroll", "navigate"];
@@ -61,6 +71,8 @@ const COMPUTER_ERRORS = {
   computer_upgrade_required: {status:409, message:"This computer is running an older image. Suspend it after its current work finishes to save its workspace, then retry on the updated image. No action was executed."},
   computer_git_unavailable: {status:503, message:"The GitHub transport is unavailable. Reconnect GitHub and verify this bot's repository access."},
   computer_app_not_running: {status:503, message:"This app's computer is stopped. Ask the bot to start the app again."},
+  computer_execution_active: {status:409, message:"A command is still running. Wait for it or cancel it before suspending, checkpointing, or taking control of the computer."},
+  computer_idempotency_conflict: {status:409, message:"operationId was already used with different arguments."},
 } as const;
 
 export type ComputerErrorCode = keyof typeof COMPUTER_ERRORS;
@@ -122,6 +134,8 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   private deleted=false;
   private deleting?:Promise<void>;
   private shutdown=new AbortController();
+  private execUpdates=new Map<string,Promise<unknown>>();
+  private finalizingExecutions?:Promise<void>;
 
   constructor(ctx: DurableObjectState, env: ComputerEnv) {
     super(ctx, env);
@@ -134,11 +148,20 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       // with the same id receives interrupted, never replays the effect.
       const operations = await ctx.storage.list<OperationRecord>({ prefix: "operation:" });
       for (const [key, record] of operations) {
-        if (!record.result) {
+        if (!record.result && !record.processId) {
           record.result = {operationId: key.slice(10), status: "interrupted", error: "Execution was interrupted. Inspect effects before creating another operation."};
           await ctx.storage.put(key, record);
         }
       }
+      const sessions=await ctx.storage.list<ExecSession>({prefix:"exec-session:"});
+      for(const [key,session] of sessions) if(session.checkpoint==='attempting') {
+        const checkpoint=await ctx.storage.get<Checkpoint>('lastCheckpoint');
+        if(checkpoint && checkpoint.id===session.checkpointAttemptId) session.result.checkpointId=checkpoint.id;
+        else session.result.error=`${session.result.error?session.result.error+' ':''}The checkpoint outcome could not be confirmed after recovery. Retry checkpoint; do not repeat the command.`;
+        session.checkpoint='done';
+        await this.storeExecution(key.slice('exec-session:'.length),session);
+      }
+      if([...sessions.values()].some(session=>session.result.status==='running' || session.checkpoint==='pending')) await ctx.storage.setAlarm(Date.now()+1_000);
       if (this.container?.running) await stage("computer_lifecycle_failed", () => this.container!.setInactivityTimeout(SAFETY_TIMEOUT_MS));
     });
   }
@@ -172,6 +195,8 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       // deletion. Workspace can now remove R2 without a late uploader racing it.
       await this.tail;
       await this.workspaceTail;
+      await Promise.all([...this.execUpdates.values()].map(work=>work.catch(()=>{})));
+      await this.finalizingExecutions?.catch(()=>{});
       if(this.starting) await this.starting.catch(()=>{});
       while(true) {
         const values=await this.ctx.storage.list({limit:128});
@@ -191,7 +216,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       if(path.startsWith("/workspace/") || path.startsWith("/desktop")) return await this.inspect(request);
       if(path.startsWith("/preview/")) return await this.preview(request);
       if (request.method !== "POST") throw new ComputerProviderError("computer_method_not_allowed");
-      const body = await request.json<{botId:string; operationId?:string; action?:ComputerAction}>();
+      const body = await request.json<{botId:string; operationId?:string; processId?:string; action?:ComputerAction}>();
       if (!/^[A-Za-z0-9_-]{1,100}$/.test(body.botId)) throw new ComputerProviderError("computer_invalid_request");
       const savedBotId = await this.ctx.storage.get<string>("deleted") ?? await this.ctx.storage.get<string>("botId");
       if (savedBotId && savedBotId !== body.botId) throw new ComputerProviderError("computer_owner_mismatch");
@@ -201,9 +226,14 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       this.active();
       if (path === "/status") return Response.json(await this.status(body.botId));
       if (path === "/touch") { await this.touch(); return Response.json({ok:true}); }
+      if(path==='/exec/cancel') {
+        if(!body.processId || !/^[A-Za-z0-9:_.-]{1,160}$/.test(body.processId)) throw new ComputerProviderError('computer_invalid_request');
+        return Response.json(await this.cancelExecution(body.botId,body.processId,body.processId,false));
+      }
       if (path === "/suspend") {
         return Response.json(await this.serialize(() => this.withWorkspace(async () => {
           this.active();
+          if(await this.hasActiveExecutions()) throw new ComputerProviderError('computer_execution_active');
           await this.live.closeAll();
           if (this.container?.running) {
             await this.initializeWorkspace(body.botId);
@@ -245,6 +275,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       const mode=input.mode;
       const replaces=input.replaces as string|undefined;
       const create=()=>this.withWorkspace(async()=>{
+        if(mode==='control' && await this.hasActiveExecutions()) throw new ComputerProviderError('computer_execution_active');
         let health=this.container?.running && this.workspaceHealth
           ? this.workspaceHealth : await this.initializeWorkspace(botId);
         if(!health.capabilities?.includes("liveDesktop") && !health.capabilities?.includes("workspace")) throw new ComputerProviderError("computer_upgrade_required");
@@ -305,7 +336,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     if (state !== "running") this.desktop = false;
     return {
       id:botId, provider:"cloudflare", state,
-      capabilities: container ? [...BASE_CAPABILITIES, ...(this.desktop ? [...DESKTOP_CAPABILITIES,...this.capabilities.filter(value=>EXTENDED_MOUSE_CAPABILITIES.includes(value))] : []), ...this.capabilities.filter(value=>value==="gitClone" || value==="gitPush")] : [],
+      capabilities: container ? [...BASE_CAPABILITIES, ...(this.desktop ? [...DESKTOP_CAPABILITIES,...this.capabilities.filter(value=>EXTENDED_MOUSE_CAPABILITIES.includes(value))] : []), ...this.capabilities.filter(value=>value==="gitClone" || value==="gitPush" || value==='execSessions')] : [],
       ...(checkpoint ? {lastCheckpointId:checkpoint.id} : {}),
       ...(error ? {error:{code:error.code,message:error.publicMessage}} : {}),
     };
@@ -313,6 +344,9 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
 
   private execute(botId: string, operationId: string, action: ComputerAction): Promise<ComputerResult> {
     this.active();
+    if(action.type==='exec') return this.startExecution(botId,operationId,action);
+    if(action.type==='execPoll') return this.pollExecution(botId,operationId,action.processId,action.yieldMs===undefined?1000:action.yieldMs);
+    if(action.type==='execCancel') return this.cancelExecution(botId,operationId,action.processId);
     // Include argument digest even when another call with this id is in flight.
     const flightKey = `${operationId}:${stableAction(action)}`;
     const existing = this.flights.get(flightKey);
@@ -334,7 +368,14 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       if(EXTENDED_MOUSE_CAPABILITIES.includes(action.type) && (!health.desktop || !health.capabilities?.includes(action.type))) throw new ComputerProviderError("computer_upgrade_required");
       await this.touch();
       this.active();
-      await this.ctx.storage.put<OperationRecord>(key, {digest});
+      const reserved=await this.ctx.storage.transaction(async txn=>{
+        const record=await txn.get<OperationRecord>(key);
+        if(!record) await txn.put<OperationRecord>(key,{digest});
+        return record;
+      });
+      if(reserved) return reserved.digest===digest
+        ? reserved.result??{operationId,status:'interrupted' as const,error:'Operation outcome is unknown; it will not be replayed'}
+        : {operationId,status:'failed' as const,error:'operationId was already used with different arguments'};
       this.active();
       let result: ComputerResult;
       let operationStage: "checkpoint" | "action" | "artifact_read" | "artifact_store" = "action";
@@ -362,7 +403,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
           }
           // Terminal commands can mutate files even on nonzero exit. Confirm a
           // portable checkpoint before acknowledging these filesystem operations.
-          if (action.type === "exec" || action.type === "writeFile" || action.type === "gitClone") {
+          if (action.type === "writeFile" || action.type === "gitClone") {
             operationStage = "checkpoint";
             try { result.checkpointId = (await this.withWorkspace(() => this.saveCheckpoint(botId))).id; }
             catch(error) {
@@ -394,11 +435,216 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     return work;
   }
 
+  private validExecution(processId:string,yieldMs=0):void {
+    if(typeof processId!=='string' || !/^[A-Za-z0-9:_.-]{1,160}$/.test(processId) || !Number.isSafeInteger(yieldMs) || yieldMs<0 || yieldMs>30_000) throw new ComputerProviderError('computer_invalid_request');
+  }
+
+  private withExecUpdate<T>(processId:string,work:()=>Promise<T>):Promise<T> {
+    const result=(this.execUpdates.get(processId)??Promise.resolve()).then(()=>{this.active();return work();});
+    const tail=result.catch(()=>{});
+    this.execUpdates.set(processId,tail);
+    void tail.then(()=>{if(this.execUpdates.get(processId)===tail) this.execUpdates.delete(processId);});
+    return result;
+  }
+
+  private async storeExecution(processId:string,session:ExecSession):Promise<void> {
+    this.active();
+    await this.ctx.storage.put({[`exec-session:${processId}`]:session,[`operation:${processId}`]:{digest:session.digest,processId,result:session.result} satisfies OperationRecord});
+  }
+
+  private async hasActiveExecutions():Promise<boolean> {
+    return [...(await this.ctx.storage.list<ExecSession>({prefix:'exec-session:'})).values()].some(session=>session.result.status==='running');
+  }
+
+  private async needsExecutionMaintenance():Promise<boolean> {
+    return [...(await this.ctx.storage.list<ExecSession>({prefix:'exec-session:'})).values()].some(session=>session.result.status==='running' || session.checkpoint==='pending');
+  }
+
+  private executionResult(session:ExecSession,operationId:string):ComputerResult {
+    const result={...session.result,operationId};
+    if(result.status!=='running' && session.checkpoint!=='done') result.error=`${result.error?result.error+' ':''}Files are not yet checkpointed. A checkpoint is scheduled after all active commands finish.`;
+    return result;
+  }
+
+  private async updateExecution(processId:string,value:ComputerResult,lost=false):Promise<ExecSession> {
+    return this.withExecUpdate(processId,async()=>{
+      const session=await this.ctx.storage.get<ExecSession>(`exec-session:${processId}`);
+      if(!session) throw new ComputerProviderError('computer_unavailable');
+      // HTTP polls may finish out of order. A stale running snapshot can never
+      // replace a known terminal outcome or shrink accumulated output.
+      if(session.result.status==='running') {
+        session.result={...value,operationId:processId,processId,
+          output:(value.output?.length??0)<(session.result.output?.length??0)?session.result.output:value.output};
+        if(lost) session.checkpoint='done';
+        await this.storeExecution(processId,session);
+      }
+      return session;
+    });
+  }
+
+  private async executionRequest(operationId:string,action:ComputerAction,yieldMs:number):Promise<ComputerResult> {
+    const timeout=new AbortController(),timer=setTimeout(()=>timeout.abort(),yieldMs+10_000);
+    try {
+      const response=await this.call('/actions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operationId,action}),signal:timeout.signal});
+      if(!response.ok) {
+        if(response.status===409) {
+          const body=await response.json<{error?:{code?:string}}>().catch(()=>undefined);
+          if(body?.error?.code==='computer_idempotency_conflict') throw new ComputerProviderError('computer_idempotency_conflict');
+        }
+        throw new ComputerProviderError('computer_unavailable');
+      }
+      const result=await response.json<ComputerResult>();
+      if(!['running','completed','failed','interrupted','cancelled'].includes(result.status) || (result.output!==undefined && typeof result.output!=='string')) throw new ComputerProviderError('computer_unavailable');
+      return result;
+    } finally {clearTimeout(timer);}
+  }
+
+  private async startExecution(botId:string,processId:string,action:Extract<ComputerAction,{type:'exec'}>):Promise<ComputerResult> {
+    const yieldMs=action.yieldMs===undefined?1000:action.yieldMs;
+    this.validExecution(processId,yieldMs);
+    if(typeof action.command!=='string' || !action.command || action.command.length>32768 || (action.timeoutMs!==undefined && (!Number.isSafeInteger(action.timeoutMs) || action.timeoutMs<=0))) throw new ComputerProviderError('computer_invalid_request');
+    // Waiting is a read preference, so changing yieldMs never changes the effect.
+    const digest=await sha256(stableAction({type:'exec',command:action.command,...(action.timeoutMs===undefined?{}:{timeoutMs:action.timeoutMs})}));
+    const prepared=await this.serialize(async()=>{
+      this.active();
+      const existing=await this.ctx.storage.get<OperationRecord>(`operation:${processId}`);
+      if(existing) {
+        if(existing.digest!==digest) return {operationId:processId,status:'failed' as const,error:'operationId was already used with different arguments'};
+        if(!existing.processId) return existing.result??{operationId:processId,status:'interrupted' as const,error:'Operation outcome is unknown; it will not be replayed'};
+        return undefined;
+      }
+      if(await this.ctx.storage.get(`exec-cancelled:${processId}`)) return {operationId:processId,processId,status:'cancelled' as const,output:''};
+      if(await this.live.controlled()) return {operationId:processId,status:'failed' as const,error:'A person has control of the desktop. No action was executed. Release desktop control before issuing a new action.'};
+      const health=await this.ensureReady(botId);
+      if(!health.capabilities?.includes('execSessions')) throw new ComputerProviderError('computer_upgrade_required');
+      await this.touch();
+      const dispatch=await this.withExecUpdate(processId,async()=>{
+        if(await this.ctx.storage.get(`exec-cancelled:${processId}`)) return false;
+        const session:ExecSession={digest,bootId:health.bootId,dispatched:true,checkpoint:'pending',result:{operationId:processId,processId,status:'running',output:''}};
+        await this.ctx.storage.transaction(async txn=>{
+          if(await txn.get(`operation:${processId}`)) throw new ComputerProviderError('computer_idempotency_conflict');
+          await txn.put({[`exec-session:${processId}`]:session,[`operation:${processId}`]:{digest,processId,result:session.result} satisfies OperationRecord});
+        });
+        return true;
+      });
+      if(!dispatch) return {operationId:processId,processId,status:'cancelled' as const,output:''};
+      // Admission is short. The process owns its lifetime, not this request.
+      try { await this.updateExecution(processId,await this.executionRequest(processId,{...action,yieldMs:0},0)); }
+      catch(error) {
+        this.active();
+        if(error instanceof ComputerProviderError && error.code==='computer_idempotency_conflict') {
+          await this.updateExecution(processId,{operationId:processId,processId,status:'failed',error:error.publicMessage},true);
+          throw error;
+        }
+        console.error('computer.failure',{stage:'exec_admission',code:safeError(error).code});
+      }
+      await this.ctx.storage.setAlarm(Date.now()+EXEC_POLL_MS);
+      return undefined;
+    });
+    if(prepared) return prepared;
+    return this.pollExecution(botId,processId,processId,yieldMs);
+  }
+
+  private async pollExecution(botId:string,operationId:string,processId:string,yieldMs:number,finalize=true):Promise<ComputerResult> {
+    this.validExecution(processId,yieldMs);
+    this.active();
+    let session=await this.ctx.storage.get<ExecSession>(`exec-session:${processId}`);
+    if(!session) return {operationId,processId,status:await this.ctx.storage.get(`exec-cancelled:${processId}`)?'cancelled':'interrupted',error:'Execution session is unavailable; inspect its effects before creating another operation.'};
+    if(session.result.status==='running') {
+      const lost=async()=>this.updateExecution(processId,{operationId:processId,processId,status:'interrupted',output:session!.result.output,error:'The execution computer was restarted or stopped. Inspect its effects before creating another operation. Uncheckpointed files may have been lost.'},true);
+      if(!this.container?.running) session=await lost();
+      else {
+        const health=await this.health();
+        if(health.bootId!==session.bootId || !health.capabilities?.includes('execSessions')) session=await lost();
+        else {
+          await this.touch();
+          session=await this.updateExecution(processId,await this.executionRequest(operationId,{type:'execPoll',processId,yieldMs},yieldMs));
+        }
+      }
+    }
+    if(finalize && session.result.status!=='running' && session.checkpoint==='pending') {
+      await this.finalizeExecutions(botId);
+      session=(await this.ctx.storage.get<ExecSession>(`exec-session:${processId}`))??session;
+    }
+    return this.executionResult(session,operationId);
+  }
+
+  private async cancelExecution(botId:string,operationId:string,processId:string,journal=true):Promise<ComputerResult> {
+    this.validExecution(processId);
+    this.active();
+    const digest=journal?await sha256(stableAction({type:'execCancel',processId})):undefined;
+    const prepared=await this.withExecUpdate(processId,()=>this.ctx.storage.transaction(async txn=>{
+      if(journal) {
+        const previous=await txn.get<OperationRecord>(`operation:${operationId}`);
+        if(previous && (previous.digest!==digest || previous.conflict)) throw new ComputerProviderError('computer_idempotency_conflict');
+        if(previous?.result && previous.result.status!=='running') return {result:previous.result};
+        if(!previous) await txn.put(`operation:${operationId}`,{digest,processId});
+      }
+      // The control reservation and cancellation intent are one durable write.
+      // Recovery never observes an admitted cancel without its wakeable intent.
+      await txn.put<ExecCancellation>(`exec-cancelled:${processId}`,{operationId,journal});
+      return {session:await txn.get<ExecSession>(`exec-session:${processId}`)};
+    }));
+    if(prepared.result) return prepared.result;
+    const session=prepared.session;
+    let result:ComputerResult;
+    if(!session || !session.dispatched) result={operationId,processId,status:'cancelled',output:''};
+    else if(session.result.status!=='running') result=this.executionResult(session,operationId);
+    else if(!this.container?.running) result=await this.pollExecution(botId,operationId,processId,0,false);
+    else {
+      const health=await this.health();
+      if(health.bootId!==session.bootId || !health.capabilities?.includes('execSessions')) result=await this.pollExecution(botId,operationId,processId,0,false);
+      else {
+        const controlId=journal?operationId:`exec-cancel:${await sha256(processId)}`;
+        try {result=this.executionResult(await this.updateExecution(processId,await this.executionRequest(controlId,{type:'execCancel',processId},0)),operationId);}
+        catch(error) {
+          if(error instanceof ComputerProviderError && error.code==='computer_idempotency_conflict') {
+            await this.withExecUpdate(processId,async()=>{
+              const intent=await this.ctx.storage.get<ExecCancellation>(`exec-cancelled:${processId}`);
+              if(intent?.operationId===operationId && intent.journal===journal) await this.ctx.storage.delete(`exec-cancelled:${processId}`);
+              if(digest) await this.ctx.storage.put(`operation:${operationId}`,{digest,processId,conflict:true});
+            });
+          }
+          throw error;
+        }
+      }
+    }
+    if(digest) {this.active();await this.ctx.storage.put(`operation:${operationId}`,{digest,processId,result});}
+    // Stop never queues behind a checkpoint upload. The alarm owns finalization.
+    if(await this.needsExecutionMaintenance()) await this.ctx.storage.setAlarm(Date.now()+1_000);
+    return result;
+  }
+
+  private finalizeExecutions(botId:string):Promise<void> {
+    this.finalizingExecutions??=this.serialize(()=>this.withWorkspace(async()=>{
+      if(await this.hasActiveExecutions()) return;
+      const pending=[...(await this.ctx.storage.list<ExecSession>({prefix:'exec-session:'}))].filter(([,session])=>session.checkpoint==='pending');
+      if(!pending.length) return;
+      const attemptId=crypto.randomUUID();
+      for(const [key,session] of pending) {session.checkpoint='attempting';session.checkpointAttemptId=attemptId;await this.storeExecution(key.slice('exec-session:'.length),session);}
+      let checkpoint:Checkpoint|undefined,failure:ComputerProviderError|undefined;
+      try {
+        if(!this.container?.running) throw new ComputerProviderError('computer_checkpoint_failed');
+        const health=await this.health();
+        if(pending.some(([,session])=>session.bootId!==health.bootId)) throw new ComputerProviderError('computer_checkpoint_failed');
+        checkpoint=await this.saveCheckpoint(botId,false,attemptId);
+      } catch(error) {failure=safeError(error);console.error('computer.failure',{stage:'checkpoint',code:failure.code});}
+      for(const [key,session] of pending) {
+        session.checkpoint='done';
+        if(checkpoint) session.result.checkpointId=checkpoint.id;
+        else session.result.error=`${session.result.error?session.result.error+' ':''}The action finished, but its files are not yet checkpointed. ${failure!.publicMessage} Do not repeat the action to save its files.`;
+        await this.storeExecution(key.slice('exec-session:'.length),session);
+      }
+      try {await this.touch();} catch(error) {this.active();console.error('computer.failure',{stage:'post_result_touch',code:safeError(error).code});}
+    })).finally(()=>{this.finalizingExecutions=undefined;});
+    return this.finalizingExecutions;
+  }
+
   private async touch(): Promise<void> {
     this.active();
     await this.ctx.storage.put("lastActivity", Date.now());
     this.active();
-    await this.ctx.storage.setAlarm(Date.now() + IDLE_MS);
+    await this.ctx.storage.setAlarm(Date.now() + (await this.needsExecutionMaintenance()?EXEC_POLL_MS:IDLE_MS));
     this.active();
     if (this.container?.running) await stage("computer_lifecycle_failed", () => this.container!.setInactivityTimeout(SAFETY_TIMEOUT_MS));
   }
@@ -461,6 +707,21 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
 
   async alarm(): Promise<void> {
     if(this.deleted) {await this.ctx.storage.deleteAlarm();return;}
+    const botId=await this.ctx.storage.get<string>('botId');
+    if(botId && await this.needsExecutionMaintenance()) {
+      try {
+        for(const [key,session] of await this.ctx.storage.list<ExecSession>({prefix:'exec-session:'})) {
+          if(session.result.status==='running') {
+            const processId=key.slice('exec-session:'.length);
+            const intent=await this.ctx.storage.get<ExecCancellation|true>(`exec-cancelled:${processId}`);
+            if(intent) await this.cancelExecution(botId,intent===true?processId:intent.operationId,processId,intent===true?false:intent.journal);
+            await this.pollExecution(botId,processId,processId,0,false);
+          }
+        }
+        await this.finalizeExecutions(botId);
+      } catch { /* Keep a durable wake for unavailable process status or checkpointing. */ }
+      if(!this.deleted && await this.needsExecutionMaintenance()) { await this.ctx.storage.setAlarm(Date.now()+EXEC_POLL_MS);return; }
+    }
     await this.serialize(() => this.withWorkspace(async () => {
       if(this.deleted) return;
       const lastActivity = await this.ctx.storage.get<number>("lastActivity") ?? 0;
@@ -610,14 +871,15 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     });
   }
 
-  private async saveCheckpoint(botId: string, quiesce = false): Promise<Checkpoint> {
+  private async saveCheckpoint(botId: string, quiesce = false, checkpointId?:string): Promise<Checkpoint> {
     this.active();
+    if(await this.hasActiveExecutions()) throw new ComputerProviderError('computer_execution_active');
     const response = await stage("computer_checkpoint_failed", () => this.call("/checkpoint", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({quiesce})}));
     if (!response.ok) throw await checkpointResponseError(response);
     if (!response.body) throw new ComputerProviderError("computer_checkpoint_failed");
     const size = Number(response.headers.get("Content-Length"));
     if (!Number.isSafeInteger(size) || size <= 0 || size > 256 * 1024 * 1024) throw new ComputerProviderError("computer_checkpoint_integrity_failed");
-    const id = crypto.randomUUID();
+    const id = checkpointId??crypto.randomUUID();
     const key = `bots/${botId}/checkpoints/${id}.tar.gz`;
     const checksum = response.headers.get("X-Content-SHA256") ?? "";
     if (!/^[a-f0-9]{64}$/.test(checksum)) throw new ComputerProviderError("computer_checkpoint_integrity_failed");
@@ -677,6 +939,7 @@ export function createCloudComputerProvider(binding: DurableObjectNamespace): Co
     exec:(botId,operationId,action) => rpc<ComputerResult>(binding,botId,"/actions",{operationId,action}),
     status:botId => rpc<ComputerStatus>(binding,botId,"/status"),
     checkpoint:botId => rpc<ComputerResult>(binding,botId,"/actions",{operationId:crypto.randomUUID(),action:{type:"checkpoint"}}),
+    cancel:(botId,processId)=>rpc<ComputerResult>(binding,botId,'/exec/cancel',{processId}),
   };
 }
 export const touchCloudComputer = (binding: DurableObjectNamespace, botId: string) => rpc<{ok:true}>(binding,botId,"/touch");

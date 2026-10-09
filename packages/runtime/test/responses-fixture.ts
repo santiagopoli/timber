@@ -5,6 +5,7 @@ export function responsesFixture(payload: { input: Record<string, unknown>[] }, 
   const userIndex = payload.input.map(item => item.role === 'user').lastIndexOf(true);
   const user = payload.input[userIndex];
   const text = JSON.stringify(user);
+  if (text.includes('request-resumable-exec') || text.includes('request-cancel-resumable-exec')) return resumableExecResponse(payload.input.slice(userIndex + 1), text.includes('request-cancel-resumable-exec'));
   if (text.includes('request-multistep-recovery')) return multistepResponse(payload.input.slice(userIndex + 1));
   if (text.includes('request-tool-budget')) return multistepResponse(payload.input.slice(userIndex + 1),'budget');
   if (text.includes('request-long-task')) return multistepResponse(payload.input.slice(userIndex + 1),'long');
@@ -46,6 +47,29 @@ export function responsesFixture(payload: { input: Record<string, unknown>[] }, 
   else if (text.includes('incomplete-response')) events.push({ type: 'response.incomplete', response: { ...response, status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } } });
   else if (!text.includes('truncated-stream') && !(hasToolOutput && text.includes('recover-stream-once') && requestNumber === 2)) events.push({ type: 'response.completed', response });
   return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
+}
+
+/** The provider follows the process ID returned by the real runtime tool bridge. */
+function resumableExecResponse(history: Record<string, unknown>[], cancel: boolean): Response {
+  const results = history.filter(item => item.type === 'function_call_output');
+  const previous = results.at(-1);
+  const process = previous && typeof previous.output === 'string' ? JSON.parse(previous.output) as {processId?: string; status?: string} : undefined;
+  const call = !process ? {name: 'exec', args: {command: 'fixture managed command'}}
+    : process.status === 'running' ? {name: cancel ? 'exec_cancel' : 'exec_poll', args: {processId: process.processId, ...(cancel ? {} : {yieldMs: 0})}} : undefined;
+  const answer = cancel ? 'The managed command was cancelled.' : 'The managed command completed.';
+  const index = results.length;
+  const item = call
+    ? {type: 'function_call', id: `fc_process_${index}`, call_id: `call_process_${index}`, name: call.name, namespace: TOOL_NAMESPACE, arguments: JSON.stringify(call.args), status: 'completed'}
+    : {type: 'message', id: 'msg_process_final', role: 'assistant', status: 'completed', content: [{type: 'output_text', text: answer, annotations: []}]};
+  const response = {id: `resp_process_${index}`, object: 'response', status: 'completed', output: [item], usage: {input_tokens: 10, output_tokens: 8, total_tokens: 18}};
+  const events = [
+    {type: 'response.created', response: {...response, output: [], status: 'in_progress'}},
+    {type: 'response.output_item.added', output_index: 0, item: {...item, ...(call ? {arguments: ''} : {content: []}), status: 'in_progress'}},
+    call ? {type: 'response.function_call_arguments.delta', output_index: 0, delta: JSON.stringify(call.args)} : {type: 'response.output_text.delta', output_index: 0, content_index: 0, delta: answer},
+    {type: 'response.output_item.done', output_index: 0, item},
+    {type: 'response.completed', response},
+  ];
+  return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), {headers: {'content-type': 'text/event-stream'}});
 }
 
 /** Several tool rounds with commentary/reasoning and distinct composite call IDs. */

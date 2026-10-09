@@ -33,14 +33,15 @@ export function normalizeEntries(entries: readonly EntryRecord[]): RuntimeMessag
 }
 
 /** Correlate a native completion with the host journal without exposing tool output. */
-export function toolCompletion(entry: EntryRecord | undefined): { operationId?: string; status?: string } {
+export function toolCompletion(entry: EntryRecord | undefined): { operationId?: string; processId?: string; status?: string } {
   const message = entry?.model?.find(message => message.role === 'toolResult');
   if (!message || message.role !== 'toolResult') return {};
   try {
-    const result = JSON.parse(textContent(message.content)) as { operationId?: unknown; status?: unknown };
+    const result = JSON.parse(textContent(message.content)) as { operationId?: unknown; processId?: unknown; status?: unknown };
     return {
       ...(typeof result.operationId === 'string' && /^[A-Za-z0-9:_.-]{1,160}$/.test(result.operationId) ? { operationId: result.operationId } : {}),
-      ...(typeof result.status === 'string' && ['completed', 'failed', 'interrupted', 'pending_approval', 'pending_connection'].includes(result.status) ? { status: result.status } : message.isError ? { status: 'failed' } : {}),
+      ...(typeof result.processId === 'string' && /^[A-Za-z0-9:_.-]{1,160}$/.test(result.processId) ? { processId: result.processId } : {}),
+      ...(typeof result.status === 'string' && ['running', 'completed', 'cancelled', 'failed', 'interrupted', 'pending_approval', 'pending_connection'].includes(result.status) ? { status: result.status } : message.isError ? { status: 'failed' } : {}),
     };
   } catch { return message.isError ? { status: 'failed' } : {}; }
 }

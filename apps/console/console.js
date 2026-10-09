@@ -2,6 +2,8 @@ import './src/styles.css';
 import { mountChat, mountToolActivity } from './src/chat.tsx';
 import { mountAgents } from './src/agents.tsx';
 import { hasBotMention } from './src/mentions.ts';
+import {agentColor} from './src/agent-colors.ts';
+import './src/agent-colors.css';
 import { createDesktopViewer } from './src/desktop.ts';
 import { mountWorkspaceExplorer } from './src/workspace.tsx';
 import './src/layout.css';
@@ -12,8 +14,10 @@ import './src/layout.css';
   const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
   const guiActions = new Set(['navigate', 'click', 'move', 'doubleClick', 'drag', 'type', 'key', 'scroll']);
   const removedBots = new Set(), deletionPending = new Map();
+  const botSummaries = new Map();
+  let botSummaryTimer,botSummaryLoading=false,botSummaryPending=false,botRenderKey='';
   const drafts = new Map(), draftMentions = new Map(), pendingMessages = new Map(), pendingActions = new Map(), computerPending = new Map(), stopping = new Set(), approvalWork = new Map(), approvalFeedback = new Map(), connectionWork = new Map(), appWork = new Map();
-  let authenticated = false, bots = [], selected = null, currentRun = null, generation = 0, authSession = 0;
+  let authenticated = false, bots = [], selected = null, currentRun = null, stoppableRun = null, generation = 0, authSession = 0;
   let sessionController = new AbortController(), streamController, refreshTimer, progressTimer, computerStatusTimer;
   let computerStatusRequest = 0, currentPanel = 'conversation', workspaceExpanded = false, desktopFullscreen = false;
   const wideLayout = matchMedia('(min-width: 761px)'), tabletLayout = matchMedia('(max-width: 1099px)');
@@ -24,7 +28,7 @@ import './src/layout.css';
   let lastWorkspacePanel = panelNames.includes(preferences.workspacePanel) && preferences.workspacePanel !== 'conversation' ? preferences.workspacePanel : 'computer';
   const saveLayout = () => {preferences = {botsCollapsed, workspacePanel: lastWorkspacePanel, workspaceOpen: currentPanel !== 'conversation'}; try {localStorage.setItem('timber.layout', JSON.stringify(preferences));} catch {}};
   const streamedMessages = new Map();
-  let subagents = [], delegations = [], agentEvents = [], agentsLoading = false, agentsError = '', agentsRequest = 0, agentsRevision = 0, selectedAgentId = null, agentsTimer;
+  let subagents = [], delegations = [], agentEvents = [], collaborationEvents = [], agentsLoading = false, agentsError = '', agentsRequest = 0, agentsRevision = 0, selectedAgentId = null, agentsTimer;
   let messages = [], approvals = [], connections = [], workspaceApps = [], connectionsRequest = 0, appsRequest = 0, runs = new Map(), activeRunIds = new Set(), nextCursor = null, olderPagesLoaded = false, loadingOlderRuns = false, runFilter = null, runRevision = 0, runsRequest = 0, messagesRequest = 0, approvalsRequest = 0;
   let cursor = 0, boundary = '', events = [], streamDrafts = new Map(), chatLoading = false, focusApproval = 0, screenUrl = null, artifact = null, directoryPath = '.';
   let chatGPTConnected = false, chatGPTBusy = false, chatGPTAccount = null, editBotId = null, deleteTarget = null, deleteBusy = false, sendBusy = new Set();
@@ -151,8 +155,9 @@ import './src/layout.css';
   }
   function disconnect(message = '') {
     desktop.disconnect(); workspace.clear();
-    stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];selectedAgentId=null; generation++; authSession++; authenticated = false; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
-    selected = null; currentRun = null; bots = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
+    stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId=null; generation++; authSession++; authenticated = false; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
+    selected = null; currentRun = null; stoppableRun = null; bots = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
+    clearTimeout(botSummaryTimer);botSummaries.clear();botSummaryLoading=false;botSummaryPending=false;botRenderKey='';
     removedBots.clear(); deletionPending.clear(); deleteTarget = null; deleteBusy = false; editBotId = null; drafts.clear(); draftMentions.clear(); pendingMessages.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); connectionWork.clear(); appWork.clear(); closeDialogs(); clearScreen();
     chatGPTConnected = false; chatGPTAccount = null; chatGPTBusy = false;
     chat.clear(); activity.clear(); $('toggle-bots').hidden = true;
@@ -170,12 +175,26 @@ import './src/layout.css';
   function emptyState(title, detail) { const node = el('div', 'empty-state'); node.append(el('strong', '', title), el('p', '', detail)); return node; }
   function renderBots() {
     const query = $('bot-search').value.trim().toLowerCase(), matching = bots.filter((bot) => `${bot.name} ${bot.instructions}`.toLowerCase().includes(query));
+    const rows=matching.map(bot=>{
+      const saved=botSummaries.get(bot.id),isSelected=bot.id===selected?.id;
+      const active=isSelected?[...runs.values()].filter(run=>!run.subagentId&&!terminal.has(run.status)):[];
+      const activity=isSelected&&!chatLoading?['waiting_approval','waiting_connection','running','queued'].find(status=>active.some(run=>run.status===status))||(processRunIds().size?'running':'ready'):saved?.status;
+      const latest=isSelected?messages.filter(message=>['user','assistant'].includes(message.role)).at(-1):undefined;
+      const activeAgents=isSelected&&!chatLoading?subagents.filter(agent=>!terminal.has(agent.status)).length:saved?.activeAgents||0;
+      const latestText=latest?.text?.trim()||(latest?.attachments?.length?(latest.attachments.length===1?'Image':`${latest.attachments.length} images`):'');
+      return {bot,activity,activeAgents,preview:(latestText||saved?.lastMessage?.text||bot.instructions||'Start a conversation').trim().replace(/\s+/g,' ').slice(0,180)};
+    });
+    const renderKey=JSON.stringify([bots.length,selected?.id,rows,[...deletionPending.values()]]);if(renderKey===botRenderKey)return;botRenderKey=renderKey;
     $('bot-count').textContent = String(bots.length); $('bot-list').replaceChildren();
     if (!matching.length) $('bot-list').append(emptyState(bots.length ? 'No matching bots' : 'No bots yet', bots.length ? 'Try another name or keyword.' : 'Create your first bot.'));
-    for (const bot of matching) {
+    for (const {bot,activity,activeAgents,preview} of rows) {
       const button = el('button', `bot-item${bot.id === selected?.id ? ' selected' : ''}`); button.type = 'button'; button.dataset.botId = bot.id;
-      button.setAttribute('aria-pressed', String(bot.id === selected?.id)); button.append(el('span', 'avatar', bot.name.slice(0, 1).toUpperCase()));
-      const info = el('span', 'bot-info'); info.append(el('span', 'bot-name', bot.name), el('small', '', bot.instructions?.trim().split('\n')[0] || 'Ready'));
+      const avatar=el('span','avatar',bot.name.slice(0,1).toUpperCase());avatar.dataset.agentColor=agentColor(bot.id);
+      button.setAttribute('aria-pressed', String(bot.id === selected?.id)); button.append(avatar);
+      const info=el('span','bot-info'),name=el('span','bot-name-line');name.append(el('span','bot-name',bot.name));
+      if(activity && activity!=='ready') {const status=el('span','bot-activity-status',statusLabel(activity));status.dataset.status=activity;name.append(status);}
+      else if(activeAgents){const status=el('span','bot-activity-status',`${activeAgents} ${activeAgents===1?'agent':'agents'} active`);status.dataset.status='running';name.append(status);}
+      const snippet=el('small','bot-preview',preview);snippet.title=preview;info.append(name,snippet);
       button.append(info); button.addEventListener('click', () => guarded(() => selectBot(bot))); $('bot-list').append(button);
     }
     for (const pending of deletionPending.values()) {
@@ -183,8 +202,28 @@ import './src/layout.css';
       button.addEventListener('click', () => openDelete(pending)); $('bot-list').append(button);
     }
   }
-  async function loadBots() { const session = authSession, result = await request('/v1/bots'); if (session !== authSession) return; bots = result.bots.filter(bot => !removedBots.has(bot.id)); renderBots(); renderMessages();renderAgents(); }
-  function updateBotHeader() { $('selected-name').textContent = selected.name; $('selected-avatar').textContent = selected.name.slice(0, 1).toUpperCase(); $('selected-model').textContent = `${selected.runtime} · ${selected.model}`; $('selected-computer-mode').textContent = selected.computerApprovalMode === 'automatic' ? 'Computer · Use authorized' : 'Computer · Ask for each action'; }
+  async function refreshBotSummaries() {
+    clearTimeout(botSummaryTimer);
+    if(!authenticated||document.hidden)return;
+    if(botSummaryLoading){botSummaryPending=true;return;}
+    botSummaryLoading=true;const session=authSession,queue=[...bots];
+    try {
+      await Promise.all(Array.from({length:Math.min(3,queue.length)},async()=>{
+        while(queue.length&&authenticated&&session===authSession&&!document.hidden){
+          const bot=queue.shift();if(!bot)break;
+          try {const result=await request(`${botPath(bot.id)}/summary`);if(authenticated&&session===authSession&&!removedBots.has(bot.id)&&result.summary)botSummaries.set(bot.id,result.summary);}
+          catch { /* Keep the last confirmed summary during a connection gap. */ }
+        }
+      }));
+      if(authenticated&&session===authSession)renderBots();
+    } finally {
+      if(session===authSession){botSummaryLoading=false;if(authenticated&&!document.hidden){const delay=botSummaryPending?0:30000;botSummaryPending=false;botSummaryTimer=setTimeout(()=>void refreshBotSummaries(),delay);}}
+    }
+  }
+  document.addEventListener('visibilitychange',()=>{if(document.hidden)clearTimeout(botSummaryTimer);else void refreshBotSummaries();});
+  window.addEventListener('focus',()=>void refreshBotSummaries());
+  async function loadBots() { const session = authSession, result = await request('/v1/bots'); if (session !== authSession) return; bots = result.bots.filter(bot => !removedBots.has(bot.id)); renderBots(); renderMessages();renderAgents();void refreshBotSummaries(); }
+  function updateBotHeader() { $('selected-name').textContent = selected.name; $('selected-avatar').textContent = selected.name.slice(0, 1).toUpperCase();$('selected-avatar').dataset.agentColor=agentColor(selected.id); $('selected-model').textContent = `${selected.runtime} · ${selected.model}`; $('selected-computer-mode').textContent = selected.computerApprovalMode === 'automatic' ? 'Computer · Use authorized' : 'Computer · Ask for each action'; }
   function chosenHash() { const value = new URLSearchParams(location.hash.slice(1)).get('bot'); return /^[a-f\d-]{36}$/i.test(value || '') ? value : null; }
   async function selectBot(bot, {replace = false} = {}) {
     if (removedBots.has(bot.id)) return;
@@ -197,8 +236,8 @@ import './src/layout.css';
     }
     desktop.disconnect(); workspace.clear();
     if (!$('panel-files').hidden) workspace.setBot(bot.id);
-    stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];selectedAgentId = chosenHash() === bot.id ? new URLSearchParams(location.hash.slice(1)).get('agent') : null;agentsLoading=true;agentsError=''; generation++; const version = generation; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
-    selected = bot; chatLoading = true; currentRun = null; cursor = 0; boundary = ''; events = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs = new Map(); activeRunIds = new Set(); streamDrafts = new Map(); nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; runFilter = null; runRevision = 0;
+    stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId = chosenHash() === bot.id ? new URLSearchParams(location.hash.slice(1)).get('agent') : null;agentsLoading=true;agentsError=''; generation++; const version = generation; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
+    selected = bot; chatLoading = true; currentRun = null; stoppableRun = null; cursor = 0; boundary = ''; events = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs = new Map(); activeRunIds = new Set(); streamDrafts = new Map(); nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; runFilter = null; runRevision = 0;
     $('refresh-apps').disabled = false; $('refresh-apps').textContent = 'Refresh';
     history[replace ? 'replaceState' : 'pushState'](null, '', `${location.pathname}${location.search}#bot=${encodeURIComponent(bot.id)}`);
     $('empty').hidden = true; $('bot-workspace').hidden = false; updateBotHeader(); renderBots(); renderApps();renderAgents();syncAgentHash();if(selectedAgentId)showPanel('agents');
@@ -238,18 +277,19 @@ import './src/layout.css';
   }
   function renderMessages() {
     if (!selected || !authenticated) return;
+    renderBots();
     const visibleApprovals = effectiveApprovals(), pending = visibleApprovals.filter(approval => approval.status === 'pending');
     $('approval-count').textContent = String(pending.length); $('approval-shortcut').hidden = !pending.length;
     const stream = [...streamDrafts.entries()].find(([id, text]) => text && activeRunIds.has(id) && !terminal.has(runs.get(id)?.status) && (!runFilter || id === runFilter));
     const model = { acceptedImageIds: acceptedImageIds.get(selected.id) || [], bot: selected, messages, runs: [...runs.values()], approvals: visibleApprovals, connections: connections.map(item => ({...item, ...connectionWork.get(`${selected.id}:${item.id}`)})), events: events.map(event => ({...event, data: redact(event.data)})),
-      deliveries: [...pendingMessages.values()].filter(delivery => delivery.botId === selected.id).map(delivery => ({...delivery})), draft: drafts.get(selected.id) || '', mentionBots: bots, subagents, delegations, draftMentions: draftMentions.get(selected.id) || [], sending: sendBusy.has(selected.id), loading: chatLoading,
+      deliveries: [...pendingMessages.values()].filter(delivery => delivery.botId === selected.id).map(delivery => ({...delivery})), draft: drafts.get(selected.id) || '', mentionBots: bots, subagents, delegations, collaborationEvents, draftMentions: draftMentions.get(selected.id) || [], sending: sendBusy.has(selected.id), loading: chatLoading,
       currentRun, runFilter, focusApproval, stream: stream ? {runId: stream[0], text: stream[1]} : null, feedback: approvalFeedback.get(selected.id) };
     chat.update(model); activity.update({...model, runFilter: null});
   }
   function renderAgents() {
     if (!selected || !authenticated) return;
     $('agent-count').textContent = String(subagents.length);
-    agentsView.update({botId:selected.id,botName:selected.name,agents:subagents,namedAgents:bots.filter(bot=>bot.createdByBotId===selected.id),delegations,loading:agentsLoading,error:agentsError,selectedAgentId,revision:agentsRevision,events:agentEvents});
+    agentsView.update({botId:selected.id,botName:selected.name,agents:subagents,namedAgents:bots.filter(bot=>bot.createdByBotId===selected.id),delegations,loading:agentsLoading,error:agentsError,selectedAgentId,revision:agentsRevision,events:agentEvents,runs:[...runs.values()],collaborationEvents});
   }
   async function loadAgents(version = generation) {
     const id = selected?.id, sequence = ++agentsRequest;
@@ -258,7 +298,8 @@ import './src/layout.css';
     try {
       const [temporary, named] = await Promise.all([request(`${botPath(id)}/agents`),request(`${botPath(id)}/delegations`)]);
       if (!validView(version) || sequence !== agentsRequest) return;
-      subagents = temporary.agents;delegations = named.delegations;agentsLoading=false;agentsError='';agentsRevision++;
+      const mergeLatest=(existing,incoming)=>{const merged=new Map(existing.map(item=>[item.id,item]));for(const item of incoming){const prior=merged.get(item.id);if(!prior||item.updatedAt>=prior.updatedAt)merged.set(item.id,item);}return [...merged.values()];};
+      subagents=mergeLatest(subagents,temporary.agents);delegations=mergeLatest(delegations,named.delegations);agentsLoading=false;agentsError='';agentsRevision++;
       renderAgents();renderMessages();
     } catch(error) {
       if (!validView(version) || sequence !== agentsRequest || error.name === 'AbortError') return;
@@ -336,18 +377,38 @@ import './src/layout.css';
     runs.set(run.id, run); if (terminal.has(run.status)) { activeRunIds.delete(run.id); streamDrafts.delete(run.id); } return true;
   }
   const sortedRuns = () => [...runs.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  function processRunIds() {
+    const processes = new Map();
+    for (const approval of approvals) if (approval.result?.processId) processes.set(approval.result.processId, {runId: approval.runId, status: approval.result.status});
+    const observations = new Set();
+    for (const event of events) {
+      const processId = event.data.processId || event.data.result?.processId;
+      if (!processId || !event.data.result?.status) continue;
+      if (event.type === 'process.updated') {processes.set(processId, {runId: event.runId, status: event.data.result.status}); observations.add(processId);}
+      else if (event.type === 'tool.completed' && !observations.has(processId)) processes.set(processId, {runId: event.runId, status: event.data.result.status});
+    }
+    const owners = new Set();
+    for (const process of processes.values()) {
+      if (process.status !== 'running' || !process.runId) continue;
+      let id = process.runId;
+      while (id && !owners.has(id)) {owners.add(id); id = runs.get(id)?.parentRunId;}
+    }
+    return owners;
+  }
   function renderCurrentRun() {
     const active = sortedRuns().filter((run) => !run.subagentId && activeRunIds.has(run.id) && !terminal.has(run.status));
     currentRun = active.find((run) => run.status === 'running') || active.find((run) => ['waiting_approval', 'waiting_connection'].includes(run.status)) || active[0] || null;
+    const processOwners = processRunIds();
+    stoppableRun = currentRun || sortedRuns().find(run => !run.subagentId && processOwners.has(run.id)) || (processOwners.size ? {id: [...processOwners][0]} : null);
     $('run-status').textContent = currentRun ? statusLabel(currentRun.status) : 'Ready'; $('run-status').dataset.status = currentRun?.status || 'ready';
     $('run-status').hidden = !currentRun;
-    $('cancel-run').hidden = !currentRun || terminal.has(currentRun.status); $('cancel-run').disabled = currentRun ? stopping.has(currentRun.id) : false;
+    $('cancel-run').hidden = !stoppableRun; $('cancel-run').disabled = stoppableRun ? stopping.has(stoppableRun.id) : false;
     $('active-run-count').hidden = !active.length; $('active-run-count').textContent = String(active.length);
     // Outcomes belong to their task in the transcript, never to the bot header.
     $('run-error').textContent = ''; $('run-error').hidden = true; renderStreamDraft();
   }
   function renderRuns() {
-    $('run-list').replaceChildren(); const ordered = sortedRuns();
+    $('run-list').replaceChildren(); const ordered = sortedRuns(), processOwners = processRunIds();
     if (!ordered.length) $('run-list').append(emptyState('No runs yet', 'Send a message to start this bot’s first task.'));
     for (const run of ordered) {
       const card = el('article', 'run-card'); card.dataset.runId = run.id;
@@ -355,7 +416,7 @@ import './src/layout.css';
       if (run.subagentId) card.append(el('p','hint',`Subagent · ${subagents.find(agent=>agent.id===run.subagentId)?.name || run.subagentId}`));
       if (run.error) card.append(el('p', 'error', run.error));
       const controls = el('div', 'row'); const view = el('button', 'quiet', run.subagentId ? 'View agent' : 'View messages'); view.type = 'button'; view.addEventListener('click', () => { if(run.subagentId){openAgents(run.subagentId);return;} runFilter = run.id; showPanel('conversation'); renderMessages(); renderStreamDraft(); }); controls.append(view);
-      if (!terminal.has(run.status)) { const stop = el('button', 'quiet', stopping.has(run.id) ? 'Stopping…' : 'Stop run'); stop.type = 'button'; stop.dataset.runCancel = run.id; stop.disabled = stopping.has(run.id); stop.addEventListener('click', () => guarded(() => cancelRun(run.id))); controls.append(stop); }
+      if (!terminal.has(run.status) || processOwners.has(run.id)) { const stop = el('button', 'quiet', stopping.has(run.id) ? 'Stopping…' : 'Stop run'); stop.type = 'button'; stop.dataset.runCancel = run.id; stop.disabled = stopping.has(run.id); stop.addEventListener('click', () => guarded(() => cancelRun(run.id))); controls.append(stop); }
       card.append(controls); $('run-list').append(card);
     }
     $('load-more-runs').hidden = !nextCursor; renderCurrentRun();
@@ -586,13 +647,24 @@ import './src/layout.css';
   function recordEvent(event, version) {
     if (!validView(version) || !Number.isSafeInteger(event.id) || event.id <= cursor) return;
     if (event.type === 'computer.suspended') desktop.disconnect();
-    if (['computer.action', 'computer.suspended', 'tool.started', 'tool.completed', 'approval.updated'].includes(event.type)) queueComputerStatus();
+    if (['computer.action', 'computer.suspended', 'tool.started', 'tool.completed', 'process.updated', 'approval.updated'].includes(event.type)) queueComputerStatus();
     cursor = event.id;
     // Actions belong to the conversation, including after a task completes.
     // Only the separate diagnostic log is capped; SSE replay restores history.
-    if (['tool.started', 'tool.completed', 'run.retrying'].includes(event.type) && !event.data.subagentId) events.push(event);
-    if (event.data.subagentId && (event.type.startsWith('subagent.') || ['tool.started','tool.completed'].includes(event.type))) {agentEvents.push({...event,type:event.type.startsWith('subagent.')?event.type:`subagent.${event.type}`,data:redact(event.data)});renderAgents();}
-    if (event.type === 'bot.created' || event.type === 'agent.bot_created' || event.type === 'tool.completed' && event.data.toolName === 'create_bot') void guarded(loadBots);
+    if (event.type === 'process.updated' || ['tool.started', 'tool.completed', 'run.retrying'].includes(event.type) && !event.data.subagentId) events.push(event);
+    if(['subagent.created','subagent.updated','subagent.reported','subagent.message.sent','agent.named.created','delegation.updated'].includes(event.type)) {
+      collaborationEvents.push({...event,data:redact(event.data)});
+      const agent=event.data.subagent;
+      if(agent && typeof agent.id==='string' && typeof agent.name==='string') {
+        const old=subagents.find(item=>item.id===agent.id);
+        if(!old || agent.updatedAt>=old.updatedAt)subagents=[...subagents.filter(item=>item.id!==agent.id),agent];
+      }
+      const delegation=event.data.delegation;
+      if(delegation && typeof delegation.id==='string')delegations=[...delegations.filter(item=>item.id!==delegation.id),delegation];
+      renderAgents();renderMessages();
+    }
+    if (event.data.subagentId && (event.type.startsWith('subagent.') || ['tool.started','tool.completed','process.updated'].includes(event.type))) {agentEvents.push({...event,type:event.type.startsWith('subagent.')?event.type:`subagent.${event.type}`,data:redact(event.data)});renderAgents();}
+    if (event.type === 'bot.created' || event.type === 'agent.bot_created' || event.type === 'agent.named.created' || event.type === 'tool.completed' && event.data.toolName === 'create_bot') void guarded(loadBots);
     const row = el('article', 'event'), title = el('div', 'event-title'); title.append(el('span', '', event.type.replaceAll('.', ' · ')), el('span', 'muted', `#${event.id} · ${time(event.createdAt)}`));
     const detail = el('details'); detail.append(el('summary', '', 'Event details')); const serialized = JSON.stringify(redact(event.data), null, 2); detail.append(el('pre', '', serialized.length > 8000 ? `${serialized.slice(0, 8000)}\n…` : serialized)); row.append(title, detail); $('activity-list').prepend(row); while ($('activity-list').children.length > 200) $('activity-list').lastElementChild.remove();
     $('event-count').textContent = String($('activity-list').children.length);
@@ -623,7 +695,8 @@ import './src/layout.css';
     if ((event.type === 'message.created' && event.data.message?.role === 'assistant') || (event.type === 'message' && event.data.role === 'assistant')) { streamDrafts.delete(event.runId); renderStreamDraft(); }
     // Tool progress is already in the stream. Rendering it must not wait for
     // transcript/runs REST refreshes (which may be delayed by ongoing work).
-    if (['tool.started', 'tool.completed', 'run.retrying'].includes(event.type)) renderMessages();
+    if (event.type === 'process.updated') renderRuns();
+    else if (['tool.started', 'tool.completed', 'run.retrying'].includes(event.type)) renderMessages();
     scheduleRefresh(version);
   }
   const pause = (ms, signal) => new Promise((resolve) => { if (signal.aborted) return resolve(); const done = () => { clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); }; const timer = setTimeout(done, ms); signal.addEventListener('abort', done, { once: true }); });
@@ -750,7 +823,7 @@ import './src/layout.css';
     $('edit-dialog').close(); renderDeleteControls(); $('delete-dialog').showModal(); $('cancel-delete-bot').focus();
   }
   function forgetBot(id) {
-    if (selected?.id === id) { desktop.disconnect(); workspace.clear();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];selectedAgentId=null; }
+    if (selected?.id === id) { desktop.disconnect(); workspace.clear();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId=null; }
     removedBots.add(id); bots = bots.filter(bot => bot.id !== id); drafts.delete(id); draftMentions.delete(id); sendBusy.delete(id); approvalFeedback.delete(id); computerPending.delete(id);
     for (const [key, message] of pendingMessages) if (message.botId === id) pendingMessages.delete(key);
     for (const map of [pendingActions, approvalWork, connectionWork, appWork]) for (const key of map.keys()) if (key.startsWith(`${id}:`)) map.delete(key);
@@ -759,7 +832,7 @@ import './src/layout.css';
     if (wasSelected) {
       stopComputerStatus(); generation++; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
       for (const runId of runs.keys()) stopping.delete(runId);
-      selected = null; currentRun = null; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
+      selected = null; currentRun = null; stoppableRun = null; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
       cursor = 0; boundary = ''; runFilter = null; nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; chatLoading = false; chat.clear(); activity.clear();
       for (const element of ['activity-list', 'run-list', 'file-list', 'workspace-app-list']) $(element).replaceChildren();
       for (const element of ['file-content', 'type-text', 'exec-command', 'navigate-url', 'key-name']) $(element).value = '';
@@ -935,7 +1008,7 @@ import './src/layout.css';
   $('delete-form').addEventListener('submit', event => {event.preventDefault(); void deleteBot();});
   $('cancel-delete-bot').addEventListener('click', () => {if (!deleteBusy) {$('delete-dialog').close(); deleteTarget = null;}});
   $('delete-dialog').addEventListener('cancel', event => {if (deleteBusy) event.preventDefault(); else deleteTarget = null;});
-  $('cancel-run').addEventListener('click', () => { if (currentRun) void guarded(() => cancelRun(currentRun.id)); });
+  $('cancel-run').addEventListener('click', () => { if (stoppableRun) void guarded(() => cancelRun(stoppableRun.id)); });
   $('refresh-runs').addEventListener('click', () => guarded(() => loadRuns())); $('load-more-runs').addEventListener('click', () => guarded(() => loadRuns(generation, true)));
   $('approval-shortcut').addEventListener('click', () => { runFilter = null; focusApproval++; showPanel('conversation'); renderMessages(); });
   const tabs = [...document.querySelectorAll('[data-panel]')];

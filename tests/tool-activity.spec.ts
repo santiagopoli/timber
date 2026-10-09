@@ -41,7 +41,7 @@ async function activeBot() {
   return {bot, run};
 }
 const events = (storage: DurableObjectStorage, operationId: string) => storage.sql.exec<{data: string}>(
-  "SELECT data FROM events WHERE json_extract(data,'$.data.operationId')=? ORDER BY id", operationId,
+  "SELECT data FROM events WHERE json_extract(data,'$.data.operationId')=? AND json_extract(data,'$.type')!='process.updated' ORDER BY id", operationId,
 ).toArray().map(row => JSON.parse(row.data) as BotEvent);
 
 describe('live tool activity projection', () => {

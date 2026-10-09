@@ -33,7 +33,7 @@ it('runs a visible temporary Pi conversation, attributes its tools and keeps its
     const messages = await instance.runtime.subagentMessages(agents[0]!.id);
     expect(messages.filter(message => message.role === 'user').map(message => message.text)).toEqual(['child-fixture-read']);
     const events = state.storage.sql.exec<{ event: string }>('SELECT event FROM projected').toArray().map(row => JSON.parse(row.event));
-    expect(events).toContainEqual(expect.objectContaining({ type: 'subagent.created', operationId: 'parent-with-child' }));
+    expect(events).toContainEqual(expect.objectContaining({ type: 'subagent.created', operationId: 'parent-with-child', data: expect.objectContaining({operationId: agents[0]!.operationId, toolCallId: 'call-spawn-1'}) }));
     expect(events).toContainEqual(expect.objectContaining({ type: 'subagent.tool.completed', data: expect.objectContaining({ subagentId: agents[0]!.id, status: 'completed' }) }));
     return agents[0]!;
   });
@@ -101,6 +101,39 @@ it('queues a child followup without changing its active tool attribution', async
     })).toBe('completed');
   } finally { await runInDurableObject(stub, instance => instance.releaseHeldTool?.()); }
 });
+it('attends a new root request and spawns its own child while an earlier child is still working', async () => {
+  const namespace = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE;
+  let stub = namespace.getByName(probeId);
+  await runInDurableObject(stub, instance => { instance.heldTool = new Promise(resolve => { instance.releaseHeldTool = resolve; }); });
+  try {
+    await request('/submit', {text: 'request-subagent-wait', operationId: 'original-task'});
+    await expect.poll(() => runInDurableObject(stub, (_instance, state) => state.storage.sql.exec<{event:string}>('SELECT event FROM projected').toArray().map(row => JSON.parse(row.event)).some(event => event.type === 'tool.started' && event.data.toolName === 'wait_subagent'))).toBe(true);
+    await request('/submit', {text: 'request-subagent second-task', operationId: 'new-independent-task'});
+    await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents()).length)).toBe(2);
+    const answers = await Promise.all(['original-task', 'new-independent-task'].map(async operationId => (await request(`/wait?id=${operationId}`)).json<{status:string;answerId:string;answerOperationId:string}>()));
+    expect(answers[0]).toMatchObject({status: 'done', answerOperationId: 'new-independent-task'});
+    expect(answers[1]).toMatchObject({status: 'done', answerId: answers[0]!.answerId, answerOperationId: 'new-independent-task'});
+    await runInDurableObject(stub, async (instance, state) => {
+      const children = await instance.runtime.subagents();
+      expect(children.map(child => ({parent:child.parentOperationId,status:child.status}))).toEqual([{parent:'original-task',status:'running'},{parent:'new-independent-task',status:'running'}]);
+      const events = state.storage.sql.exec<{event:string}>('SELECT event FROM projected').toArray().map(row => JSON.parse(row.event));
+      expect(events.filter(event => event.type === 'tool.started' && event.data.toolName === 'spawn_subagent').map(event => event.operationId)).toEqual(['original-task','new-independent-task']);
+      expect(events.filter(event => event.type === 'run.completed').map(event => event.data.answerId)).toEqual([answers[0]!.answerId,answers[0]!.answerId]);
+      const root = await instance.runtime.messages();
+      expect(root.filter(message => message.role === 'assistant' && message.kind === 'final')).toHaveLength(1);
+      expect(root.some(message => message.role === 'tool' && message.text.includes('"reason":"new_input"'))).toBe(true);
+      instance.releaseHeldTool?.();
+    });
+    await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents()).every(child => child.status === 'completed'))).toBe(true);
+    await abortAllDurableObjects();
+    stub = namespace.getByName(probeId);
+    await runInDurableObject(stub, async instance => {
+      for (const operationId of ['original-task','new-independent-task']) {
+        expect(await instance.runtime.operation(operationId)).toMatchObject({status:'done',answerId:answers[0]!.answerId,answerOperationId:'new-independent-task'});
+      }
+    });
+  } finally { await runInDurableObject(stub, instance => instance.releaseHeldTool?.()); }
+});
 it('recovers an in-flight child without repeating an unsafe computer action', async () => {
   const namespace = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE;
   let stub = namespace.getByName(probeId);
@@ -150,16 +183,31 @@ it('delivers sibling messages and lets the root message, wait for and cancel a p
   await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents()).length)).toBe(2);
   const target = await runInDurableObject(stub, async instance => (await instance.runtime.subagents()).find(agent => agent.name === 'Reader')!);
   await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagentMessages(target.id)).filter(message => message.role === 'user').length)).toBe(2);
-  await runInDurableObject(stub, async instance => {
+  await runInDurableObject(stub, async (instance, state) => {
     expect(await instance.runtime.subagentMessages(target.id)).toContainEqual(expect.objectContaining({ role: 'user', text: 'Message from Messenger:\nA public coordination message.' }));
+    const events = state.storage.sql.exec<{event: string}>('SELECT event FROM projected').toArray().map(row => JSON.parse(row.event));
+    expect(events).toContainEqual(expect.objectContaining({type: 'subagent.message.sent', data: expect.objectContaining({sourceSubagentId: expect.any(String), targetSubagentId: target.id, sourceName: 'Messenger', targetName: 'Reader', text: 'A public coordination message.', operationId: expect.any(String), toolCallId: 'call-agent-communication'})}));
   });
+  await runInDurableObject(stub, instance => instance.runtime.sendSubagent(target.id, 'child-fixture-peer:parent', {operationId: 'child-to-root-message'}));
+  await expect.poll(() => runInDurableObject(stub, (_instance, state) => state.storage.sql.exec<{event: string}>('SELECT event FROM projected').toArray().map(row => JSON.parse(row.event)).filter(event => event.type === 'subagent.message.sent' && event.data.sourceSubagentId === target.id && event.data.targetName === 'Ada').length)).toBe(1);
   for (const action of ['message', 'wait', 'cancel']) {
     await request('/submit', { text: `request-${action}-existing:${target.id}`, operationId: `later-root-${action}` });
     expect(await (await request(`/wait?id=later-root-${action}`)).json()).toMatchObject({ status: 'done' });
   }
-  await runInDurableObject(stub, async instance => {
+  await runInDurableObject(stub, async (instance, state) => {
     expect((await instance.runtime.subagents()).find(agent => agent.id === target.id)?.status).toBe('cancelled');
     expect(await instance.runtime.subagentMessages(target.id)).toContainEqual(expect.objectContaining({ role: 'user', text: 'Message from parent:\nA public coordination message.' }));
+    const events = state.storage.sql.exec<{event: string}>('SELECT event FROM projected').toArray().map(row => JSON.parse(row.event));
+    const sent = events.filter(event => event.type === 'subagent.message.sent');
+    expect(sent).toHaveLength(3);
+    expect(new Set(sent.map(event => event.eventKey)).size).toBe(3);
+    const fromRoot = sent.find(event => event.data.sourceName === 'Ada');
+    expect(fromRoot.data).toMatchObject({targetSubagentId: target.id, targetName: 'Reader', text: 'A public coordination message.'});
+    expect(fromRoot.data).not.toHaveProperty('sourceSubagentId');
+    const toRoot = sent.find(event => event.data.targetName === 'Ada');
+    expect(toRoot.data).not.toHaveProperty('targetSubagentId');
+    const reports = state.storage.sql.exec<{input: string}>('SELECT input FROM child_reports').toArray().map(row => JSON.parse(row.input));
+    expect(reports).toContainEqual(expect.objectContaining({operationId: toRoot.data.operationId, subagentId: target.id}));
   });
 });
 it('durably retries a rejected parent report across eviction without repeating child work', async () => {
@@ -233,7 +281,7 @@ it('keeps tool-calling commentary classified as progress when approval pauses a 
   expect(await (await request('/wait?id=approval-commentary')).json()).toMatchObject({ status: 'done', text: 'Working on fixture round 1.', kind: 'progress' });
   const state = await (await request('/inspect')).json<{ events: { event: string }[] }>();
   expect(state.events.map(row => JSON.parse(row.event))).toContainEqual(expect.objectContaining({
-    type: 'run.completed', operationId: 'approval-commentary', data: { text: 'Working on fixture round 1.', kind: 'progress' },
+    type: 'run.completed', operationId: 'approval-commentary', data: { text: 'Working on fixture round 1.', kind: 'progress', answerId: expect.any(String), answerOperationId: 'approval-commentary' },
   }));
 });
 it('reports a reasoning-only final response as a failure without repeating completed tools', async () => {
@@ -247,6 +295,43 @@ it('reports a reasoning-only final response as a failure without repeating compl
   expect(events).toContainEqual(expect.objectContaining({ type: 'run.failed', data: expect.objectContaining({ errorCode: 'model_empty_response' }) }));
   expect(events.some(event => event.type === 'run.completed')).toBe(false);
   expect(JSON.stringify({ messages: state.messages, events })).not.toContain('Private fixture reasoning');
+});
+it.each([false, true])('continues a running exec through its process ID with cancel=%s', async cancel => {
+  await request('/host-context', {mode: 'automatic'});
+  await request('/submit', {text: cancel ? 'request-cancel-resumable-exec' : 'request-resumable-exec', operationId: 'managed-exec', chatgpt: true});
+  expect(await (await request('/wait?id=managed-exec')).json()).toMatchObject({status: 'done', text: cancel ? 'The managed command was cancelled.' : 'The managed command completed.'});
+  const state = await (await request('/inspect')).json<{toolCalls: {input: string}[]; calls: {input: string}[]; events: {event: string}[]}>();
+  const tools = state.toolCalls.map(row => JSON.parse(row.input));
+  expect(tools.map(tool => tool.action.type)).toEqual(['exec', cancel ? 'execCancel' : 'execPoll']);
+  expect(tools[0].action).toEqual({type: 'exec', command: 'fixture managed command', yieldMs: 1000});
+  expect(tools[1].action.processId).toBe(tools[0].operationId);
+  expect(tools[1].operationId).not.toBe(tools[0].operationId);
+  const events = state.events.map(row => JSON.parse(row.event));
+  expect(events).toContainEqual(expect.objectContaining({type: 'tool.completed', data: expect.objectContaining({status: 'running', processId: tools[0].operationId})}));
+  expect(events).toContainEqual(expect.objectContaining({type: 'tool.completed', data: expect.objectContaining({status: cancel ? 'cancelled' : 'completed', processId: tools[0].operationId})}));
+  expect(events.some(event => event.type === 'run.failed')).toBe(false);
+});
+it('recovers after a saved running exec result by polling without launching the command again', async () => {
+  const namespace = (env as unknown as {PROBE: DurableObjectNamespace<HarnessProbe>}).PROBE;
+  let stub = namespace.getByName(probeId);
+  await request('/host-context', {mode: 'automatic'});
+  await runInDurableObject(stub, instance => {
+    instance.holdInferenceAfterToolCount = 1;
+    instance.heldInference = new Promise(() => {});
+  });
+  await request('/submit', {text: 'request-resumable-exec', operationId: 'recover-managed-exec', chatgpt: true});
+  await expect.poll(() => runInDurableObject(stub, (_instance, state) => state.storage.sql.exec('SELECT id FROM calls').toArray().length)).toBe(2);
+  await abortAllDurableObjects();
+  stub = namespace.getByName(probeId);
+  await runInDurableObject(stub, (_instance, state) => {state.storage.sql.exec("UPDATE cf_agents_jobs SET time=0 WHERE capability='pi-harness'");});
+  await runDurableObjectAlarm(stub);
+  expect(await runInDurableObject(stub, instance => instance.runtime.wait('recover-managed-exec'))).toMatchObject({status: 'done', text: 'The managed command completed.'});
+  await runInDurableObject(stub, (_instance, state) => {
+    const calls = state.storage.sql.exec<{input: string}>('SELECT input FROM tool_calls').toArray().map(row => JSON.parse(row.input));
+    expect(calls.map(call => call.action.type)).toEqual(['exec', 'execPoll']);
+    expect(calls[1].action.processId).toBe(calls[0].operationId);
+    expect(calls[0].action).not.toHaveProperty('timeoutMs');
+  });
 });
 it.each(['recover-empty-once','recover-incomplete-once','recover-stream-once'])('recovers %s after a saved tool result without another user message or tool execution',async failure=>{
   await request('/host-context',{mode:'automatic'});
@@ -312,7 +397,7 @@ it('continues multiple delayed tool rounds after a hard restart without another 
     expect(messages.filter(message => message.kind === 'progress')).toHaveLength(3);
     expect(messages).toContainEqual(expect.objectContaining({ role: 'assistant', text: finalAnswer, kind: 'final' }));
     const events = state.storage.sql.exec<{ event: string }>('SELECT event FROM projected').toArray().map(row => JSON.parse(row.event));
-    expect(events).toContainEqual(expect.objectContaining({ type: 'run.completed', operationId: 'multistep-recovery', data: { text: finalAnswer, kind: 'final' } }));
+    expect(events).toContainEqual(expect.objectContaining({ type: 'run.completed', operationId: 'multistep-recovery', data: { text: finalAnswer, kind: 'final', answerId: expect.any(String), answerOperationId: 'multistep-recovery' } }));
     for (const tool of tools) expect(events).toContainEqual(expect.objectContaining({
       type: 'tool.completed', operationId: 'multistep-recovery',
       data: expect.objectContaining({ operationId: tool.operationId, toolCallId: tool.toolCallId, status: 'completed' }),
@@ -549,7 +634,7 @@ it('pauses a namespaced ChatGPT exec for approval and resumes with a new durable
   expect(resumed.messages).toContainEqual(expect.objectContaining({ role: 'assistant', text: answer }));
   const events = resumed.events.map(row => JSON.parse(row.event));
   expect(events).toContainEqual(expect.objectContaining({ type: 'message', operationId: 'approval:decision-1', data: expect.objectContaining({ role: 'assistant', text: answer }) }));
-  expect(events).toContainEqual(expect.objectContaining({ type: 'run.completed', operationId: 'approval:decision-1', data: { text: answer, kind: 'final' } }));
+  expect(events).toContainEqual(expect.objectContaining({ type: 'run.completed', operationId: 'approval:decision-1', data: { text: answer, kind: 'final', answerId: expect.any(String), answerOperationId: 'approval:decision-1' } }));
   expect(events.filter(event => event.type === 'run.completed' && event.operationId === 'approval-chatgpt').every(event => event.data.text !== answer)).toBe(true);
 });
 
@@ -717,7 +802,7 @@ it('refreshes automatic policy for new requests while retaining historical pendi
   expect(state.messages).toContainEqual(expect.objectContaining({ role: 'assistant', text: answer }));
   const events = state.events.map(row => JSON.parse(row.event));
   expect(events).toContainEqual(expect.objectContaining({ type: 'message', operationId: 'automatic-retry', data: expect.objectContaining({ role: 'assistant', text: answer }) }));
-  expect(events).toContainEqual(expect.objectContaining({ type: 'run.completed', operationId: 'automatic-retry', data: { text: answer, kind: 'final' } }));
+  expect(events).toContainEqual(expect.objectContaining({ type: 'run.completed', operationId: 'automatic-retry', data: { text: answer, kind: 'final', answerId: expect.any(String), answerOperationId: 'automatic-retry' } }));
 });
 
 it('sends attached image bytes through the real PiHarness to the ChatGPT transport',async()=>{

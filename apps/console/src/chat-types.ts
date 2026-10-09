@@ -12,6 +12,7 @@ export type ChatModel = {
   acceptedImageIds?: string[]; deliveries: MessageDelivery[]; draft: string; sending: boolean; loading: boolean;
   mentionBots: Bot[]; draftMentions: string[];
   subagents: Subagent[]; delegations: AgentDelegation[];
+  collaborationEvents: BotEvent[];
   currentRun: Run | null; runFilter: string | null; focusApproval: number;
   stream: { runId: string; text: string } | null;
   feedback?: { createdAt: string; runId?: string; error: boolean; text: string };

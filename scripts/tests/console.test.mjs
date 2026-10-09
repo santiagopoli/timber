@@ -1946,3 +1946,249 @@ test('Retry sending clears only accepted image previews after a failed delivery'
 
   });
 });
+
+for (const viewport of [{width:1440,height:1050},{width:390,height:844}]) test(`agent creation cards and centered messages survive live updates and reload at ${viewport.width}px`, async () => {
+  await withPage(async ({page,state,login}) => {
+    const stamp='2026-10-09T12:00:00.000Z',run={id:'collab-root',botId:BOT_A,operationId:'collab-root-operation',status:'running',createdAt:stamp,updatedAt:stamp};
+    const agent={id:'collab-researcher',name:'Researcher',task:'Review architecture and persistence',parentOperationId:run.operationId,operationId:'collab-spawn-operation',status:'queued',createdAt:stamp,updatedAt:stamp};
+    state.runs.set(BOT_A,[run,{id:'collab-child-run',botId:BOT_A,operationId:agent.operationId,subagentId:agent.id,parentRunId:run.id,status:'running',createdAt:stamp,updatedAt:stamp}]);
+    state.messages.set(BOT_A,[{id:'collab-request',botId:BOT_A,runId:run.id,role:'user',text:'Ask a researcher to review persistence, then compare notes with Linus.',createdAt:stamp},{id:'collab-progress',botId:BOT_A,runId:run.id,role:'assistant',kind:'progress',text:'I’m creating a researcher and sharing the review with Linus.',createdAt:stamp}]);
+    state.agentMessages.set(agent.id,[{id:'collab-agent-result',role:'assistant',text:'Persistence and reconnect behavior are covered.',createdAt:stamp}]);
+    await login();
+    state.emit(BOT_A,'tool.started',{toolName:'spawn_subagent',toolCallId:'collab-spawn-call'},run.id);
+    state.agents.set(BOT_A,[agent]);
+    state.emit(BOT_A,'subagent.created',{subagent:agent,operationId:agent.operationId,toolCallId:'collab-spawn-call'},'collab-child-run');
+    state.emit(BOT_A,'tool.completed',{toolName:'spawn_subagent',toolCallId:'collab-spawn-call',operationId:agent.operationId,result:{status:'completed'}},run.id);
+    const card=page.locator(`[data-agent-created="${agent.id}"]`);
+    await card.getByRole('button',{name:'Open Researcher conversation',exact:true}).waitFor();assert.equal(await card.locator('[data-status="queued"]').count(),1);
+    assert.equal(await card.locator('.timber-agent-created-details').count(),0,'creation starts as a collapsed pill');
+    const pillBox=await card.locator('.timber-agent-created-pill').boundingBox(),cardBox=await card.boundingBox();
+    assert.ok(pillBox&&cardBox&&pillBox.height<=44&&pillBox.width<=400,'creation remains a compact pill');
+    assert.ok(Math.abs(pillBox.x+pillBox.width/2-cardBox.x-cardBox.width/2)<2,'the creation pill is centered in the conversation');
+    await card.getByRole('button',{name:'Show Researcher agent details',exact:true}).click();
+    await card.getByText('Review architecture and persistence',{exact:true}).waitFor();
+    assert.equal(await card.getByRole('button',{name:'Hide Researcher agent details',exact:true}).getAttribute('aria-expanded'),'true');
+    await card.getByRole('button',{name:'Hide Researcher agent details',exact:true}).click();
+    agent.status='running';agent.updatedAt='2026-10-09T12:00:01.000Z';state.emit(BOT_A,'subagent.updated',{subagent:agent},'collab-child-run');
+    await card.locator('[data-status="running"]').waitFor();
+    state.emit(BOT_A,'tool.started',{toolName:'send_subagent_message',toolCallId:'collab-send-call'},run.id);
+    state.emit(BOT_A,'subagent.message.sent',{targetSubagentId:agent.id,sourceName:'Ada',targetName:agent.name,text:'Also check recovery after reconnect.',operationId:'collab-send',toolCallId:'collab-send-call'},run.id);
+    state.emit(BOT_A,'tool.completed',{toolName:'send_subagent_message',toolCallId:'collab-send-call',operationId:'collab-send',result:{status:'completed'}},run.id);
+    state.emit(BOT_A,'subagent.reported',{subagentId:agent.id,text:'The saved result survives reconnect.',operationId:'collab-report'},run.id);
+    state.emit(BOT_A,'subagent.message.sent',{sourceSubagentId:agent.id,sourceName:agent.name,targetName:'Ada',text:'The saved result survives reconnect.',operationId:'collab-report',toolCallId:'collab-report-call'},'collab-child-run');
+    await page.locator('[data-collaboration-notice="sent:collab-send"]').filter({hasText:'Messages to'}).waitFor();
+    await page.locator('[data-collaboration-notice="sent:collab-report"]').filter({hasText:'Messages from'}).waitFor();
+    assert.equal(await page.locator('[data-collaboration-notice]').count(),2,'explicit child report and its durable parent receipt form one notice');
+    assert.equal(await page.locator('#messages [data-tool-row]').count(),0,'successful agent operations use their product cards without duplicate generic tool rows');
+    await page.getByRole('button',{name:'Show message to Researcher',exact:true}).click();await page.getByText('Also check recovery after reconnect.',{exact:true}).waitFor();
+    if(process.env.TIMBER_CAPTURE_UI){
+      await page.screenshot({path:`/tmp/timber-collaboration-${viewport.width}.png`});
+      await page.screenshot({path:`/tmp/timber-pill-${viewport.width}-light.png`});
+      await page.emulateMedia({colorScheme:'dark'});await page.screenshot({path:`/tmp/timber-pill-${viewport.width}-dark.png`});
+      await card.getByRole('button',{name:'Show Researcher agent details',exact:true}).click();await page.screenshot({path:`/tmp/timber-pill-${viewport.width}-dark-expanded.png`});
+      await card.getByRole('button',{name:'Hide Researcher agent details',exact:true}).click();await page.emulateMedia({colorScheme:'light'});
+    }
+    await card.getByRole('button',{name:'Open Researcher conversation',exact:true}).click();await page.locator(`[data-agent-detail="${agent.id}"]`).waitFor();await page.getByText('Persistence and reconnect behavior are covered.',{exact:true}).waitFor();
+    await openPanel(page,'conversation');await page.reload();await page.locator(`[data-agent-created="${agent.id}"] [data-status="running"]`).waitFor();
+    await page.locator('[data-collaboration-notice="sent:collab-report"]').waitFor();assert.equal(await page.locator('[data-collaboration-notice]').count(),2);assert.equal(await page.locator('#messages [data-tool-row]').count(),0);
+    await page.locator('[data-collaboration-notice="sent:collab-report"]').getByRole('button',{name:'Open Researcher conversation',exact:true}).click();await page.locator(`[data-agent-detail="${agent.id}"]`).waitFor();
+    const overflow=await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth);assert.equal(overflow,false);
+  },{viewport,...(viewport.width<760?{isMobile:true,hasTouch:true}:{})});
+});
+
+test('named agent creation and incoming collaboration use direct colored conversation links', async () => {
+  await withPage(async ({page,state,login}) => {
+    const stamp='2026-10-09T12:02:00.000Z',run={id:'named-collab-run',botId:BOT_A,operationId:'named-collab-op',status:'completed',createdAt:stamp,updatedAt:stamp};
+    state.runs.set(BOT_A,[run]);state.messages.set(BOT_A,[{id:'named-request',botId:BOT_A,runId:run.id,role:'user',text:'Create a persistent reviewer and share the review.',createdAt:stamp}]);
+    state.bots.find(bot=>bot.id===BOT_B).createdByBotId=BOT_A;
+    state.emit(BOT_A,'tool.started',{toolName:'create_bot',toolCallId:'create-named-call'},run.id);
+    state.emit(BOT_A,'agent.named.created',{bot:{id:BOT_B,name:'Linus'},operationId:'create-named-operation',toolCallId:'create-named-call'},run.id);
+    state.emit(BOT_A,'tool.completed',{toolName:'create_bot',toolCallId:'create-named-call',operationId:'create-named-operation',result:{status:'completed'}},run.id);
+    const delegation={id:'named-task',sourceBotId:BOT_A,sourceBotName:'Ada',sourceRunId:run.id,targetBotId:BOT_B,targetBotName:'Linus',path:[BOT_A,BOT_B],status:'running',createdAt:stamp,updatedAt:stamp};
+    state.delegations.set(BOT_A,[delegation]);
+    state.emit(BOT_A,'tool.started',{toolName:'send_to_bot',toolCallId:'send-named-call'},run.id);
+    state.emit(BOT_A,'delegation.updated',{delegation,operationId:'send-named-operation',toolCallId:'send-named-call'},run.id);
+    state.emit(BOT_A,'tool.completed',{toolName:'send_to_bot',toolCallId:'send-named-call',operationId:'send-named-operation',result:{status:'completed'}},run.id);
+    await login();await page.locator(`[data-agent-created="${BOT_B}"]`).getByRole('button',{name:'Open Linus conversation',exact:true}).waitFor();
+    await page.locator('[data-collaboration-notice="delegation:named-task"]').filter({hasText:'Messages to'}).waitFor();
+    const incoming={id:'named-incoming',botId:BOT_A,runId:run.id,role:'assistant',text:'The review is complete. **Persistence looks good.**',provenance:{kind:'delegation_result',sourceBotId:BOT_B,sourceBotName:'Linus',delegationId:delegation.id},createdAt:'2026-10-09T12:03:00.000Z'};
+    state.messages.get(BOT_A).push(incoming);state.emit(BOT_A,'message.created',{message:incoming},run.id);
+    delegation.status='completed';delegation.updatedAt=incoming.createdAt;state.emit(BOT_A,'delegation.updated',{delegation},run.id);
+    await page.locator('[data-message-id="named-incoming"]').filter({hasText:'Messages from'}).waitFor();assert.equal(await page.locator('#messages [data-tool-row]').count(),0);
+    await page.getByRole('button',{name:'Show message from Linus',exact:true}).click();await page.getByText('Persistence looks good.',{exact:true}).waitFor();
+    if(process.env.TIMBER_CAPTURE_UI)await page.screenshot({path:'/tmp/timber-named-collaboration-1440.png'});
+    const color=await page.locator(`[data-agent-created="${BOT_B}"] [data-agent-color]`).getAttribute('data-agent-color');
+    assert.equal(await page.locator(`[data-bot-id="${BOT_B}"] [data-agent-color]`).getAttribute('data-agent-color'),color);
+    assert.notEqual(await page.locator(`[data-bot-id="${BOT_A}"] [data-agent-color]`).getAttribute('data-agent-color'),color);
+    await page.locator('[data-message-id="named-incoming"]').getByRole('button',{name:'Open Linus conversation',exact:true}).click();await until(page,'#selected-name','Linus');assert.equal(await page.locator('#selected-avatar').getAttribute('data-agent-color'),color);
+    await selectBot(page,BOT_A);await page.locator('[data-message-id="named-incoming"]').waitFor();assert.equal(await page.locator('[data-collaboration-notice="delegation:named-task"]').count(),1);
+  });
+});
+
+test('background exec keeps independent processes running after the response and merges late receipts on reload', async () => {
+  await withPage(async ({page,state,login}) => {
+    const createdAt=new Date().toISOString(),run={id:'background-response-run',botId:BOT_A,operationId:'background-response',status:'running',createdAt,updatedAt:createdAt};
+    state.runs.set(BOT_A,[run]);state.messages.set(BOT_A,[{id:'background-request',botId:BOT_A,runId:run.id,role:'user',text:'Start the two builds.',createdAt}]);
+    const update=(processId,status,output,extra={})=>state.emit(BOT_A,'process.updated',{processId,operationId:processId,toolCallId:`call-${processId}`,input:{command:'npm run build',yieldMs:1000},result:{operationId:processId,processId,status,output},...extra},run.id);
+    for(const processId of ['background-process-a','background-process-b']) {
+      state.emit(BOT_A,'tool.started',{operationId:processId,toolCallId:`call-${processId}`,toolName:'exec',input:{command:'npm run build',yieldMs:1000}},run.id);
+      update(processId,'running',`Started ${processId}\n`);
+      state.emit(BOT_A,'tool.completed',{operationId:processId,toolCallId:`call-${processId}`,toolName:'exec',result:{operationId:processId,processId,status:'running',output:`Started ${processId}\n`}},run.id);
+    }
+    await login();
+    const first=page.locator('#messages [data-tool-operation-id="background-process-a"]'),second=page.locator('#messages [data-tool-operation-id="background-process-b"]');
+    await first.locator('.timber-tool-status[aria-label="Running"]').waitFor();await second.locator('.timber-tool-status[aria-label="Running"]').waitFor();
+    assert.equal(await page.locator('#messages [data-process-id]').count(),2,'identical commands retain their distinct process identities');
+    assert.doesNotMatch(await first.locator('summary').innerText(),/timeout/,'omitting an execution deadline does not invent a default');
+    run.status='completed';run.updatedAt=new Date(Date.now()+1000).toISOString();state.emit(BOT_A,'run.updated',{run},run.id);
+    await page.locator('#run-status').waitFor({state:'hidden'});
+    assert.equal(await first.locator('.timber-spinner').count(),1,'a final model response does not finish the shell process');
+    assert.equal(await page.locator('#cancel-run').isVisible(),true,'Stop remains available for the completed run’s live processes');
+    await openPanel(page,'computer');await page.locator('#expand-workspace').click();
+    await page.locator('[data-mini-activity] .timber-mini-status').filter({hasText:'Working'}).waitFor();
+    assert.equal(await page.locator('[data-mini-activity] .timber-mini-step-status[aria-label="Running"]').count(),2);
+    await page.locator('#close-workspace').click();
+    update('background-process-a','completed','Build A finished\n',{observationOperationId:'background-poll-a',result:{operationId:'background-poll-a',processId:'background-process-a',status:'completed',output:'Build A finished\n',exitCode:0}});
+    state.emit(BOT_A,'tool.completed',{operationId:'background-process-a',toolCallId:'call-background-process-a',toolName:'exec',result:{operationId:'background-process-a',processId:'background-process-a',status:'running',output:'Old running receipt'}},run.id);
+    state.emit(BOT_A,'tool.completed',{operationId:'background-process-a',toolCallId:'call-background-process-a',toolName:'exec',status:'running'},run.id);
+    await first.locator('.timber-tool-status[aria-label="Completed · exit 0"]').waitFor();
+    assert.equal(await first.getAttribute('data-tool-status'),'completed');assert.equal(await first.locator('.timber-spinner').count(),0);
+    assert.match(await first.locator('[data-tool-result-preview]').innerText(),/Build A finished/);
+    assert.equal(await second.getAttribute('data-tool-status'),'running');assert.equal(await page.locator('#messages [data-process-id]').count(),2);
+    await page.reload();await first.locator('.timber-tool-status[aria-label="Completed · exit 0"]').waitFor();await second.locator('.timber-tool-status[aria-label="Running"]').waitFor();
+    assert.equal(await page.locator('#messages [data-process-id]').count(),2);assert.equal(await page.locator('#cancel-run').isVisible(),true);
+    assert.equal(state.actions.length,0,'status display never starts or reissues an action');
+  });
+});
+
+test('background exec Stop targets the owning completed run and waits for acknowledged process cancellation', async () => {
+  await withPage(async ({page,state,login}) => {
+    const createdAt=new Date().toISOString(),run={id:'background-stop-run',botId:BOT_A,operationId:'background-stop-request',status:'completed',createdAt,updatedAt:createdAt},processId='background-stop-process';
+    state.runs.set(BOT_A,[run]);state.messages.set(BOT_A,[{id:'background-stop-message',botId:BOT_A,runId:run.id,role:'user',text:'Start a long command.',createdAt}]);
+    const update=(status,extra={})=>state.emit(BOT_A,'process.updated',{processId,operationId:processId,input:{command:'python render.py',yieldMs:1000},result:{operationId:processId,processId,status,output:'Rendering frame 12\n'},...extra},run.id);
+    update('running');await login();await page.locator('#cancel-run').waitFor();
+    const tool=page.locator(`#messages [data-tool-operation-id="${processId}"]`);
+    await tool.locator('.timber-tool-status[aria-label="Running"]').waitFor();
+    const stopped=page.waitForResponse(response=>response.url().endsWith(`/runs/${run.id}/cancel`));await page.locator('#cancel-run').click();await stopped;
+    update('running',{cancellationRequested:true});await tool.locator('.timber-tool-status[aria-label="Stopping…"]').waitFor();
+    assert.equal(await tool.getAttribute('data-tool-status'),'running','the run’s cancellation alone does not confirm the process stopped');
+    assert.equal(await tool.locator('.timber-spinner').count(),1);assert.equal(await page.locator('#cancel-run').isVisible(),true);
+    assert.deepEqual(state.calls.filter(call=>call.path.endsWith('/cancel')).map(call=>({path:call.path,method:call.method})),[{path:`/v1/bots/${BOT_A}/runs/${run.id}/cancel`,method:'POST'}]);
+    update('cancelled',{cancellationRequested:true,observationOperationId:'background-stop-observation',result:{operationId:'background-stop-observation',processId,status:'cancelled',output:'Rendering stopped\n'}});
+    await tool.locator('.timber-tool-status[aria-label="Cancelled"]').waitFor();await page.locator('#cancel-run').waitFor({state:'hidden'});
+    assert.equal(await tool.locator('.timber-spinner').count(),0);
+    await page.reload();await tool.locator('.timber-tool-status[aria-label="Cancelled"]').waitFor();assert.equal(await page.locator('#cancel-run').isVisible(),false);
+    assert.equal(state.actions.length,0);assert.equal(sentMessages(state,BOT_A).length,0);
+  });
+});
+
+test('background exec process completion overrides a stale approved running receipt in history and activity', async () => {
+  await withPage(async ({page,state,login}) => {
+    const createdAt=new Date().toISOString(),run={id:'background-approval-run',botId:BOT_A,operationId:'background-approval-request',status:'completed',createdAt,updatedAt:createdAt},processId='background-approved-process';
+    const approval={id:'background-approval',botId:BOT_A,runId:run.id,operationId:processId,status:'completed',action:{type:'exec',command:'npm run build',yieldMs:1000},result:{operationId:processId,processId,status:'running',output:'Starting approved build\n'},createdAt,expiresAt:new Date(Date.now()+60000).toISOString()};
+    state.runs.set(BOT_A,[run]);state.approvals.set(BOT_A,[approval]);state.messages.set(BOT_A,[{id:'background-approval-message',botId:BOT_A,runId:run.id,role:'user',text:'Build after approval.',createdAt}]);
+    state.emit(BOT_A,'process.updated',{processId,operationId:processId,input:{command:'npm run build',yieldMs:1000},result:approval.result},run.id);
+    await login();const history=page.locator('[data-approval-history-id="background-approval"]');await history.locator('summary').filter({hasText:'Running action'}).waitFor();
+    state.emit(BOT_A,'process.updated',{processId,operationId:processId,observationOperationId:'background-approved-poll',input:{command:'npm run build',yieldMs:1000},result:{operationId:'background-approved-poll',processId,status:'completed',output:'Approved build finished\n',exitCode:0}},run.id);
+    await history.locator('summary').filter({hasText:'Completed action'}).waitFor();await history.locator('summary').click();
+    await history.locator('.timber-result-output').filter({hasText:'Approved build finished'}).waitFor();
+    assert.equal(await history.locator('[data-process-status="completed"]').count(),1);assert.equal(await history.locator('.timber-spinner').count(),0);
+    assert.equal(approval.result.status,'running','the persisted permission receipt deliberately remains an old snapshot');
+    await openPanel(page,'activity');const activity=page.locator(`[data-activity-tool-operation-id="${processId}"]`);await activity.locator('.timber-tool-status[aria-label="Completed · exit 0"]').waitFor();
+    assert.equal(await activity.getAttribute('data-tool-status'),'completed');assert.equal(await activity.locator('.timber-spinner').count(),0);
+    await openPanel(page,'conversation');await page.reload();await history.locator('summary').filter({hasText:'Completed action'}).waitFor();
+    await history.locator('summary').click();await history.locator('.timber-result-output').filter({hasText:'Approved build finished'}).waitFor();
+    assert.equal(await page.locator('#cancel-run').isVisible(),false);
+  });
+});
+
+test('sidebar summaries show latest activity and stable bot colors with bounded background requests', async () => {
+  await withPage(async ({page,state,login}) => {
+    const stamp='2026-10-09T12:05:00.000Z';
+    state.messages.set(BOT_B,[{id:'sidebar-b-message',botId:BOT_B,role:'assistant',text:'Reviewing the computer lifecycle.',createdAt:stamp}]);
+    state.runs.set(BOT_B,[{id:'sidebar-b-run',botId:BOT_B,operationId:'sidebar-b-operation',status:'queued',createdAt:stamp,updatedAt:stamp}]);
+    for(let i=3;i<=7;i++){
+      const bot={...state.bots[1],id:`10000000-0000-4000-8000-${String(i).padStart(12,'0')}`,name:`Helper ${i}`};state.bots.push(bot);
+      state.messages.set(bot.id,[{id:`helper-${i}-message`,botId:bot.id,role:'assistant',text:`Saved progress for helper ${i}.`,createdAt:stamp}]);state.runs.set(bot.id,[]);
+    }
+    let concurrent=0,maxConcurrent=0;
+    await page.route('**/summary',async route=>{concurrent++;maxConcurrent=Math.max(maxConcurrent,concurrent);try{const response=await route.fetch();await route.fulfill({response});}finally{concurrent--;}});
+    await login();const other=page.locator(`[data-bot-id="${BOT_B}"]`);
+    await other.locator('.bot-preview').filter({hasText:'Reviewing the computer lifecycle.'}).waitFor();await other.locator('[data-status="queued"]').waitFor();
+    await page.locator('.bot-preview').filter({hasText:'Saved progress for helper 7.'}).waitFor();
+    assert.ok(maxConcurrent<=3,`summary concurrency was ${maxConcurrent}`);
+    assert.equal(state.calls.filter(call=>/\/messages(?:\?|$)|\/runs(?:\?|$)/.test(call.path)&&!call.path.startsWith(`/v1/bots/${BOT_A}/`)).length,0,'background bots fetch compact summaries, never their whole transcripts or runs');
+    const color=await other.locator('[data-agent-color]').getAttribute('data-agent-color');
+    state.runs.get(BOT_B)[0].status='running';state.messages.get(BOT_B).push({id:'sidebar-b-new',botId:BOT_B,role:'assistant',text:'The lifecycle fix is ready for review.',createdAt:stamp});
+    await page.evaluate(()=>window.dispatchEvent(new Event('focus')));await other.locator('[data-status="running"]').waitFor();await other.locator('.bot-preview').filter({hasText:'The lifecycle fix is ready for review.'}).waitFor();
+    state.emit(BOT_A,'run.updated',{run:{id:'sidebar-live-run',botId:BOT_A,operationId:'sidebar-live-operation',status:'queued',createdAt:stamp,updatedAt:stamp}},'sidebar-live-run');
+    await page.locator(`[data-bot-id="${BOT_A}"] [data-status="queued"]`).waitFor();
+    const message={id:'sidebar-live-message',botId:BOT_A,runId:'sidebar-live-run',role:'assistant',text:'Coordinating the next task.',createdAt:stamp};state.messages.get(BOT_A).push(message);state.emit(BOT_A,'message.created',{message},'sidebar-live-run');
+    await page.locator(`[data-bot-id="${BOT_A}"] .bot-preview`).filter({hasText:'Coordinating the next task.'}).waitFor();
+    await page.locator('#message').fill('@Lin');await page.locator(`[data-mention-bot="${BOT_B}"]`).waitFor();assert.equal(await page.locator(`[data-mention-bot="${BOT_B}"] [data-agent-color]`).getAttribute('data-agent-color'),color);
+    await page.reload();await other.locator('.bot-preview').filter({hasText:'The lifecycle fix is ready for review.'}).waitFor();assert.equal(await other.locator('[data-agent-color]').getAttribute('data-agent-color'),color);
+    if(process.env.TIMBER_CAPTURE_UI){await page.screenshot({path:'/tmp/timber-sidebar-1440.png'});await page.setViewportSize({width:390,height:844});await page.locator('#mobile-back').click();await page.screenshot({path:'/tmp/timber-sidebar-390.png'});}
+  });
+});
+
+test('child collaboration keeps creation cards and messages scoped to its conversation after reload', async () => {
+  await withPage(async ({page,state,login}) => {
+    const stamp='2026-10-09T13:00:00.000Z',parentRun={id:'child-scope-root',botId:BOT_A,operationId:'child-scope-root-op',status:'completed',createdAt:stamp,updatedAt:stamp};
+    const researcher={id:'child-scope-researcher',name:'Researcher',task:'Coordinate a scoped review.',parentOperationId:parentRun.operationId,operationId:'child-scope-research-op',status:'running',createdAt:stamp,updatedAt:stamp};
+    const sibling={...researcher,id:'child-scope-sibling',name:'Sibling',operationId:'child-scope-sibling-op'};
+    const nested={...researcher,id:'child-scope-nested',name:'Verifier',parentSubagentId:researcher.id,operationId:'child-scope-spawn',task:'Verify the findings.'};
+    const childRun={...parentRun,id:'child-scope-run',subagentId:researcher.id,parentRunId:parentRun.id,operationId:researcher.operationId,status:'running'};
+    const siblingRun={...childRun,id:'child-scope-sibling-run',subagentId:sibling.id,operationId:sibling.operationId};
+    state.runs.set(BOT_A,[parentRun,childRun,siblingRun,{...childRun,id:'child-scope-nested-run',subagentId:nested.id,operationId:nested.operationId}]);
+    state.agents.set(BOT_A,[researcher,sibling,nested]);state.bots.find(bot=>bot.id===BOT_B).createdByBotId=BOT_A;
+    state.agentMessages.set(researcher.id,[{id:'child-scope-task',role:'user',text:'Coordinate a scoped review.',createdAt:stamp},{id:'child-scope-plain-message',role:'user',text:'Message from Sibling:\nThe source transcript remains available.',createdAt:stamp}]);
+    state.agentMessages.set(nested.id,[{id:'child-scope-verifier-result',role:'assistant',text:'The scoped findings are verified.',createdAt:stamp}]);
+    const childTool=(operationId,toolName,toolCallId)=>{
+      state.emit(BOT_A,'subagent.tool.started',{subagentId:researcher.id,toolCallId,toolName},childRun.id);
+      state.emit(BOT_A,'subagent.tool.completed',{subagentId:researcher.id,operationId,toolCallId,toolName,status:'completed'},childRun.id);
+    };
+    childTool(nested.operationId,'spawn_subagent','child-scope-spawn-call');
+    state.emit(BOT_A,'subagent.created',{subagent:nested,operationId:nested.operationId,toolCallId:'child-scope-spawn-call'},'child-scope-nested-run');
+    childTool('child-scope-create-bot','create_bot','child-scope-create-call');
+    state.emit(BOT_A,'agent.named.created',{bot:{id:BOT_B,name:'Linus'},operationId:'child-scope-create-bot',toolCallId:'child-scope-create-call'},childRun.id);
+    await login();await openPanel(page,'agents');await page.locator(`[data-agent-id="${researcher.id}"]`).click();
+    const detail=page.locator(`[data-agent-detail="${researcher.id}"]`);
+    await detail.locator(`[data-agent-created="${nested.id}"]`).waitFor();await detail.locator(`[data-agent-created="${BOT_B}"]`).waitFor();
+    assert.equal(await detail.locator(`[data-agent-created="${researcher.id}"], [data-agent-created="${sibling.id}"]`).count(),0,'the child only lists agents it created');
+    childTool('child-scope-send-root','send_subagent_message','child-scope-send-root-call');
+    state.emit(BOT_A,'subagent.message.sent',{sourceSubagentId:researcher.id,sourceName:researcher.name,targetName:'Ada',operationId:'child-scope-send-root',toolCallId:'child-scope-send-root-call',text:'The parent can use these findings.'},childRun.id);
+    state.emit(BOT_A,'subagent.reported',{subagentId:researcher.id,operationId:'child-scope-send-root',text:'The parent can use these findings.'},parentRun.id);
+    state.emit(BOT_A,'subagent.message.sent',{sourceSubagentId:sibling.id,targetSubagentId:researcher.id,sourceName:sibling.name,targetName:researcher.name,operationId:'child-scope-incoming',text:'The source transcript remains available.'},siblingRun.id);
+    state.emit(BOT_A,'subagent.message.sent',{targetSubagentId:sibling.id,targetName:sibling.name,operationId:'child-scope-unrelated',text:'This belongs to a different child.'},parentRun.id);
+    await detail.locator('[data-collaboration-notice="sent:child-scope-send-root"]').filter({hasText:'Messages to'}).waitFor();
+    await detail.locator('[data-collaboration-notice="sent:child-scope-incoming"]').filter({hasText:'Messages from'}).waitFor();
+    assert.equal(await detail.locator('[data-collaboration-notice]').count(),2,'the explicit report and receipt are one outgoing notice');
+    assert.equal(await detail.locator('[data-collaboration-notice="sent:child-scope-unrelated"]').count(),0);
+    assert.equal(await detail.locator('.timber-agent-activity').count(),0,'successful child collaboration has no duplicate generic tool section');
+    await detail.locator('[data-agent-message="child-scope-plain-message"]').filter({hasText:'The source transcript remains available.'}).waitFor();
+    await detail.getByRole('button',{name:'Show message to Ada',exact:true}).click();await detail.getByText('The parent can use these findings.',{exact:true}).waitFor();
+    await page.reload();await detail.locator(`[data-agent-created="${nested.id}"]`).waitFor();await detail.locator('[data-collaboration-notice="sent:child-scope-incoming"]').waitFor();
+    assert.equal(await detail.locator('[data-collaboration-notice]').count(),2);assert.equal(await detail.locator('.timber-agent-activity').count(),0);
+    await detail.locator(`[data-agent-created="${nested.id}"]`).getByRole('button',{name:'Open Verifier conversation',exact:true}).click();await page.locator(`[data-agent-detail="${nested.id}"]`).getByText('The scoped findings are verified.',{exact:true}).waitFor();
+  });
+});
+
+test('sidebar image-only messages replace an older text preview and keep captions when present', async () => {
+  await withPage(async ({page,state,login}) => {
+    const stamp=new Date().toISOString(),old={id:'sidebar-image-old',botId:BOT_A,role:'assistant',text:'The older text should be replaced.',createdAt:stamp};
+    state.messages.set(BOT_A,[old]);
+    await page.route(`**/v1/bots/${BOT_A}/summary`,route=>route.fulfill({json:{summary:{status:'ready',activeRuns:0,activeAgents:0,lastMessage:{text:old.text,createdAt:stamp}}}}));
+    await login();const preview=page.locator(`[data-bot-id="${BOT_A}"] .bot-preview`);await preview.filter({hasText:old.text}).waitFor();
+    const image={artifactId:'sidebar-preview-image',mimeType:'image/png',size:100};
+    const one={id:'sidebar-image-single',botId:BOT_A,role:'user',text:'',attachments:[image],createdAt:new Date(Date.now()+1000).toISOString()};
+    state.messages.get(BOT_A).push(one);state.emit(BOT_A,'message.created',{message:one});
+    await preview.filter({hasText:/^Image$/}).waitFor();assert.equal(await preview.innerText(),'Image');
+    const multiple={...one,id:'sidebar-image-multiple',text:'   ',attachments:[image,{...image,artifactId:'sidebar-preview-image-two'}],createdAt:new Date(Date.now()+2000).toISOString()};
+    state.messages.get(BOT_A).push(multiple);state.emit(BOT_A,'message.created',{message:multiple});
+    await preview.filter({hasText:/^2 images$/}).waitFor();assert.equal(await preview.innerText(),'2 images');
+    await page.reload();await preview.filter({hasText:/^2 images$/}).waitFor();
+    const captioned={...multiple,id:'sidebar-image-captioned',text:'Compare these diagrams.',createdAt:new Date(Date.now()+3000).toISOString()};
+    state.messages.get(BOT_A).push(captioned);state.emit(BOT_A,'message.created',{message:captioned});
+    await preview.filter({hasText:/^Compare these diagrams\.$/}).waitFor();assert.equal(await preview.innerText(),captioned.text);
+  });
+});

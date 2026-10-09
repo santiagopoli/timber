@@ -1,7 +1,7 @@
 import { Type } from '@earendil-works/pi-ai';
 import {
-  configure, defineDoc, defineTask, defineTool, LiveDoc, ROOT_CONVERSATION_ID,
-  type AgentEvent, type AgentEventStream, type ConversationId, type Harness,
+  configure, defineDoc, defineTask, defineTool, InboxDoc, LiveDoc, ROOT_CONVERSATION_ID,
+  type AgentEvent, type AgentEventStream, type ConversationId, type Harness, type InboxState,
   type Storage, type TaskId, type ToolExecutionApi, type ToolExecutionResult, type Tx,
 } from '@earendil-works/pi-durable';
 import type { PiHarness, PiHarnessContext } from 'agents/harness/pi';
@@ -30,6 +30,7 @@ export interface SubagentHost {
   storage(): Storage;
   context(): Context;
   assertActive(): void;
+  botName(): Promise<string>;
   emit(event: RuntimeEvent): Promise<void>;
   operationForCall(api: ToolExecutionApi, context: Context): Promise<string>;
   consume(operationId: string, kind: 'generation' | 'tool', itemId: string): void;
@@ -357,7 +358,7 @@ export function createSubagents(host: SubagentHost) {
             return record;
           }, context);
           await api.details({ subagentId: agent.id }, context);
-          await host.emit({ type: 'subagent.created', operationId: parentOperationId, eventKey: `subagent:created:${agent.id}`, data: { subagent: publicAgent(agent) } });
+          await host.emit({ type: 'subagent.created', operationId: parentOperationId, eventKey: `subagent:created:${agent.id}`, data: { subagent: publicAgent(agent), operationId, toolCallId: api.callId } });
           await attach(agent.id);
           return content({ subagent: publicAgent(agent) });
         }) }),
@@ -367,26 +368,63 @@ export function createSubagents(host: SubagentHost) {
         parameters: Type.Object({ targetId: id, text: Type.String({ minLength: 1, maxLength: 20_000 }) }),
         execute: (input, api, context) => guarded(api, context, async (parentOperationId, operationId) => {
           const sender = await forConversation(api.conversationId);
+          const parentName = await host.botName();
+          const sourceName = sender?.name ?? parentName;
+          const sent = async (receipt: RuntimeReceipt, target?: StoredAgent): Promise<ToolExecutionResult> => {
+            await host.emit({ type: 'subagent.message.sent', operationId: parentOperationId,
+              eventKey: `subagent:message-sent:${operationId}`, data: {
+                ...(sender ? { sourceSubagentId: sender.id } : {}), ...(target ? { targetSubagentId: target.id } : {}),
+                sourceName, targetName: target?.name ?? parentName, text: input.text, operationId, toolCallId: api.callId,
+              } });
+            return content(receipt);
+          };
           if (input.targetId === 'parent') {
             if (!sender) throw new Error('The main bot has no temporary parent');
-            if (sender.parentSubagentId) return content(await send(sender.parentSubagentId, input.text, { operationId }, false, context));
+            if (sender.parentSubagentId) {
+              const parent = await find(sender.parentSubagentId);
+              return sent(await send(parent.id, input.text, { operationId }, false, context), parent);
+            }
             if (!host.onMessage) throw new Error('Parent messaging is not configured');
             await host.onMessage({ subagentId: sender.id, parentOperationId, operationId, text: `Message from subagent ${sender.name}:\n${input.text}` });
-            return content({ operationId, accepted: true });
+            return sent({ operationId, accepted: true });
           }
           const target = await find(input.targetId);
           if (sender && target.parentOperationId !== parentOperationId) throw new Error('Subagent belongs to another task');
-          return content(await send(target.id, `Message from ${sender?.name ?? 'parent'}:\n${input.text}`, { operationId }, false, context));
+          return sent(await send(target.id, `Message from ${sender?.name ?? 'parent'}:\n${input.text}`, { operationId }, false, context), target);
         }) }),
-      defineTool({ name: 'wait_subagent', description: 'Wait for a temporary agent’s current task and return its public result. Waiting survives recovery; approval or connection waits are returned immediately for host review.', replay: 'safe',
+      defineTool({ name: 'wait_subagent', description: 'Wait for a temporary agent’s current task and return its public result. Yield promptly when a new steering input arrives so you can handle it while the child keeps working. Waiting survives recovery; approval or connection waits are returned immediately for host review.', replay: 'safe',
         parameters: Type.Object({ subagentId: id }), execute: (input, api, context) => guarded(api, context, async (parentOperationId) => {
           const agent = await find(input.subagentId);
           const sender = await forConversation(api.conversationId);
           if ((sender && agent.parentOperationId !== parentOperationId) || agent.conversationId === String(api.conversationId)) throw new Error('Invalid subagent wait');
-          const pending = (await state()).deliveries[`${agent.id}:${agent.operationId}`];
-          if (pending) await api.waitForTask(pending.taskId as TaskId, context);
-          const result = await host.harness().session(agent.conversationId).wait(agent.operationId, context.abortSignal);
-          return content({ subagent: publicAgent(await find(agent.id)), result });
+          const controller = new AbortController();
+          const signal = context.abortSignal ? AbortSignal.any([context.abortSignal, controller.signal]) : controller.signal;
+          const waitContext: Context = { abortSignal: signal, value: key => context.value(key), toString: () => context.toString() };
+          const inbox = await api.watchDoc(InboxDoc, api.conversationId, context);
+          let yieldToInput!: () => void;
+          const incoming = new Promise<'input'>(resolve => { yieldToInput = () => resolve('input'); });
+          const notice = (value: Readonly<InboxState> | null) => {
+            if (value?.items.some(item => item.mode === 'steer')) yieldToInput();
+          };
+          try {
+            // Acquisition includes an exact initial frame; starting its listener
+            // before checking that frame also covers admission during this call.
+            inbox?.start(async value => { notice(value); });
+            if (inbox) notice(inbox.value);
+            const done = (async () => {
+              const pending = (await state()).deliveries[`${agent.id}:${agent.operationId}`];
+              if (pending) await api.waitForTask(pending.taskId as TaskId, waitContext);
+              return host.harness().session(agent.conversationId).wait(agent.operationId, signal);
+            })();
+            const result = await Promise.race([done, incoming]);
+            if (result === 'input') return content({ status: 'yielded', reason: 'new_input', subagent: publicAgent(await find(agent.id)) });
+            return content({ subagent: publicAgent(await find(agent.id)), result });
+          } finally {
+            // Cancel only our observer. Native child work and its delivery stay
+            // alive; ending this safe tool lets Pi place the incoming steer.
+            controller.abort(new Error('Subagent wait observer finished'));
+            await inbox?.stop();
+          }
         }) }),
       defineTool({ name: 'cancel_subagent', description: 'Cancel a temporary agent and its descendants. Cancelled agents cannot be restarted; create a new agent for new work.', replay: 'unsafe',
         parameters: Type.Object({ subagentId: id }), execute: (input, api, context) => guarded(api, context, async parentOperationId => {

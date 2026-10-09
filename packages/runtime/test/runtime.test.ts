@@ -101,10 +101,11 @@ describe('runtime computer bridge', () => {
   });
   it('marks side-effecting tools unsafe for crash recovery', () => {
     const tools = computerTools(bridge());
-    for (const name of ['exec', 'write_file', 'browser_navigate', 'desktop_click', 'desktop_move', 'desktop_double_click', 'desktop_drag', 'desktop_type', 'desktop_key', 'desktop_scroll']) {
+    for (const name of ['exec', 'exec_cancel', 'write_file', 'browser_navigate', 'desktop_click', 'desktop_move', 'desktop_double_click', 'desktop_drag', 'desktop_type', 'desktop_key', 'desktop_scroll']) {
       expect(tools.find(tool => tool.name === name)?.replay).toBe('unsafe');
     }
     expect(tools.find(tool => tool.name === 'read_file')?.replay).toBe('safe');
+    expect(tools.find(tool => tool.name === 'exec_poll')?.replay).toBe('safe');
   });
   it('passes mouse gestures through the same sequential host approval and operation boundary', async () => {
     const host = bridge();
@@ -121,13 +122,39 @@ describe('runtime computer bridge', () => {
       expect(host.tools.execute).toHaveBeenLastCalledWith(expect.objectContaining({action: gesture.action, toolCallId: api.callId, runOperationId: 'user-operation', signal: context.abortSignal}));
     }
   });
-  it('gives finite exec commands a 120-second default while retaining an explicit shorter bound', async () => {
+  it('keeps an omitted execution deadline absent and preserves long deadlines separately from yield', async () => {
     const host = bridge();
     const exec = computerTools(host).find(tool => tool.name === 'exec')!;
     await exec.execute({command: 'install dependencies'}, api, context);
-    expect(vi.mocked(host.tools.execute).mock.calls[0]?.[0].action).toEqual({type: 'exec', command: 'install dependencies', timeoutMs: 120000});
-    await exec.execute({command: 'quick readiness probe', timeoutMs: 10000}, api, context);
-    expect(vi.mocked(host.tools.execute).mock.calls[1]?.[0].action).toEqual({type: 'exec', command: 'quick readiness probe', timeoutMs: 10000});
+    expect(vi.mocked(host.tools.execute).mock.calls[0]?.[0].action).toEqual({type: 'exec', command: 'install dependencies', yieldMs: 1000});
+    await exec.execute({command: 'long build', timeoutMs: 900000, yieldMs: 0}, api, context);
+    expect(vi.mocked(host.tools.execute).mock.calls[1]?.[0].action).toEqual({type: 'exec', command: 'long build', timeoutMs: 900000, yieldMs: 0});
+    const properties = exec.parameters.properties as Record<string, unknown>;
+    expect(properties.timeoutMs).toMatchObject({minimum: 1, maximum: Number.MAX_SAFE_INTEGER});
+    expect(properties.timeoutMs).not.toHaveProperty('default');
+  });
+  it('polls and cancels only the supplied process while retaining independent invocation identities', async () => {
+    const host = bridge(), tools = computerTools(host), processId = 'pi-tool:original:exec';
+    const poll = tools.find(tool => tool.name === 'exec_poll')!;
+    const cancel = tools.find(tool => tool.name === 'exec_cancel')!;
+    await poll.execute({processId}, api, context);
+    await poll.execute({processId, yieldMs: 30000}, {...api, callId: 'poll-next'}, context);
+    await cancel.execute({processId}, {...api, callId: 'cancel-process'}, context);
+    const calls = vi.mocked(host.tools.execute).mock.calls.map(([request]) => request);
+    expect(calls.map(call => call.action)).toEqual([
+      {type: 'execPoll', processId, yieldMs: 1000},
+      {type: 'execPoll', processId, yieldMs: 30000},
+      {type: 'execCancel', processId},
+    ]);
+    expect(new Set(calls.map(call => call.operationId)).size).toBe(3);
+  });
+  it.each(['running', 'cancelled'] as const)('returns process state %s without failing or pausing the Pi turn', async status => {
+    const host = bridge();
+    host.tools.execute = vi.fn(async ({operationId}) => ({operationId, processId: 'process-1', status, output: 'retained output'}));
+    const result = await executeComputerTool(host, {type: status === 'running' ? 'execPoll' : 'execCancel', processId: 'process-1'}, api, context);
+    expect(result.isError).toBe(false);
+    expect(result.control).toBeUndefined();
+    expect(JSON.parse(textContent(result.content))).toMatchObject({status, processId: 'process-1', output: 'retained output'});
   });
 });
 
@@ -197,6 +224,12 @@ describe('public transcript projection', () => {
   it('projects a pending connection without disclosing its repository or request payload', () => {
     const entry = { model: [{ role: 'toolResult', content: [{ type: 'text', text: JSON.stringify({ operationId: 'host:1', status: 'pending_connection', repository: 'owner/private', arguments: { private: true } }) }] }] } as unknown as EntryRecord;
     expect(toolCompletion(entry)).toEqual({ operationId: 'host:1', status: 'pending_connection' });
+  });
+  it.each(['running', 'cancelled'])('projects resumable exec %s and a bounded process ID without command output', status => {
+    const entry = {model: [{role: 'toolResult', content: [{type: 'text', text: JSON.stringify({operationId: 'poll:1', processId: 'exec:1', status, output: 'private output'})}]}]} as unknown as EntryRecord;
+    expect(toolCompletion(entry)).toEqual({operationId: 'poll:1', processId: 'exec:1', status});
+    const invalid = {model: [{role: 'toolResult', content: [{type: 'text', text: JSON.stringify({processId: 'invalid\nprocess', status})}]}]} as unknown as EntryRecord;
+    expect(toolCompletion(invalid)).toEqual({status});
   });
   it('does not serialize private reasoning, tool arguments, or image payloads as text', () => {
     expect(textContent([{ type: 'thinking', thinking: 'internal' }, { type: 'text', text: 'Answer' }, { type: 'image', data: 'secret-pixels' }])).toBe('Answer');

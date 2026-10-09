@@ -55,18 +55,24 @@ export class HarnessProbe extends DurableObject {
         const hasTool = input.messages.slice(lastUser + 1).some(message => message.role === 'tool');
         const toolResults = input.messages.slice(lastUser + 1).filter(message => message.role === 'tool');
         const existingAction = text.match(/request-(message|wait|cancel)-existing:([a-f0-9-]+)/);
-        const peer = text.match(/child-fixture-peer:([a-f0-9-]+)/);
+        const peer = text.match(/child-fixture-peer:([a-f0-9-]+|parent)/);
         const childTool = isChild && !hasTool && (text.includes('read') || text.includes('exec'));
         let toolRequest = text.includes('request-exec') || text.includes('request-loop') || (isSubagent && !hasTool) || childTool || (!!existingAction && !hasTool) || (!!peer && !hasTool);
         const readCall = { index: 0, id: 'call-read-1', type: 'function', function: { name: 'read_file', arguments: '{"path":"/workspace/test.txt"}' } };
         const execCall = { index: text.includes('mixed') ? 1 : 0, id: 'call-fixture-1', type: 'function', function: { name: 'exec', arguments: '{"command":"echo fixture"}' } };
-        const spawnCall = { index: 0, id: 'call-spawn-1', type: 'function', function: { name: 'spawn_subagent', arguments: JSON.stringify({ name: 'Reader', task: text.includes('nested') ? 'request-subagent nested' : text.includes('child-exec') ? 'child-fixture-exec' : 'child-fixture-read' }) } };
+        const spawnCall = { index: 0, id: text.includes('second-task') ? 'call-spawn-second' : 'call-spawn-1', type: 'function', function: { name: 'spawn_subagent', arguments: JSON.stringify({ name: text.includes('second-task') ? 'Second reader' : 'Reader', task: text.includes('nested') ? 'request-subagent nested' : text.includes('child-exec') ? 'child-fixture-exec' : 'child-fixture-read' }) } };
         let calls = isSubagent ? [spawnCall] : isChild ? text.includes('exec') ? [execCall] : [readCall] : text.includes('request-loop') ? [readCall] : text.includes('mixed') ? [readCall, execCall] : [execCall];
         if (text.includes('request-subagent-peers') && toolResults.length === 1) {
           const toolContent = toolResults[0]!.content;
           const result = JSON.parse(typeof toolContent === 'string' ? toolContent : (toolContent as {text:string}[]).map(part => part.text).join(''));
           toolRequest = true;
           calls = [{ ...spawnCall, id: 'call-spawn-peer', function: { name: 'spawn_subagent', arguments: JSON.stringify({ name: 'Messenger', task: `child-fixture-peer:${result.subagent.id}` }) } }];
+        }
+        if (text.includes('request-subagent-wait') && toolResults.length === 1) {
+          const toolContent = toolResults[0]!.content;
+          const result = JSON.parse(typeof toolContent === 'string' ? toolContent : (toolContent as {text:string}[]).map(part => part.text).join(''));
+          toolRequest = true;
+          calls = [{ index: 0, id: 'call-wait-child', type: 'function', function: { name: 'wait_subagent', arguments: JSON.stringify({subagentId: result.subagent.id}) } }];
         }
         if (peer || existingAction) {
           const targetId = peer?.[1] ?? existingAction?.[2];
@@ -105,6 +111,14 @@ export class HarnessProbe extends DurableObject {
           const nextContext = this.setting('afterToolApprovalContext');
           if (nextContext) ctx.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)', 'approvalContext', nextContext);
           if (this.toolFailure) return {operationId,status:'failed',exitCode:1,output:'fixture command failed',error:'Command exited with code 1.'};
+          if (this.setting('approvalMode') === 'automatic' && action.type === 'exec' && action.command === 'fixture managed command') {
+            ctx.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)', 'managedProcessId', operationId);
+            return {operationId, processId: operationId, status: 'running', output: 'The command has started.'};
+          }
+          if (action.type === 'execPoll' || action.type === 'execCancel') {
+            if (action.processId !== this.setting('managedProcessId')) return {operationId, status: 'failed', error: 'Unknown process.'};
+            return {operationId, processId: action.processId, status: action.type === 'execCancel' ? 'cancelled' : 'completed', exitCode: action.type === 'execCancel' ? -15 : 0, output: 'Retained command output.'};
+          }
           return action.type === 'readFile' ? { operationId, status: 'completed', output: 'test file' } : action.type === 'screenshot' ? { operationId, status: 'completed', artifactId: 'test.png' } : this.setting('approvalMode') === 'automatic' ? { operationId, status: 'completed', output: 'fixture completed' } : { status: 'pending_approval', approvalId: `approval-fixture-${call.id}` };
         },
         readImage: async () => ({ data: 'aW1hZ2U=', mimeType: 'image/png' }),

@@ -80,6 +80,14 @@ function coordinate(value:unknown,name:string,max:number):number {
   if(!Number.isInteger(value)) invalid("Mouse coordinates must be integers.");
   return finite(value,name,0,max);
 }
+function milliseconds(value:unknown,name:string,min:number,max=Number.MAX_SAFE_INTEGER):number {
+  if(!Number.isSafeInteger(value)) invalid(`${name} must be a safe integer.`);
+  return finite(value,name,min,max);
+}
+function processId(value:unknown):string {
+  if(typeof value!=="string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(value)) invalid("Invalid processId.");
+  return value as string;
+}
 function mouseButton(value:unknown):"left"|"right"|"middle"|undefined {
   if(value===undefined || value==="left" || value==="right" || value==="middle") return value;
   invalid("Invalid mouse button.");
@@ -92,7 +100,9 @@ function path(value:unknown):string {
 export function parseAction(value:unknown):ComputerAction {
   const data=object(value);
   switch(data.type) {
-    case "exec": return {type:"exec",command:string(data.command,"command",16_000),...(data.timeoutMs===undefined?{}:{timeoutMs:finite(data.timeoutMs,"timeoutMs",1,120_000)})};
+    case "exec": return {type:"exec",command:string(data.command,"command",16_000),...(data.timeoutMs===undefined?{}:{timeoutMs:milliseconds(data.timeoutMs,"timeoutMs",1)}),...(data.yieldMs===undefined?{}:{yieldMs:milliseconds(data.yieldMs,"yieldMs",0,30_000)})};
+    case "execPoll": return {type:"execPoll",processId:processId(data.processId),...(data.yieldMs===undefined?{}:{yieldMs:milliseconds(data.yieldMs,"yieldMs",0,30_000)})};
+    case "execCancel": return {type:"execCancel",processId:processId(data.processId)};
     case "readFile": return {type:"readFile",path:path(data.path)};
     case "writeFile": return {type:"writeFile",path:path(data.path),content:string(data.content,"content",200_000,0)};
     case "listFiles": return {type:"listFiles",...(data.path===undefined?{}:{path:path(data.path)})};

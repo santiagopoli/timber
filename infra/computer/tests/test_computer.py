@@ -142,17 +142,28 @@ class ComputerTests(unittest.TestCase):
             process = real_popen(*args, **kwargs)
             # CI login-shell startup can itself exceed a 50 ms timeout. Start
             # this test's deadline only once the real child has emitted output.
-            # Readiness does not consume it; run_shell must still capture it.
-            readable, _, _ = select.select([process.stdout], [], [], 10)
-            if not readable:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=5)
-                process.stdout.close()
-                self.fail("Test shell did not produce initial output")
+            # Wait after the durable launch gate is opened. Readiness does not
+            # consume output; the session monitor must still capture it.
+            original_stdin = process.stdin
+            outer = self
+
+            class ReadyInput:
+                write = original_stdin.write
+                close = original_stdin.close
+
+                def flush(self):
+                    original_stdin.flush()
+                    readable, _, _ = select.select([process.stdout], [], [], 10)
+                    if not readable:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=5)
+                        outer.fail("Test shell did not produce initial output")
+
+            process.stdin = ReadyInput()
             return process
 
         with patch.object(server.subprocess, "Popen", side_effect=start_after_output_is_ready):
-            result = self.action("timeout", type="exec", command="printf ready; sleep 10; touch too-late", timeoutMs=100)
+            result = self.action("timeout", type="exec", command="printf ready; sleep 10; touch too-late", timeoutMs=100, yieldMs=30000)
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["output"], "ready")
         self.assertIn("timed out", result["error"])
@@ -239,6 +250,7 @@ class ComputerTests(unittest.TestCase):
                 health = json.load(response)
             self.assertTrue(health["ok"])
             self.assertEqual(health["bootId"], self.computer.boot_id)
+            self.assertIn("execSessions", health["capabilities"])
             request = urllib.request.Request(url + "/actions", data=json.dumps({"operationId":"http", "action":{"type":"exec","command":"printf actual-process"}}).encode(), headers={"Authorization":"Bearer test-token","Content-Type":"application/json"})
             with urllib.request.urlopen(request) as response:
                 self.assertEqual(json.load(response)["output"], "actual-process")

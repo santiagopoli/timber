@@ -1,0 +1,125 @@
+import {useState} from 'react';
+import {ArrowRightIcon, ChevronDownIcon, ChevronRightIcon, GitBranchIcon} from 'lucide-react';
+import type {BotEvent, Message, Subagent} from '../../../packages/contracts/src/index';
+import type {ChatCallbacks, ChatModel} from './chat-types';
+import {MessageResponse} from './components/ai-elements/message';
+import {agentColor} from './agent-colors';
+import './collaboration-timeline.css';
+
+export type AgentLink = {id:string;name:string;kind:'bot'|'subagent'};
+type Creation = {agent:AgentLink;status:string;task?:string;creator?:AgentLink};
+type Notice = {direction:'from'|'to'|'between';agent:AgentLink;recipient?:AgentLink;text?:string;status?:string;messageId?:string};
+export type CollaborationItem = {key:string;runId?:string;createdAt:string;creation?:Creation;notice?:Notice};
+const record = (value:unknown):Record<string,unknown> => value && typeof value==='object' && !Array.isArray(value) ? value as Record<string,unknown> : {};
+const text = (value:unknown) => typeof value==='string' ? value : '';
+const statusLabel = (value:string) => value.replaceAll('_',' ');
+const active = new Set(['queued','running','waiting_approval','waiting_connection']);
+
+function AgentAvatar({agent}: {agent:AgentLink}) {
+  return <span className={`timber-collaborator-avatar is-${agent.kind}`} data-agent-color={agentColor(agent.id)} aria-hidden="true">{agent.name.slice(0,1).toUpperCase()}</span>;
+}
+function openAgent(agent:AgentLink,callbacks:Pick<ChatCallbacks,'onOpenBot'|'onOpenAgents'>) {
+  if(agent.kind==='subagent') callbacks.onOpenAgents(agent.id);else callbacks.onOpenBot(agent.id);
+}
+export function AgentMessageNotice({notice,callbacks,eventKey}: {notice:Notice;callbacks:Pick<ChatCallbacks,'onOpenBot'|'onOpenAgents'>;eventKey:string}) {
+  const [expanded,setExpanded]=useState(false);
+  const identity=(agent:AgentLink)=><button type="button" className="timber-collaborator-link" aria-label={`Open ${agent.name} conversation`} onClick={()=>openAgent(agent,callbacks)}><AgentAvatar agent={agent}/><strong>{agent.name}</strong><ChevronRightIcon aria-hidden="true"/></button>;
+  return <article className="timber-collaboration-message" data-collaboration-notice={eventKey} data-message-id={notice.messageId}>
+    <div className="timber-collaboration-message-row timber-agent-source">
+      <span className="timber-collaboration-direction">{notice.direction==='between' ? 'Messages from' : `Messages ${notice.direction}`}</span>{identity(notice.agent)}
+      {notice.recipient && <><ArrowRightIcon className="timber-collaboration-arrow" aria-label="to"/>{identity(notice.recipient)}</>}
+      {notice.text && <button type="button" className="timber-collaboration-disclosure" aria-expanded={expanded} aria-label={`${expanded?'Hide':'Show'} message ${notice.direction==='to'?'to':'from'} ${notice.agent.name}`} onClick={()=>setExpanded(value=>!value)}><ChevronDownIcon className={expanded?'is-expanded':''}/></button>}
+      {notice.status && active.has(notice.status) && <span className="timber-collaboration-status" data-status={notice.status}>{statusLabel(notice.status)}</span>}
+    </div>
+    {expanded && notice.text && <div className="timber-collaboration-message-body"><MessageResponse className="timber-markdown" mode="static" skipHtml plugins={{}} components={{img:()=>null}} linkSafety={{enabled:false}} controls={false}>{notice.text}</MessageResponse></div>}
+  </article>;
+}
+export function AgentCreationCard({creation,callbacks}: {creation:Creation;callbacks:Pick<ChatCallbacks,'onOpenBot'|'onOpenAgents'>}) {
+  const [expanded,setExpanded]=useState(false);
+  const kind=creation.agent.kind==='subagent'?'subagent':'named agent';
+  return <article className="timber-agent-created" data-agent-created={creation.agent.id} data-agent-kind={creation.agent.kind}>
+    <div className="timber-agent-created-pill">
+      <button type="button" className="timber-agent-created-link" onClick={()=>openAgent(creation.agent,callbacks)} aria-label={`Open ${creation.agent.name} conversation`} title={`Created ${kind}${creation.task?` · ${creation.task}`:''}`}><GitBranchIcon className="timber-agent-created-icon" aria-hidden="true"/><AgentAvatar agent={creation.agent}/><strong>{creation.agent.name}</strong></button>
+      <span className="status" data-status={creation.status}>{statusLabel(creation.status)}</span>
+      <button type="button" className="timber-agent-created-toggle" onClick={()=>setExpanded(value=>!value)} aria-expanded={expanded} aria-label={`${expanded?'Hide':'Show'} ${creation.agent.name} agent details`}><ChevronDownIcon className={expanded?'is-expanded':''}/></button>
+    </div>
+    {expanded && <div className="timber-agent-created-details">
+      <span className="timber-agent-created-caption">Created {kind}{creation.creator?` · by ${creation.creator.name}`:''}</span>
+      {creation.task && <p className="timber-agent-created-task">{creation.task}</p>}
+      <button type="button" className="timber-agent-created-open" onClick={()=>openAgent(creation.agent,callbacks)}>Open conversation<ChevronRightIcon aria-hidden="true"/></button>
+    </div>}
+  </article>;
+}
+
+export function provenanceNotice(message:Message,model:ChatModel):Notice | undefined {
+  if(!message.provenance)return;
+  return {direction:'from',agent:{id:message.provenance.sourceBotId,name:message.provenance.sourceBotName,kind:'bot'},text:message.text,messageId:message.id,status:model.runs.find(run=>run.id===message.runId)?.status};
+}
+
+/** Project durable product events. Never infer a sender from model-authored text. */
+type CollaborationModel = Pick<ChatModel,'subagents'|'runs'|'mentionBots'|'delegations'|'messages'|'collaborationEvents'|'runFilter'> & {bot:Pick<ChatModel['bot'],'id'|'name'>};
+export function collectCollaboration(model:CollaborationModel,scopeSubagentId?:string) {
+  const items=new Map<string,CollaborationItem>(),toolIdentities=new Set<string>();
+  const events=model.collaborationEvents;
+  const rootRun=(runId?:string):string|undefined=>{
+    const visited=new Set<string>();let current=runId;
+    while(current&&!visited.has(current)){visited.add(current);const run=model.runs.find(item=>item.id===current);if(!run?.subagentId||!run.parentRunId)return current;current=run.parentRunId;}
+    return current;
+  };
+  const parentRun=(agent:Subagent,event?:BotEvent)=>rootRun(event?.runId || model.runs.find(run=>run.operationId===agent.parentOperationId || run.operationId===`subagent:${agent.parentOperationId}`)?.id);
+  const childLink=(id:string,name?:string):AgentLink=>({id,name:name||model.subagents.find(agent=>agent.id===id)?.name||'Subagent',kind:'subagent'});
+  const namedStatus=(id:string)=>model.delegations.filter(delegation=>delegation.targetBotId===id).sort((left,right)=>right.updatedAt.localeCompare(left.updatedAt))[0]?.status||'created';
+  const rootLink:AgentLink={id:model.bot.id,name:model.bot.name,kind:'bot'};
+  const belongsToScope=(runId?:string)=>!scopeSubagentId || model.runs.some(run=>run.id===runId&&run.subagentId===scopeSubagentId);
+  const correlation=(event:BotEvent)=>{for(const identity of [event.data.operationId,event.data.toolCallId])if(typeof identity==='string')toolIdentities.add(identity);};
+  const creations=new Map<string,BotEvent>();
+  for(const event of events)if(event.type==='subagent.created'){const agent=record(event.data.subagent);if(typeof agent.id==='string'&&!creations.has(agent.id))creations.set(agent.id,event);}
+  const temporary=new Map(model.subagents.map(agent=>[agent.id,agent]));
+  for(const [id,event] of creations)if(!temporary.has(id))temporary.set(id,event.data.subagent as Subagent);
+  for(const agent of temporary.values()){
+    if(scopeSubagentId && agent.parentSubagentId!==scopeSubagentId)continue;
+    const event=creations.get(agent.id);
+    items.set(`created:subagent:${agent.id}`,{key:`created:subagent:${agent.id}`,createdAt:agent.createdAt,runId:parentRun(agent,event),creation:{agent:childLink(agent.id,agent.name),status:agent.status,task:agent.task,...(agent.parentSubagentId?{creator:childLink(agent.parentSubagentId)}:{})}});
+    if(event){correlation(event);const original=record(event.data.subagent).operationId;if(typeof original==='string')toolIdentities.add(original);}
+  }
+  for(const bot of model.mentionBots.filter(bot=>!scopeSubagentId&&bot.createdByBotId===model.bot.id)){
+    items.set(`created:bot:${bot.id}`,{key:`created:bot:${bot.id}`,createdAt:bot.createdAt,creation:{agent:{id:bot.id,name:bot.name,kind:'bot'},status:namedStatus(bot.id),task:bot.instructions}});
+  }
+  for(const event of events)if(event.type==='agent.named.created'){
+    if(!belongsToScope(event.runId))continue;
+    const bot=record(event.data.bot),id=text(bot.id);if(!id)continue;
+    const saved=items.get(`created:bot:${id}`),sourceRun=model.runs.find(run=>run.id===event.runId);
+    items.set(`created:bot:${id}`,{key:`created:bot:${id}`,createdAt:saved?.createdAt||event.createdAt,runId:rootRun(event.runId),creation:{agent:{id,name:text(bot.name)||saved?.creation?.agent.name||'Named agent',kind:'bot'},status:namedStatus(id),task:saved?.creation?.task,...(sourceRun?.subagentId?{creator:childLink(sourceRun.subagentId)}:{})}});correlation(event);
+  }
+  const reports=new Map<string,BotEvent>();
+  for(const event of events)if(event.type==='subagent.reported'&&typeof event.data.subagentId==='string')reports.set(text(event.data.operationId)||`event:${event.id}`,event);
+  const sentOperations=new Set(events.filter(event=>event.type==='subagent.message.sent').map(event=>text(event.data.operationId)).filter(Boolean));
+  for(const [identity,event] of reports){
+    if(sentOperations.has(identity))continue;
+    const id=text(event.data.subagentId);if(scopeSubagentId&&id!==scopeSubagentId)continue;
+    items.set(`reported:${identity}`,{key:`reported:${identity}`,createdAt:event.createdAt,runId:rootRun(event.runId),notice:{direction:scopeSubagentId?'to':'from',agent:scopeSubagentId?rootLink:childLink(id),text:text(event.data.text)}});
+  }
+  for(const event of events)if(event.type==='subagent.message.sent'){
+    const source=text(event.data.sourceSubagentId),target=text(event.data.targetSubagentId),identity=text(event.data.operationId)||`event:${event.id}`;
+    if(!source&&!target)continue;
+    if(scopeSubagentId){
+      if(source!==scopeSubagentId&&target!==scopeSubagentId)continue;
+      const outgoing=source===scopeSubagentId,other=outgoing?target:source,name=text(outgoing?event.data.targetName:event.data.sourceName);
+      items.set(`sent:${identity}`,{key:`sent:${identity}`,createdAt:event.createdAt,runId:event.runId,notice:{direction:outgoing?'to':'from',agent:other?childLink(other,name):rootLink,text:text(event.data.text)}});correlation(event);continue;
+    }
+    const direction=source&&target?'between':source?'from':'to';
+    items.set(`sent:${identity}`,{key:`sent:${identity}`,createdAt:event.createdAt,runId:rootRun(event.runId),notice:{direction,agent:direction==='to'?childLink(target,text(event.data.targetName)):childLink(source,text(event.data.sourceName)),...(direction==='between'?{recipient:childLink(target,text(event.data.targetName))}:{}),text:text(event.data.text)}});correlation(event);
+  }
+  const named=new Map(model.delegations.map(delegation=>[delegation.id,delegation]));
+  for(const event of events)if(event.type==='delegation.updated'){
+    const value=record(event.data.delegation);if(typeof value.id!=='string')continue;
+    const current=named.get(value.id);if(!current||text(value.updatedAt)>=current.updatedAt)named.set(value.id,event.data.delegation as ChatModel['delegations'][number]);if(belongsToScope(text(value.sourceRunId)))correlation(event);
+  }
+  for(const delegation of named.values()){
+    if(delegation.sourceBotId!==model.bot.id||!belongsToScope(delegation.sourceRunId))continue;
+    const origin=events.find(event=>event.type==='delegation.updated'&&record(event.data.delegation).id===delegation.id);
+    const sourceMessage=model.messages.find(message=>message.runId===delegation.sourceRunId&&message.role==='user'&&message.mentions?.includes(delegation.targetBotId));
+    items.set(`delegation:${delegation.id}`,{key:`delegation:${delegation.id}`,createdAt:delegation.createdAt,runId:rootRun(delegation.sourceRunId),notice:{direction:'to',agent:{id:delegation.targetBotId,name:delegation.targetBotName,kind:'bot'},text:text(origin?.data.text)||sourceMessage?.text,status:delegation.status}});
+  }
+  return {items:[...items.values()].filter(item=>!model.runFilter||item.runId===model.runFilter),toolIdentities};
+}

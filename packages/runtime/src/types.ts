@@ -114,11 +114,11 @@ export interface PiRuntimeOptions<Env extends object> {
 
 /** Host-facing protocol. No Pi session IDs, native transcript or lifecycle types. */
 export interface RuntimeReceipt { operationId: string; accepted: boolean; }
-export interface RuntimeOperationResult { operationId: string; status: 'done' | 'unanswered'; text?: string; kind?: RuntimeMessage['kind']; reason?: string; }
-export interface RuntimeOperation { operationId: string; status: 'queued' | 'running' | 'done' | 'unanswered' | 'missing'; text?: string; kind?: RuntimeMessage['kind']; reason?: string; }
+export interface RuntimeOperationResult { operationId: string; status: 'done' | 'unanswered'; text?: string; kind?: RuntimeMessage['kind']; reason?: string; answerId?: string; answerOperationId?: string; }
+export interface RuntimeOperation { operationId: string; status: 'queued' | 'running' | 'done' | 'unanswered' | 'missing'; text?: string; kind?: RuntimeMessage['kind']; reason?: string; answerId?: string; answerOperationId?: string; }
 export interface RuntimePendingOperation { operationId: string; status: 'queued' | 'running'; }
 export interface AgentRuntime {
-  submit(text: string, input: { operationId: string; images?: {data:string;mimeType:string}[] }): Promise<RuntimeReceipt>;
+  submit(text: string, input: { operationId: string; images?: {data:string;mimeType:string}[]; whenBusy?: 'steer' | 'followUp' }): Promise<RuntimeReceipt>;
   /** Persist one replaceable wake for this input; never replay a tool or await inference. */
   scheduleAdmissionRetry(operationId: string, delayMs: number): Promise<void>;
   wait(operationId: string): Promise<RuntimeOperationResult>;

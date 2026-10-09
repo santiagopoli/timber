@@ -13,7 +13,9 @@ export interface Subagent { id: string; name: string; task: string; parentOperat
 export interface RunPage { runs: Run[]; activeRuns: Run[]; nextCursor: string | null; }
 export interface BotEvent { id: number; botId: string; runId?: string; type: string; data: Record<string, unknown>; createdAt: string; }
 export type ComputerAction =
- | {type:"exec";command:string;timeoutMs?:number}
+ | {type:"exec";command:string;timeoutMs?:number;yieldMs?:number}
+ | {type:"execPoll";processId:string;yieldMs?:number}
+ | {type:"execCancel";processId:string}
  | {type:"readFile";path:string}
  | {type:"writeFile";path:string;content:string}
  | {type:"listFiles";path?:string}
@@ -29,10 +31,11 @@ export type ComputerAction =
  | {type:"gitClone";repository:string;path:string;branch?:string}
  | {type:"gitPush";repository:string;path:string;branch:string}
  | {type:"checkpoint"};
-export interface ComputerResult { operationId:string;status:"completed"|"failed"|"interrupted";output?:string;exitCode?:number;artifactId?:string;mimeType?:string;checkpointId?:string;error?:string; }
+/** An exec receipt may still be running; processId remains stable across polls and cancellation. */
+export interface ComputerResult { operationId:string;status:"running"|"completed"|"failed"|"interrupted"|"cancelled";processId?:string;output?:string;exitCode?:number;artifactId?:string;mimeType?:string;checkpointId?:string;error?:string; }
 export interface ComputerStatus { id:string;provider:"cloudflare";state:"stopped"|"starting"|"running"|"unavailable";capabilities:string[];lastCheckpointId?:string;error?:{code:string;message:string}; }
 export interface Approval {id:string;botId:string;runId:string;operationId:string;toolCallId?:string;action:ComputerAction;status:"pending"|"approved"|"denied"|"executing"|"completed"|"failed"|"interrupted";createdAt:string;expiresAt:string;result?:ComputerResult;}
-export interface ComputerProvider {exec(botId:string,operationId:string,action:ComputerAction):Promise<ComputerResult>;status(botId:string):Promise<ComputerStatus>;checkpoint(botId:string):Promise<ComputerResult>;}
+export interface ComputerProvider {exec(botId:string,operationId:string,action:ComputerAction):Promise<ComputerResult>;cancel(botId:string,processId:string):Promise<ComputerResult>;status(botId:string):Promise<ComputerStatus>;checkpoint(botId:string):Promise<ComputerResult>;}
 export interface ApiError {error:{code:string;message:string};}
 
 export interface ConnectionRequest {id:string;botId:string;runId:string;nativeOperationId?:string;provider:"github";repository?:string;permission:"read"|"write";status:"pending"|"connected"|"cancelled";createdAt:string;}

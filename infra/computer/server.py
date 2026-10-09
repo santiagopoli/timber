@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import TCPServer
 from urllib.parse import urlparse, parse_qs
@@ -33,7 +34,14 @@ MAX_OUTPUT = 128 * 1024
 MAX_READ = 256 * 1024
 MAX_ARCHIVE = 256 * 1024 * 1024
 MAX_FILES = 10000
+MAX_SAFE_INTEGER = 9_007_199_254_740_991
+DEFAULT_EXEC_YIELD_MS = 1000
 EXCLUDED = {"node_modules", ".cache", "__pycache__", ".venv"}
+
+
+class IdempotencyConflict(ValueError):
+    def __init__(self):
+        super().__init__("operationId was already used for different arguments")
 
 
 class ComputerHTTPServer(ThreadingHTTPServer):
@@ -46,6 +54,17 @@ class ComputerHTTPServer(ThreadingHTTPServer):
         self.server_port = self.server_address[1]
 
 
+class ExecutionSession:
+    def __init__(self, process_id: str):
+        self.id = process_id
+        self.process: subprocess.Popen | None = None
+        self.output = bytearray()
+        self.truncated = False
+        self.cancelled = threading.Event()
+        self.done = threading.Event()
+        self.thread: threading.Thread | None = None
+
+
 class Computer:
     def __init__(self, workspace: Path, state: Path):
         self.workspace = workspace.resolve()
@@ -53,11 +72,23 @@ class Computer:
         self.state = state.resolve()
         self.state.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self.journal_lock = threading.RLock()
+        self.sessions: dict[str, ExecutionSession] = {}
+        self.snapshot_in_progress = False
         self.db = sqlite3.connect(self.state / "operations.sqlite", check_same_thread=False)
         self.db.execute("CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, digest TEXT NOT NULL, result TEXT)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS execution_sessions (id TEXT PRIMARY KEY, pid INTEGER, identity TEXT, result TEXT NOT NULL)")
         # A process restart does not prove that an external side effect failed.
         interrupted = json.dumps({"status": "interrupted", "error": "Computer restarted during this operation; inspect its effects before creating another operation."})
         self.db.execute("UPDATE operations SET result=? WHERE result IS NULL", (interrupted,))
+        for process_id, pid, identity, encoded in self.db.execute("SELECT id,pid,identity,result FROM execution_sessions WHERE json_extract(result,'$.status')='running'").fetchall():
+            # A server restart does not turn a saved command into a new command.
+            # Only kill an orphan if Linux confirms it is the exact old process.
+            if pid and identity and self.process_identity(pid) == identity:
+                self.kill_process_group(pid)
+            result = {**json.loads(encoded), "status": "interrupted", "error": "Computer restarted during this execution; inspect its effects before creating another operation."}
+            self.db.execute("UPDATE execution_sessions SET result=? WHERE id=?", (json.dumps(result), process_id))
+            self.db.execute("UPDATE operations SET result=? WHERE id=?", (json.dumps(result), process_id))
         self.db.commit()
         boot_file = self.state / "boot-id"
         if not boot_file.exists():
@@ -78,37 +109,288 @@ class Computer:
         return candidate
 
     def execute(self, operation_id: str, action: dict, git_transport: dict | None = None) -> dict:
-        if not re.fullmatch(r"[A-Za-z0-9:_.-]{1,160}", operation_id):
+        if not isinstance(operation_id, str) or not re.fullmatch(r"[A-Za-z0-9:_.-]{1,160}", operation_id):
             raise ValueError("Invalid operationId")
+        if not isinstance(action, dict):
+            raise ValueError("Invalid action")
+        if action.get("type") in {"exec", "execPoll", "execCancel"}:
+            return self.execute_session(operation_id, action)
         digest = hashlib.sha256(json.dumps(action, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         with self.lock:
-            row = self.db.execute("SELECT digest,result FROM operations WHERE id=?", (operation_id,)).fetchone()
-            if row:
-                if row[0] != digest:
-                    raise ValueError("operationId was already used for different arguments")
-                return {"operationId": operation_id, **json.loads(row[1])}
-            self.db.execute("INSERT INTO operations(id,digest) VALUES(?,?)", (operation_id, digest))
-            self.db.commit()
+            with self.journal_lock:
+                row = self.db.execute("SELECT digest,result FROM operations WHERE id=?", (operation_id,)).fetchone()
+                if row:
+                    if row[0] != digest:
+                        raise IdempotencyConflict()
+                    return {"operationId": operation_id, **json.loads(row[1])}
+                self.db.execute("INSERT INTO operations(id,digest) VALUES(?,?)", (operation_id, digest))
+                self.db.commit()
             try:
                 result = self.action(action, git_transport)
             except (ValueError, OSError, subprocess.SubprocessError) as exc:
                 result = {"status": "failed", "error": str(exc)[:1000]}
-            self.db.execute("UPDATE operations SET result=? WHERE id=?", (json.dumps(result), operation_id))
-            self.db.commit()
+            with self.journal_lock:
+                self.db.execute("UPDATE operations SET result=? WHERE id=?", (json.dumps(result), operation_id))
+                self.db.commit()
             return {"operationId": operation_id, **result}
+
+    @staticmethod
+    def process_identity(pid: int) -> str | None:
+        try:
+            # Linux's boot identity plus process start ticks protect against PID
+            # reuse before a restarted server attempts orphan cleanup.
+            boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+            return f"{boot}:{fields[19]}"
+        except (OSError, IndexError):
+            return None
+
+    @staticmethod
+    def kill_process_group(pid: int):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    @staticmethod
+    def execution_yield(action: dict) -> int:
+        value = action.get("yieldMs", DEFAULT_EXEC_YIELD_MS)
+        if type(value) is not int or not 0 <= value <= 30000:
+            raise ValueError("yieldMs must be an integer between 0 and 30000")
+        return value
+
+    def execute_session(self, operation_id: str, action: dict) -> dict:
+        kind = action["type"]
+        process_id = operation_id if kind == "exec" else action.get("processId")
+        if not isinstance(process_id, str) or not re.fullmatch(r"[A-Za-z0-9:_.-]{1,160}", process_id):
+            raise ValueError("Invalid processId")
+        yield_ms = self.execution_yield(action) if kind != "execCancel" else 1000
+        if kind == "exec":
+            command = action.get("command")
+            timeout_ms = action.get("timeoutMs")
+            if not isinstance(command, str) or not command or len(command) > 32768:
+                raise ValueError("command must contain 1 to 32768 characters")
+            if "timeoutMs" in action and (type(timeout_ms) is not int or not 1 <= timeout_ms <= MAX_SAFE_INTEGER):
+                raise ValueError("timeoutMs must be a positive safe integer when provided")
+            # Waiting only selects when this HTTP request returns a snapshot.
+            # Command and timeout still identify the admitted execution effect.
+            effect = {key: value for key, value in action.items() if key != "yieldMs"}
+            digest = hashlib.sha256(json.dumps(effect, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            with self.journal_lock:
+                row = self.db.execute("SELECT digest,result FROM operations WHERE id=?", (process_id,)).fetchone()
+                if row:
+                    if row[0] != digest:
+                        raise IdempotencyConflict()
+                    if not self.db.execute("SELECT id FROM execution_sessions WHERE id=?", (process_id,)).fetchone():
+                        # Results written by older images retain their exact
+                        # journal semantics and never execute again.
+                        return {"operationId": operation_id, **json.loads(row[1])}
+                else:
+                    cancelled = self.db.execute("SELECT result FROM execution_sessions WHERE id=?", (process_id,)).fetchone()
+                    if cancelled:
+                        result = json.loads(cancelled[0])
+                    else:
+                        if self.snapshot_in_progress:
+                            raise ValueError("A workspace checkpoint or restore is in progress")
+                        result = {"processId": process_id, "status": "running", "output": ""}
+                        self.db.execute("INSERT INTO execution_sessions(id,result) VALUES(?,?)", (process_id, json.dumps(result)))
+                    self.db.execute("INSERT INTO operations(id,digest,result) VALUES(?,?,?)", (process_id, digest, json.dumps(result)))
+                    self.db.commit()
+                    if result["status"] == "running":
+                        session = ExecutionSession(process_id)
+                        self.sessions[process_id] = session
+                        session.thread = threading.Thread(target=self.run_session, args=(session, command, timeout_ms), daemon=True)
+                        session.thread.start()
+        elif kind == "execCancel":
+            digest = hashlib.sha256(json.dumps(action, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            with self.journal_lock:
+                receipt = self.db.execute("SELECT digest,result FROM operations WHERE id=?", (operation_id,)).fetchone()
+                if receipt:
+                    if receipt[0] != digest:
+                        raise IdempotencyConflict()
+                    if receipt[1] is not None:
+                        return {"operationId": operation_id, **json.loads(receipt[1])}
+                else:
+                    self.db.execute("INSERT INTO operations(id,digest) VALUES(?,?)", (operation_id, digest))
+                row = self.db.execute("SELECT result FROM execution_sessions WHERE id=?", (process_id,)).fetchone()
+                if not row:
+                    # Stop may arrive before the start request. This tombstone
+                    # prevents that delayed request from creating any process.
+                    result = {"processId": process_id, "status": "cancelled", "output": ""}
+                    self.db.execute("INSERT INTO execution_sessions(id,result) VALUES(?,?)", (process_id, json.dumps(result)))
+                self.db.commit()
+                session = self.sessions.get(process_id) if row and json.loads(row[0])["status"] == "running" else None
+                if session and not receipt:
+                    session.cancelled.set()
+                    process = session.process
+                else:
+                    process = None
+            if process:
+                self.kill_process_group(process.pid)
+        # Polling is a read: it never adds operation journal rows, starts a
+        # computer process or replays an effect after a missing receipt.
+        with self.journal_lock:
+            session = self.sessions.get(process_id)
+        if session and yield_ms:
+            session.done.wait(yield_ms / 1000)
+        with self.journal_lock:
+            row = self.db.execute("SELECT result FROM execution_sessions WHERE id=?", (process_id,)).fetchone()
+            result = json.loads(row[0]) if row else {"processId": process_id, "status": "interrupted", "output": "", "error": "Execution session is unavailable; inspect its effects before creating another operation."}
+            if kind == "execCancel":
+                self.db.execute("UPDATE operations SET result=? WHERE id=? AND result IS NULL", (json.dumps(result), operation_id))
+                self.db.commit()
+                result = json.loads(self.db.execute("SELECT result FROM operations WHERE id=?", (operation_id,)).fetchone()[0])
+        return {"operationId": operation_id, **result}
+
+    @staticmethod
+    def execution_output(session: ExecutionSession) -> str:
+        encoded = session.output.decode(errors="replace").encode("utf-8")
+        if session.truncated or len(encoded) > MAX_OUTPUT:
+            suffix = b"\n[output truncated at 128 KiB]"
+            return encoded[:MAX_OUTPUT - len(suffix)].decode("utf-8", errors="ignore") + suffix.decode()
+        return encoded.decode()
+
+    def persist_session(self, session: ExecutionSession, status: str, *, exit_code: int | None = None, error: str | None = None):
+        result = {"processId": session.id, "status": status, "output": self.execution_output(session)}
+        if exit_code is not None:
+            result["exitCode"] = exit_code
+        if error:
+            result["error"] = error
+        with self.journal_lock:
+            # A restarted server may have fenced this exact session. Its old
+            # reader cannot overwrite that interruption with a later success.
+            changed = self.db.execute("UPDATE execution_sessions SET result=? WHERE id=? AND json_extract(result,'$.status')='running'", (json.dumps(result), session.id)).rowcount
+            if changed:
+                self.db.execute("UPDATE operations SET result=? WHERE id=?", (json.dumps(result), session.id))
+                self.db.commit()
+
+    def run_session(self, session: ExecutionSession, command: str, timeout_ms: int | None):
+        selector = selectors.DefaultSelector()
+        proc = None
+        try:
+            if session.cancelled.is_set():
+                self.persist_session(session, "cancelled")
+                return
+            # The wrapper cannot execute the command until its process identity
+            # is durable. If this server dies in the fork/journal window, stdin
+            # closes and the wrapper exits without executing any command effect.
+            gate = 'IFS= read -r _timber_exec_gate && [ "$_timber_exec_gate" = execute ] || exit 0; exec /bin/bash -lc "$1" </dev/null'
+            proc = subprocess.Popen(["/bin/bash", "-c", gate, "timber-exec-launch", command], cwd=self.workspace, env=self.child_env(),
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+            session.process = proc
+            identity = self.process_identity(proc.pid)
+            if identity is None:
+                raise OSError("Execution process identity is unavailable")
+            with self.journal_lock:
+                self.db.execute("UPDATE execution_sessions SET pid=?,identity=? WHERE id=?", (proc.pid, identity, session.id))
+                self.db.commit()
+            if session.cancelled.is_set():
+                self.kill_process_group(proc.pid)
+            else:
+                proc.stdin.write(b"execute\n")
+                proc.stdin.flush()
+            proc.stdin.close()
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            os.set_blocking(proc.stdout.fileno(), False)
+            started = time.monotonic()
+            deadline = None if timeout_ms is None else started + timeout_ms / 1000
+            timed_out = False
+            exited_at = None
+            last_publish = started
+            dirty = False
+            while True:
+                now = time.monotonic()
+                if not timed_out and deadline is not None and now >= deadline:
+                    timed_out = True
+                    self.kill_process_group(proc.pid)
+                if session.cancelled.is_set():
+                    self.kill_process_group(proc.pid)
+                for key, _ in selector.select(0.05):
+                    try:
+                        data = os.read(key.fd, 16384)
+                    except BlockingIOError:
+                        continue
+                    if not data:
+                        selector.unregister(key.fileobj)
+                    else:
+                        remaining = MAX_OUTPUT - len(session.output)
+                        session.output.extend(data[:remaining])
+                        was_truncated = session.truncated
+                        session.truncated = session.truncated or len(data) > remaining
+                        dirty = dirty or remaining > 0 or session.truncated != was_truncated
+                        if exited_at is not None:
+                            exited_at = now
+                code = proc.poll()
+                if code is not None:
+                    if exited_at is None:
+                        exited_at = now
+                    if not selector.get_map() or now - exited_at >= 0.1:
+                        break
+                if dirty and now - last_publish >= 0.1:
+                    self.persist_session(session, "running")
+                    last_publish = now
+                    dirty = False
+            code = proc.wait()
+            status = "cancelled" if session.cancelled.is_set() else "failed" if code or timed_out else "completed"
+            error = "Command timed out; its process group was terminated. External effects may have occurred." if timed_out else None
+            self.persist_session(session, status, exit_code=code, error=error)
+        except (OSError, ValueError, subprocess.SubprocessError, sqlite3.Error):
+            if proc:
+                self.kill_process_group(proc.pid)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            try:
+                if session.cancelled.is_set():
+                    self.persist_session(session, "cancelled", exit_code=proc.returncode if proc else None)
+                else:
+                    self.persist_session(session, "interrupted" if proc else "failed", error="Execution was interrupted; inspect its effects before creating another operation." if proc else "The computer could not start this command.")
+            except sqlite3.Error:
+                pass  # Durable running intent is interrupted on the next startup.
+        finally:
+            selector.close()
+            if proc and proc.stdin:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+            if proc and proc.stdout:
+                proc.stdout.close()
+            with self.journal_lock:
+                self.sessions.pop(session.id, None)
+            session.done.set()
+
+    def close(self):
+        with self.journal_lock:
+            sessions = list(self.sessions.values())
+            for session in sessions:
+                session.cancelled.set()
+                if session.process:
+                    self.kill_process_group(session.process.pid)
+        for session in sessions:
+            session.done.wait(5)
+        self.close_browser()
+        with self.journal_lock:
+            self.db.close()
+
+    @contextmanager
+    def workspace_snapshot(self):
+        with self.lock:
+            with self.journal_lock:
+                if self.db.execute("SELECT id FROM execution_sessions WHERE json_extract(result,'$.status')='running' LIMIT 1").fetchone():
+                    raise ValueError("Execution sessions are still running; wait for completion before checkpoint or restore")
+                self.snapshot_in_progress = True
+            try:
+                yield
+            finally:
+                with self.journal_lock:
+                    self.snapshot_in_progress = False
 
     def action(self, action: dict, git_transport: dict | None = None) -> dict:
         kind = action.get("type")
         if kind in {"gitClone", "gitPush"}:
             return self.git_action(action, git_transport)
-        if kind == "exec":
-            command = action.get("command")
-            if not isinstance(command, str) or not command or len(command) > 32768:
-                raise ValueError("command must contain 1 to 32768 characters")
-            timeout = action.get("timeoutMs", 30000)
-            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 1 <= timeout <= 120000:
-                raise ValueError("timeoutMs must be between 1 and 120000")
-            return self.run_shell(command, timeout / 1000)
         if kind == "writeFile":
             destination = self.path(action.get("path"))
             content = action.get("content")
@@ -264,9 +546,6 @@ class Computer:
     def child_env():
         return {key: value for key, value in os.environ.items() if key != "BOTSPACE_COMPUTER_TOKEN"}
 
-    def run_shell(self, command: str, timeout: float) -> dict:
-        return self.run_process(["/bin/bash", "-lc", command], timeout, self.workspace, self.child_env())
-
     def run_process(self, argv: list[str], timeout: float, cwd: Path, env: dict) -> dict:
         proc = subprocess.Popen(argv, cwd=cwd, env=env,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
@@ -408,7 +687,7 @@ class Computer:
         Managed calls are serialized. External/background writers can still exist;
         metadata checks reject detectable races rather than claim a live disk image.
         """
-        with self.lock:
+        with self.workspace_snapshot():
             browser_was_running = self.browser is not None and self.browser.poll() is None
             self.close_browser()
             fd, name = tempfile.mkstemp(suffix=".tar.gz", dir=self.state)
@@ -469,7 +748,7 @@ class Computer:
         self.browser = None
 
     def restore(self, archive_path: Path):
-        with self.lock:
+        with self.workspace_snapshot():
             self.close_browser()
             stage = Path(tempfile.mkdtemp(prefix="restore-", dir=self.workspace.parent))
             old = self.workspace.parent / ("previous-" + str(uuid.uuid4()))
@@ -584,7 +863,7 @@ def create_handler(computer: Computer, token: str):
                 desktop = all(shutil.which(tool) for tool in ["scrot", "xdotool", "chromium", "xclip"])
                 if desktop:
                     desktop = subprocess.run(["xdotool", "getdisplaygeometry"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2).returncode == 0
-                return self.respond(200, {"ok": True, "bootId": computer.boot_id, "desktop": desktop, "capabilities": ["gitClone", "gitPush", "workspace"] + (["move", "doubleClick", "drag"] if desktop else []) + (["liveDesktop"] if desktop and desktop_ready() else [])})
+                return self.respond(200, {"ok": True, "bootId": computer.boot_id, "desktop": desktop, "capabilities": ["gitClone", "gitPush", "workspace", "execSessions"] + (["move", "doubleClick", "drag"] if desktop else []) + (["liveDesktop"] if desktop and desktop_ready() else [])})
             parsed = urlparse(self.path)
             if parsed.path.startswith("/workspace/"):
                 try:
@@ -646,6 +925,8 @@ def create_handler(computer: Computer, token: str):
                     finally:
                         path.unlink(missing_ok=True)
                 return self.respond(404, {"error": "Not found"})
+            except IdempotencyConflict:
+                return self.respond(409, {"error": {"code": "computer_idempotency_conflict", "message": "operationId was already used with different arguments."}})
             except (ValueError, KeyError, OSError, tarfile.TarError) as exc:
                 return self.respond(400, {"error": str(exc)[:1000]})
     return Handler

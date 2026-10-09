@@ -171,10 +171,12 @@ restarts, including when a cap is enabled later; replaying an already recorded
 logical operation does not count it again. There is no hidden 100/200 clamp.
 Budget exhaustion does not automatically restart or replay the task.
 
-Individual operations remain bounded: two retries for transient inference
-failures, a 120-second model stream timeout, the existing response-size cap, and
-a 120-second maximum for a finite `exec`. Provider allowance limits still apply.
-The console's Stop action remains available while the task is running.
+Inference retains two retries for transient failures, a 120-second model stream
+timeout and the existing response-size cap. Shell commands have no execution
+deadline unless one is explicitly requested. `exec` can return a running process;
+`exec_poll` observes it without restarting it, and `exec_cancel` terminates its
+process group. The console's Stop action also cancels the task's managed processes.
+Provider allowance limits still apply.
 
 This policy follows the opt-in task-count limits documented by
 [OpenCode](https://opencode.ai/docs/agents/#max-steps),
@@ -247,8 +249,10 @@ To rotate credentials, replace the secret value in GitHub. To switch from a glob
 key to a deployment token, add `CLOUDFLARE_API_TOKEN`, then remove the old key/email
 secrets. No workflow edit is needed. Re-run the workflow on `main` after initial
 secret setup. Pull requests never receive the deployment credentials.
-The desktop image remains pinned to the digest in the production configuration;
-publishing an image archive alone does not roll it out.
+The workflow promotes the exact desktop image that passed its smoke tests to
+Cloudflare Registry, pins its immutable digest in the deployment configuration,
+and retains a `production-image-reference` artifact linking that digest to the
+source commit. Publishing an image archive alone does not roll it out.
 
 Full computer use requires a Cloudflare account with **Workers Paid and Containers
 enabled**, plus R2. The default model is `gpt-6.1-sol`, using the owner's authorized
@@ -282,12 +286,13 @@ restart running computers; the new image is used on their next natural start.
 
 For another Cloudflare account, use `npm run deploy:build` with a working Docker
 daemon to build and upload the desktop image for that account. For this deployment,
-the **Desktop image release** GitHub workflow builds and tests the image, then
-publishes a pristine Docker archive and SHA-256 checksum. To release a newer
-image without local Docker, verify the archive checksum, decompress it, push it
-to the account's Cloudflare Registry with `crane push` and temporary registry
-credentials, and update the digest in `wrangler.production.jsonc`. No Cloudflare
-credentials are stored in the repository or image release.
+the main CI workflow publishes and deploys its verified desktop image automatically.
+The **Desktop image release** workflow also publishes a pristine Docker archive
+and SHA-256 checksum for manual recovery. To deploy such an archive manually,
+verify its checksum, import it into Cloudflare Registry, and update the digest in
+`wrangler.production.jsonc`. No Cloudflare credentials are stored in the repository
+or image release. A local `npm run deploy` uses the checked-in digest; use the
+production image reference artifact when reproducing a CI deployment.
 
 `npm run deploy:bootstrap` remains an explicit fallback. It installs desktop
 dependencies when a fresh computer starts and is substantially slower.

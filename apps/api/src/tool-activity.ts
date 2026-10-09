@@ -32,7 +32,9 @@ function displayCommand(value: string): string {
 /** A small, explicit display contract; do not spread raw tool arguments here. */
 export function computerActivityInput(action: ComputerAction): DisplayInput {
   switch (action.type) {
-    case 'exec': return {command: displayCommand(action.command), timeoutMs: action.timeoutMs ?? 30_000};
+    case 'exec': return {command: displayCommand(action.command), ...(action.timeoutMs === undefined ? {} : {timeoutMs: action.timeoutMs}), yieldMs: action.yieldMs ?? 1_000};
+    case 'execPoll': return {processId: action.processId, yieldMs: action.yieldMs ?? 1_000};
+    case 'execCancel': return {processId: action.processId};
     case 'readFile':
     case 'writeFile': return {path: bounded(action.path)};
     case 'listFiles': return {path: bounded(action.path ?? '/workspace')};

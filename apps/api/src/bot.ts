@@ -17,9 +17,12 @@ type Submission = {operation_id:string;run_id:string;text:string;admitted:number
 type MentionDelivery = {operation_id:string;run_id:string;target_id:string;text:string;attempts:number};
 
 type AdmissionRetry = {attempts:number;next_at:number};
+type ProcessRow = {process_id:string;run_id:string|null;subagent_id:string|null;tool_call_id:string|null;action:string;input:string;status:ComputerResult["status"];result:string|null;cancel_requested:number;cancel_attempts:number;next_at:number};
+type ProcessObservation = {process_id:string;sequence:number;operation_id:string|null;next_at:number};
 type RuntimeProjection = {type:string;data:Record<string,unknown>;operationId?:string;eventKey?:string};
+type RuntimeAnswer = {answerId?:string;answerOperationId?:string};
 const terminal = new Set<RunStatus>(["completed","failed","cancelled","interrupted"]);
-const automatic = new Set<ComputerAction["type"]>(["readFile","listFiles","screenshot","checkpoint"]);
+const automatic = new Set<ComputerAction["type"]>(["readFile","listFiles","screenshot","checkpoint","execPoll","execCancel"]);
 const gui = new Set<ComputerAction["type"]>(["navigate","click","move","doubleClick","drag","type","key","scroll"]);
 const timestamp = ()=>new Date().toISOString();
 const legacyAdmissionFailure="The agent runtime could not accept this run.";
@@ -37,6 +40,8 @@ export class BotDO extends DurableObject<Env> {
   private reconcilingConnections?:Promise<void>;
   private lastConnectionCheck=0;
   private finishingApprovals=new Map<string,Promise<void>>();
+  private cancellingProcesses=new Map<string,Promise<void>>();
+  private pollingProcesses=new Map<string,Promise<void>>();
   private streams=0;
   private lastComputerTouch=0;
   private takingControl=false;
@@ -66,6 +71,9 @@ export class BotDO extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, source_key TEXT UNIQUE, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS mention_deliveries (operation_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,target_id TEXT NOT NULL,text TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS cancelled_agent_inputs (operation_id TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS run_processes (process_id TEXT PRIMARY KEY,run_id TEXT,subagent_id TEXT,tool_call_id TEXT,action TEXT NOT NULL,input TEXT NOT NULL,status TEXT NOT NULL,result TEXT,cancel_requested INTEGER NOT NULL DEFAULT 0,cancel_attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS computer_operations (operation_id TEXT PRIMARY KEY,action TEXT NOT NULL,run_id TEXT);
+      CREATE TABLE IF NOT EXISTS process_observations (process_id TEXT PRIMARY KEY,sequence INTEGER NOT NULL DEFAULT 0,operation_id TEXT,next_at INTEGER NOT NULL);
     `);
     if(!ctx.storage.sql.exec<{name:string}>("PRAGMA table_info(submissions)").toArray().some(column=>column.name==="subagent_id")) ctx.storage.sql.exec("ALTER TABLE submissions ADD COLUMN subagent_id TEXT");
     this.runtime=createPiRuntime({
@@ -167,6 +175,15 @@ export class BotDO extends DurableObject<Env> {
     return row;
   }
   private getRun(id:string):Run {return JSON.parse(this.getRunRow(id).data);}
+  private summary():{lastMessage?:{text:string;createdAt:string};status:RunStatus|"ready";activeRuns:number;activeAgents:number;activeProcesses:number} {
+    const active=this.ctx.storage.sql.exec<{status:RunStatus;subagent_id:string|null}>("SELECT json_extract(data,'$.status') AS status,json_extract(data,'$.subagentId') AS subagent_id FROM runs WHERE json_extract(data,'$.status') IN ('queued','running','waiting_approval','waiting_connection')").toArray();
+    const roots=active.filter(run=>!run.subagent_id);
+    const priority:RunStatus[]=["waiting_approval","waiting_connection","running","queued"];
+    const message=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM messages WHERE json_extract(data,'$.role') IN ('user','assistant') ORDER BY rowid DESC LIMIT 1").toArray()[0];
+    const latest=message?JSON.parse(message.data) as Message:undefined;
+    const activeProcesses=this.ctx.storage.sql.exec<{total:number}>("SELECT COUNT(*) AS total FROM run_processes WHERE status='running'").toArray()[0].total;
+    return {status:priority.find(status=>roots.some(run=>run.status===status))??(activeProcesses?"running":"ready"),activeRuns:roots.length,activeAgents:new Set(active.flatMap(run=>run.subagent_id?[run.subagent_id]:[])).size,activeProcesses,...(latest?{lastMessage:{text:latest.text.slice(0,240),createdAt:latest.createdAt}}:{})};
+  }
   private listRuns(url:URL):RunPage {
     const limitRaw=url.searchParams.get("limit");
     const limit=limitRaw===null?30:Number(limitRaw);
@@ -285,7 +302,7 @@ export class BotDO extends DurableObject<Env> {
       this.ctx.waitUntil(touchCloudComputer(this.env.COMPUTER,run.botId).catch(()=>{}));
     }
     if(event.type==="run.started" && !this.hasPendingApproval(run.id) && !this.hasPendingConnection(run.id)) this.updateStatus(run.id,"running");
-    if(event.type==="run.completed") await this.completeOperation(event.operationId!,"done",typeof event.data.text==="string"?event.data.text:undefined,undefined,event.data.kind==="progress"?"progress":"final");
+    if(event.type==="run.completed") await this.completeOperation(event.operationId!,"done",typeof event.data.text==="string"?event.data.text:undefined,undefined,event.data.kind==="progress"?"progress":"final",{answerId:typeof event.data.answerId==="string"?event.data.answerId:undefined,answerOperationId:typeof event.data.answerOperationId==="string"?event.data.answerOperationId:undefined});
     if(event.type==="run.failed") {
       if(this.hasPendingConnection(run.id)) this.updateStatus(run.id,"waiting_connection");
       else if(this.hasPendingApproval(run.id)) this.updateStatus(run.id,"waiting_approval");
@@ -302,12 +319,16 @@ export class BotDO extends DurableObject<Env> {
       error:publicMessage?.slice(0,800) ?? (reason==="model_error"?"The model could not complete this request.":failed?"The agent encountered an execution error.":"The agent run was interrupted before a final answer."),
     };
   }
-  private async completeOperation(nativeOperationId:string,status:string,text?:string,reason?:string,kind?:Message["kind"]):Promise<void> {
+  private async completeOperation(nativeOperationId:string,status:string,text?:string,reason?:string,kind?:Message["kind"],answer?:RuntimeAnswer):Promise<void> {
     if(this.deleted) return;
     const row=this.findRun(nativeOperationId);
     if(!row) return;
     const run=JSON.parse(row.data) as Run;
-    if(text && kind!=="progress") this.addMessage({id:crypto.randomUUID(),botId:run.botId,runId:run.id,role:"assistant",kind:"final",text,createdAt:timestamp()},`answer:${nativeOperationId}`);
+    // Pi may place several user inputs in one native turn. Every receipt settles
+    // its own host run, while one immutable native answer appears exactly once
+    // under the input that authored that generation, independent of wait order.
+    const answerRow=answer?.answerOperationId?this.findRun(answer.answerOperationId):undefined;
+    if(text && kind!=="progress") this.addMessage({id:crypto.randomUUID(),botId:run.botId,runId:answerRow?.id??run.id,role:"assistant",kind:"final",text,createdAt:timestamp()},answer?.answerId?`answer-entry:${answer.answerId}`:`answer:${nativeOperationId}`);
     if(row.native_operation_id!==nativeOperationId || terminal.has(run.status)) return;
     if(this.hasPendingConnection(run.id)) {this.updateStatus(run.id,"waiting_connection");return;}
     if(this.hasPendingApproval(run.id)) {this.updateStatus(run.id,"waiting_approval");return;}
@@ -400,7 +421,7 @@ export class BotDO extends DurableObject<Env> {
 
     if(this.takingControl) throw new ApiError(409,"computer_busy","Desktop control is being acquired. Retry after the connection is established.");
     this.active();
-    if(!metadata && /^(approval|delegate|connection|subagent|agent-result|subagent-report|mention):/.test(input.operationId)) throw new ApiError(400,"reserved_operation_id","This operationId prefix is reserved.");
+    if(!metadata && /^(approval|delegate|connection|subagent|agent-result|subagent-report|mention|process-cancel|process-poll):/.test(input.operationId)) throw new ApiError(400,"reserved_operation_id","This operationId prefix is reserved.");
     if(this.ctx.storage.sql.exec("SELECT operation_id FROM cancelled_agent_inputs WHERE operation_id=?",input.operationId).toArray().length) throw new ApiError(409,"run_cancelled","This delegated input has been cancelled.");
     if(metadata?.parentRunId && this.getRun(metadata.parentRunId).status==="cancelled") throw new ApiError(409,"run_cancelled","The parent task has been cancelled.");
     const existing=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs WHERE operation_id=?",input.operationId).toArray()[0];
@@ -468,7 +489,7 @@ export class BotDO extends DurableObject<Env> {
     const agent=(await this.runtime.subagents()).find(item=>item.id===input.subagentId);
     if(!agent || agent.status==="cancelled") return;
     const text=`Subagent ${agent.name}: ${input.text}`.slice(0,32_000);
-    this.emit("subagent.reported",{subagentId:agent.id,text},source.id,`report:${input.operationId}`);
+    this.emit("subagent.reported",{subagentId:agent.id,operationId:input.operationId,text},source.id,`report:${input.operationId}`);
     await this.enqueueAgentContinuation(source,input.operationId,text);
   }
   private async enqueueAgentContinuation(source:Run,op:string,text:string):Promise<void> {
@@ -489,7 +510,11 @@ export class BotDO extends DurableObject<Env> {
     return agent;
   }
   private async cancelSubagent(id:string):Promise<void> {
-    await this.runtime.cancelSubagent(id);
+    const agents=await this.runtime.subagents();
+    const ids=new Set([id]);
+    for(let changed=true;changed;) {changed=false;for(const agent of agents) if(agent.parentSubagentId && ids.has(agent.parentSubagentId) && !ids.has(agent.id)) {ids.add(agent.id);changed=true;}}
+    for(const childId of ids) this.fenceSubagent(childId);
+    await Promise.all([this.flushProcessCancellations(),this.runtime.cancelSubagent(id)]);
     // Native cancellation includes descendants and queued messages. Fence every
     // corresponding host input, including approvals belonging to earlier turns.
     const cancelled=(await this.runtime.subagents()).filter(agent=>agent.status==="cancelled");
@@ -497,9 +522,18 @@ export class BotDO extends DurableObject<Env> {
   }
   private fenceSubagent(id:string):void {
     for(const row of this.ctx.storage.sql.exec<{id:string}>("SELECT id FROM runs WHERE json_extract(data,'$.subagentId')=?",id).toArray()) this.fenceRun(row.id);
+    this.ctx.waitUntil(this.flushProcessCancellations());
   }
   private fenceRun(id:string):void {
     this.updateStatus(id,"cancelled");
+    this.ctx.storage.sql.exec("UPDATE run_processes SET cancel_requested=1,next_at=0 WHERE run_id=? AND status='running'",id);
+    // Persist the fence before any await. A provider receipt or a recovered
+    // approval must never restart a command after Stop has been accepted.
+    for(const row of this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM approvals WHERE json_extract(data,'$.runId')=? AND json_extract(data,'$.status')='executing' AND json_extract(data,'$.action.type')='exec'",id).toArray()) {
+      const approval=JSON.parse(row.data) as Approval;
+      approval.status="interrupted";approval.result={operationId:approval.operationId,processId:approval.operationId,status:"interrupted",error:"Run stopped. Process cancellation requested."};
+      this.saveApproval(approval);this.emit("approval.updated",{approval},id);
+    }
     for(const row of this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM approvals WHERE json_extract(data,'$.runId')=? AND json_extract(data,'$.status')='pending'",id).toArray()) {
       const approval=JSON.parse(row.data) as Approval;
       approval.status="denied";this.saveApproval(approval);this.emit("approval.updated",{approval},id);
@@ -512,6 +546,8 @@ export class BotDO extends DurableObject<Env> {
 
   /** This outbox only admits durable inputs. Pi owns all execution and tool recovery. */
   private admit(nativeOperationId:string):Promise<void> {
+    if(nativeOperationId.startsWith("process-poll:")) return this.pollProcess(nativeOperationId.slice("process-poll:".length));
+    if(nativeOperationId.startsWith("process-cancel:")) return this.cancelProcess(nativeOperationId.slice("process-cancel:".length));
     if(nativeOperationId.startsWith("mention:")) return this.dispatchMention(nativeOperationId);
     const existing=this.admitting.get(nativeOperationId);
     if(existing) return existing;
@@ -531,12 +567,12 @@ export class BotDO extends DurableObject<Env> {
       if(!submission.admitted) {
         if(submission.subagent_id) await this.runtime.sendSubagent(submission.subagent_id,submission.text,{operationId:nativeOperationId});
         else {
-        const message=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM messages WHERE source_key=?",`input:${nativeOperationId}`).toArray()[0];
-        const attachments=message?(JSON.parse(message.data) as Message).attachments:undefined;
-        const images=await Promise.all((attachments??[]).map(image=>this.readImage(image.artifactId)));
-        await this.runtime.submit(submission.text,{operationId:nativeOperationId,...(images.length?{images}:{})});
+          const message=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM messages WHERE source_key=?",`input:${nativeOperationId}`).toArray()[0];
+          const attachments=message?(JSON.parse(message.data) as Message).attachments:undefined;
+          const images=await Promise.all((attachments??[]).map(image=>this.readImage(image.artifactId)));
+          if(!this.canAdmit(nativeOperationId,run.id)) return;
+          await this.runtime.submit(submission.text,{operationId:nativeOperationId,whenBusy:"steer",...(images.length?{images}:{})});
         }
-
         if(this.deleted) return;
         this.ctx.storage.sql.exec("UPDATE submissions SET admitted=1 WHERE operation_id=?",nativeOperationId);
         this.ctx.storage.sql.exec("DELETE FROM admission_retries WHERE operation_id=?",nativeOperationId);
@@ -556,7 +592,7 @@ export class BotDO extends DurableObject<Env> {
       if(known && known.status!=="missing") {
         this.ctx.storage.sql.exec("UPDATE submissions SET admitted=1 WHERE operation_id=?",nativeOperationId);
         this.ctx.storage.sql.exec("DELETE FROM admission_retries WHERE operation_id=?",nativeOperationId);
-        if(known.status==="done" || known.status==="unanswered") await this.completeOperation(nativeOperationId,known.status,known.text,known.reason,known.kind);
+        if(known.status==="done" || known.status==="unanswered") await this.completeOperation(nativeOperationId,known.status,known.text,known.reason,known.kind,known);
         else {this.updateStatus(run.id,known.status==="running"?"running":"queued");this.observe(nativeOperationId);}
         return;
       }
@@ -578,7 +614,7 @@ export class BotDO extends DurableObject<Env> {
     this.ctx.waitUntil((async()=>{
       try {
         const result=await this.runtime.wait(nativeOperationId);
-        await this.completeOperation(nativeOperationId,result.status,result.text,result.reason,result.kind);
+        await this.completeOperation(nativeOperationId,result.status,result.text,result.reason,result.kind,result);
       } catch {if(!this.deleted) {const row=this.findRun(nativeOperationId);if(row?.native_operation_id===nativeOperationId) {const run=JSON.parse(row.data) as Run;if(!terminal.has(run.status) && !["waiting_approval","waiting_connection"].includes(run.status)) this.updateStatus(run.id,"interrupted","The agent run was interrupted.");}}}
       finally {this.observing.delete(nativeOperationId);}
     })());
@@ -587,6 +623,13 @@ export class BotDO extends DurableObject<Env> {
     if(this.deleted) return Promise.resolve();
     if(this.recovering) return this.recovering;
     this.recovering=(async()=>{
+      await this.flushProcessCancellations();
+      for(const process of this.ctx.storage.sql.exec<ProcessRow>("SELECT * FROM run_processes WHERE status='running' AND result IS NOT NULL AND cancel_requested=0").toArray()) {
+        const observation=this.ctx.storage.sql.exec<ProcessObservation>("SELECT * FROM process_observations WHERE process_id=?",process.process_id).toArray()[0];
+        if(!observation) this.scheduleProcessPoll(process.process_id);
+        else if(observation.next_at<=Date.now()) await this.pollProcess(process.process_id);
+        else await this.runtime.scheduleAdmissionRetry(`process-poll:${process.process_id}`,observation.next_at-Date.now());
+      }
       await this.reconcileConnections();
       for(const delivery of this.ctx.storage.sql.exec<MentionDelivery>("SELECT * FROM mention_deliveries WHERE attempts<?",maxAdmissionAttempts).toArray()) await this.dispatchMention(delivery.operation_id);
       const rows=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs").toArray();
@@ -612,6 +655,138 @@ export class BotDO extends DurableObject<Env> {
     }
     return undefined;
   }
+  private process(id:string):ProcessRow|undefined {
+    return this.ctx.storage.sql.exec<ProcessRow>("SELECT * FROM run_processes WHERE process_id=?",id).toArray()[0];
+  }
+  private registerProcess(op:string,action:Extract<ComputerAction,{type:"exec"}>,run?:Run,toolCallId?:string):ProcessRow {
+    const existing=this.process(op);
+    if(existing) {
+      if(existing.action!==JSON.stringify(action) || existing.run_id!==(run?.id??null)) throw new ApiError(409,"idempotency_conflict","Process operation arguments or owner changed.");
+      return existing;
+    }
+    this.ctx.storage.sql.exec("INSERT INTO run_processes(process_id,run_id,subagent_id,tool_call_id,action,input,status) VALUES(?,?,?,?,?,?,'running')",op,run?.id??null,run?.subagentId??null,toolCallId??null,JSON.stringify(action),JSON.stringify(computerActivityInput(action)));
+    return this.process(op)!;
+  }
+  private authorizeProcess(action:Extract<ComputerAction,{type:"execPoll"|"execCancel"}>,run?:Run):ProcessRow {
+    const process=this.process(action.processId);
+    if(!process) throw new ApiError(404,"process_not_found","Process not found for this bot.");
+    if(action.type==="execCancel" && run?.subagentId) {
+      // Root bot and authenticated owner control this bot's computer. A temporary
+      // child may stop its own inputs and descendants, never a sibling's work.
+      let owner=process.run_id?this.getRun(process.run_id):undefined;
+      const visited=new Set<string>();
+      while(owner && owner.subagentId!==run.subagentId && owner.parentRunId && !visited.has(owner.id)) {visited.add(owner.id);owner=this.getRun(owner.parentRunId);}
+      if(owner?.subagentId!==run.subagentId) throw new ApiError(403,"process_forbidden","A subagent may cancel only its own processes or those of its descendants.");
+    }
+    return process;
+  }
+  private publishProcess(process:ProcessRow,result:ComputerResult,observationOperationId=result.operationId):void {
+    this.emit("process.updated",{processId:process.process_id,operationId:process.process_id,...(observationOperationId!==process.process_id?{observationOperationId}:{}),...(process.subagent_id?{subagentId:process.subagent_id}:{}),...(process.tool_call_id?{toolCallId:process.tool_call_id}:{}),input:JSON.parse(process.input),result,...(process.cancel_requested?{cancellationRequested:true}:{})},process.run_id??undefined);
+  }
+  private recordProcessResult(id:string,result:ComputerResult):ComputerResult {
+    const process=this.process(id);
+    if(!process || this.deleted) return result;
+    // A late initial receipt or poll cannot undo a completed cancellation.
+    if(process.status!=="running" && result.status==="running" || process.status==="cancelled" && result.status!=="cancelled") return {...JSON.parse(process.result!),operationId:result.operationId};
+    const receipt={...result,processId:id};
+    const cancellationPending=process.cancel_requested && result.status==="running";
+    if(process.result===JSON.stringify(receipt) && !!process.cancel_requested===!!cancellationPending) return receipt;
+    this.ctx.storage.sql.exec("UPDATE run_processes SET status=?,result=?,cancel_requested=? WHERE process_id=?",result.status,JSON.stringify(receipt),cancellationPending?1:0,id);
+    this.publishProcess(this.process(id)!,receipt);
+    if(result.status==="running" && !cancellationPending) this.scheduleProcessPoll(id);
+    else if(result.status!=="running") this.ctx.storage.sql.exec("DELETE FROM process_observations WHERE process_id=?",id);
+    return receipt;
+  }
+  private scheduleProcessPoll(id:string,delayMs=10_000):void {
+    if(this.deleted) return;
+    const process=this.process(id);
+    if(!process || process.status!=="running" || process.cancel_requested) return;
+    this.ctx.storage.sql.exec("INSERT INTO process_observations(process_id,next_at) VALUES(?,?) ON CONFLICT(process_id) DO UPDATE SET next_at=excluded.next_at",id,Date.now()+delayMs);
+    this.ctx.waitUntil(this.runtime.scheduleAdmissionRetry(`process-poll:${id}`,delayMs));
+  }
+  private pollProcess(id:string):Promise<void> {
+    const previous=this.pollingProcesses.get(id);if(previous) return previous;
+    const pending=(async()=>{
+      if(this.deleted) return;
+      let process=this.process(id);
+      if(!process || process.status!=="running") return;
+      if(process.cancel_requested) {await this.cancelProcess(id);return;}
+      let observation=this.ctx.storage.sql.exec<ProcessObservation>("SELECT * FROM process_observations WHERE process_id=?",id).toArray()[0];
+      if(!observation) {this.scheduleProcessPoll(id);return;}
+      try {
+        if(!observation.operation_id) {
+          const sequence=observation.sequence+1;
+          const op=`process-poll:${await fingerprint({processId:id,sequence})}`;
+          process=this.process(id);
+          if(this.deleted || !process || process.status!=="running" || process.cancel_requested) return;
+          this.ctx.storage.sql.exec("UPDATE process_observations SET operation_id=?,sequence=? WHERE process_id=?",op,sequence,id);
+          observation={...observation,sequence,operation_id:op};
+        }
+        // A passive observation never admits a model input or invokes a runtime
+        // tool. Its stable receipt survives transport loss without restarting exec.
+        const result=await this.computer.exec(this.bot().id,observation.operation_id!,{type:"execPoll",processId:id,yieldMs:0});
+        if(this.deleted) return;
+        this.ctx.storage.sql.exec("UPDATE process_observations SET operation_id=NULL WHERE process_id=?",id);
+        this.recordProcessResult(id,result);
+      } catch {if(!this.deleted) this.scheduleProcessPoll(id);}
+    })().finally(()=>this.pollingProcesses.delete(id));
+    this.pollingProcesses.set(id,pending);return pending;
+  }
+  private async dispatchComputer(op:string,action:ComputerAction,run?:Run,toolCallId?:string):Promise<ComputerResult> {
+    const known=this.ctx.storage.sql.exec<{action:string;run_id:string|null}>("SELECT action,run_id FROM computer_operations WHERE operation_id=?",op).toArray()[0];
+    if(known && (known.action!==JSON.stringify(action) || known.run_id!==(run?.id??null))) throw new ApiError(409,"idempotency_conflict","Computer operation arguments or owner changed.");
+    // Reserve the invocation before persisting a cancellation intent. A reused
+    // control ID must not fence another process when the provider rejects it.
+    if(!known) this.ctx.storage.sql.exec("INSERT INTO computer_operations(operation_id,action,run_id) VALUES(?,?,?)",op,JSON.stringify(action),run?.id??null);
+    let process:ProcessRow|undefined;
+    if(action.type==="exec") {
+      process=this.registerProcess(op,action,run,toolCallId);
+      if(process.cancel_requested || process.status==="cancelled") {
+        await this.cancelProcess(op);
+        const current=this.process(op)!;
+        return current.status==="cancelled"?{...JSON.parse(current.result!),operationId:op}:{operationId:op,processId:op,status:"interrupted",error:"Process cancellation requested. Do not restart it."};
+      }
+    } else if(action.type==="execPoll" || action.type==="execCancel") {
+      process=this.authorizeProcess(action,run);
+    }
+    try {
+      const result=await this.computer.exec(this.bot().id,op,action);
+      if(!process || this.deleted) return result;
+      const receipt=this.recordProcessResult(process.process_id,result);
+      if(this.process(process.process_id)?.cancel_requested) this.ctx.waitUntil(this.cancelProcess(process.process_id));
+      return receipt;
+    } catch(error) {
+      if(action.type==="execCancel" && process && !this.deleted && !(error instanceof ComputerProviderError && error.code==="computer_idempotency_conflict")) this.ctx.storage.sql.exec("UPDATE run_processes SET cancel_requested=1,next_at=0 WHERE process_id=?",process.process_id);
+      if(process && !this.deleted && this.process(process.process_id)?.cancel_requested) this.ctx.waitUntil(this.cancelProcess(process.process_id));
+      throw error;
+    }
+  }
+  private flushProcessCancellations():Promise<void> {
+    const processes=this.ctx.storage.sql.exec<{process_id:string}>("SELECT process_id FROM run_processes WHERE cancel_requested=1 AND next_at<=?",Date.now()).toArray();
+    return Promise.all(processes.map(process=>this.cancelProcess(process.process_id))).then(()=>{});
+  }
+  private cancelProcess(id:string):Promise<void> {
+    const existing=this.cancellingProcesses.get(id);
+    if(existing) return existing;
+    const pending=(async()=>{
+      const process=this.process(id);
+      if(this.deleted || !process?.cancel_requested) return;
+      this.publishProcess(process,process.result?JSON.parse(process.result):{operationId:id,processId:id,status:"running"});
+      try {
+        const result=await this.computer.cancel(this.bot().id,id);
+        if(this.deleted) return;
+        this.recordProcessResult(id,result);
+        if(this.process(id)?.cancel_requested) throw new Error("Cancellation not acknowledged");
+      } catch {
+        if(this.deleted) return;
+        const attempts=process.cancel_attempts+1,delay=Math.min(60_000,1000*2**Math.min(attempts-1,6));
+        this.ctx.storage.sql.exec("UPDATE run_processes SET cancel_attempts=?,next_at=? WHERE process_id=? AND cancel_requested=1",attempts,Date.now()+delay,id);
+        await this.runtime.scheduleAdmissionRetry(`process-cancel:${id}`,delay);
+      }
+    })().finally(()=>this.cancellingProcesses.delete(id));
+    this.cancellingProcesses.set(id,pending);
+    return pending;
+  }
   private async executeTool(input:{operationId:string;runOperationId:string;subagentId?:string;subagentOperationId?:string;toolCallId?:string;action:ComputerAction;signal?:AbortSignal}):Promise<RuntimeToolResult> {
     this.active();
     input=await this.childToolInput(input);
@@ -634,7 +809,7 @@ export class BotDO extends DurableObject<Env> {
     if(automatic.has(action.type) || bot.computerApprovalMode==="automatic") {
       const activity={...(input.subagentId?{subagentId:input.subagentId}:{}),...(input.toolCallId?{toolCallId:input.toolCallId}:{}),actionType:action.type,input:computerActivityInput(action)};
       this.startTool(input.operationId,activity,run.id);
-      const result=await this.computer.exec(run.botId,input.operationId,action);
+      const result=await this.dispatchComputer(input.operationId,action,run,input.toolCallId);
       this.emit("tool.completed",{operationId:input.operationId,...activity,result},run.id,`tool:${input.operationId}`);
       return result;
     }
@@ -767,10 +942,10 @@ export class BotDO extends DurableObject<Env> {
       result=completed({bots:bots.map(({id,name,createdByBotId})=>({id,name,...(createdByBotId?{createdByBotId}:{})}))});
     } else if(input.name==='create_bot') {
       const value=await agentCoordinatorRequest<{bot:Bot}>(this.env,"/agents/create",{sourceBotId:run.botId,sourceRunId:run.id,operationId:input.operationId,name:args.name,instructions:args.instructions});
-      this.emit("agent.named.created",{bot:{id:value.bot.id,name:value.bot.name}},run.id,`named:${input.operationId}`);result=completed(value);
+      this.emit("agent.named.created",{bot:{id:value.bot.id,name:value.bot.name},operationId:input.operationId,...(input.toolCallId?{toolCallId:input.toolCallId}:{})},run.id,`named:${input.operationId}`);result=completed(value);
     } else if(input.name==='send_to_bot') {
       const value=await agentCoordinatorRequest<{delegation:AgentDelegation}>(this.env,"/agents/send",{sourceBotId:run.botId,sourceRunId:run.id,operationId:input.operationId,targetBotId:args.botId,text:args.text});
-      this.emit("delegation.updated",value,run.id,`delegation:${input.operationId}`);result=completed(value);
+      this.emit("delegation.updated",{...value,operationId:input.operationId,...(input.toolCallId?{toolCallId:input.toolCallId}:{})},run.id,`delegation:${input.operationId}`);result=completed(value);
     } else if(input.name==='load_skill') result=completed(args.name==='github-development'?githubDevelopmentSkill:workspaceAppsSkill);
     else if(input.name==='publish_app') {
       const app=await this.apps().publish({name:args.name as string,port:args.port as number,operationId:input.operationId});
@@ -839,6 +1014,7 @@ export class BotDO extends DurableObject<Env> {
       return approval;
     }
     approval.status="executing";
+    if(approval.action.type==="exec") this.registerProcess(approval.operationId,approval.action,run,approval.toolCallId);
     this.saveApproval(approval);
     this.emit("approval.updated",{approval},approval.runId);
     // Persist the decision before executing; closing the client cannot cancel an accepted action.
@@ -877,7 +1053,11 @@ export class BotDO extends DurableObject<Env> {
     this.startTool(approval.operationId,activity,approval.runId);
     let result:ComputerResult;
     let providerDiagnostic:string|undefined;
-    try {result=await this.computer.exec(approval.botId,approval.operationId,approval.action);}
+    try {
+      const run=this.getRun(approval.runId);
+      if(terminal.has(run.status)) {this.invalidateApproval(approval,"The run stopped before this action could be dispatched.");return;}
+      result=await this.dispatchComputer(approval.operationId,approval.action,run,approval.toolCallId);
+    }
     catch(error) {
       if(this.deleted) return;
       console.error("approval.failure",{code:error instanceof ComputerProviderError?error.code:"computer_unavailable",actionType:approval.action.type});
@@ -889,7 +1069,7 @@ export class BotDO extends DurableObject<Env> {
     this.ctx.storage.transactionSync(()=>{
       const currentRow=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM approvals WHERE id=?",id).toArray()[0];
       if(!currentRow || (JSON.parse(currentRow.data) as Approval).status!=="executing") return;
-      const completed:Approval={...approval,result,status:result.status==="completed"?"completed":result.status==="interrupted"?"interrupted":"failed"};
+      const completed:Approval={...approval,result,status:["completed","running","cancelled"].includes(result.status)?"completed":result.status==="interrupted"?"interrupted":"failed"};
       this.saveApproval(completed);
       this.emit("approval.updated",{approval:completed},approval.runId,`approval-result:${approval.id}`);
       this.emit("tool.completed",{operationId:approval.operationId,...activity,result},approval.runId,`tool:${approval.operationId}`);
@@ -912,7 +1092,7 @@ export class BotDO extends DurableObject<Env> {
     if(existing) return row.native_operation_id===nativeOperationId?nativeOperationId:undefined;
     const text=approval.status==="denied"
       ? `The user denied action ${approval.id}. Do not execute it. Explain or continue using allowed alternatives.`
-      : `The user approved action ${approval.id}. The platform already executed exactly the stored action. Do not repeat it. Result: ${JSON.stringify(approval.result)}. Continue the original task.`;
+      : `The user approved action ${approval.id}. The platform already executed exactly the stored action. Do not repeat it. Result: ${JSON.stringify(approval.result)}.${approval.result?.status==="running"?" The process is still running. Use exec_poll with this processId to observe it, or exec_cancel to stop it; do not issue exec again.":""} Continue the original task.`;
     this.ctx.storage.sql.exec("INSERT INTO submissions (operation_id,run_id,text,subagent_id) VALUES (?,?,?,?)",nativeOperationId,run.id,text,run.subagentId??null);
     this.ctx.storage.sql.exec("UPDATE runs SET native_operation_id=? WHERE id=?",nativeOperationId,run.id);
     this.updateStatus(run.id,"queued");
@@ -920,12 +1100,13 @@ export class BotDO extends DurableObject<Env> {
   }
   private async cancelRun(id:string):Promise<Run> {
     const row=this.getRunRow(id),run=JSON.parse(row.data) as Run;
-    this.fenceRun(id);
-    if(run.subagentId) await this.cancelSubagent(run.subagentId);
-    else await this.runtime.cancel(row.native_operation_id);
-    // Completion/failure does not end background work. A later Stop still fences
-    // all descendant host inputs and their approvals, including result turns.
-    for(const child of this.ctx.storage.sql.exec<{id:string}>("SELECT id FROM runs WHERE json_extract(data,'$.parentRunId')=?",id).toArray()) await this.cancelRun(child.id);
+    const ids=new Set([id]);
+    const rows=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs").toArray();
+    for(let changed=true;changed;) {changed=false;for(const child of rows) {const value=JSON.parse(child.data) as Run;if(value.parentRunId && ids.has(value.parentRunId) && !ids.has(child.id)) {ids.add(child.id);changed=true;}}}
+    for(const runId of ids) this.fenceRun(runId);
+    // Cancellation bypasses the provider's action queue, including a command
+    // whose initial dispatch has not returned. Fence descendants before awaits.
+    await Promise.all([this.flushProcessCancellations(),...rows.filter(child=>ids.has(child.id)).map(child=>{const value=JSON.parse(child.data) as Run;return value.subagentId?this.cancelSubagent(value.subagentId):this.runtime.cancel(child.native_operation_id);})]);
     return this.getRun(id);
   }
 
@@ -1011,6 +1192,7 @@ export class BotDO extends DurableObject<Env> {
         return json({connection:await this.completeConnection(completedConnection[1])});
       }
       this.configure(request);
+      if(path==="/summary" && request.method==="GET") return json({summary:this.summary()});
       this.ctx.waitUntil(this.recover());
       if(["/agent-messages","/agent-results","/agent-cancel"].includes(path)) {
         if(request.headers.get("x-timber-internal")!=="agents" || request.method!=="POST") throw new ApiError(403,"internal_only","This agent route is internal.");
@@ -1030,7 +1212,7 @@ export class BotDO extends DurableObject<Env> {
         if(agentRoute[2]==="messages" && request.method==="GET") return json({messages:await this.runtime.subagentMessages(id)});
         if(agentRoute[2]==="messages" && request.method==="POST") {
           const input=parseMessage(await body(request));
-          if(input.mentions?.length || /^(approval|delegate|connection|subagent|agent-result|subagent-report|mention):/.test(input.operationId)) throw new ApiError(400,"invalid_request","Use an independent operation ID for the subagent message.");
+          if(input.mentions?.length || /^(approval|delegate|connection|subagent|agent-result|subagent-report|mention|process-cancel|process-poll):/.test(input.operationId)) throw new ApiError(400,"invalid_request","Use an independent operation ID for the subagent message.");
           const agent=await this.subagent(id),parent=this.findRun(agent.parentOperationId);
           if(agent.status==="cancelled" || !parent) throw new ApiError(409,"agent_inactive","This subagent is no longer active.");
           const run=await this.createRun(input,{subagentId:id,parentRunId:parent.id});
@@ -1095,8 +1277,8 @@ export class BotDO extends DurableObject<Env> {
         if(this.suspending) throw new ApiError(409,"computer_busy","The computer is being suspended. Retry after it stops.");
         const input=await body(request),action=parseAction(input.action),op=operationId(input.operationId);
         this.active();
-        if(!["readFile","listFiles","screenshot"].includes(action.type)) this.invalidatePendingGui();
-        const result=await this.computer.exec(this.bot().id,op,action);
+        if(!["readFile","listFiles","screenshot","execPoll","execCancel"].includes(action.type)) this.invalidatePendingGui();
+        const result=await this.dispatchComputer(op,action);
         this.emit("computer.action",{operationId:op,actionType:action.type,input:computerActivityInput(action),result},undefined,`direct:${op}`);
         return json({result});
       }

@@ -6,7 +6,7 @@ const bindings=env as unknown as {REAL_COMPUTER:DurableObjectNamespace};
 const deferred=()=>{let resolve!:()=>void;const promise=new Promise<void>(done=>{resolve=done;});return {promise,resolve};};
 const post=(botId:string,path:string,extra={})=>new Request(`https://computer${path}`,{method:"POST",body:JSON.stringify({botId,...extra})});
 const read=(botId:string,kind="tree")=>new Request(`https://computer/workspace/${kind}`,{headers:{"x-timber-bot-id":botId}});
-const health=(bootId="boot-1")=>Response.json({ok:true,bootId,desktop:true,capabilities:["workspace","liveDesktop"]});
+const health=(bootId="boot-1")=>Response.json({ok:true,bootId,desktop:true,capabilities:["workspace","liveDesktop","execSessions"]});
 afterEach(()=>vi.restoreAllMocks());
 
 describe("workspace inspection alongside computer effects",()=>{
