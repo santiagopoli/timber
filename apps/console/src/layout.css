@@ -31,7 +31,6 @@
   .workspace-inspector[data-expanded=true] #panel-computer{display:flex;flex-direction:column;overflow:hidden}
   .workspace-inspector[data-expanded=true] #desktop-root{flex:1;min-height:0;display:flex;flex-direction:column}
   .workspace-inspector[data-expanded=true] .desktop-screen{flex:1;min-height:0;aspect-ratio:auto}
-  .workspace-inspector[data-expanded=true] #computer-tools,.workspace-inspector[data-expanded=true] .computer-utilities{display:none}
 }
 @media(min-width:761px) and (max-width:1099px){
   /* At iPad widths the bot list is a drawer so opening it never crushes the chat. */
@@ -56,3 +55,28 @@
   .panel-menu>summary>svg,.panel-menu>summary>span{display:none}
   .panel-menu>summary>.panel-more-icon{display:block}
 }
+
+/* Computer chrome stays flat in dock, expanded workspace, and phone views. */
+.workspace-inspector #panel-computer{display:flex;flex-direction:column;padding:0;gap:0;overflow:auto}
+.workspace-inspector #panel-computer[hidden]{display:none}
+.workspace-inspector .computer-panel-header{margin:0;padding:0 8px;flex:none;min-height:0}
+.workspace-inspector #computer-status{margin:0;font-size:11px;line-height:1.5}
+.workspace-inspector #computer-status:empty{display:none}
+.workspace-inspector #desktop-root{flex:1 0 240px;display:flex;flex-direction:column;min-height:240px}
+.workspace-inspector #desktop-root .desktop-screen{flex:1;aspect-ratio:auto;min-height:160px}
+.workspace-inspector .computer-utilities{flex:none;margin:0;padding:2px 8px}
+.workspace-inspector .computer-utilities .row{gap:4px}
+.workspace-inspector .computer-utilities button{font-size:11px;min-height:36px;padding:6px 8px}
+.workspace-inspector #computer-tools{flex:none;border:0;border-radius:0;margin:0;padding:0 8px 8px}
+.workspace-inspector #computer-tools>summary{min-height:36px;display:flex;align-items:center;gap:6px;padding:6px 8px;font-size:12px;list-style:none;cursor:pointer}
+.workspace-inspector #computer-tools>summary::before{content:'›';font-size:16px}
+.workspace-inspector #computer-tools[open]>summary::before{transform:rotate(90deg)}
+.workspace-inspector #computer-tools>.hint{font-size:11px;margin:4px 8px 8px}
+.workspace-inspector #computer-progress{flex:none;margin:4px 8px;padding:8px;font-size:12px}
+@media(max-width:760px){
+ .workspace-inspector .computer-utilities button,.workspace-inspector #computer-tools>summary{min-height:44px}
+}
+
+/* Fullscreen must be able to yield height to its mounted conversation composer. */
+.workspace-inspector #desktop-root.desktop-fullscreen{min-height:0}
+.workspace-inspector #desktop-root.desktop-fullscreen .desktop-screen{min-height:0}

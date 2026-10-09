@@ -171,6 +171,10 @@ test('mobile Computer uses the full screen and returns to the preserved conversa
   assert.equal(await page.locator('#panel-conversation').isVisible(),false);
   assert.equal(await page.locator('#panel-computer').isVisible(),true);
   assert.equal(await page.locator('#expand-workspace').isVisible(),false);
+  const viewport=await page.locator('.desktop-screen').boundingBox(),panel=await page.locator('#panel-computer').boundingBox();
+  assert.ok(viewport.width>=panel.width-2,'desktop reaches the panel edges');
+  assert.ok(viewport.height>=panel.height*0.60,'desktop uses most of the available panel height');
+  assert.equal(await page.locator('.computer-panel-header h2').evaluate(el=>el.classList.contains('sr-only')),true,'redundant heading is accessible without consuming space');
   await open('view');
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
   await page.locator('#close-workspace').click();

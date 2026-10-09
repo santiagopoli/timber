@@ -68,10 +68,10 @@
         <div id="workspace-app-list" class="workspace-app-list"></div>
       </section>
       <section id="panel-computer" class="panel" role="region" aria-labelledby="tab-computer" hidden>
-        <div class="section-title computer-panel-header"><div><h2>Computer</h2><p id="computer-status" class="hint"></p></div><div class="computer-panel-actions"><button id="refresh-computer" class="quiet">Refresh</button></div></div>
+        <div class="section-title computer-panel-header"><div><h2 class="sr-only">Computer</h2><p id="computer-status" class="hint"></p></div></div>
         <div id="computer-progress" class="progress-banner" role="status" hidden><span class="spinner" aria-hidden="true"></span><div><strong id="computer-progress-label"></strong><p id="computer-cold-hint" class="hint" hidden>Starting the computer…</p></div><span class="spacer"></span><span id="computer-elapsed"></span></div>
         <div id="desktop-root"></div>
-        <div class="section-title computer-utilities"><div class="row"><button id="checkpoint" class="text-button" data-computer>Checkpoint</button><button id="suspend-computer" class="text-button" data-computer title="Save files and stop processes. The next action restores the workspace.">Suspend</button></div></div>
+        <div class="section-title computer-utilities"><div class="row"><button id="refresh-computer" class="text-button" aria-label="Refresh computer status">Refresh</button><button id="checkpoint" class="text-button" data-computer>Checkpoint</button><button id="suspend-computer" class="text-button" data-computer title="Save files and stop processes. The next action restores the workspace.">Suspend</button></div></div>
         <details id="computer-tools" class="tool-block"><summary>Manual tools</summary>
         <p class="hint">Actions here run directly as you. Commands and desktop input are never retried automatically.</p>
         <div class="computer-grid"><div class="computer-main">
