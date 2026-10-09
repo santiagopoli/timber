@@ -21,6 +21,7 @@ export class ChatGPTFixture extends DurableObject {
   constructor(ctx:DurableObjectState,env:object) {
     super(ctx,env);
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS inference_calls(id INTEGER PRIMARY KEY AUTOINCREMENT,input TEXT)");
+    ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS review_calls(id INTEGER PRIMARY KEY AUTOINCREMENT,input TEXT)");
   }
   async fetch(request:Request):Promise<Response> {
     const path=new URL(request.url).pathname;
@@ -31,7 +32,10 @@ export class ChatGPTFixture extends DurableObject {
       return Response.json({settings:{...settings,reasoningEffort:settings.reasoningEffort??"medium",fast:settings.fast??false},model});
     }
     const input=await request.json<{input:Record<string,unknown>[]}>();
-    this.ctx.storage.sql.exec("INSERT INTO inference_calls(input) VALUES(?)",JSON.stringify(input));
+    // Auxiliary memory extraction must not change conversation request counts
+    // or hide a repeated command behind an inflated inference allowance.
+    const review=input.input.some(item=>['system','developer'].includes(String(item.role))&&JSON.stringify(item).includes('TIMBER_MEMORY_REVIEW_V1'));
+    this.ctx.storage.sql.exec(review?"INSERT INTO review_calls(input) VALUES(?)":"INSERT INTO inference_calls(input) VALUES(?)",JSON.stringify(input));
     const lastUser=input.input.filter(item=>item.role==="user").at(-1);
     if(inferenceFixtureControl.gate && JSON.stringify(lastUser).includes(inferenceFixtureControl.matches??"")) await inferenceFixtureControl.gate;
     const maintenance=maintenanceFixture(input.input);

@@ -1,7 +1,7 @@
 import { Type, createAssistantMessageEventStream, type AssistantMessage } from '@earendil-works/pi-ai';
 import { createModels } from '@earendil-works/pi-ai/models';
 import {
-  AgentDoc, configure, createRegistry, defineDoc, defineTool, GenerationTask, CompactionTask, Harness, hook, InboxDoc, LiveDoc, ProviderDoc, ROOT_CONVERSATION_ID,
+  AgentDoc, CompactionTask, configure, createRegistry, defineDoc, defineTool, GenerationTask, Harness, hook, InboxDoc, LiveDoc, ProviderDoc, ROOT_CONVERSATION_ID,
   type AgentEvent, type AgentEventStream, type ConversationId, type HookApi, type Storage, type SubmissionId, type TaskId, type Tx,
 } from '@earendil-works/pi-durable';
 import { PiHarness, type PiHarnessContext } from 'agents/harness/pi';
@@ -125,7 +125,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
   const maintenance = createMaintenance({native:()=>native,storage:()=>storage,context:()=>background,
     ready:async()=>{await harness.pi()},assertActive,scheduleWake:()=>subagentWakes.schedule(),
     contextWindow:async id=>resolveModel((await native.snapshot(AgentDoc,id,background))?.model?.modelId??DEFAULT_MODEL).contextWindow,
-    authorizeTool:authorizeMaintenance});
+    authorizeTool:authorizeMaintenance,durable:options.storage,scope:async id=>{if(id===ROOT_CONVERSATION_ID)return 'bot';const child=await subagents.forConversation(id);if(!child)throw new Error('Subagent memory scope unavailable');return `subagent:${child.id}`;}});
   const providerConversations = new Map<string, ConversationId>();
   // beforeRequest exceptions bypass Pi's terminal-response classifier. Carry a
   // failed guard only to this invocation's provider wrapper, which returns the
@@ -171,7 +171,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
               assertActive();
               policyBlocked = false;
               const upstream = provider.streamSimple(model, context, {
-                ...streamOptions, maxTokens: Math.min(streamOptions?.maxTokens ?? 4096, 4096),
+                ...streamOptions, maxTokens: streamOptions?.maxTokens ?? 4096,
               });
               let emptyAnswer: AssistantMessage | undefined;
               for await (const event of upstream) {
@@ -242,7 +242,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
             requestFailures.set(marker,{error});
             return {messages:[marker,...request.messages.slice(1)]};
           }
-        }}),hook(CompactionTask,{beforeCompact:maintenance.beforeCompact})],
+        },onYield:async(_answer,api)=>{await maintenance.onYield(api.conversationId,Number(api.taskId));}}),hook(CompactionTask,{beforeCompact:async(input,api,context)=>{await maintenance.recordCompaction(input,api,context);await maintenance.beforeCompact(api.conversationId,String(api.taskId));}})],
         sections: [{key:'durable_memory',render:input=>maintenance.prompt(input.conversationId)}, { key: 'preamble', tag: false, render: async input => {
           const bot = await options.getBot();
           const child = await subagents.forConversation(input.conversationId);
@@ -290,7 +290,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
           ].filter(Boolean).join('\n');
         } }],
         tools: [...computerTools(bridge), ...hostTools(bridge), ...subagents.tools(), ...maintenance.tools, defineTool({name:'list_models',description:'List models available through the connected account, their reasoning efforts and Fast support. Use these IDs when creating subagents; omit model to inherit.',parameters:Type.Object({}),replay:'safe',execute:async (_input,api,context)=>{await authorizeMaintenance(api,context);return {content:[{type:'text',text:JSON.stringify(await modelSettings.catalog())}]};}})],
-        tasks: subagents.tasks,
+        tasks: [...subagents.tasks,...maintenance.tasks],
       });
       native = await Harness.open(context.storage, {
         models, registry,
@@ -500,7 +500,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
   };
 
   return {
-    memory: maintenance.memory, updateMemory: maintenance.updateMemory, compact: maintenance.compact, contextStatus: maintenance.status,
+    memory: maintenance.memory, memoryEntry:maintenance.memoryEntry,memoryHistory:maintenance.memoryHistory,searchMemory:maintenance.searchMemory,saveMemory:maintenance.saveMemory,forgetMemory:maintenance.forgetMemory,acceptMemory:maintenance.acceptMemory,reviewMemory:maintenance.reviewMemory,updateMemory: maintenance.updateMemory, compact: maintenance.compact, contextStatus: maintenance.status,
     failureDiagnostic(operationId) {
       assertActive();
       if(!options.storage.sql.exec("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='pi_submissions'").toArray().length)return undefined;

@@ -17,6 +17,19 @@ async function configureLimits(limits: { maxGenerations?: number; maxToolCalls?:
   });
   await abortAllDurableObjects();
 }
+it.each([{name:'Workers AI',chatgpt:false},{name:'ChatGPT',chatgpt:true}])('completes background memory inference separately from conversation calls with $name',async({chatgpt})=>{
+  const stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+  await request('/submit',{text:'Hello, please answer this user turn.',operationId:'review-transport',chatgpt});
+  await request('/wait?id=review-transport');
+  await expect.poll(()=>runInDurableObject(stub,async instance=>(await instance.runtime.memory()).review.status)).toBe('completed');
+  const state=await(await request('/inspect')).json<{calls:{input:string}[];reviewCalls:{input:string}[];toolCalls:unknown[];messages:{role:string;text:string}[]}>();
+  expect(state.calls).toHaveLength(1);
+  expect(state.reviewCalls).toHaveLength(1);
+  expect(state.reviewCalls[0]!.input).toContain('TIMBER_MEMORY_REVIEW_V1');
+  expect(state.toolCalls).toHaveLength(0);
+  expect(state.messages.map(message=>message.role)).toEqual(['user','assistant']);
+  expect(state.messages.some(message=>message.text.includes('candidates'))).toBe(false);
+});
 it('runs a visible temporary Pi conversation, attributes its tools and keeps its context across eviction', async () => {
   const namespace = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE;
   let stub = namespace.getByName(probeId);

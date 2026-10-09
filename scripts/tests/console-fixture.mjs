@@ -31,6 +31,7 @@ export async function createConsoleFixture({port = 0} = {}) {
   const state = {
     modelCatalog:{connected:true,defaultModel:'gpt-6.1-sol',models:[{id:'gpt-6.1-sol',name:'GPT-6.1 Sol',provider:'openai',reasoningEfforts:['low','medium','high'],defaultReasoningEffort:'medium',supportsFast:true}]},modelsError:null,
     sessions: new Set(), sessionCalls: [], requestAuth: [],
+    memories: new Map(), memoryHistories: new Map(), memoryOperations: new Map(), memoryRepliesToLose: 0, contexts: new Map(),
     githubConnected: false, connectionGate: null, appOpenGate: null, appRefreshStates: new Map(), appRefreshGate: null, previewCalls: [], rejectAuth: false, actionGate: null, readsGate: null, messageGates: new Map(), messageResponseGates: new Map(), messageOperations: new Map(), patchGate: null, patchError: null, deleteGates: new Map(), deleteError: null, deletingBots: new Set(), deletedBots: new Set(), approvalGate: null, approvalError: null, approvalStatus: null, computerStates: new Map(), computerStatusGate: null, failures: [], actions: [], calls: [], streams: new Set(), events: [],
     bots: [
       {id: BOT_A, name: 'Ada', instructions: 'Research and turn findings into useful notes.', model: 'gpt-6.1-sol', runtime: 'pi', createdAt: date, updatedAt: date},
@@ -121,6 +122,49 @@ export async function createConsoleFixture({port = 0} = {}) {
         return json({botId: id, deleted: true});
       }
       if (!bot || state.deletingBots.has(id)) return json({}, 404);
+      if (tail.startsWith('/memory')) {
+        let memory=state.memories.get(id);
+        if(!memory){memory={schemaVersion:2,entries:[],suggestions:[],revision:0,limits:{maxEntries:200,maxEntryCharacters:1200,maxTitleCharacters:100,contextCharacters:16000},review:{status:'idle',examinedMessages:0,added:0,suggested:0},content:'',maxCharacters:16000};state.memories.set(id,memory);}
+        if(tail==='/memory'&&request.method==='GET')return json({memory});
+        if(tail==='/memory/search'&&request.method==='GET'){
+          const limit=Number(url.searchParams.get('limit')||20);if(!Number.isInteger(limit)||limit<1||limit>50)return json({error:{code:'invalid_request',message:'limit must be an integer from 1 to 50.'}},400);
+          const query=(url.searchParams.get('q')||'').toLowerCase();if(query.length>200)return json({error:{code:'invalid_request',message:'q is too long.'}},400);const hits=memory.entries.filter(entry=>`${entry.title} ${entry.content}`.toLowerCase().includes(query)).map(entry=>({entry,score:1}));
+          return json({results:{hits:hits.slice(0,limit),total:hits.length,truncated:hits.length>limit}});
+        }
+        const entryMatch=/^\/memory\/entries\/([^/]+)(\/history|\/accept)?$/.exec(tail),entryId=entryMatch?.[1],suffix=entryMatch?.[2];
+        const entry=memory.entries.concat(memory.suggestions).find(item=>item.id===entryId),historyKey=`${id}:${entryId}`;
+        if(request.method==='GET'){
+          if(suffix==='/history')return json({history:state.memoryHistories.get(historyKey)||[]});
+          return entry?json({entry}):json({error:{code:'not_found',message:'Memory not found.'}},404);
+        }
+        const identity=`${id}:${body?.operationId}`,fingerprint=JSON.stringify({tail,method:request.method,body}),receipt=state.memoryOperations.get(identity);
+        if(receipt)return receipt.fingerprint===fingerprint?json(receipt.payload):json({error:{code:'operation_conflict',message:'This operation was already used for another change.'}},409);
+        if(!body?.operationId)return json({error:{code:'invalid_request',message:'An operation ID is required.'}},400);
+        if(tail==='/memory/review'){
+          memory.review={status:'completed',operationId:body.operationId,examinedMessages:2,added:0,suggested:0,hasMore:false};const payload={review:memory.review};state.memoryOperations.set(identity,{fingerprint,payload});return json(payload,202);
+        }
+        const creating=tail==='/memory/entries'&&request.method==='POST';
+        if(!creating&&!entry)return json({error:{code:'not_found',message:'Memory not found.'}},404);
+        if(!creating&&body.expectedRevision!==entry.revision)return json({error:{code:'memory_conflict',message:'This memory changed. Review the latest revision before saving.'}},409);
+        if(suffix==='/accept'&&entry.replacesId){const previous=memory.entries.find(item=>item.id===entry.replacesId);if(!previous||previous.revision!==body.replacesRevision||previous.revision!==entry.replacesRevision)return json({error:{code:'memory_conflict',message:'The note being replaced changed.'}},409);memory.entries=memory.entries.filter(item=>item.id!==previous.id);}
+        const now=new Date().toISOString(),updated=creating?{id:randomUUID(),category:body.category,title:body.title,content:body.content,pinned:Boolean(body.pinned),state:'active',revision:1,actor:'user',sources:[{kind:'user'}],createdAt:now,updatedAt:now}:{...entry,revision:entry.revision+1,updatedAt:now};
+        let operation=creating?'create':'update';
+        if(request.method==='PATCH')Object.assign(updated,{category:body.category,title:body.title,content:body.content,pinned:Boolean(body.pinned),actor:'user',sources:[{kind:'user'}]});
+        if(request.method==='DELETE'){updated.state='forgotten';operation='forget';}
+        if(suffix==='/accept'){updated.state='active';operation='accept';}
+        memory.entries=memory.entries.filter(item=>item.id!==updated.id);memory.suggestions=memory.suggestions.filter(item=>item.id!==updated.id);
+        if(updated.state==='active')memory.entries.push(updated);if(updated.state==='suggested')memory.suggestions.push(updated);
+        memory.revision++;memory.updatedAt=now;memory.content=memory.entries.map(item=>`${item.title}: ${item.content}`).join('\n');
+        const revisions=state.memoryHistories.get(`${id}:${updated.id}`)||[];revisions.unshift({entry:structuredClone(updated),operation,at:now});state.memoryHistories.set(`${id}:${updated.id}`,revisions);
+        const payload={result:{entry:updated,changed:true}};state.memoryOperations.set(identity,{fingerprint,payload});
+        if(state.memoryRepliesToLose>0){state.memoryRepliesToLose--;response.writeHead(200,{'content-type':'application/json'});response.end('{"result":');return;}
+        return json(payload,creating?201:200);
+      }
+      if(tail==='/context'||tail==='/context/compact'){
+        let context=state.contexts.get(id);if(!context){context={automatic:true,estimatedTokens:42000,activeEntries:50,contextWindow:128000,historyRetained:true,compactions:[]};state.contexts.set(id,context);}
+        if(tail==='/context')return json({context});
+        context.compactions=[{id:`compact:${body.operationId}`,reason:'manual',status:'completed',summaryApplied:true}];context.estimatedTokens=12000;return json({compaction:context.compactions[0]},202);
+      }
       if (tail === '/summary') {
         const activeRuns=(state.runs.get(id)||[]).filter(run=>!run.subagentId&&active.has(run.status));
         const lastMessage=(state.messages.get(id)||[]).filter(message=>['user','assistant'].includes(message.role)).at(-1);

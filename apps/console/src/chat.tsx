@@ -376,6 +376,10 @@ const HistoryMessage = memo(function HistoryMessage({message, botId, botName, ru
 
 const TimelineCompaction = memo(function TimelineCompaction({item}: {item:CompactionItem}) {return <CompactionPill item={item}/>;}, (previous, next) => sameValue(previous.item, next.item));
 
+const UnpositionedCompactionHistory = memo(function UnpositionedCompactionHistory({items}: {items:CompactionItem[]}) {
+  return items.length ? <section className="timber-compaction-history" data-compaction-unpositioned-group data-timeline-key="unpositioned-compactions" aria-label="Compaction history with unavailable dates"><p className="timber-history-caption">Compaction history · dates unavailable</p>{items.map(item => <TimelineCompaction key={item.key} item={item}/>)}</section> : null;
+});
+
 const TimelineCollaboration = memo(function TimelineCollaboration({item, callbacks, context = 'timeline'}: {item:CollaborationItem;callbacks:Pick<ChatCallbacks,'onOpenBot'|'onOpenAgents'>;context?:'timeline'|'activity'|'preview'}) {
   return item.notice ? <AgentMessageNotice notice={item.notice} callbacks={callbacks} eventKey={item.key} context={context}/> : item.creation ? <AgentCreationCard creation={item.creation} callbacks={callbacks} context={context === 'preview' ? 'timeline' : context}/> : null;
 }, (previous, next) => previous.callbacks === next.callbacks && previous.context === next.context && sameValue(previous.item, next.item));
@@ -441,8 +445,7 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks) {
   }
   deliveries.forEach((delivery, index) => entries.push({key: `delivery:${delivery.operationId}`, at: timestamp(delivery.createdAt), order: (messages.length + index) * 2, node: <DeliveryEntry delivery={delivery} busy={model.sending} callbacks={callbacks} />}));
   for(const item of collaboration.items)entries.push({key:`collaboration:${item.key}`,...afterRequest(item.runId,timestamp(item.createdAt)),node:<TimelineCollaboration item={item} callbacks={callbacks}/>});
-  const compactions = collectCompactions(model), unpositioned = compactions.filter(item => item.unpositioned);
-  if (unpositioned.length) entries.push({key:'unpositioned-compactions',at:-Infinity,order:-1,node:<section className="timber-compaction-history" aria-label="Compaction history with unavailable dates"><p className="timber-history-caption">Earlier compactions · dates unavailable</p>{unpositioned.map(item => <TimelineCompaction key={item.key} item={item}/>)}</section>});
+  const compactions = collectCompactions(model), unpositionedCompactions = compactions.filter(item => item.unpositioned);
   for (const item of compactions) if (!item.unpositioned) entries.push({key:item.key,...afterRequest(item.runId,timestamp(item.createdAt)),node:<TimelineCompaction item={item}/>});
   const tools = collectTools(model, false, collaboration, indexes);
   const toolRuns = new Set(tools.map(tool => tool.runId));
@@ -475,7 +478,7 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks) {
     group.steps.push({tool:entry.tool,key:entry.tool.key,at:entry.at});
   }
   flush();
-  return {entries: ordered, indexes, toolRuns, pendingApprovalRuns, pendingConnectionRuns};
+  return {entries: ordered, unpositionedCompactions, indexes, toolRuns, pendingApprovalRuns, pendingConnectionRuns};
 }
 
 function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: ChatCallbacks }) {
@@ -512,7 +515,7 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
   }, [model.bot.id, model.runFilter, model.historyHasMore, model.historyLoading, model.historyError, callbacks, scrollRef]);
   // Drafts and response chunks never invalidate the completed history. The
   // transport supplies immutable, referentially stable collection revisions.
-  const {entries, indexes, toolRuns, pendingApprovalRuns, pendingConnectionRuns} = useMemo(() => timeline(model, callbacks), [model.bot.id, model.bot.name, model.bot.model, model.bot.computerApprovalMode, model.messages, model.runs, model.approvals, model.connections, model.events, model.deliveries, model.subagents, model.delegations, model.mentionBots, model.collaborationEvents, model.compactions, model.runFilter, model.sending, callbacks]);
+  const {entries, unpositionedCompactions, indexes, toolRuns, pendingApprovalRuns, pendingConnectionRuns} = useMemo(() => timeline(model, callbacks), [model.bot.id, model.bot.name, model.bot.model, model.bot.computerApprovalMode, model.messages, model.runs, model.approvals, model.connections, model.events, model.deliveries, model.subagents, model.delegations, model.mentionBots, model.collaborationEvents, model.compactions, model.runFilter, model.sending, callbacks]);
   const visibleRun = model.currentRun && (!model.runFilter || model.runFilter === model.currentRun.id) ? model.currentRun : null;
   const hasInlineStatus = visibleRun && (
     pendingApprovalRuns.has(visibleRun.id) ||
@@ -523,7 +526,8 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
   return <>
     <ConversationContent className="timber-conversation-content">
       {!model.runFilter && (model.historyLoading || model.historyError) && <p className={`timber-history-caption${model.historyError ? ' timber-inline-error' : ''}`} data-conversation-history-status role="status">{model.historyError ? 'Reconnecting to older conversation history…' : 'Loading earlier conversation…'}</p>}
-      {!entries.length && <ConversationEmptyState className="timber-chat-empty" title={model.loading ? 'Loading…' : `Ask ${model.bot.name}`} description="" />}
+      {!entries.length && !unpositionedCompactions.length && <ConversationEmptyState className="timber-chat-empty" title={model.loading ? 'Loading…' : `Ask ${model.bot.name}`} description="" />}
+      <UnpositionedCompactionHistory items={unpositionedCompactions}/>
       <TimelineHistory entries={entries}/>
       {model.feedback && (!model.runFilter || model.feedback.runId === model.runFilter) && <div id="approval-feedback" role="status" className={model.feedback.error ? 'timber-feedback timber-inline-error' : 'timber-feedback'}>{model.feedback.text}</div>}
       {model.stream && <Message from="assistant" id="streaming-message" className="timber-message" data-run-id={model.stream.runId}>

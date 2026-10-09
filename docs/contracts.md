@@ -711,7 +711,7 @@ product-level concepts without adopting CUA as the cloud compute provider.
 ## Context compaction and durable memory
 
 Owner-authenticated bot routes expose `GET /context`, `POST /context/compact`
-`{operationId,instructions?}`, and `GET` / `PUT /memory` `{content,revision}`.
+`{operationId,instructions?}`, and an independent memory API under `/memory`.
 Manual compaction returns 202 with a durable receipt; automatic compaction uses
 Pi's threshold and overflow policies. Both retain the complete archived history. `GET /context` returns every native
 root-conversation compaction, not a last-20 slice; stable `compact:<taskId>`
@@ -720,8 +720,68 @@ createdAt/startedAt/summaryCreatedAt, firstKeptEntryId, summarizedEntries and
 estimatedTokensBefore (selected-prefix estimate, not billed usage). Unrecorded
 historical times/details are omitted; private summaries/instructions/checkpoints
 are never exposed. See [context-memory.md](context-memory.md) for field semantics.
-Memory updates use revisions to reject concurrent overwrites. Each child has
-isolated editable notes and read-only inherited bot notes. Native `memory_read`,
-`memory_update` and `recall_history` tools remain scoped to that conversation.
-See [context and memory](context-memory.md) for receipt states, limits, recovery
-and the Hermes/OpenClaw research informing this behavior.
+
+Memory lives in the bot's SQLite Durable Object through `packages/memory`,
+independently of Pi's model context and the computer filesystem. The shared
+contract is `packages/contracts/src/memory.ts`:
+
+- `GET /memory` returns `{memory}` with `schemaVersion:2`, active `entries`,
+  `suggestions`, optional preserved `legacy`, `revision`, `limits` and `review`.
+  The `content` field is a read-only text export for older clients.
+- `GET /memory/search?q=...&limit=...` returns
+  `{results:{hits,total,truncated}}`. Search uses deterministic text ranking;
+  `limit`, when present, is an integer from 1 to 50.
+- `GET /memory/entries/:id` returns `{entry}`;
+  `GET /memory/entries/:id/history` returns `{history}`.
+- `POST /memory/entries` accepts
+  `{operationId,category,title,content,pinned?}` and returns
+  `201 {result:{entry,changed}}`.
+- `PATCH /memory/entries/:id` accepts the same fields plus `expectedRevision`
+  and returns `{result:{entry,changed}}`. This is a complete entry edit;
+  category, title and content are required.
+- `DELETE /memory/entries/:id` accepts `{operationId,expectedRevision}` and
+  returns `{result:{entry,changed}}`. Forgetting memory does not erase source
+  conversations; tombstones prevent silent recreation by maintenance.
+- `POST /memory/entries/:id/accept` accepts
+  `{operationId,expectedRevision,replacesRevision?}` and returns
+  `{result:{entry,changed}}`. Accepting a correction also checks the revision
+  of the entry it replaces.
+- `POST /memory/review` accepts `{operationId}` and returns `202 {review}`.
+  A different manual operation ID while review is queued/running returns
+  `409 memory_review_busy`; an existing ID returns its recorded receipt.
+- `PUT /memory` is retired and returns `409 memory_upgrade_required`.
+  Existing freeform notes remain preserved as legacy data, excluded from
+  automatic context injection and automatic promotion.
+
+Categories are `preference`, `fact`, `decision` and `procedure`. Scope, actor,
+sources, state and replacement identity are host-owned metadata, not caller
+write fields. Mutations use operation IDs for replay deduplication and record
+revisions for conflict detection. Each temporary child has isolated editable
+memory and read-only inherited root-bot memory; named bots remain isolated.
+Memory does not grant authority or supersede the user's current request.
+
+Background review works from original user/assistant evidence, not compaction
+summaries, system messages, assistant progress, collaboration envelopes or raw
+tool output. Agent writes cite one to three exact source quotes of at most 400
+characters; the host validates source ownership and quote membership. This
+proves provenance, not the truth of an extracted conclusion. Assistant-only
+evidence and proposed corrections remain suggestions until accepted; preferences
+require a user source. `memory_suggest` is the agent's correction path for
+user-authored or pinned notes. Temporary-child inputs are conservatively treated
+as agent evidence, not proof of a human preference. The active tools are `memory_list`, `memory_search`,
+`memory_get`, `memory_save`, `memory_suggest` and `memory_forget`;
+`memory_read` remains a listing alias and `memory_update` reports its retirement.
+Listing is a paginated index without note bodies (default 20, maximum 50 entries
+per scope). `memory_get` accepts `scope:"own"|"inherited"`; inherited reads are
+available only to a child and resolve to its read-only root-bot memory.
+
+Each scope allows 200 active notes and 100 suggestions, with 100-character titles
+and 1,200-character bodies. Selected context is capped at 8,000 characters across
+own and inherited notes. History, operation receipts and forget tombstones are
+retained separately; forgetting is not erasure of those records or source
+conversations. Background apply rechecks memory revisions and forget fences.
+Memory maintenance and model-context compaction are separate operations;
+the pre-compaction hook schedules review but does not wait for extraction.
+`recall_history` still reads the caller's archive.
+See [context and memory](context-memory.md) for API details, recovery, verification
+boundaries and the Hermes, OpenClaw and Meta Muse sources informing this design.
