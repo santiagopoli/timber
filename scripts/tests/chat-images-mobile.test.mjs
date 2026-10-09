@@ -31,6 +31,10 @@ for(const width of [390,320]) test(`mobile image composer geometry and accessibl
  try{
   await page.goto(fixture.url);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('.bot-item').first().click();await page.locator('#message').waitFor({state:'visible'});
   assert.equal(await page.locator('#message').getAttribute('placeholder'),'Message Ada','short placeholder omits mention instructions');
+  await page.locator('#message').fill('Mobile line one');await page.locator('#message').press('Enter');await page.locator('#message').pressSequentially('line two');
+  assert.equal(await page.locator('#message').inputValue(),'Mobile line one\nline two','mobile keyboard Enter inserts a newline');
+  assert.equal(fixture.state.calls.filter(call=>call.method==='POST'&&call.path.endsWith('/messages')).length,0,'mobile newline does not submit the message');
+  await page.locator('#message').fill('');
   await capture('empty');await geometry(0);assert.equal(await page.getByRole('button',{name:'Send message',exact:true}).isDisabled(),true);
   const chooser=page.waitForEvent('filechooser');await page.getByRole('button',{name:'Attach images',exact:true}).click();await(await chooser).setFiles(image(1));await page.locator('.timber-image-attachments img').waitFor();
   await capture('one');await geometry(1);assert.equal(await page.getByRole('button',{name:'Send message',exact:true}).isEnabled(),true,'image-only input can send');

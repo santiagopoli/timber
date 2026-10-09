@@ -227,14 +227,15 @@ button.danger-quiet{background:transparent;color:var(--danger);border-color:var(
 .topbar #settings-button{border-radius:50%;background:var(--surface);border-color:var(--line)}
 .app{display:block;width:100%;min-height:0;overflow:hidden}
 .sidebar{height:100%;padding:14px 18px calc(16px + env(safe-area-inset-bottom));gap:18px;border:0;background:var(--bg)}
+.sidebar .section-title{margin-inline:0}
 .sidebar-heading h2{font-size:29px;letter-spacing:-.8px;font-weight:600}
 .sidebar-heading .counter{font-size:12px;vertical-align:middle;margin-left:4px;padding:3px 7px;border-radius:7px}
 .sidebar-heading .row{gap:7px}
 .new-bot{height:44px!important;min-height:44px!important;width:44px!important;min-width:44px!important}
 .search-field{border-color:transparent;background:var(--soft);border-radius:14px;padding:0 13px;gap:9px}
 .search{font-size:16px;min-height:46px;padding:12px 0}
-.bot-list{gap:4px;margin:0 -5px;flex:1}
-.bot-item{min-height:80px;padding:14px 10px;gap:14px;border-radius:16px}
+.bot-list{gap:4px;margin:0;padding-inline:0;flex:1}
+.bot-item{min-height:80px;padding:14px 0;gap:14px;border-radius:16px}
 .bot-item.selected{background:transparent}
 .bot-item:active{background:var(--soft)}
 .bot-item .avatar{width:44px;height:44px;font-size:18px}

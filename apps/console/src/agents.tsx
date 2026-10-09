@@ -106,7 +106,7 @@ function AgentConversation({model, agent, callbacks}: {model: AgentsModel; agent
     </div>
     {error && <p className="error" role="alert">{error}</p>}
     {agent.status === 'cancelled' ? <p className="hint">This agent was stopped. Its conversation remains available; ask {model.botName} to create a new subagent for more work.</p> : <form className="timber-agent-composer" onSubmit={event => {event.preventDefault();void send();}}>
-      <label htmlFor="agent-message" className="sr-only">Message {agent.name}</label><textarea id="agent-message" rows={2} value={draft} onChange={event => setDraft(event.currentTarget.value)} placeholder={`Message ${agent.name}…`} onKeyDown={event => {if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {event.preventDefault();void send();}}}/>
+      <label htmlFor="agent-message" className="sr-only">Message {agent.name}</label><textarea id="agent-message" rows={2} value={draft} onChange={event => setDraft(event.currentTarget.value)} placeholder={`Message ${agent.name}…`}/>
       <button type="submit" aria-label={`Send message to ${agent.name}`} disabled={busy || !draft.trim()}>{busy ? <LoaderCircleIcon className="timber-spinner"/> : <ArrowUpIcon/>}</button>
     </form>}
   </div>;

@@ -72,17 +72,21 @@ const sendMessage = page => page.locator('#message-form').getByRole('button', {n
 const deletedBots = state => state.calls.filter(call => call.method === 'DELETE' && /^\/v1\/bots\//.test(call.path));
 const openDelete = async page => {await openBotEditor(page); await page.locator('#delete-bot').click(); await page.locator('#delete-dialog').waitFor({state: 'visible'});};
 
-test('Enter and Send enqueue follow-up messages without cancelling the active run', async () => {
+test('keyboard newlines never send; only Send enqueues follow-up messages', async () => {
   await withPage(async ({page, login, state}) => {
     const run = {id: 'active-send-run', botId: BOT_A, operationId: 'active-send-operation', status: 'running', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()};
     state.runs.set(BOT_A, [run]);
     state.messages.set(BOT_A, [{id: 'active-send-request', botId: BOT_A, runId: run.id, role: 'user', text: 'Continue the current task.', createdAt: run.createdAt}]);
     await login(); await until(page, '#run-status', 'running');
-    await page.locator('#message').fill('Follow-up sent with Enter'); await page.locator('#message').press('Enter');
-    await page.locator('[data-message-id]').filter({hasText: 'Follow-up sent with Enter'}).waitFor();
-    await page.locator('#message').fill('A second follow-up sent with the button'); await sendMessage(page);
+    const input = page.locator('#message');
+    await input.fill('Follow-up line one'); await input.press('Enter'); await input.pressSequentially('line two');
+    assert.equal(await input.inputValue(), 'Follow-up line one\nline two', 'Enter inserts a newline in the draft');
+    assert.deepEqual(sentMessages(state, BOT_A), [], 'typing a newline does not send');
+    await sendMessage(page);
+    await page.locator('[data-message-id]').filter({hasText: 'Follow-up line one'}).waitFor();
+    await input.fill('A second follow-up sent with the button'); await sendMessage(page);
     await page.locator('[data-message-id]').filter({hasText: 'A second follow-up sent with the button'}).waitFor();
-    assert.deepEqual(sentMessages(state, BOT_A).map(call => call.body.text), ['Follow-up sent with Enter', 'A second follow-up sent with the button']);
+    assert.deepEqual(sentMessages(state, BOT_A).map(call => call.body.text), ['Follow-up line one\nline two', 'A second follow-up sent with the button']);
     assert.equal(state.calls.filter(call => call.path.endsWith('/cancel')).length, 0);
     assert.equal(run.status, 'running'); assert.equal(state.runs.get(BOT_A).length, 3);
     assert.equal(await page.locator('#message-form').getByRole('button', {name: /stop/i}).count(), 0, 'sending has no adjacent implicit stop control');
@@ -1840,15 +1844,17 @@ for (const viewport of [{width:1440,height:1050},{width:390,height:844}]) test(`
     state.runs.set(BOT_A,[{id:'child-run',botId:BOT_A,operationId:agent.operationId,subagentId:agent.id,parentRunId:'parent-run',status:'running',createdAt:stamp,updatedAt:stamp}]);
     await login();assert.equal(await page.locator('#run-status').isVisible(),false,'child activity has its own status and does not replace the parent header');await page.locator('[data-chat-agents-toggle]').click();await page.locator('[data-chat-agent="child-research"]').click();
     await page.locator('[data-agent-detail="child-research"]').waitFor();await page.getByText('The architecture review is underway.',{exact:true}).waitFor();
-    await page.locator('#agent-message').fill('Also review persistence');await page.getByRole('button',{name:'Send message to Researcher',exact:true}).click();
-    await page.getByText('Also review persistence',{exact:true}).waitFor();
+    const agentInput=page.locator('#agent-message');await agentInput.fill('Also review');await agentInput.press('Enter');await agentInput.pressSequentially('persistence');
+    assert.equal(await agentInput.inputValue(),'Also review\npersistence','Enter inserts a newline in the agent draft');assert.equal(state.agentMessageOperations.size,0,'agent keyboard newline does not send');
+    await page.getByRole('button',{name:'Send message to Researcher',exact:true}).click();
+    await page.getByText('Also review\npersistence',{exact:true}).waitFor();
     assert.equal(state.agentMessageOperations.size,1);assert.equal(new URL(page.url()).hash.includes('agent=child-research'),true);
     state.emit(BOT_A,'subagent.tool.completed',{subagentId:agent.id,toolCallId:'child-tool',toolName:'read_file',result:{status:'completed',output:'Public tool result'}});
     await page.locator('.timber-agent-activity summary').click();await page.getByText('Public tool result',{exact:true}).waitFor();
     state.emit(BOT_A,'tool.completed',{subagentId:agent.id,operationId:'child-effect',toolCallId:'child-tool',toolName:'read_file',result:{status:'completed',output:'Public tool result'}});
     await page.locator('.timber-agent-activity summary').filter({hasText:'Tool activity · 1'}).waitFor();
     assert.equal(await page.locator('#messages [data-tool-operation-id]').count(),0,'child tool output never appears as a parent tool');
-    await page.reload();await page.locator('[data-agent-detail="child-research"]').waitFor();await page.getByText('Also review persistence',{exact:true}).waitFor();
+    await page.reload();await page.locator('[data-agent-detail="child-research"]').waitFor();await page.getByText('Also review\npersistence',{exact:true}).waitFor();
     await page.getByRole('button',{name:'Stop agent',exact:true}).click();
     await page.locator('.timber-agent-detail-heading [data-status="cancelled"]').waitFor();
     assert.equal(await page.locator('#agent-message').count(),0,'cancelled agents retain history without accepting more work');

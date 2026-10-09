@@ -947,7 +947,6 @@ export const PromptInputTextarea = ({
 }: PromptInputTextareaProps) => {
   const controller = useOptionalPromptInputController();
   const attachments = usePromptInputAttachments();
-  const [isComposing, setIsComposing] = useState(false);
 
   const handleKeyDown: KeyboardEventHandler<HTMLTextAreaElement> = useCallback(
     (e) => {
@@ -960,26 +959,9 @@ export const PromptInputTextarea = ({
         return;
       }
 
-      if (e.key === "Enter") {
-        if (isComposing || e.nativeEvent.isComposing) {
-          return;
-        }
-        if (e.shiftKey) {
-          return;
-        }
-        e.preventDefault();
-
-        // Check if the submit button is disabled before submitting
-        const { form } = e.currentTarget;
-        const submitButton = form?.querySelector(
-          'button[type="submit"]'
-        ) as HTMLButtonElement | null;
-        if (submitButton?.disabled) {
-          return;
-        }
-
-        form?.requestSubmit();
-      }
+      // Enter always keeps its native textarea behavior (inserts a newline).
+      // Sending is an explicit action on the form's submit button, which is
+      // reliable across desktop and mobile keyboards.
 
       // Remove last attachment when Backspace is pressed and textarea is empty
       if (
@@ -994,7 +976,7 @@ export const PromptInputTextarea = ({
         }
       }
     },
-    [onKeyDown, isComposing, attachments, props.disabled]
+    [onKeyDown, attachments, props.disabled]
   );
 
   const handlePaste: ClipboardEventHandler<HTMLTextAreaElement> = useCallback(
@@ -1025,8 +1007,6 @@ export const PromptInputTextarea = ({
     [attachments, props.disabled]
   );
 
-  const handleCompositionEnd = useCallback(() => setIsComposing(false), []);
-  const handleCompositionStart = useCallback(() => setIsComposing(true), []);
 
   const controlledProps = controller
     ? {
@@ -1044,8 +1024,6 @@ export const PromptInputTextarea = ({
     <InputGroupTextarea
       className={cn("field-sizing-content max-h-48 min-h-16", className)}
       name="message"
-      onCompositionEnd={handleCompositionEnd}
-      onCompositionStart={handleCompositionStart}
       onKeyDown={handleKeyDown}
       onPaste={handlePaste}
       placeholder={placeholder}
