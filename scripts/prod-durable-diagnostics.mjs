@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { pathToFileURL } from 'node:url';
+import {createCipheriv,createHash,createPublicKey,publicEncrypt,randomBytes,constants} from 'node:crypto';
 import { DIAGNOSTIC_CODES, timeframe } from './prod-diagnostics.mjs';
 
 // Cloudflare Data Studio's SQL API. These are fixed read-only statements;
@@ -61,12 +62,25 @@ SELECT CASE WHEN d.kind IN ('pi.generation','pi.compaction','pi.tool') THEN d.ki
 FROM detail d LEFT JOIN botspace_runtime_generations g ON g.task_id=CAST(d.id AS TEXT)
 LEFT JOIN submissions s ON s.operation_id=g.operation_id LEFT JOIN runs r ON r.id=s.run_id ORDER BY d.id DESC`;
 
+// Optional private diagnostic: exactly three bounded native error details, with
+// no prompts, conversation entries, identifiers, tool results or auth storage.
+// This response is encrypted in memory for the caller before any console output.
+export const PRIVATE_FAILURE_QUERY=`WITH recent AS (
+ SELECT id,record FROM pi_submissions WHERE status='unanswered' AND json_extract(record,'$.type')='input' ORDER BY id DESC LIMIT 3
+)
+SELECT json_extract(r.data,'$.createdAt') AS run_created_at,json_extract(r.data,'$.updatedAt') AS run_updated_at,
+ json_extract(p.record,'$.reason') AS native_reason,
+ json_type(p.record,'$.detail') AS detail_type,
+ CASE WHEN json_type(p.record,'$.detail')='text' THEN substr(json_extract(p.record,'$.detail'),1,8192) ELSE NULL END AS detail
+FROM recent p LEFT JOIN submissions s ON s.operation_id=json_extract(p.record,'$.requestId') LEFT JOIN runs r ON r.id=s.run_id ORDER BY p.id DESC`;
+const ENCRYPTION_CONTEXT='timber-api/native-failure-diagnostics/v1';
+
 const SCHEMA_NAMES = new Set(['pi_submissions','pi_tasks','runs','submissions','botspace_runtime_generations']);
 const SIGNATURES = new Set(['no_detail','non_string_detail','sanitized_model_request_failed','contains_fixed_model_request_failed','native_json_undefined','native_entry_visibility','sdk_unfinished_tool_call','sdk_unhandled_stop_reason','json_parse','missing_origin_operation','missing_conversation_identity','sqlite_error','javascript_type_error','chatgpt_connection_changed','chatgpt_invalid_tool_namespace','chatgpt_incomplete_response','chatgpt_output_limit','unclassified']);
 const REASONS = new Set(['model_error','faulted','aborted','no_model','reset','stale','tool_error','task_error','task_failed','budget_exceeded','other']);
 const STATUSES = new Set(['queued','running','waiting_approval','waiting_connection','completed','failed','interrupted','cancelled']);
 const TYPES = new Set(['text','integer','real','object','array','true','false','null']);
-const ERRORS = new Set(['durable_diagnostics_account_missing','durable_diagnostics_auth_missing','durable_diagnostics_transport_failed','durable_diagnostics_response_limit','durable_diagnostics_invalid_response','durable_diagnostics_query_failed','durable_diagnostics_namespace_missing','durable_diagnostics_bot_not_unique','durable_diagnostics_schema_mismatch']);
+const ERRORS = new Set(['durable_diagnostics_account_missing','durable_diagnostics_auth_missing','durable_diagnostics_transport_failed','durable_diagnostics_response_limit','durable_diagnostics_invalid_response','durable_diagnostics_query_failed','durable_diagnostics_namespace_missing','durable_diagnostics_bot_not_unique','durable_diagnostics_schema_mismatch','durable_diagnostics_invalid_recipient','durable_diagnostics_encryption_failed']);
 const MAX_BYTES = 256 * 1024;
 const uuid = value => typeof value==='string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value);
 const iso = value => typeof value==='string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value) && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : null;
@@ -113,6 +127,38 @@ export function summarizeTasks(records,window) {
   return {inspectedRecentTasks:Math.min(records.length,24),outsideWindowOrUnattributed:Math.min(records.length,24)-tasks.length,tasks};
 }
 
+export function recipientPublicKey(pem) {
+  if(typeof pem!=='string'||pem.length>8192||!/^-{5}BEGIN PUBLIC KEY-{5}\r?\n/.test(pem)||pem.includes('PRIVATE KEY'))throw new Error('durable_diagnostics_invalid_recipient');
+  try{
+    const key=createPublicKey(pem);
+    if(key.asymmetricKeyType!=='rsa'||!Number.isInteger(key.asymmetricKeyDetails?.modulusLength)||key.asymmetricKeyDetails.modulusLength<3072||key.asymmetricKeyDetails.modulusLength>8192)throw new Error();
+    return key;
+  }catch{throw new Error('durable_diagnostics_invalid_recipient');}
+}
+
+export function encryptDetails(records,recipient,window) {
+  // Reconstruct the payload explicitly; unexpected response columns never enter
+  // even the encrypted diagnostic. All raw provider detail remains in memory.
+  const failures=records.slice(0,3).map(row=>({createdAt:iso(row.run_created_at),updatedAt:iso(row.run_updated_at),
+    nativeReason:REASONS.has(row.native_reason)?row.native_reason:'other',
+    detailType:TYPES.has(row.detail_type)?row.detail_type:row.detail_type===null?'absent':'unknown',
+    detail:typeof row.detail==='string'?row.detail.slice(0,8192):null}));
+  const key=randomBytes(32),iv=randomBytes(12);
+  try{
+    const cipher=createCipheriv('aes-256-gcm',key,iv);
+    cipher.setAAD(Buffer.from(ENCRYPTION_CONTEXT));
+    const plaintext=Buffer.from(JSON.stringify({context:ENCRYPTION_CONTEXT,requestedWindow:{from:new Date(window.from).toISOString(),to:new Date(window.to).toISOString()},selection:'latest_three_unanswered_inputs',failures}));
+    try{
+      const ciphertext=Buffer.concat([cipher.update(plaintext),cipher.final()]);
+      const wrapped=publicEncrypt({key:recipient,padding:constants.RSA_PKCS1_OAEP_PADDING,oaepHash:'sha256',oaepLabel:Buffer.from(ENCRYPTION_CONTEXT)},key);
+      return {version:1,algorithm:'RSA-OAEP-SHA256+A256GCM',context:ENCRYPTION_CONTEXT,
+        recipientKeySha256:createHash('sha256').update(recipient.export({format:'der',type:'spki'})).digest('hex'),
+        encryptedKey:wrapped.toString('base64'),iv:iv.toString('base64'),tag:cipher.getAuthTag().toString('base64'),ciphertext:ciphertext.toString('base64')};
+    }finally{plaintext.fill(0);}
+  }catch{throw new Error('durable_diagnostics_encryption_failed');}
+  finally{key.fill(0);}
+}
+
 async function readJson(response) {
   if(!response.body)throw new Error('durable_diagnostics_invalid_response');
   const reader=response.body.getReader();let size=0;const chunks=[];
@@ -122,6 +168,7 @@ async function readJson(response) {
 }
 
 export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now()}={}) {
+  const recipient=env.DIAGNOSTIC_RECIPIENT_PUBLIC_KEY?recipientPublicKey(env.DIAGNOSTIC_RECIPIENT_PUBLIC_KEY):undefined;
   const account=env.CLOUDFLARE_ACCOUNT_ID;
   if(typeof account!=='string'||!/^[a-f0-9]{24,64}$/i.test(account))throw new Error('durable_diagnostics_account_missing');
   const headers={'content-type':'application/json'};
@@ -152,7 +199,9 @@ export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now
   const schema=await query(bot,name,SCHEMA);
   if(schema.length!==SCHEMA_NAMES.size||!schema.every(row=>SCHEMA_NAMES.has(row.name)))throw new Error('durable_diagnostics_schema_mismatch');
   const summary=summarizeFailures(await query(bot,name,FAILURE_QUERY),window);
-  return {...summary,nativeTasks:summarizeTasks(await query(bot,name,TASK_QUERY),window)};
+  const nativeTasks=summarizeTasks(await query(bot,name,TASK_QUERY),window);
+  const encryptedDiagnostic=recipient?encryptDetails(await query(bot,name,PRIVATE_FAILURE_QUERY),recipient,window):undefined;
+  return {...summary,nativeTasks,...(encryptedDiagnostic?{encryptedDiagnostic}:{})};
 }
 
 export function safeError(error) {

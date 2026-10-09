@@ -7,6 +7,10 @@ on:
         required: true
         default: '1'
         type: string
+      recipient_public_key:
+        description: Optional ephemeral RSA public key PEM (3072+ bits); encrypts only three native failure details for private diagnosis
+        required: false
+        type: string
 permissions:
   contents: read
 jobs:
@@ -29,4 +33,5 @@ jobs:
           CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
           CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
           DIAGNOSTIC_HOURS: ${{ inputs.hours }}
+          DIAGNOSTIC_RECIPIENT_PUBLIC_KEY: ${{ inputs.recipient_public_key }}
         run: node scripts/prod-durable-diagnostics.mjs

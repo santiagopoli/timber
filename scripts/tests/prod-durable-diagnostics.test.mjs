@@ -1,14 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
-import {BOT_LOOKUP,SCHEMA,FAILURE_QUERY,TASK_QUERY,collectDurable,rows,safeError,summarizeFailures,summarizeTasks} from '../prod-durable-diagnostics.mjs';
+import {generateKeyPairSync,privateDecrypt,createDecipheriv,createHash,constants} from 'node:crypto';
+import {BOT_LOOKUP,SCHEMA,FAILURE_QUERY,TASK_QUERY,PRIVATE_FAILURE_QUERY,collectDurable,rows,safeError,summarizeFailures,summarizeTasks,recipientPublicKey,encryptDetails} from '../prod-durable-diagnostics.mjs';
 
 const now=Date.parse('2026-10-09T19:45:00Z'),window={from:now-3600_000,to:now};
 const row={run_created_at:'2026-10-09T19:34:00Z',run_updated_at:'2026-10-09T19:35:00Z',run_status:'failed',error_code:'model_request_failed',native_reason:'model_error',detail_type:'text',detail_characters:123,detail_signature:'native_json_undefined'};
 const sqlResult=(columns,data)=>({success:true,result:{results:[{columns,rows:data,meta:{rows_written:0,rows_read:data.length}}]}});
 
 test('fixed SQL returns failure signatures without projecting raw native detail or user content',()=>{
-  for(const sql of [BOT_LOOKUP,SCHEMA,FAILURE_QUERY,TASK_QUERY]){
+  for(const sql of [BOT_LOOKUP,SCHEMA,FAILURE_QUERY,TASK_QUERY,PRIVATE_FAILURE_QUERY]){
     assert.match(sql,/^(?:SELECT|WITH) /);
     assert.doesNotMatch(sql,/\b(?:INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE|ATTACH|PRAGMA)\b/i);
     assert.doesNotMatch(sql,/;/);
@@ -38,7 +39,36 @@ test('real SQLite queries decode native indexed strings and correlate failures t
     assert.equal(tasks[0].task_kind,'pi.generation');
     assert.equal(tasks[0].detail_signature,'native_json_undefined');
     assert.doesNotMatch(JSON.stringify({failures,tasks}),/private-canary/);
+    const privateRows=db.prepare(PRIVATE_FAILURE_QUERY).all();
+    assert.equal(privateRows[0].detail,detail);
+    assert.deepEqual(Object.keys(privateRows[0]),['run_created_at','run_updated_at','native_reason','detail_type','detail']);
   }finally{db.close();}
+});
+
+test('encrypts bounded native errors exclusively for the supplied ephemeral RSA recipient',()=>{
+  const pair=generateKeyPairSync('rsa',{modulusLength:3072});
+  const pem=pair.publicKey.export({type:'spki',format:'pem'});
+  const recipient=recipientPublicKey(pem);
+  const envelope=encryptDetails([{...row,detail:'private-error-canary',prompt:'excluded-prompt-canary',token:'excluded-token-canary'}],recipient,window);
+  assert.doesNotMatch(JSON.stringify(envelope),/canary/);
+  assert.equal(envelope.recipientKeySha256,createHash('sha256').update(pair.publicKey.export({format:'der',type:'spki'})).digest('hex'));
+  const key=privateDecrypt({key:pair.privateKey,padding:constants.RSA_PKCS1_OAEP_PADDING,oaepHash:'sha256',oaepLabel:Buffer.from(envelope.context)},Buffer.from(envelope.encryptedKey,'base64'));
+  const cipher=createDecipheriv('aes-256-gcm',key,Buffer.from(envelope.iv,'base64'));
+  cipher.setAAD(Buffer.from(envelope.context));cipher.setAuthTag(Buffer.from(envelope.tag,'base64'));
+  const plaintext=Buffer.concat([cipher.update(Buffer.from(envelope.ciphertext,'base64')),cipher.final()]).toString('utf8');
+  assert.equal(JSON.parse(plaintext).failures[0].detail,'private-error-canary');
+  assert.doesNotMatch(plaintext,/excluded-prompt-canary|excluded-token-canary/);
+  assert.notEqual(envelope.ciphertext,encryptDetails([{...row,detail:'private-error-canary'}],recipient,window).ciphertext);
+  assert.throws(()=>recipientPublicKey(pair.privateKey.export({type:'pkcs8',format:'pem'})),{message:'durable_diagnostics_invalid_recipient'});
+});
+
+test('rejects weak or invalid recipient keys before making any production requests',async()=>{
+  const weak=generateKeyPairSync('rsa',{modulusLength:2048}).publicKey.export({type:'spki',format:'pem'});
+  for(const pem of [weak,'private-canary','-----BEGIN PUBLIC KEY-----\nprivate-canary\n-----END PUBLIC KEY-----']){
+    let requested=false;
+    await assert.rejects(()=>collectDurable({env:{DIAGNOSTIC_RECIPIENT_PUBLIC_KEY:pem},fetcher:async()=>{requested=true;throw new Error('should-not-fetch');}}),{message:'durable_diagnostics_invalid_recipient'});
+    assert.equal(requested,false);
+  }
 });
 
 test('allowlisted report drops identifiers, credentials, raw details and adversarial fields',()=>{
