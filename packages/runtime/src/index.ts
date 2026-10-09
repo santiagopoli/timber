@@ -1,8 +1,8 @@
 import { createAssistantMessageEventStream, type AssistantMessage } from '@earendil-works/pi-ai';
 import { createModels } from '@earendil-works/pi-ai/models';
 import {
-  createRegistry, Harness, LiveDoc, ProviderDoc, ROOT_CONVERSATION_ID,
-  type AgentEvent, type AgentEventStream, type ConversationId, type HookApi, type Storage, type SubmissionId,
+  createRegistry, defineDoc, Harness, InboxDoc, LiveDoc, ProviderDoc, ROOT_CONVERSATION_ID,
+  type AgentEvent, type AgentEventStream, type ConversationId, type HookApi, type Storage, type SubmissionId, type TaskId, type Tx,
 } from '@earendil-works/pi-durable';
 import { PiHarness, type PiHarnessContext } from 'agents/harness/pi';
 import { Lifecycle, LifecycleCapability, type LifecycleJobContext } from 'agents/lifecycle';
@@ -19,6 +19,9 @@ export { normalizeEntries, textContent } from './normalize.js';
 export { createBudget, parseRuntimeLimit } from './budget.js';
 export const DEFAULT_MODEL = CHATGPT_MODEL;
 const MODEL_RETRIES = 2;
+const Stops = defineDoc<{operations: Record<string, {cancellationId?: string}>; pending: Record<string, {operations: string[]; taskId?: number; cancellationId?: string}>}>({
+  kind: 'timber.stops', version: 1, scope: 'session', initial: () => ({operations:{},pending:{}}),
+});
 
 export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<Env>): AgentRuntime {
   const ai = createAI({ binding: options.ai });
@@ -36,6 +39,20 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
   // Native task memos disappear at settlement; retain generation attribution so
   // every joined input can resolve the same answer after recovery.
   options.storage.sql.exec('CREATE TABLE IF NOT EXISTS botspace_runtime_generations (task_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL)');
+  const stopped = async (operationId: string, tx?: Tx) => Boolean((tx ? await tx.doc(Stops) : await native.snapshot(Stops, background))?.operations[operationId]);
+  const cancellation = async (operationId: string, reason?: string): Promise<{cancellationId?: string}> => {
+    if (reason !== 'aborted') return {};
+    const id = (await native.snapshot(Stops, background))?.operations[operationId]?.cancellationId;
+    return id ? {cancellationId: id} : {};
+  };
+  // Only admission and cancellation share this queue, never model execution.
+  // Inputs admitted after a Stop must not join its captured native cohort.
+  let rootAdmission: Promise<unknown> = Promise.resolve();
+  const admitRoot = <T>(operation: () => Promise<T>): Promise<T> => {
+    const next = rootAdmission.then(operation, operation);
+    rootAdmission = next.catch(() => {});
+    return next;
+  };
   const paused = (operationId: string): RuntimePause | undefined => {
     const row = options.storage.sql.exec<{ approval: string }>('SELECT approval FROM botspace_runtime_pauses WHERE operation_id=?', operationId).toArray()[0];
     return row ? JSON.parse(row.approval) as RuntimePause : undefined;
@@ -63,20 +80,26 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
   };
   const operationForCall = async (api: HookApi, context: PiHarnessContext['context']): Promise<string> => {
     const child = await subagents.forConversation(api.conversationId);
-    if (child) return child.parentOperationId;
+    if (child) {
+      if (child.stopped || await stopped(child.parentOperationId)) throw new Error('Subagent was stopped');
+      return child.parentOperationId;
+    }
     const previous = await api.memo<string>('botspace.operationId', context);
-    if (previous) return previous;
+    if (previous) { if (await stopped(previous)) throw new Error('Operation was stopped'); return previous; }
     const live = await api.snapshot(LiveDoc, api.conversationId, context);
     for (const input of [...(live?.run?.inputs ?? [])].reverse()) {
       const submission = await storage.submission(input, context);
-      if (submission?.requestId) return api.memo('botspace.operationId', submission.requestId, context);
+      if (submission?.requestId) {
+        if (await stopped(submission.requestId)) throw new Error('Operation was stopped');
+        return api.memo('botspace.operationId', submission.requestId, context);
+      }
     }
     throw new Error('Tool or generation has no durable originating operation');
   };
 
   const subagents = createSubagents({
     native: () => native, harness: () => harness, storage: () => storage, context: () => background,
-    assertActive, emit, operationForCall, consume, paused, onMessage: options.onSubagentMessage,
+    assertActive, emit, operationForCall, consume, paused, stopped, onMessage: options.onSubagentMessage,
     botName: async () => (await options.getBot()).name,
     scheduleWake: () => subagentWakes.schedule(),
   });
@@ -120,7 +143,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
               options.storage.sql.exec('INSERT OR IGNORE INTO botspace_runtime_generations(task_id,operation_id) VALUES(?,?)', String(live.run.taskId), operationId);
               if (paused(operationId)) throw new Error('Run is paused awaiting a host decision or connection');
               const child = await subagents.forConversation(conversationId);
-              if (child?.status === 'cancelled') throw new Error('Subagent was cancelled');
+              if (await stopped(operationId) || (child && (child.stopped || child.status === 'cancelled' || await stopped(child.parentOperationId)))) throw new Error('Operation was stopped');
               consume(child?.parentOperationId ?? operationId, 'generation', String(live.run.taskId));
               assertActive();
               policyBlocked = false;
@@ -165,7 +188,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
         childForCall: async (api, context) => {
           const child = await subagents.forConversation(api.conversationId);
           if (!child) return undefined;
-          if (child.status === 'cancelled') throw new Error('Subagent was cancelled');
+          if (child.stopped || child.status === 'cancelled') throw new Error('Subagent was cancelled');
           const live = await api.snapshot(LiveDoc, api.conversationId, context);
           const operationId = live?.run ? await resolveInputs(live.run.inputs) : undefined;
           if (!operationId) throw new Error('Subagent tool has no durable originating input');
@@ -237,6 +260,13 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
           progress: { partialIntervalMs: 250, outputIntervalMs: 500 },
         },
       }, context.context);
+      // Redrive exact task marks before Pi enables scheduling after recovery.
+      // No broad conversation abort can reach a later independent input.
+      for (const stop of Object.values((await native.snapshot(Stops, background))?.pending ?? {})) {
+        if (stop.taskId !== undefined) await native.abortTask(stop.taskId as TaskId, background);
+        for (const operationId of stop.operations) await subagents.markParentStopped(operationId, stop.cancellationId);
+      }
+      await subagents.prepareStops();
       return native;
     },
   });
@@ -312,6 +342,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
         if (record.status === 'unanswered') {
           data.reason = record.reason;
           Object.assign(data, classifyFailure(record.reason, record.detail));
+          Object.assign(data, await cancellation(record.requestId, record.reason));
         }
         if (record.status === 'done') {
           const answer = await storage.entry(record.answer, background);
@@ -334,6 +365,17 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
     }
   };
 
+  const finishStops = async () => {
+    for (const [id, stop] of Object.entries((await native.snapshot(Stops, background))?.pending ?? {})) {
+      if (stop.taskId !== undefined) {
+        await native.abortTask(stop.taskId as TaskId, background);
+        await native.waitForTask(stop.taskId as TaskId, background);
+      }
+      for (const operationId of stop.operations) await subagents.cancelParent(operationId, stop.cancellationId);
+      await native.commit(async tx => { delete (await tx.doc(Stops)).pending[id]; }, background);
+    }
+    await subagents.finishStops();
+  };
   class Projection extends LifecycleCapability {
     constructor() { super('botspace-pi-projection'); }
     override async onStart(): Promise<void> {
@@ -343,6 +385,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
       eventStream.start(async events => {
         for (const event of events) await processEvent(event);
       });
+      await finishStops();
       await subagents.start();
     }
   }
@@ -375,6 +418,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
     }
     async onJob() {
       if (destroyed) return;
+      await finishStops();
       native.resume();
       if (await subagents.hasDeliveries()) return { rescheduleAt: Date.now() + 5_000 };
     }
@@ -419,35 +463,88 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
       assertActive();
       await harness.session().setModel(resolveModel(bot.model));
       assertActive();
-      const result = await harness.submit(input.images?.length ? [{type:'text' as const,text},...input.images.map(image=>({type:'image' as const,...image}))] : text, { operationId: input.operationId, whenBusy: input.whenBusy ?? 'steer' });
+      const result = await admitRoot(async () => {
+        for (const stop of Object.values((await native.snapshot(Stops, background))?.pending ?? {})) {
+          if (stop.taskId !== undefined) {
+            await native.abortTask(stop.taskId as TaskId, background);
+            await native.waitForTask(stop.taskId as TaskId, background);
+          }
+        }
+        if (await stopped(input.operationId)) {
+          const previous = await storage.submissionByRequest(ROOT_CONVERSATION_ID, input.operationId, background);
+          if (previous) return {operationId: input.operationId, accepted: false};
+          throw new Error('Operation was stopped before admission');
+        }
+        return harness.submit(input.images?.length ? [{type:'text' as const,text},...input.images.map(image=>({type:'image' as const,...image}))] : text, { operationId: input.operationId, whenBusy: input.whenBusy ?? 'steer' });
+      });
       return { operationId: result.operationId, accepted: result.accepted };
     },
     async wait(operationId: string): Promise<RuntimeOperationResult> {
       assertActive();
       const { status, text, reason } = await harness.wait(operationId);
       const answer = status === 'done' ? await completedAnswer(operationId) : {};
-      return { operationId, status, ...(text === undefined ? {} : { text }), ...answer, ...(reason === undefined ? {} : { reason }) };
+      return { operationId, status, ...(text === undefined ? {} : { text }), ...answer, ...await cancellation(operationId, reason), ...(reason === undefined ? {} : { reason }) };
     },
     async pending() { assertActive(); return (await harness.pending({ session: '1' })).map(({ operationId, status }) => ({ operationId, status })); },
-    async cancel(operationId?: string) {
+    async cancel(operationId?: string, input: {cancellationId?: string} = {}) {
       assertActive();
       await harness.pi();
-      await subagents.cancelParent(operationId);
-      if (operationId) {
-        // A steering input can share the native run with an older host task.
-        // Withdraw only that older input atomically: aborting its conversation
-        // would also kill the newer independent work that now owns the run.
-        const detached = await native.commit(async tx => {
-          const submission = await tx.submissionByRequest(ROOT_CONVERSATION_ID, operationId);
+      await subagentWakes.schedule();
+      const stopId = crypto.randomUUID();
+      const capture = await admitRoot(async () => {
+        const ownedOrigins = operationId === undefined ? [...new Set((await subagents.list()).map(agent => agent.parentOperationId))] : [];
+        const captured = await native.commit(async tx => {
+          const submission = operationId ? await tx.submissionByRequest(ROOT_CONVERSATION_ID, operationId) : undefined;
           const live = await tx.doc(LiveDoc, ROOT_CONVERSATION_ID);
+          const inbox = await tx.doc(InboxDoc, ROOT_CONVERSATION_ID);
           const inputs = live.run?.inputs;
-          if (submission?.type !== 'input' || submission.status !== 'placed' || !inputs?.includes(submission.id) || inputs.at(-1) === submission.id) return false;
-          tx.settleSubmission(submission.id, { status: 'unanswered', reason: 'aborted' });
-          return true;
+          const stops = await tx.doc(Stops);
+          const mark = (id: string, pending: boolean) => { stops.operations[id] ??= pending && input.cancellationId ? {cancellationId:input.cancellationId} : {}; };
+          const record = (mode: 'settled' | 'withdrawn' | 'active', operations: string[], taskId?: TaskId) => {
+            stops.pending[stopId] = {operations,...(taskId === undefined ? {} : {taskId:Number(taskId)}),...(input.cancellationId ? {cancellationId:input.cancellationId} : {})};
+            return {mode,operations,taskId};
+          };
+          if (operationId && (submission?.type !== 'input' || !['queued','placed'].includes(submission.status))) {
+            // Preserve completed outcomes, but fence their background children.
+            mark(operationId, false);
+            return record('settled', [operationId]);
+          }
+          if (submission?.type === 'input' && (submission.status === 'queued' || (submission.status === 'placed' && inputs?.includes(submission.id) && inputs.at(-1) !== submission.id))) {
+            mark(operationId!, true);
+            if (submission.status === 'queued') {
+              const index = inbox.items.findIndex(item => item.id === submission.id);
+              if (index >= 0) inbox.items.splice(index, 1);
+            }
+            tx.settleSubmission(submission.id, {status:'unanswered',reason:'aborted'});
+            return record('withdrawn', [operationId!]);
+          }
+          const ids = new Set([...(inputs ?? []), ...inbox.items.filter(item => item.mode !== 'write').map(item => item.id)]);
+          const operations: string[] = [];
+          for (const id of ids) {
+            const record = await storage.submission(id, background);
+            if (record?.requestId && record.type === 'input' && ['queued','placed'].includes(record.status)) {
+              if (!operations.includes(record.requestId)) operations.push(record.requestId);
+              mark(record.requestId, true);
+            }
+          }
+          for (const id of ownedOrigins) { if (!operations.includes(id)) operations.push(id); mark(id, false); }
+          for (const item of [...inbox.items]) {
+            if (item.mode === 'write') continue;
+            tx.settleSubmission(item.id, {status:'unanswered',reason:'aborted'});
+            inbox.items.splice(inbox.items.findIndex(value => value.id === item.id), 1);
+          }
+          return record('active', operations, live.run?.taskId);
         }, background);
-        if (detached) return true;
-      }
-      return harness.abort({ operationId });
+        if (captured.taskId !== undefined) {
+          await native.abortTask(captured.taskId, background);
+          await native.waitForTask(captured.taskId, background);
+        }
+        return captured;
+      });
+      // Outside the admission queue: a child may already be awaiting a parent
+      // delivery. Stop only captured origins, leaving future independent inputs.
+      await finishStops();
+      return capture.mode !== 'settled' && capture.operations.length > 0;
     },
     async operation(operationId: string): Promise<RuntimeOperation> {
       assertActive();
@@ -456,7 +553,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
       // For a known finished or unknown operation, Pi wait resolves immediately from its durable record.
       const result = await harness.wait(operationId);
       const answer = result.status === 'done' ? await completedAnswer(operationId) : {};
-      return { operationId, status: result.reason === 'not_found' ? 'missing' : result.status, ...(result.text === undefined ? {} : { text: result.text }), ...answer, ...(result.reason === undefined ? {} : { reason: result.reason }) };
+      return { operationId, status: result.reason === 'not_found' ? 'missing' : result.status, ...(result.text === undefined ? {} : { text: result.text }), ...answer, ...await cancellation(operationId, result.reason), ...(result.reason === undefined ? {} : { reason: result.reason }) };
     },
     async messages(): Promise<RuntimeMessage[]> { assertActive(); return normalizeEntries(await harness.messages()); },
     async subagents() { assertActive(); await harness.pi(); return subagents.list(); },

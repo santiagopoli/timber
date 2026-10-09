@@ -197,7 +197,22 @@ Stopping an older input that has already been joined by a newer input withdraws
 only the older submission and cancels its descendants; the newer root work and
 its children continue. Stopping the latest input aborts the active native run.
 An input still queued in the native inbox is withdrawn without aborting the
-active work.
+active work. Explicit Stop persists the exact affected native input IDs, root task
+ID and cancellation group before requesting abort. Recovery marks that same task
+before native scheduling resumes; it never aborts a later independent run. Pending
+child cleanup and public stop events remain durable until acknowledged.
+`wait`, `operation` and `run.failed` include `cancellationId` only for an affected
+input that actually settles as `aborted`; unexpected aborts remain failures.
+
+The host persists an outbox of exact input/session IDs before Stop dispatch. New
+admissions drain earlier Stop intents first; failed dispatch retries through
+Lifecycle without replaying tools. `Run.cancellation:{id,requestedRunId}` records
+explicit Stop intent, including on an already completed or failed owner whose
+background work remains active. Existing terminal status, answer and error remain
+unchanged. Active affected runs become cancelled and share one neutral
+`run.cancellation.requested` notice per stable group. Private host and runtime
+fences prevent late continuations, approvals, messages and effects from reopening
+stopped work; new independent inputs remain available.
 
 ComputerProvider exports exec(botId,operationId,action), status(botId), checkpoint(botId).
 ComputerAction is a discriminated union: exec, execPoll, execCancel, readFile, writeFile, listFiles,
@@ -375,15 +390,24 @@ present that decision. A native steering input also releases `wait_subagent` wit
 `{status:"yielded",reason:"new_input",subagent}`. Only that read-only observer
 ends: the child and its durable delivery keep running. The completed tool round
 then lets the parent attend to the input, including creating another child.
+Public `subagent.reported` events contain the message body in `text`, with
+`contentFormat:"plain"` and sender identity in `subagentId`/`subagentName`.
+Model-only attribution stays separate so the UI shows the sender once. Legacy
+events retain their original stored text; display removes only the known sender
+wrappers, never prefixes from new plain messages or unrelated transcript entries.
 There are at most eight active agents per bot and three
 levels of nesting. Model generations and tool calls share the originating parent
 operation's optional budgets; spawning does not reset those counters.
 
 An agent's conversation is owned by a native background task and its submissions
 and result delivery use native durable tasks. Parent completion leaves background
-work running. Explicit cancellation cascades to descendants; a cancelled agent is
-permanently fenced. Completed or failed agents can accept explicit follow-up
-messages. Bot deletion stops all of its temporary agents before deleting storage.
+work running. Explicit cancellation cascades to descendants. Active agents become
+cancelled; already completed or failed agents retain their public result, error and
+timestamps. A private durable fence closes every stopped session, and the
+`subagent.stopped` event projects that intent without rewriting completed history.
+Completed or failed agents accept explicit follow-up messages unless their session
+or originating task was stopped. Bot deletion stops all of its temporary agents
+before deleting storage.
 Public histories remain inspectable after task completion and recovery. Fresh
 computer actions always pass through the owning bot's current host policy, and
 child approvals/connections remain attached to the child run. A host continuation
@@ -458,7 +482,9 @@ is a visible terminal failure. A cancellation request remains pending until the
 target acknowledges it.
 
 Cancelling the source run or deleting its bot requests cancellation of the exact
-delegated target operation. A target cancellation tombstone fences a late or lost
+delegated target operation. The coordinator also honors `Run.cancellation` on a
+completed source: its terminal result stays intact while new mentions, pending
+delegation submissions and outstanding target work are fenced. A target cancellation tombstone fences a late or lost
 submission receipt, so cancellation does not depend on knowing the target run ID.
 Cancellation delivery retries until acknowledged, with backoff capped at one
 minute. Source deletion removes task text, result text and names from its outbox,

@@ -82,7 +82,7 @@ import './src/layout.css';
     if (selectedAgentId && currentPanel === 'agents') hash.set('agent', selectedAgentId);
     history.replaceState(null, '', `${location.pathname}${location.search}#${hash}`);
   }
-  const activity = mountToolActivity($('activity-tools'), loadArtifact);
+  const activity = mountToolActivity($('activity-tools'), loadArtifact, {onOpenBot:openAgentBot,onOpenAgents:openAgents});
   async function loadArtifact(botId, artifactId, signal) {
     if (!authenticated || selected?.id !== botId) throw new DOMException('The bot changed.', 'AbortError');
     const version = generation;
@@ -651,8 +651,8 @@ import './src/layout.css';
     cursor = event.id;
     // Actions belong to the conversation, including after a task completes.
     // Only the separate diagnostic log is capped; SSE replay restores history.
-    if (event.type === 'process.updated' || ['tool.started', 'tool.completed', 'run.retrying'].includes(event.type) && !event.data.subagentId) events.push(event);
-    if(['subagent.created','subagent.updated','subagent.reported','subagent.message.sent','agent.named.created','delegation.updated'].includes(event.type)) {
+    if (['process.updated','tool.started','tool.completed','subagent.tool.started','subagent.tool.completed','run.retrying','run.cancellation.requested'].includes(event.type)) events.push(event);
+    if(['subagent.created','subagent.updated','subagent.stopped','subagent.reported','subagent.message.sent','agent.named.created','delegation.updated'].includes(event.type)) {
       collaborationEvents.push({...event,data:redact(event.data)});
       const agent=event.data.subagent;
       if(agent && typeof agent.id==='string' && typeof agent.name==='string') {
@@ -696,7 +696,7 @@ import './src/layout.css';
     // Tool progress is already in the stream. Rendering it must not wait for
     // transcript/runs REST refreshes (which may be delayed by ongoing work).
     if (event.type === 'process.updated') renderRuns();
-    else if (['tool.started', 'tool.completed', 'run.retrying'].includes(event.type)) renderMessages();
+    else if (['tool.started','tool.completed','subagent.tool.started','subagent.tool.completed','run.retrying','run.cancellation.requested'].includes(event.type)) renderMessages();
     scheduleRefresh(version);
   }
   const pause = (ms, signal) => new Promise((resolve) => { if (signal.aborted) return resolve(); const done = () => { clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); }; const timer = setTimeout(done, ms); signal.addEventListener('abort', done, { once: true }); });

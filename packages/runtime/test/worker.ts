@@ -10,6 +10,7 @@ export class HarnessProbe extends DurableObject {
   heldTool?: Promise<void>;
   releaseHeldTool?: () => void;
   abortHeldTool?: boolean;
+  failStopProjection?: boolean;
   heldInference?: Promise<void>;
   releaseHeldInference?: () => void;
   holdInferenceAfterToolCount?: number;
@@ -134,7 +135,10 @@ export class HarnessProbe extends DurableObject {
         },
         readImage: async () => ({ data: 'aW1hZ2U=', mimeType: 'image/png' }),
       },
-      onEvent: event => { ctx.storage.sql.exec('INSERT INTO projected(event) VALUES(?)', JSON.stringify(event)); },
+      onEvent: event => {
+        if (event.type === 'subagent.stopped' && this.failStopProjection) throw new Error('Fixture lost child Stop projection');
+        ctx.storage.sql.exec('INSERT INTO projected(event) VALUES(?)', JSON.stringify(event));
+      },
       onSubagentMessage: async input => {
         ctx.storage.sql.exec('INSERT INTO child_report_attempts(input) VALUES(?)', JSON.stringify(input));
         if (this.setting('failChildReportOnce') === 'true') {

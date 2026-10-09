@@ -4,6 +4,7 @@ import {ArrowLeftIcon, ArrowUpIcon, GitBranchIcon, LoaderCircleIcon, RefreshCwIc
 import type {AgentDelegation, Bot, BotEvent, Run, Subagent} from '../../../packages/contracts/src/index';
 import {MessageResponse} from './components/ai-elements/message';
 import {AgentCreationCard, AgentMessageNotice, collectCollaboration} from './collaboration-timeline';
+import {mergeToolResult, mergeToolStatus} from './cancellation-presentation';
 import './agents.css';
 
 const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
@@ -15,32 +16,39 @@ type AgentRequest = (botId: string, path: string, options?: {method?: string; bo
 type Callbacks = {request: AgentRequest; onSelect(id: string | null): void; onRefresh(): void; onOpenBot(botId: string): void};
 
 function AgentActivity({events, agentId, hiddenIdentities}: {events:BotEvent[];agentId:string;hiddenIdentities:Set<string>}) {
-  type AgentTool = {event:BotEvent;process?:BotEvent;aliases:Set<string>};
+  type AgentResult = {output?:string;error?:string;status?:string;checkpointStatus?:'pending'|'saved'|'failed'};
+  type AgentTool = {event:BotEvent;process?:BotEvent;aliases:Set<string>;result?:AgentResult;status?:string};
   const tools = new Map<string, AgentTool>();
   for (const event of events) {
     if (event.data.subagentId !== agentId || !['subagent.tool.started','subagent.tool.completed','subagent.process.updated'].includes(event.type)) continue;
-    const identities = [event.data.operationId,event.data.toolCallId,event.type==='subagent.process.updated'?event.data.processId:undefined].filter((id):id is string => typeof id === 'string' && Boolean(id));
+    const identities = [event.data.operationId,event.data.toolCallId,event.type==='subagent.process.updated'?event.data.processId:undefined].filter((id):id is string => typeof id === 'string' && Boolean(id)).map(id=>`${event.runId||''}:${id}`);
     if (!identities.length) continue;
     const matches = [...new Set(identities.map(id=>tools.get(id)).filter((item):item is AgentTool => Boolean(item)))];
     const tool: AgentTool = matches[0] || {event,aliases:new Set<string>()};
     for(const merged of matches.slice(1)) {
       if(merged.process && (!tool.process || merged.process.id>tool.process.id))tool.process=merged.process;
+      tool.result=mergeToolResult(tool.result,merged.result);tool.status=mergeToolStatus(tool.status,merged.status);
       for(const alias of merged.aliases){tool.aliases.add(alias);tools.set(alias,tool);}
     }
     for(const id of identities){tool.aliases.add(id);tools.set(id,tool);}
+    const previous=tool.result,previousStatus=previous?.status||tool.status;
+    const incoming=event.data.result as AgentResult|undefined;
+    const receivedStatus=typeof event.data.status==='string'?event.data.status:incoming?.status||(event.type==='subagent.tool.completed'&&!previousStatus?'completed':undefined);
+    tool.status=mergeToolStatus(previousStatus,receivedStatus);
+    if(event.data.result&&typeof event.data.result==='object')tool.result=mergeToolResult(previous,event.data.result as AgentResult,{snapshot:event.type==='subagent.process.updated'});
     if(event.type==='subagent.process.updated')tool.process=event;
     if(event.type==='subagent.tool.completed' || tool.event.type!=='subagent.tool.completed') tool.event={...event,data:{...tool.event.data,...event.data}};
   }
   if (!tools.size) return null;
-  const records=[...new Set(tools.values())].filter(tool=>![...tool.aliases].some(id=>hiddenIdentities.has(id)) || ['failed','interrupted','cancelled'].includes(String((tool.event.data.result as {status?:string}|undefined)?.status||tool.event.data.status)));
+  const records=[...new Set(tools.values())].filter(tool=>![...tool.aliases].some(id=>hiddenIdentities.has(id)) || tool.event.data.toolName!=='send_subagent_message'&&['failed','interrupted','cancelled'].includes(tool.result?.status||tool.status||''));
   if(!records.length)return null;
-  return <details className="timber-agent-activity"><summary>Tool activity · {records.length}</summary>{records.map(({event: original,process,aliases}) => {
+  return <details className="timber-agent-activity"><summary>Tool activity · {records.length}</summary>{records.map(({event: original,process,aliases,result:observed,status:observedStatus}) => {
     const event=process?{...original,type:process.type,data:{...original.data,...process.data,toolName:'exec'}}:original;
-    const result = event.data.result as {output?:string;error?:string;status?:string;checkpointStatus?:'pending'|'saved'|'failed'} | undefined;
+    const result = observed;
     const input = event.data.input && typeof event.data.input === 'object' ? event.data.input as Record<string,unknown> : {};
     const summary = ['command','path','url','key'].flatMap(key => typeof input[key] === 'string' ? [input[key] as string] : []).join(' · ');
-    const status = event.type === 'subagent.tool.started' ? 'running' : result?.status || String(event.data.status || 'completed');
-    return <article key={[...aliases][0]}><div className="timber-agent-card-heading"><strong>{String(event.data.toolName || event.data.actionType || 'Tool')}</strong><span className="status" data-status={status}>{status==='running' && event.data.cancellationRequested?'Stopping…':label(status)}</span></div>{summary && <pre>{summary.slice(0,1000)}</pre>}{result?.checkpointStatus==='pending' && <p className="hint" data-checkpoint-status="pending">Saving files…</p>}{result?.output && <pre>{result.output.slice(0,4000)}</pre>}{result?.error && <p className={result.status==='completed'?'timber-save-warning':'error'}>{result.error}</p>}</article>;
+    const status = result?.status || observedStatus || (event.type === 'subagent.tool.started' ? 'running' : 'completed');
+    return <article key={[...aliases][0]}><div className="timber-agent-card-heading"><strong>{String(event.data.toolName || event.data.actionType || 'Tool')}</strong><span className="status" data-status={status}>{status==='running' && event.data.cancellationRequested?'Stopping…':label(status)}</span></div>{summary && <pre>{summary.slice(0,1000)}</pre>}{result?.checkpointStatus==='pending' && <p className="hint" data-checkpoint-status="pending">Saving files…</p>}{result?.output && <pre>{result.output.slice(0,4000)}</pre>}{result?.error && status!=='cancelled' && <p className={status==='completed'?'timber-save-warning':'error'}>{result.error}</p>}</article>;
   })}</details>;
 }
 
@@ -75,7 +83,7 @@ function AgentConversation({model, agent, callbacks}: {model: AgentsModel; agent
     catch (reason) {if (mounted.current) setError(reason instanceof Error ? reason.message : 'Could not stop this agent.');}
     finally {if (mounted.current) setStopping(false);}
   };
-  const collaboration=collectCollaboration({bot:{id:model.botId,name:model.botName},subagents:model.agents,runs:model.runs,mentionBots:model.namedAgents,delegations:model.delegations,messages:[],collaborationEvents:model.collaborationEvents,runFilter:null},agent.id);
+  const collaboration=collectCollaboration({bot:{id:model.botId,name:model.botName},events:model.events,subagents:model.agents,runs:model.runs,mentionBots:model.namedAgents,delegations:model.delegations,messages:[],collaborationEvents:model.collaborationEvents,runFilter:null},agent.id);
   const collaborationCallbacks={onOpenBot:callbacks.onOpenBot,onOpenAgents:(id?:string)=>callbacks.onSelect(id??null)};
   const timeline=[...messages.map((message,index)=>({key:`message:${message.id||index}`,createdAt:message.createdAt||agent.createdAt,node:<article className={`timber-agent-message timber-agent-message-${message.role}`} data-agent-message={message.id}>
     <div className="timber-message-meta"><strong>{(message.role === 'assistant' ? agent.name : message.role === 'user' ? 'Task / message' : label(message.role))}</strong>{message.createdAt && <time>{date(message.createdAt)}</time>}</div>

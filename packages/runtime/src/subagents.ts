@@ -10,14 +10,15 @@ import { computerToolOperationId } from './tools.js';
 import type { RuntimeEvent, RuntimePause, RuntimeReceipt, RuntimeSubagent } from './types.js';
 
 type Context = PiHarnessContext['context'];
-type StoredAgent = RuntimeSubagent & { conversationId: string; depth: number; spawnOperationId: string };
+type StoredAgent = RuntimeSubagent & { conversationId: string; depth: number; spawnOperationId: string; stopped?: boolean; stopPending?: boolean; cancellationId?: string };
 const Registry = defineDoc<{ agents: Record<string, StoredAgent>; deliveries: Record<string, { text: string; taskId: number }> }>({
   kind: 'timber.subagents', version: 1, scope: 'session', initial: () => ({ agents: {}, deliveries: {} }),
 });
 const active = new Set<RuntimeSubagent['status']>(['queued', 'running', 'waiting_approval', 'waiting_connection']);
 const MAX_AGENTS = 8;
 const MAX_DEPTH = 3;
-const publicAgent = ({ conversationId: _conversationId, depth: _depth, spawnOperationId: _spawnOperationId, ...agent }: StoredAgent): RuntimeSubagent => agent;
+const publicAgent = ({ conversationId: _conversationId, depth: _depth, spawnOperationId: _spawnOperationId, stopped: _stopped, stopPending: _stopPending, cancellationId: _cancellationId, ...agent }: StoredAgent): RuntimeSubagent => agent;
+const isStopped = (agent: StoredAgent) => agent.stopped || agent.status === 'cancelled';
 const content = (value: unknown): ToolExecutionResult => ({ content: [{ type: 'text', text: JSON.stringify(value) }] });
 async function reportOperationId(subagentId: string, operationId: string): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify([subagentId, operationId])));
@@ -35,8 +36,9 @@ export interface SubagentHost {
   operationForCall(api: ToolExecutionApi, context: Context): Promise<string>;
   consume(operationId: string, kind: 'generation' | 'tool', itemId: string): void;
   paused(operationId: string): RuntimePause | undefined;
+  stopped(operationId: string, tx?: Tx): Promise<boolean>;
   scheduleWake(): Promise<void>;
-  onMessage?(input: { subagentId: string; parentOperationId: string; operationId: string; text: string }): Promise<void>;
+  onMessage?(input: { subagentId: string; parentOperationId: string; operationId: string; text: string; promptText?: string; kind?: 'message' | 'result' }): Promise<void>;
 }
 
 /** Native Pi conversations and background tasks own execution, inboxes and recovery. */
@@ -55,7 +57,7 @@ export function createSubagents(host: SubagentHost) {
     let changed: StoredAgent | undefined;
     await host.native().commit(async tx => {
       const record = (await tx.doc(Registry)).agents[id];
-      if (!record || (operationId && record.operationId !== operationId) || record.status === 'cancelled') return;
+      if (!record || (operationId && record.operationId !== operationId) || isStopped(record)) return;
       Object.assign(record, patch, { updatedAt: new Date().toISOString() });
       if (patch.status === 'running') { delete record.result; delete record.error; }
       changed = { ...record };
@@ -69,7 +71,7 @@ export function createSubagents(host: SubagentHost) {
     await host.native().commit(async tx => {
       const registry = await tx.doc(Registry);
       const record = registry.agents[id];
-      if (!record || record.status === 'cancelled') return;
+      if (!record || isStopped(record)) return;
       projected = { ...record, ...patch, operationId, updatedAt: new Date().toISOString() };
       if (patch.result === undefined) delete projected.result;
       if (patch.error === undefined) delete projected.error;
@@ -200,7 +202,7 @@ export function createSubagents(host: SubagentHost) {
         host.assertActive();
         if (task.state.checkpoint.retryAt) await runtime.sleep(task.state.checkpoint.retryAt, context);
         const agent = await find(task.input.id);
-        if (agent.status === 'cancelled') {
+        if (isStopped(agent) || await host.stopped(agent.parentOperationId)) {
           await runtime.commit(() => ({ status: 'terminal', outcome: { status: 'aborted' } }), context);
           return;
         }
@@ -240,12 +242,13 @@ export function createSubagents(host: SubagentHost) {
         if (task.state.checkpoint.retryAt) await runtime.sleep(task.state.checkpoint.retryAt, context);
         const agent = await find(task.input.id);
         const report = task.state.checkpoint.text;
-        if (report && agent.status !== 'cancelled') {
-          const text = `Subagent ${agent.name} completed its task:\n${report.length > 31_000 ? `${report.slice(0, 31_000)}\n[The full result is available in the subagent conversation.]` : report}`;
+        if (report && !isStopped(agent) && !await host.stopped(agent.parentOperationId)) {
+          const text = report.length > 31_000 ? `${report.slice(0, 31_000)}\n[The full result is available in the subagent conversation.]` : report;
+          const promptText = `Subagent ${agent.name} completed its task:\n${text}`;
           const operationId = await reportOperationId(agent.id, task.input.operationId);
           try {
-            if (agent.parentSubagentId) await send(agent.parentSubagentId, text, { operationId }, false, context);
-            else await host.onMessage?.({ subagentId: agent.id, parentOperationId: agent.parentOperationId, operationId, text });
+            if (agent.parentSubagentId) await send(agent.parentSubagentId, promptText, { operationId }, false, context);
+            else await host.onMessage?.({ subagentId: agent.id, parentOperationId: agent.parentOperationId, operationId, text, promptText, kind: 'result' });
           } catch (error) {
             context.abortSignal?.throwIfAborted();
             const attempt = (task.state.checkpoint.attempt ?? 0) + 1;
@@ -291,7 +294,7 @@ export function createSubagents(host: SubagentHost) {
       const registry = await tx.doc(Registry);
       const record = registry.agents[id];
       if (!record) throw new Error('Subagent not found');
-      if (record.status === 'cancelled') throw new Error('Subagent was cancelled');
+      if (isStopped(record) || await host.stopped(record.parentOperationId, tx)) throw new Error('Subagent was cancelled');
       const existing = await tx.submissionByRequest(Number(record.conversationId) as ConversationId, input.operationId);
       const previous = registry.deliveries[`${id}:${input.operationId}`];
       if (previous && previous.text !== text) throw new Error('Operation ID already used for another subagent message');
@@ -302,17 +305,41 @@ export function createSubagents(host: SubagentHost) {
     host.native().resume();
     return { operationId: input.operationId, accepted };
   };
-  const cancel = async (id: string, callContext?: Context): Promise<boolean> => {
+  const finishStops = async () => {
+    for (const agent of Object.values((await state()).agents).filter(agent => agent.stopPending)) {
+      // Publish before native cleanup; retries retain the same event identity.
+      await host.emit({type:'subagent.stopped',operationId:agent.parentOperationId,eventKey:`subagent:stopped:${agent.id}`,
+        data:{subagent:publicAgent(agent),...(agent.cancellationId?{cancellationId:agent.cancellationId}:{})}});
+      await host.harness().session(agent.conversationId).abort();
+      await host.native().commit(async tx => { delete (await tx.doc(Registry)).agents[agent.id]!.stopPending; }, host.context());
+    }
+  };
+  const markStopped = async (selected: Set<string>, cancellationId?: string) => {
+    await host.native().commit(async tx => {
+      const registry = await tx.doc(Registry);
+      for (const agent of Object.values(registry.agents).filter(agent => selected.has(agent.id))) {
+        const record = registry.agents[agent.id]!;
+        record.stopped = true;
+        record.stopPending = true;
+        if (cancellationId) record.cancellationId ??= cancellationId;
+        if (active.has(record.status)) {
+          record.status = 'cancelled';
+          record.updatedAt = new Date().toISOString();
+          delete record.error;
+        }
+      }
+    }, host.context());
+  };
+  const cancel = async (id: string, callContext?: Context, cancellationId?: string): Promise<boolean> => {
     host.assertActive();
     const all = Object.values((await state()).agents);
     const selected = new Set([id]);
     if (!all.some(agent => agent.id === id)) throw new Error('Subagent not found');
     for (let depth = 0; depth < MAX_DEPTH; depth++) for (const agent of all) if (agent.parentSubagentId && selected.has(agent.parentSubagentId)) selected.add(agent.id);
-    for (const agent of all.filter(agent => selected.has(agent.id))) {
-      callContext?.abortSignal?.throwIfAborted();
-      await update(agent.id, { status: 'cancelled' });
-      await host.harness().session(agent.conversationId).abort();
-    }
+    await host.scheduleWake();
+    await markStopped(selected, cancellationId);
+    callContext?.abortSignal?.throwIfAborted();
+    await finishStops();
     return true;
   };
   const tools = () => {
@@ -321,7 +348,7 @@ export function createSubagents(host: SubagentHost) {
       const parentOperationId = await host.operationForCall(api, context);
       const operationId = await computerToolOperationId(String(api.taskId), api.callId);
       const sender = await forConversation(api.conversationId);
-      if (sender?.status === 'cancelled') throw new Error('Subagent was cancelled');
+      if ((sender && isStopped(sender)) || await host.stopped(parentOperationId)) throw new Error('Subagent was cancelled');
       const live = await api.snapshot(LiveDoc, api.conversationId, context);
       for (const id of live?.run?.inputs ?? []) {
         const request = await host.storage().submission(id, context);
@@ -340,6 +367,7 @@ export function createSubagents(host: SubagentHost) {
           await host.scheduleWake();
           const parent = await forConversation(api.conversationId);
           const agent = await api.commit(async tx => {
+            if (await host.stopped(parentOperationId, tx)) throw new Error('Parent operation was stopped');
             const registry = await tx.doc(Registry);
             const previous = Object.values(registry.agents).find(agent => agent.spawnOperationId === operationId);
             if (previous) return { ...previous };
@@ -385,7 +413,8 @@ export function createSubagents(host: SubagentHost) {
               return sent(await send(parent.id, input.text, { operationId }, false, context), parent);
             }
             if (!host.onMessage) throw new Error('Parent messaging is not configured');
-            await host.onMessage({ subagentId: sender.id, parentOperationId, operationId, text: `Message from subagent ${sender.name}:\n${input.text}` });
+            await host.onMessage({ subagentId: sender.id, parentOperationId, operationId, text: input.text,
+              promptText: `Message from subagent ${sender.name}:\n${input.text}`, kind: 'message' });
             return sent({ operationId, accepted: true });
           }
           const target = await find(input.targetId);
@@ -442,7 +471,21 @@ export function createSubagents(host: SubagentHost) {
     async hasDeliveries() { return (await host.native().inspect(host.context())).tasks.some(task => task.record.kind === 'timber.subagent-delivery'); },
     async list() { return Object.values((await state()).agents).map(publicAgent); },
     async messages(id: string) { const agent = await find(id); return normalizeEntries(await host.harness().session(agent.conversationId).messages()).filter(message => message.role !== 'tool' && message.role !== 'system'); },
-    send, cancel,
-    async cancelParent(operationId?: string) { for (const agent of Object.values((await state()).agents)) if ((!operationId || agent.parentOperationId === operationId) && agent.status !== 'cancelled') await cancel(agent.id); },
+    send, cancel, finishStops,
+    async markParentStopped(operationId: string, cancellationId?: string) {
+      const agents = Object.values((await state()).agents);
+      await markStopped(new Set(agents.filter(agent => agent.parentOperationId === operationId).map(agent => agent.id)), cancellationId);
+    },
+    async prepareStops() {
+      for (const agent of Object.values((await state()).agents).filter(agent => agent.stopPending)) {
+        const live = await host.native().snapshot(LiveDoc, Number(agent.conversationId) as ConversationId, host.context());
+        if (live?.run) await host.native().abortTask(live.run.taskId, host.context());
+      }
+    },
+    async cancelParent(operationId?: string, cancellationId?: string) {
+      const agents = Object.values((await state()).agents).filter(agent => !operationId || agent.parentOperationId === operationId);
+      const selected = new Set(agents.map(agent => agent.id));
+      for (const agent of agents) if (!agent.parentSubagentId || !selected.has(agent.parentSubagentId)) await cancel(agent.id, undefined, cancellationId);
+    },
   };
 }

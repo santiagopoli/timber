@@ -224,6 +224,29 @@ describe("durable communication between named bots", () => {
     expect(sourceRuns.runs.filter(value => value.operationId === `agent-result:${delegation.id}`)).toHaveLength(0);
   });
 
+  it("stops outstanding delegated work while preserving a completed source outcome", async () => {
+    const {bot, run} = await source(), target = await create();
+    await hold(target);
+    const delegation = await delivered(bot, await send(input(bot, run, target)));
+    await runInDurableObject(stubFor(bot), (_instance, state) => {
+      const row = state.storage.sql.exec<{data:string}>("SELECT data FROM runs WHERE id=?", run.id).one();
+      const completed = {...JSON.parse(row.data), status:"completed"};
+      state.storage.sql.exec("UPDATE runs SET data=? WHERE id=?", JSON.stringify(completed), run.id);
+    });
+    await (await api(`/v1/bots/${bot.id}/runs/${run.id}/cancel`, {})).text();
+    const stopped = await current(bot, run.id);
+    expect(stopped).toMatchObject({status:"completed", cancellation:{requestedRunId:run.id}});
+    await evictDurableObject(registry());
+    for (let attempt = 0; attempt < 3; attempt++) await advance(delegation.id);
+    expect((await current(target, delegation.targetRunId!)).status).toBe("cancelled");
+    expect((await current(bot, run.id)).status).toBe("completed");
+    const late = await coordinator({...input(bot, run, target), kind:"mention"});
+    expect(late.status).toBe(409);
+    await late.text();
+    const sourceRuns = await (await api(`/v1/bots/${bot.id}/runs`)).json<{runs:Run[]}>();
+    expect(sourceRuns.runs.filter(value => value.operationId === `agent-result:${delegation.id}`)).toHaveLength(0);
+  });
+
   it("turns recipient deletion into a visible terminal result without recreating its bot", async () => {
     const {bot, run} = await source(), target = await create();
     await hold(target);

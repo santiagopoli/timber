@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
-import { PlusIcon, ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon, HistoryIcon } from 'lucide-react';
+import { PlusIcon, ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon, HistoryIcon, SquareIcon } from 'lucide-react';
 import { useStickToBottomContext } from 'use-stick-to-bottom';
 import { defaultUrlTransform, type UrlTransform } from 'streamdown';
 import { Conversation, ConversationContent, ConversationEmptyState, ConversationScrollButton } from '@/components/ai-elements/conversation';
@@ -17,6 +17,7 @@ import './chat.css';
 import {hasBotMention} from './mentions';
 import {agentColor} from './agent-colors';
 import {AgentCreationCard, AgentMessageNotice, collectCollaboration, provenanceNotice} from './collaboration-timeline';
+import {mergeToolResult, mergeToolStatus, runOutcomes, toolActivityState, toolFailureSummary} from './cancellation-presentation';
 
 const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
 const timestamp = (value?: string) => value ? Date.parse(value) || 0 : 0;
@@ -60,7 +61,7 @@ function CopyMessage({ text, kind = 'message', createdAt }: { text: string; kind
 
 function ApprovalEntry({ approval, current, automatic, callbacks, agentName, events = [] }: { approval: ChatApproval; current: boolean; automatic: boolean; callbacks: ChatCallbacks; agentName?:string; events?: ChatModel['events'] }) {
   const process = processUpdate(events, approval.result?.processId || approval.operationId);
-  if (process) approval = {...approval, result: process.data.result as ChatApproval['result']};
+  if (process) approval = {...approval, result: mergeToolResult(approval.result, process.data.result as ChatApproval['result'], {snapshot:true})};
   const saving = approval.result?.checkpointStatus === 'pending';
   const pending = approval.status === 'pending';
   const executing = approval.status === 'executing' || approval.status === 'approved' || approval.result?.status === 'running';
@@ -108,13 +109,14 @@ function MessageRunStatus({ model, runId, callbacks }: { model: ChatModel; runId
   </div>;
 }
 
-function TaskOutcome({model, run, callbacks}: {model:ChatModel;run:ChatModel['runs'][number];callbacks:ChatCallbacks}) {
+function TaskOutcome({model, run, callbacks, kind, cancellationId}: {model:ChatModel;run:ChatModel['runs'][number];callbacks:ChatCallbacks;kind:'stopped'|'failure';cancellationId?:string}) {
+  if (kind === 'stopped') return <article className="timber-work-status" data-run-outcome={run.id} data-cancellation-id={cancellationId} data-task-outcome-kind="stopped" role="status"><SquareIcon aria-hidden="true"/><span>Task stopped</span></article>;
   const request = model.messages.find(message=>message.runId===run.id && message.role==='user');
-  const canContinue = request && run.status !== 'cancelled';
+  const canContinue = Boolean(request);
   return <article className="timber-task-outcome" data-run-outcome={run.id} role="status">
-    <div className="timber-task-outcome-heading"><CircleAlertIcon aria-hidden="true"/><span>{run.status==='cancelled' ? 'Task stopped' : 'Response interrupted'}</span></div>
+    <div className="timber-task-outcome-heading"><CircleAlertIcon aria-hidden="true"/><span>Response interrupted</span></div>
     {run.error && <p>{run.error}</p>}
-    {canContinue && <Button type="button" variant="outline" size="sm" disabled={model.sending || model.runs.some(item=>!item.subagentId && !terminal.has(item.status))} onClick={()=>callbacks.onSend(model.bot.id, `Continue this task:\n\n${bounded(request.text,6000)}\n\nUse the results already recorded in this conversation. Check the last outcome before taking another action; do not repeat completed work. Explain the result or any remaining blocker.`)}>Continue</Button>}
+    {canContinue && request && <Button type="button" variant="outline" size="sm" disabled={model.sending || model.runs.some(item=>!item.subagentId && !terminal.has(item.status))} onClick={()=>callbacks.onSend(model.bot.id, `Continue this task:\n\n${bounded(request.text,6000)}\n\nUse the results already recorded in this conversation. Check the last outcome before taking another action; do not repeat completed work. Explain the result or any remaining blocker.`)}>Continue</Button>}
   </article>;
 }
 
@@ -148,7 +150,7 @@ function DeliveryEntry({ delivery, busy, callbacks }: { delivery: MessageDeliver
 type TimelineEntry = { key: string; at: number; order: number; node: ReactNode; tool?: ToolActivity };
 type ToolActivity = { key: string; runId?: string; at: number; name: string; aliases: Set<string>; returned: boolean; status?: string; result?: {status?: string; processId?: string; checkpointStatus?: 'pending'|'saved'|'failed'; output?: string; error?: string; exitCode?: number; artifactId?: string}; process?: ChatModel['events'][number]; data: Record<string, unknown> };
 type ActivityStep = {at: number; key: string; tool: ToolActivity};
-type ActivityModel = Pick<ChatModel, 'bot' | 'events' | 'runs' | 'approvals' | 'runFilter'> & Partial<Pick<ChatModel,'collaborationEvents'>>;
+type ActivityModel = Pick<ChatModel, 'bot' | 'events' | 'runs' | 'approvals' | 'runFilter' | 'subagents' | 'delegations' | 'mentionBots' | 'messages' | 'collaborationEvents'>;
 const toolNames: Record<string, string> = {exec: 'Run command', read_file: 'Read file', readFile: 'Read file', write_file: 'Write file', writeFile: 'Write file', list_files: 'Browse files', listFiles: 'Browse files', desktop_screenshot: 'Capture desktop', screenshot: 'Capture desktop', browser_navigate: 'Open', navigate: 'Open', desktop_click: 'Click', click: 'Click', desktop_move: 'Move pointer', move: 'Move pointer', desktop_double_click: 'Double click', doubleClick: 'Double click', desktop_drag: 'Drag', drag: 'Drag', desktop_type: 'Type text', type: 'Type text', desktop_key: 'Press', key: 'Press', desktop_scroll: 'Scroll', scroll: 'Scroll', checkpoint: 'Save workspace', github_clone: 'Clone', gitClone: 'Clone', github_push: 'Push', gitPush: 'Push', github_connect: 'Connect GitHub', github_create_pull_request: 'Create pull request', github_list_pull_requests: 'List pull requests', github_list_repositories: 'List repositories', load_skill: 'Load skill', list_tools: 'Available tools', publish_app: 'Publish app', list_apps: 'List apps', remove_app: 'Remove app', spawn_subagent:'Create subagent', list_subagents:'View subagents', send_subagent_message:'Message subagent', wait_subagent:'Wait for subagent', cancel_subagent:'Stop subagent', send_to_bot:'Message bot', create_bot:'Create named bot', list_bots:'View bots'};
 const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 Object.assign(toolNames, {exec_poll: 'Check command', execPoll: 'Check command', exec_cancel: 'Stop command', execCancel: 'Stop command'});
@@ -169,7 +171,7 @@ function collectTools(model: ActivityModel, includeApprovals = false): ToolActiv
   // A host event bridges the native call ID and the durable computer operation ID.
   // Merge those explicit aliases only: identical command text is not identity.
   const aliases = new Map<string, ToolActivity>();
-  const collaborationIdentities=new Set((model.collaborationEvents||[]).filter(event=>['subagent.created','subagent.message.sent','agent.named.created','delegation.updated'].includes(event.type)).flatMap(event=>[event.data.operationId,event.data.toolCallId,event.type==='subagent.created'?record(event.data.subagent).operationId:undefined]).filter((id):id is string=>typeof id==='string'&&Boolean(id)));
+  const collaborationIdentities=collectCollaboration(model).toolIdentities;
   for (const event of model.events) {
     if (!['tool.started', 'tool.completed', 'process.updated'].includes(event.type) || event.data.subagentId || model.runFilter && event.runId !== model.runFilter) continue;
     const data = event.data, ids = [data.operationId, data.toolCallId, event.type === 'process.updated' ? data.processId : undefined].filter((id): id is string => typeof id === 'string' && Boolean(id));
@@ -190,8 +192,10 @@ function collectTools(model: ActivityModel, includeApprovals = false): ToolActiv
     if (typeof data.actionType === 'string') tool.name = data.actionType;
     else if (typeof data.toolName === 'string' && (data.toolName !== 'call_tool' || tool.name === 'Computer tool')) tool.name = data.toolName;
     tool.returned ||= event.type === 'tool.completed';
-    if (typeof data.status === 'string') tool.status = data.status;
-    if (data.result && typeof data.result === 'object') tool.result = event.type==='process.updated' ? data.result as ToolActivity['result'] : {...tool.result, ...data.result as ToolActivity['result']};
+    const previous = tool.result, previousStatus = previous?.status || tool.status;
+    const receivedStatus=typeof data.status==='string'?data.status:typeof record(data.result).status==='string'?String(record(data.result).status):event.type==='tool.completed'&&!previousStatus?'completed':undefined;
+    tool.status = mergeToolStatus(previousStatus, receivedStatus);
+    if (data.result && typeof data.result === 'object') tool.result = mergeToolResult(previous, data.result as ToolActivity['result'], {snapshot:event.type==='process.updated'});
     tool.data = {...tool.data, ...data};
   }
   for (const approval of model.approvals) {
@@ -203,18 +207,19 @@ function collectTools(model: ActivityModel, includeApprovals = false): ToolActiv
     }
     const value: ToolActivity = tool || {key, runId: approval.runId, at: timestamp(approval.createdAt), name: approval.action.type, aliases: new Set([key]), returned: false, data: {}};
     value.data = {...value.data, operationId: approval.operationId, input: approval.action};
-    value.status = approval.status === 'pending' ? 'pending_approval' : ['approved', 'executing'].includes(approval.status) ? 'running' : approval.status;
+    value.status = mergeToolStatus(value.status, approval.status === 'pending' ? 'pending_approval' : ['approved', 'executing'].includes(approval.status) ? 'running' : approval.status);
     value.returned = !['pending', 'approved', 'executing'].includes(approval.status);
-    if (approval.result) value.result = approval.result;
+    if (approval.result) value.result = mergeToolResult(value.result, approval.result);
     aliases.set(key, value);
   }
-  return [...new Set(aliases.values())].filter(tool=>!['spawn_subagent','create_bot','send_subagent_message','send_to_bot'].includes(tool.name) || ['failed','interrupted','cancelled'].includes(tool.result?.status||tool.status||'') || ![...tool.aliases].some(alias=>collaborationIdentities.has(alias.slice((tool.runId||'').length+1)))).map(tool => {
+  return [...new Set(aliases.values())].filter(tool=>!['spawn_subagent','create_bot','send_subagent_message','send_to_bot'].includes(tool.name) || tool.name!=='send_subagent_message'&&['failed','interrupted','cancelled'].includes(tool.result?.status||tool.status||'') || ![...tool.aliases].some(alias=>collaborationIdentities.has(alias))).map(tool => {
     const process = tool.process || processUpdate(model.events, tool.result?.processId || displayText(tool.data.operationId));
     if (!process) return tool;
     // Process observations outlive the original tool/approval receipt. Keep the
     // original operation and timeline position while applying the latest state.
     const originalExec = tool.name === 'exec' || Boolean(tool.process);
-    return {...tool, process, name: originalExec ? 'exec' : tool.name, result: record(process.data.result), data: originalExec ? {...tool.data, ...process.data, input: {...toolInput(tool), ...record(process.data.input)}} : {...tool.data, result:process.data.result, cancellationRequested: process.data.cancellationRequested}};
+    const result=mergeToolResult(tool.result,record(process.data.result),{snapshot:true});
+    return {...tool, process, name: originalExec ? 'exec' : tool.name, result, data: originalExec ? {...tool.data, ...process.data, input: {...toolInput(tool), ...record(process.data.input)},result} : {...tool.data, result, cancellationRequested: process.data.cancellationRequested}};
   });
 }
 
@@ -253,14 +258,7 @@ function toolPresentation(tool: ToolActivity) {
 }
 
 function toolState(tool: ToolActivity, model: ActivityModel) {
-  const run = model.runs.find(item => item.id === tool.runId), active = Boolean(run && !terminal.has(run.status));
-  const status = tool.result?.status || tool.status;
-  const pending = status === 'pending_approval' || status === 'pending_connection';
-  const running = status === 'running' && Boolean(tool.result?.processId || tool.data.processId) || (!tool.returned && !status || status === 'running') && active;
-  const unknown = !running && !tool.returned && (!status || status === 'running') && !active;
-  const failed = ['failed', 'interrupted', 'cancelled', 'denied', 'expired'].includes(status || '') || unknown;
-  const text = unknown ? 'Outcome unconfirmed' : status === 'pending_connection' ? 'Connection requested' : pending ? 'Approval requested' : status === 'completed' ? 'Completed' : running ? tool.data.cancellationRequested ? 'Stopping…' : 'Running' : status ? label(status).replace(/^./, character => character.toUpperCase()) : 'Returned';
-  return {status: status || (unknown ? 'unconfirmed' : running ? 'running' : 'returned'), text, running, failed, pending};
+  return toolActivityState(tool, model.runs.find(item => item.id === tool.runId));
 }
 
 function ToolActivityRow({tool, model, panel = false}: {tool: ToolActivity; model: ActivityModel; panel?: boolean}) {
@@ -268,13 +266,15 @@ function ToolActivityRow({tool, model, panel = false}: {tool: ToolActivity; mode
   const state = toolState(tool, model), presentation = toolPresentation(tool), input = toolInput(tool);
   const command = presentation.command ? displayText(input.command) : '';
   const identity = activityIdentity(tool.name, command), Icon = identity.Icon;
-  const StatusIcon = state.running ? LoaderCircleIcon : state.failed ? CircleAlertIcon : state.pending ? ShieldCheckIcon : CheckIcon;
+  const StatusIcon = state.running ? LoaderCircleIcon : state.cancelled ? SquareIcon : state.failed || state.unknown ? CircleAlertIcon : state.pending ? ShieldCheckIcon : CheckIcon;
   const output = typeof tool.result?.output === 'string' ? tool.result.output : '';
-  const error = tool.result?.error;
+  const error = toolFailureSummary(tool.result, state);
+  const diagnosticClass = tool.result?.status === 'completed' ? 'timber-save-warning' : state.failed ? 'timber-inline-error' : '';
   const gui = /^(?:desktop_)?(?:click|move|double_click|doubleClick|drag|type|key|scroll|navigate)$/.test(tool.name) || tool.name === 'browser_navigate';
   const redundant = gui && tool.result?.status === 'completed' && /^(?:click|move|doubleClick|drag|type|key|scroll|navigate) submitted to desktop\.?$/i.test(output.trim());
   const format = useMemo(()=>outputFormat(output, tool.name, {path: input.path}), [output, tool.name, input.path]);
   const preview = error || (tool.name === 'exec' && state.status === 'completed' && !output.trim() ? 'No output' : '');
+  const showOutput = Boolean(output.trim()) && !redundant && output.trim() !== preview.trim();
   const operation = String(tool.data.operationId || tool.data.toolCallId || tool.key);
   const attributes = panel ? {'data-activity-tool-operation-id': operation} : {'data-tool-operation-id': operation};
   const statusLabel = `${state.text}${tool.result?.exitCode !== undefined ? ` · exit ${tool.result.exitCode}` : ''}`;
@@ -285,8 +285,8 @@ function ToolActivityRow({tool, model, panel = false}: {tool: ToolActivity; mode
       <span className="timber-tool-kind" title={identity.label} aria-label={identity.label}><Icon aria-hidden="true"/></span>
       <div className="timber-tool-overview">
         <div className={`timber-tool-command${presentation.command ? ' is-command' : ''}`}>{command ? <ActivityCode code={command} language="bash" compact/> : presentation.title}</div>
-        <div className="timber-tool-meta"><span className={state.pending || state.status === 'unconfirmed' ? 'timber-tool-parameters' : 'timber-sr-only'}>{statusLabel}</span>{tool.result?.exitCode !== undefined && tool.result.exitCode !== 0 && <span className="timber-tool-exit">exit {tool.result.exitCode}</span>}{presentation.parameters && <span className="timber-tool-parameters">{presentation.parameters}</span>}{tool.result?.checkpointStatus==='pending' && <span className="timber-tool-parameters" data-checkpoint-status="pending">Saving files…</span>}</div>
-        {preview ? <div className={`timber-tool-preview${error ? tool.result?.status === 'completed' ? ' timber-save-warning' : ' timber-inline-error' : ''}`} data-tool-result-preview>{bounded(preview,420)}</div> : output.trim() && !redundant && <div className="timber-tool-preview" data-tool-result-preview><ActivityOutput format={format} compact/></div>}
+        <div className="timber-tool-meta"><span className={state.pending || state.cancelled || state.unknown ? 'timber-tool-parameters' : 'timber-sr-only'}>{statusLabel}</span>{tool.result?.exitCode !== undefined && tool.result.exitCode !== 0 && !state.cancelled && <span className="timber-tool-exit">exit {tool.result.exitCode}</span>}{presentation.parameters && <span className="timber-tool-parameters">{presentation.parameters}</span>}{tool.result?.checkpointStatus==='pending' && <span className="timber-tool-parameters" data-checkpoint-status="pending">Saving files…</span>}</div>
+        {(preview || showOutput) && <div className="timber-tool-preview" data-tool-result-preview>{preview && <div className={`timber-tool-preview${error && diagnosticClass ? ` ${diagnosticClass}` : ''}`}>{bounded(preview,420)}</div>}{showOutput && <ActivityOutput format={format} compact/>}</div>}
         {tool.result?.artifactId && <ArtifactPreview key={`${model.bot.id}:${tool.result.artifactId}`} botId={model.bot.id} artifactId={tool.result.artifactId}/>}
       </div>
       <span className="timber-tool-corner"><span className="timber-tool-status" role="status" aria-label={statusLabel} title={statusLabel}><StatusIcon className={state.running ? 'timber-spinner' : ''} aria-hidden="true"/></span><ChevronDownIcon className="timber-tool-chevron" aria-hidden="true"/></span>
@@ -296,7 +296,7 @@ function ToolActivityRow({tool, model, panel = false}: {tool: ToolActivity; mode
       {selected === 'output' && <div className="timber-tool-output"><ActivityOutput format={format} source={output}/></div>}
       {selected === 'command' && <ActivityCode code={command} language="bash"/>}
       {selected === 'details' && <div className="timber-tool-data"><ActivityCode code={safeJSON(publicToolData(tool))} language="json"/></div>}
-      {error && <p className={tool.result?.status === 'completed' ? 'timber-save-warning' : 'timber-inline-error'}>{error}</p>}
+      {error && <p className={diagnosticClass}>{error}</p>}
     </div>}
   </details>;
 }
@@ -316,9 +316,13 @@ function ActivityGroup({model, runId, steps, latest}: {model: ActivityModel; run
   </section>;
 }
 
-function ActivityPanel({model}: {model: ActivityModel}) {
-  const tools = collectTools(model, true).sort((a, b) => Number(toolState(b, model).running) - Number(toolState(a, model).running) || b.at - a.at);
-  return <div className="timber-activity-panel">{tools.length ? tools.map(tool => <ToolActivityRow key={tool.key} tool={tool} model={model} panel />) : <p className="timber-activity-empty">No actions yet.</p>}</div>;
+function ActivityPanel({model,callbacks}: {model: ActivityModel;callbacks:Pick<ChatCallbacks,'onOpenBot'|'onOpenAgents'>}) {
+  const tools=collectTools(model,true),collaboration=collectCollaboration(model);
+  const entries=[
+    ...tools.map(tool=>({key:`tool:${tool.key}`,at:tool.at,running:toolState(tool,model).running,node:<ToolActivityRow tool={tool} model={model} panel/>})),
+    ...collaboration.items.map(item=>({key:item.key,at:timestamp(item.createdAt),running:['queued','running','waiting_approval','waiting_connection'].includes(item.notice?.status||item.creation?.status||''),node:item.notice?<AgentMessageNotice notice={item.notice} callbacks={callbacks} eventKey={item.key} context="activity"/>:item.creation?<AgentCreationCard creation={item.creation} callbacks={callbacks} context="activity"/>:null})),
+  ].sort((a,b)=>Number(b.running)-Number(a.running)||b.at-a.at);
+  return <div className="timber-activity-panel">{entries.length?entries.map(entry=><div key={entry.key}>{entry.node}</div>):<p className="timber-activity-empty">No actions yet.</p>}</div>;
 }
 
 function timeline(model: ChatModel, callbacks: ChatCallbacks): TimelineEntry[] {
@@ -375,12 +379,12 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks): TimelineEntry[] {
   deliveries.forEach((delivery, index) => entries.push({key: `delivery:${delivery.operationId}`, at: timestamp(delivery.createdAt), order: (messages.length + index) * 2, node: <DeliveryEntry delivery={delivery} busy={model.sending} callbacks={callbacks} />}));
   for(const item of collaboration.items)entries.push({key:`collaboration:${item.key}`,...afterRequest(item.runId,timestamp(item.createdAt)),node:item.creation?<AgentCreationCard creation={item.creation} callbacks={callbacks}/>:item.notice?<AgentMessageNotice notice={item.notice} callbacks={callbacks} eventKey={item.key}/>:null});
   for (const tool of collectTools(model)) {
-    if(['spawn_subagent','create_bot','send_subagent_message','send_to_bot'].includes(tool.name) && [...tool.aliases].some(alias=>collaboration.toolIdentities.has(alias.slice((tool.runId||'').length+1))))continue;
     entries.push({key:`activity:${tool.key}`, ...afterRequest(tool.runId,tool.at), node:null, tool});
   }
-  for (const run of model.runs.filter(run=>!run.subagentId && ['failed','interrupted','cancelled'].includes(run.status) && (!model.runFilter || model.runFilter===run.id))) {
-    const at = Math.max(requests.get(run.id)?.at || 0, timestamp(run.updatedAt), ...messages.filter(message=>message.runId===run.id).map(message=>timestamp(message.createdAt)), ...model.events.filter(event=>event.runId===run.id).map(event=>timestamp(event.createdAt)));
-    entries.push({key:`outcome:${run.id}`,at,order:(messages.length + deliveries.length)*2+4,node:<TaskOutcome model={model} run={run} callbacks={callbacks}/>});
+  for (const outcome of runOutcomes(model.runs, model.events, model.runFilter)) {
+    const {run} = outcome;
+    const at = Math.max(requests.get(run.id)?.at || 0, timestamp(run.updatedAt), timestamp(outcome.createdAt), ...messages.filter(message=>message.runId===run.id).map(message=>timestamp(message.createdAt)), ...model.events.filter(event=>event.runId===run.id).map(event=>timestamp(event.createdAt)));
+    entries.push({key:`outcome:${outcome.key}`,at,order:(messages.length + deliveries.length)*2+4,node:<TaskOutcome model={model} run={run} kind={outcome.kind} cancellationId={outcome.cancellationId} callbacks={callbacks}/>});
   }
   // Group only adjacent actions after ordering the complete conversation.
   // A single run can contain several replies; later actions must not be moved
@@ -540,6 +544,7 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
 
 function MiniActivity({model, historyOpen, onHistory, callbacks}: {model: ChatModel; historyOpen: boolean; onHistory(value:boolean): void;callbacks:ChatCallbacks}) {
   const [collapsed,setCollapsed] = useState(false);
+  const notices=collectCollaboration({...model,runFilter:null}).items.filter(item=>item.notice).sort((a,b)=>timestamp(a.createdAt)-timestamp(b.createdAt)).slice(-2);
   const tools = collectTools({...model, runFilter: null}, true).sort((a,b) => b.at - a.at);
   const active = tools.filter(tool => toolState(tool, model).running);
   const run = model.currentRun, latestRun = model.runs.filter(run=>!run.subagentId).sort((a,b) => timestamp(b.updatedAt) - timestamp(a.updatedAt))[0];
@@ -567,9 +572,10 @@ function MiniActivity({model, historyOpen, onHistory, callbacks}: {model: ChatMo
         <div className={`timber-mini-reply${warning?' timber-inline-error':''}`} data-mini-reply>{warning?<p>{warning}</p>:reply?<Response text={reply} streaming={Boolean(model.stream)}/>:null}</div>
         {screenshot && <ArtifactPreview key={`${model.bot.id}:${screenshot}`} botId={model.bot.id} artifactId={screenshot} compact/>}
       </div>}
+      {notices.map(item=>item.notice&&<AgentMessageNotice key={item.key} notice={item.notice} callbacks={callbacks} eventKey={item.key} context="preview"/>)}
       {visible.map(tool=>{
         const state=toolState(tool,model),presentation=toolPresentation(tool),identity=activityIdentity(tool.name,presentation.command?displayText(toolInput(tool).command):'');
-        const Icon=identity.Icon,StatusIcon=state.running?LoaderCircleIcon:state.failed?CircleAlertIcon:state.pending?ShieldCheckIcon:CheckIcon;
+        const Icon=identity.Icon,StatusIcon=state.running?LoaderCircleIcon:state.cancelled?SquareIcon:state.failed||state.unknown?CircleAlertIcon:state.pending?ShieldCheckIcon:CheckIcon;
         return <div className="timber-mini-step" key={tool.key} title={`${presentation.title} · ${state.text}`}><Icon aria-hidden="true"/><span className={presentation.command?'is-command':''}>{presentation.title}</span><span className="timber-mini-step-status" role="status" aria-label={state.text}><StatusIcon className={state.running?'timber-spinner':''}/><span className="timber-sr-only">{state.text}</span></span></div>;
       })}
     </div>}
@@ -604,7 +610,7 @@ export function mountChat(element: HTMLElement, callbacks: ChatCallbacks, loadAr
   };
 }
 
-export function mountToolActivity(element: HTMLElement, loadArtifact: ArtifactLoader) {
+export function mountToolActivity(element: HTMLElement, loadArtifact: ArtifactLoader, callbacks:Pick<ChatCallbacks,'onOpenBot'|'onOpenAgents'>) {
   const root = createRoot(element);
-  return { update(model: ActivityModel) {root.render(<ArtifactProvider load={loadArtifact}><ActivityPanel key={model.bot.id} model={model} /></ArtifactProvider>);}, clear() {root.render(null);} };
+  return { update(model: ActivityModel) {root.render(<ArtifactProvider load={loadArtifact}><ActivityPanel key={model.bot.id} model={model} callbacks={callbacks}/></ArtifactProvider>);}, clear() {root.render(null);} };
 }

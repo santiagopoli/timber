@@ -46,6 +46,68 @@ async function setup(): Promise<{bot: Bot; parent: Run; child: Subagent; approva
 }
 
 describe("temporary subagent host projection and approval routing", () => {
+  it.each(["message","result"] as const)("projects a raw %s body while keeping source attribution in the model continuation", async kind => {
+    const {bot,parent,child}=await setup();
+    await runInDurableObject(stubFor(bot),async(instance,state)=>{
+      type Input={subagentId:string;parentOperationId:string;operationId:string;text:string;promptText?:string;kind?:"message"|"result"};
+      const target=instance as unknown as {receiveSubagentMessage(input:Input):Promise<void>;admit(operationId:string):Promise<void>};
+      const originalAdmit=target.admit;target.admit=async()=>{};
+      const text=`Still awaiting approval. Preserve this literal example: Subagent ${child.name}: sample.`,operationId=`subagent-report:${crypto.randomUUID()}`;
+      const promptText=kind==="message"?`Message from subagent ${child.name}:\n${text}`:`Subagent ${child.name} completed its task:\n${text}`;
+      const input:Input={subagentId:child.id,parentOperationId:parent.operationId,operationId,text,promptText,kind};
+      try {
+        await target.receiveSubagentMessage(input);
+        await target.receiveSubagentMessage(input);
+        const reports=state.storage.sql.exec<{data:string}>("SELECT data FROM events WHERE source_key=?",`report:${operationId}`).toArray();
+        expect(reports).toHaveLength(1);
+        expect(JSON.parse(reports[0].data)).toMatchObject({runId:parent.id,type:"subagent.reported",data:{subagentId:child.id,subagentName:child.name,operationId,text,contentFormat:"plain",kind}});
+        const inputs=state.storage.sql.exec<{text:string}>("SELECT text FROM submissions WHERE operation_id=?",operationId).toArray();
+        expect(inputs).toEqual([{text:`Subagent ${child.name}: ${promptText}`}]);
+        expect(state.storage.sql.exec("SELECT id FROM messages WHERE source_key=?",`input:${operationId}`).toArray()).toHaveLength(0);
+      } finally {target.admit=originalAdmit;}
+    });
+  });
+
+  it("keeps the legacy continuation fingerprint when a saved parent delivery retries with the raw-body callback",async()=>{
+    const {bot,parent,child}=await setup();
+    await runInDurableObject(stubFor(bot),async(instance,state)=>{
+      const target=instance as unknown as {admit(operationId:string):Promise<void>;createRun(input:{operationId:string;text:string},metadata:{role:"system";parentRunId:string}):Promise<Run>;receiveSubagentMessage(input:{subagentId:string;parentOperationId:string;operationId:string;text:string;promptText:string;kind:"message"}):Promise<void>};
+      const originalAdmit=target.admit;target.admit=async()=>{};
+      const text="Still awaiting approval",operationId=`subagent-report:${crypto.randomUUID()}`,promptText=`Message from subagent ${child.name}:\n${text}`;
+      try {
+        const saved=await target.createRun({operationId,text:`Subagent ${child.name}: ${promptText}`},{role:"system",parentRunId:parent.id});
+        await target.receiveSubagentMessage({subagentId:child.id,parentOperationId:parent.operationId,operationId,text,promptText,kind:"message"});
+        expect(state.storage.sql.exec<{id:string}>("SELECT id FROM runs WHERE operation_id=?",operationId).toArray()).toEqual([{id:saved.id}]);
+        const reports=state.storage.sql.exec<{data:string}>("SELECT data FROM events WHERE source_key=?",`report:${operationId}`).toArray();
+        expect(JSON.parse(reports[0].data).data).toMatchObject({text,contentFormat:"plain"});
+      } finally {target.admit=originalAdmit;}
+    });
+  });
+
+  it("attributes message events to the sender's host input rather than the recipient's task",async()=>{
+    const {bot,parent,child,childRun}=await setup();
+    await runInDurableObject(stubFor(bot),async(instance,state)=>{
+      const target=instance as unknown as {project(event:{type:string;operationId:string;eventKey:string;data:Record<string,unknown>}):Promise<void>};
+      const now=new Date().toISOString(),laterRoot:Run={id:crypto.randomUUID(),botId:bot.id,operationId:crypto.randomUUID(),status:"running",createdAt:now,updatedAt:now};
+      const nestedNative=`pi-tool:nested:${crypto.randomUUID()}`,nested:Run={...laterRoot,id:crypto.randomUUID(),operationId:`subagent:${nestedNative}`,subagentId:crypto.randomUUID(),parentRunId:childRun.id};
+      for(const [run,native] of [[laterRoot,laterRoot.operationId],[nested,nestedNative]] as const) {
+        state.storage.sql.exec("INSERT INTO runs(id,operation_id,fingerprint,native_operation_id,data) VALUES(?,?,?,?,?)",run.id,run.operationId,"fixture",native,JSON.stringify(run));
+        state.storage.sql.exec("INSERT INTO submissions(operation_id,run_id,text,admitted,subagent_id) VALUES(?,?,?,1,?)",native,run.id,"fixture message",run.subagentId??null);
+      }
+      const cases=[
+        {key:"root-to-old-child",operationId:laterRoot.operationId,data:{targetSubagentId:child.id},runId:laterRoot.id},
+        {key:"child-to-root",operationId:parent.operationId,data:{sourceSubagentId:child.id},runId:childRun.id},
+        {key:"nested-to-other",operationId:parent.operationId,data:{sourceSubagentId:nested.subagentId,targetSubagentId:child.id},runId:nested.id},
+        {key:"native-input-fallback",operationId:nestedNative,data:{targetSubagentId:child.id},runId:nested.id},
+      ];
+      for(const value of cases) {
+        await target.project({type:"subagent.message.sent",operationId:value.operationId,eventKey:value.key,data:{...value.data,operationId:`message:${value.key}`,toolCallId:`call:${value.key}`,text:"A public message"}});
+        const row=state.storage.sql.exec<{data:string}>("SELECT data FROM events WHERE source_key=?",`runtime:${value.key}`).toArray()[0];
+        expect(JSON.parse(row.data)).toMatchObject({runId:value.runId,data:{operationId:`message:${value.key}`,toolCallId:`call:${value.key}`}});
+      }
+    });
+  });
+
   it("lists a durable child with its own active host run after the parent has answered", async () => {
     const {bot, parent, child, approval, childRun} = await setup();
     expect(child).toMatchObject({name: "Temporary researcher", parentOperationId: parent.operationId, status: "waiting_approval"});
@@ -118,7 +180,7 @@ describe("temporary subagent host projection and approval routing", () => {
     const {bot, parent, childRun, approval} = await setup();
     const cancelled = await api(`/v1/bots/${bot.id}/runs/${parent.id}/cancel`, {});
     expect(cancelled.status).toBe(200);
-    expect((await cancelled.json<{run: Run}>()).run.status).toBe("cancelled");
+    expect((await cancelled.json<{run: Run}>()).run.status).toBe("completed");
     expect((await current(bot, childRun)).status).toBe("cancelled");
     expect((await agents(bot))[0].status).toBe("cancelled");
     await (await api(`/v1/bots/${bot.id}/approvals/${approval.id}`, {decision: "approve"})).text();

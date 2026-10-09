@@ -65,7 +65,7 @@ it('pauses and resumes the child alone for approval, then cascades parent cancel
   await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents())[0]?.status)).toBe('completed');
   await runInDurableObject(stub, async instance => {
     await instance.runtime.cancel('parent-approval-child');
-    expect((await instance.runtime.subagents())[0]?.status).toBe('cancelled');
+    expect((await instance.runtime.subagents())[0]?.status).toBe('completed');
     await expect(instance.runtime.sendSubagent(child.id, 'late message', { operationId: 'late-child-message' })).rejects.toThrow('cancelled');
   });
 });
@@ -75,7 +75,10 @@ it('charges child generations to the durable parent budget', async () => {
   await request('/submit', { text: 'request-subagent', operationId: 'limited-parent' });
   await request('/wait?id=limited-parent');
   await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents())[0]?.status)).toBe('failed');
-  await runInDurableObject(stub, (_instance, state) => {
+  await runInDurableObject(stub, async (instance, state) => {
+    const failed = (await instance.runtime.subagents())[0]!;
+    await instance.runtime.cancel('limited-parent', {cancellationId:'stop-failed-history'});
+    expect((await instance.runtime.subagents())[0]).toEqual(failed);
     expect(state.storage.sql.exec('SELECT input FROM calls').toArray()).toHaveLength(1);
     expect(state.storage.sql.exec('SELECT input FROM tool_calls').toArray()).toHaveLength(0);
     expect(state.storage.sql.exec('SELECT operation_id FROM botspace_runtime_budget WHERE kind=\'generation\'').toArray()).toEqual([{ operation_id: 'limited-parent' }]);
@@ -149,8 +152,8 @@ it('stops an older joined task without aborting the newer root input or its chil
       return children.length === 2 && children.every(child => child.status === 'running');
     })).toBe(true);
     await runInDurableObject(stub, async instance => {
-      expect(await instance.runtime.cancel('older-joined-task')).toBe(true);
-      expect(await instance.runtime.operation('older-joined-task')).toMatchObject({status:'unanswered',reason:'aborted'});
+      expect(await instance.runtime.cancel('older-joined-task', {cancellationId:'stop-older-task'})).toBe(true);
+      expect(await instance.runtime.operation('older-joined-task')).toMatchObject({status:'unanswered',reason:'aborted',cancellationId:'stop-older-task'});
       expect(await instance.runtime.operation('newer-joined-task')).toMatchObject({status:'running'});
       const children = await instance.runtime.subagents();
       expect(children.find(child => child.parentOperationId === 'older-joined-task')?.status).toBe('cancelled');
@@ -158,9 +161,132 @@ it('stops an older joined task without aborting the newer root input or its chil
       instance.releaseHeldTool?.();
     });
     expect(await (await request('/wait?id=newer-joined-task')).json()).toMatchObject({status:'done',answerOperationId:'newer-joined-task'});
-    expect(await (await request('/wait?id=older-joined-task')).json()).toMatchObject({status:'unanswered',reason:'aborted'});
+    expect(await (await request('/wait?id=older-joined-task')).json()).toMatchObject({status:'unanswered',reason:'aborted',cancellationId:'stop-older-task'});
     await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents()).find(child => child.parentOperationId === 'newer-joined-task')?.status)).toBe('completed');
   } finally { await runInDurableObject(stub, instance => instance.releaseHeldTool?.()); }
+});
+it('records one explicit Stop for the exact joined cohort across recovery and preserves completed history', async () => {
+  const namespace = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE;
+  let stub = namespace.getByName(probeId);
+  await request('/submit', {text:'request-subagent',operationId:'completed-before-stop'});
+  const completed = await (await request('/wait?id=completed-before-stop')).json();
+  await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents())[0]?.status)).toBe('completed');
+  const history = await runInDurableObject(stub, async instance => (await instance.runtime.subagents())[0]!);
+  await runInDurableObject(stub, instance => {instance.abortHeldTool = true;instance.heldTool = new Promise(resolve => {instance.releaseHeldTool = resolve;});});
+  try {
+    await request('/submit', {text:'request-subagent-wait',operationId:'cohort-first'});
+    await expect.poll(() => runInDurableObject(stub, (_instance, state) => state.storage.sql.exec<{event:string}>('SELECT event FROM projected').toArray().map(row=>JSON.parse(row.event)).some(event=>event.type==='tool.started'&&event.operationId==='cohort-first'&&event.data.toolName==='wait_subagent'))).toBe(true);
+    await request('/submit', {text:'request-subagent-wait second-task',operationId:'cohort-latest'});
+    await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents()).filter(agent=>agent.status==='running').length)).toBe(2);
+    await runInDurableObject(stub, async instance => {
+      await instance.runtime.submit('Queued before Stop',{operationId:'cohort-queued',whenBusy:'followUp'});
+      expect(await instance.runtime.cancel('cohort-latest',{cancellationId:'one-user-stop'})).toBe(true);
+      for (const id of ['cohort-first','cohort-latest','cohort-queued']) expect(await instance.runtime.wait(id)).toMatchObject({status:'unanswered',reason:'aborted',cancellationId:'one-user-stop'});
+      expect((await instance.runtime.subagents()).find(agent=>agent.id===history.id)).toEqual(history);
+      expect((await instance.runtime.subagents()).filter(agent=>agent.id!==history.id).every(agent=>agent.status==='cancelled')).toBe(true);
+      // Stopping an already completed origin also keeps its historical result.
+      await instance.runtime.cancel('completed-before-stop',{cancellationId:'later-stop'});
+      expect(await instance.runtime.wait('completed-before-stop')).toEqual(completed);
+      expect((await instance.runtime.subagents()).find(agent=>agent.id===history.id)).toEqual(history);
+      await expect(instance.runtime.sendSubagent(history.id,'late followup',{operationId:'must-not-reopen'})).rejects.toThrow('cancelled');
+      instance.releaseHeldTool?.();
+    });
+    await request('/submit',{text:'A new independent request',operationId:'after-user-stop'});
+    expect(await (await request('/wait?id=after-user-stop')).json()).not.toHaveProperty('cancellationId');
+    await abortAllDurableObjects();
+    stub = namespace.getByName(probeId);
+    await runInDurableObject(stub, async (instance,state) => {
+      for (const id of ['cohort-first','cohort-latest','cohort-queued']) expect(await instance.runtime.operation(id)).toMatchObject({status:'unanswered',reason:'aborted',cancellationId:'one-user-stop'});
+      expect(await instance.runtime.wait('completed-before-stop')).toEqual(completed);
+      expect((await instance.runtime.subagents()).find(agent=>agent.id===history.id)).toEqual(history);
+      const failed = state.storage.sql.exec<{event:string}>('SELECT event FROM projected').toArray().map(row=>JSON.parse(row.event)).filter(event=>event.type==='run.failed'&&event.data.cancellationId==='one-user-stop');
+      expect(failed.map(event=>event.operationId).sort()).toEqual(['cohort-first','cohort-latest','cohort-queued']);
+      expect(await instance.runtime.operation('after-user-stop')).toMatchObject({status:'done'});
+      expect(await instance.runtime.operation('after-user-stop')).not.toHaveProperty('cancellationId');
+    });
+  } finally {await runInDurableObject(stub, instance=>instance.releaseHeldTool?.());}
+});
+it('recovers an explicit Stop captured before native abort without rerunning children or touching future work', async () => {
+  const namespace = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE;
+  let stub = namespace.getByName(probeId);
+  await runInDurableObject(stub, instance => { instance.heldTool = new Promise(() => {}); });
+  await request('/submit', {text:'request-subagent-wait',operationId:'capture-before-abort'});
+  await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents())[0]?.status)).toBe('running');
+  const original = PiHarness.prototype.pi;
+  PiHarness.prototype.pi = async function() {
+    const native = await original.call(this);
+    native.abortTask = async () => { throw new Error('Fixture lost runtime after Stop capture'); };
+    return native;
+  };
+  try {
+    await runInDurableObject(stub, async instance => {
+      await expect(instance.runtime.cancel('capture-before-abort',{cancellationId:'stop-before-eviction'})).rejects.toThrow('Fixture lost runtime');
+    });
+  } finally { PiHarness.prototype.pi = original; }
+  await abortAllDurableObjects();
+  stub = namespace.getByName(probeId);
+  await runInDurableObject(stub, async instance => {
+    expect(await instance.runtime.wait('capture-before-abort')).toMatchObject({status:'unanswered',reason:'aborted',cancellationId:'stop-before-eviction'});
+  });
+  await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents())[0]?.status)).toBe('cancelled');
+  await expect.poll(() => runInDurableObject(stub, (_instance,state) => state.storage.sql.exec<{event:string}>('SELECT event FROM projected').toArray().map(row=>JSON.parse(row.event)).some(event=>event.type==='subagent.stopped'&&event.data.cancellationId==='stop-before-eviction'))).toBe(true);
+  await runInDurableObject(stub, (_instance,state) => {expect(state.storage.sql.exec('SELECT id FROM tool_calls').toArray()).toHaveLength(1);});
+  await request('/submit',{text:'Fresh request after recovered Stop',operationId:'future-after-captured-stop'});
+  expect(await (await request('/wait?id=future-after-captured-stop')).json()).toMatchObject({status:'done'});
+  expect(await (await request('/wait?id=future-after-captured-stop')).json()).not.toHaveProperty('cancellationId');
+});
+it('retries child Stop projection and cleanup after eviction without rewriting its terminal history', async () => {
+  const namespace = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE;
+  let stub = namespace.getByName(probeId);
+  await request('/submit',{text:'request-subagent',operationId:'finished-child-stop'});
+  await request('/wait?id=finished-child-stop');
+  await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents())[0]?.status)).toBe('completed');
+  const history = await runInDurableObject(stub, async instance => {
+    const child = (await instance.runtime.subagents())[0]!;
+    instance.failStopProjection = true;
+    await expect(instance.runtime.cancelSubagent(child.id)).rejects.toThrow('Fixture lost child Stop projection');
+    expect((await instance.runtime.subagents())[0]).toEqual(child);
+    return child;
+  });
+  await abortAllDurableObjects();
+  stub = namespace.getByName(probeId);
+  await expect.poll(() => runInDurableObject(stub, (_instance,state) => state.storage.sql.exec<{event:string}>('SELECT event FROM projected').toArray().map(row=>JSON.parse(row.event)).some(event=>event.type==='subagent.stopped'&&event.data.subagent.id===history.id))).toBe(true);
+  await runInDurableObject(stub, async instance => {
+    expect((await instance.runtime.subagents())[0]).toEqual(history);
+    await expect(instance.runtime.sendSubagent(history.id,'Must remain closed',{operationId:'late-after-stop-recovery'})).rejects.toThrow('cancelled');
+  });
+});
+it('fences a Stop before input admission and preserves completed deduplication receipts', async () => {
+  const stub = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE.getByName(probeId);
+  await runInDurableObject(stub, async instance => {
+    await instance.runtime.cancel('never-admit',{cancellationId:'stop-before-admission'});
+    await expect(instance.runtime.submit('This must not execute',{operationId:'never-admit'})).rejects.toThrow('stopped before admission');
+    expect(await instance.runtime.operation('never-admit')).toMatchObject({status:'missing'});
+  });
+  await request('/submit',{text:'Keep this answer',operationId:'completed-dedup'});
+  const result = await (await request('/wait?id=completed-dedup')).json();
+  await runInDurableObject(stub, async instance => {
+    await instance.runtime.cancel('completed-dedup',{cancellationId:'stop-finished'});
+    expect(await instance.runtime.submit('Keep this answer',{operationId:'completed-dedup'})).toMatchObject({accepted:false});
+    expect(await instance.runtime.wait('completed-dedup')).toEqual(result);
+  });
+});
+it('withdraws only a queued explicit Stop and leaves the active input alone', async () => {
+  const stub = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE.getByName(probeId);
+  await request('/host-context',{mode:'automatic'});
+  await runInDurableObject(stub, instance=>{instance.heldTool=new Promise(resolve=>{instance.releaseHeldTool=resolve;});});
+  try {
+    await request('/submit',{text:'request-exec',operationId:'active-during-queued-stop',chatgpt:true});
+    await expect.poll(()=>runInDurableObject(stub,(_instance,state)=>state.storage.sql.exec('SELECT id FROM tool_calls').toArray().length)).toBe(1);
+    await runInDurableObject(stub,async instance=>{
+      await instance.runtime.submit('Withdraw this queued followup',{operationId:'queued-stop',whenBusy:'followUp'});
+      expect(await instance.runtime.cancel('queued-stop',{cancellationId:'stop-queued'})).toBe(true);
+      expect(await instance.runtime.wait('queued-stop')).toMatchObject({status:'unanswered',reason:'aborted',cancellationId:'stop-queued'});
+      expect(await instance.runtime.operation('active-during-queued-stop')).toMatchObject({status:'running'});
+      instance.releaseHeldTool?.();
+    });
+    expect(await (await request('/wait?id=active-during-queued-stop')).json()).not.toHaveProperty('cancellationId');
+  } finally {await runInDurableObject(stub,instance=>instance.releaseHeldTool?.());}
 });
 it('recovers an in-flight child without repeating an unsafe computer action', async () => {
   const namespace = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE;
@@ -223,7 +349,7 @@ it('delivers sibling messages and lets the root message, wait for and cancel a p
     expect(await (await request(`/wait?id=later-root-${action}`)).json()).toMatchObject({ status: 'done' });
   }
   await runInDurableObject(stub, async (instance, state) => {
-    expect((await instance.runtime.subagents()).find(agent => agent.id === target.id)?.status).toBe('cancelled');
+    expect((await instance.runtime.subagents()).find(agent => agent.id === target.id)?.status).toBe('completed');
     expect(await instance.runtime.subagentMessages(target.id)).toContainEqual(expect.objectContaining({ role: 'user', text: 'Message from parent:\nA public coordination message.' }));
     const events = state.storage.sql.exec<{event: string}>('SELECT event FROM projected').toArray().map(row => JSON.parse(row.event));
     const sent = events.filter(event => event.type === 'subagent.message.sent');
@@ -235,7 +361,8 @@ it('delivers sibling messages and lets the root message, wait for and cancel a p
     const toRoot = sent.find(event => event.data.targetName === 'Ada');
     expect(toRoot.data).not.toHaveProperty('targetSubagentId');
     const reports = state.storage.sql.exec<{input: string}>('SELECT input FROM child_reports').toArray().map(row => JSON.parse(row.input));
-    expect(reports).toContainEqual(expect.objectContaining({operationId: toRoot.data.operationId, subagentId: target.id}));
+    expect(reports).toContainEqual(expect.objectContaining({operationId: toRoot.data.operationId, subagentId: target.id,
+      text: 'A public coordination message.', promptText: `Message from subagent ${target.name}:\nA public coordination message.`, kind: 'message'}));
   });
 });
 it('durably retries a rejected parent report across eviction without repeating child work', async () => {
@@ -258,6 +385,8 @@ it('durably retries a rejected parent report across eviction without repeating c
     const attempts = state.storage.sql.exec<{input:string}>('SELECT input FROM child_report_attempts').toArray().map(row => JSON.parse(row.input));
     expect(attempts).toHaveLength(2);
     expect(attempts[0].operationId).toMatch(/^subagent-report:[a-f0-9]{64}$/);
+    expect(attempts[0]).toMatchObject({text: 'Hello from the real Pi harness.',
+      promptText: 'Subagent Reader completed its task:\nHello from the real Pi harness.', kind: 'result'});
     expect(attempts[1]).toEqual(attempts[0]);
     expect(state.storage.sql.exec('SELECT id FROM calls').toArray()).toHaveLength(before.calls);
     expect(state.storage.sql.exec('SELECT id FROM tool_calls').toArray()).toHaveLength(before.tools);
@@ -728,6 +857,7 @@ it('still cancels an uncapped task after it has passed the former limits', async
     finally {instance.releaseHeldInference?.();}
   });
   expect(await (await request('/wait?id=cancel-uncapped')).json()).toMatchObject({status:'unanswered'});
+  expect(await (await request('/wait?id=cancel-uncapped')).json()).not.toHaveProperty('cancellationId');
   const result=await (await request('/inspect')).json<{toolCalls:unknown[];calls:unknown[]}>();
   expect(result.toolCalls).toHaveLength(26);
   expect(result.calls).toHaveLength(27);

@@ -64,7 +64,7 @@ it("integrates native Pi child spawning, independent parent completion, child ap
   expect(messages.filter(value => value.runId === parent.id && value.role === "assistant").map(value => value.text)).toEqual(["I delegated the command to Native researcher."]);
   const reportEvents = await runInDurableObject(bindings.BOT.get(bindings.BOT.idFromName(`owner:${bot.id}`)), (_instance, state) =>
     state.storage.sql.exec<{data: string}>("SELECT data FROM events WHERE json_extract(data,'$.type')='subagent.reported'").toArray().map(value => JSON.parse(value.data).data));
-  expect(reportEvents).toEqual([expect.objectContaining({subagentId: child.id, text: expect.stringContaining("Native researcher completed its task")})]);
+  expect(reportEvents).toEqual([expect.objectContaining({subagentId:child.id,subagentName:"Native researcher",contentFormat:"plain",kind:"result",text:"Hello from ChatGPT via the real Pi harness."})]);
   const stored = await runInDurableObject(bindings.BOT.get(bindings.BOT.idFromName(`owner:${bot.id}`)), (_instance, state) =>
     state.storage.sql.exec<{subagent_id: string}>("SELECT subagent_id FROM submissions WHERE operation_id=?", `approval:${approval.id}`).toArray());
   expect(stored).toEqual([{subagent_id: child.id}]);

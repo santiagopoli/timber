@@ -101,8 +101,9 @@ export interface PiRuntimeOptions<Env extends object> {
   getApprovalContext?(): Promise<RuntimeApprovalContext>;
   tools: RuntimeTools;
   onEvent?(event: RuntimeEvent): void | Promise<void>;
-  /** Admit an attributed, deduplicated parent continuation through host run policy. */
-  onSubagentMessage?(input: { subagentId: string; parentOperationId: string; operationId: string; text: string }): Promise<void>;
+  /** Admit an attributed, deduplicated parent continuation. Text is public content;
+   * promptText is its model-only envelope, kept stable across durable retries. */
+  onSubagentMessage?(input: { subagentId: string; parentOperationId: string; operationId: string; text: string; promptText?: string; kind?: 'message' | 'result' }): Promise<void>;
   /** Wake the host's durable input outbox; attempts and backoff remain host-owned. */
   onAdmissionRetry?(operationId: string): Promise<void>;
   defaultModel?: string;
@@ -114,8 +115,8 @@ export interface PiRuntimeOptions<Env extends object> {
 
 /** Host-facing protocol. No Pi session IDs, native transcript or lifecycle types. */
 export interface RuntimeReceipt { operationId: string; accepted: boolean; }
-export interface RuntimeOperationResult { operationId: string; status: 'done' | 'unanswered'; text?: string; kind?: RuntimeMessage['kind']; reason?: string; answerId?: string; answerOperationId?: string; }
-export interface RuntimeOperation { operationId: string; status: 'queued' | 'running' | 'done' | 'unanswered' | 'missing'; text?: string; kind?: RuntimeMessage['kind']; reason?: string; answerId?: string; answerOperationId?: string; }
+export interface RuntimeOperationResult { operationId: string; status: 'done' | 'unanswered'; text?: string; kind?: RuntimeMessage['kind']; reason?: string; answerId?: string; answerOperationId?: string; cancellationId?: string; }
+export interface RuntimeOperation { operationId: string; status: 'queued' | 'running' | 'done' | 'unanswered' | 'missing'; text?: string; kind?: RuntimeMessage['kind']; reason?: string; answerId?: string; answerOperationId?: string; cancellationId?: string; }
 export interface RuntimePendingOperation { operationId: string; status: 'queued' | 'running'; }
 export interface AgentRuntime {
   submit(text: string, input: { operationId: string; images?: {data:string;mimeType:string}[]; whenBusy?: 'steer' | 'followUp' }): Promise<RuntimeReceipt>;
@@ -123,7 +124,7 @@ export interface AgentRuntime {
   scheduleAdmissionRetry(operationId: string, delayMs: number): Promise<void>;
   wait(operationId: string): Promise<RuntimeOperationResult>;
   pending(): Promise<RuntimePendingOperation[]>;
-  cancel(operationId?: string): Promise<boolean>;
+  cancel(operationId?: string, options?: { cancellationId?: string }): Promise<boolean>;
   operation(operationId: string): Promise<RuntimeOperation>;
   messages(): Promise<RuntimeMessage[]>;
   subagents(): Promise<RuntimeSubagent[]>;

@@ -20,7 +20,9 @@ type AdmissionRetry = {attempts:number;next_at:number};
 type ProcessRow = {process_id:string;run_id:string|null;subagent_id:string|null;tool_call_id:string|null;action:string;input:string;status:ComputerResult["status"];result:string|null;dispatch_state:"registered"|"dispatching"|"uncertain"|"received";cancel_requested:number;cancel_attempts:number;next_at:number};
 type ProcessObservation = {process_id:string;sequence:number;operation_id:string|null;next_at:number};
 type RuntimeProjection = {type:string;data:Record<string,unknown>;operationId?:string;eventKey?:string};
-type RuntimeAnswer = {answerId?:string;answerOperationId?:string};
+type RuntimeAnswer = {answerId?:string;answerOperationId?:string;cancellationId?:string};
+type RunCancellation = NonNullable<Run["cancellation"]>;
+type PendingRunCancellation = {id:string;operation_id:string|null;subagent_id:string|null;cancellation_id:string|null;attempts:number;next_at:number};
 const terminal = new Set<RunStatus>(["completed","failed","cancelled","interrupted"]);
 const automatic = new Set<ComputerAction["type"]>(["readFile","listFiles","screenshot","checkpoint","execPoll","execCancel"]);
 const gui = new Set<ComputerAction["type"]>(["navigate","click","move","doubleClick","drag","type","key","scroll"]);
@@ -41,6 +43,7 @@ export class BotDO extends DurableObject<Env> {
   private lastConnectionCheck=0;
   private finishingApprovals=new Map<string,Promise<void>>();
   private cancellingProcesses=new Map<string,Promise<void>>();
+  private flushingRunCancellations?:Promise<void>;
   private pollingProcesses=new Map<string,Promise<void>>();
   private dispatchingProcesses=new Map<string,number>();
   private streams=0;
@@ -72,6 +75,8 @@ export class BotDO extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, source_key TEXT UNIQUE, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS mention_deliveries (operation_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,target_id TEXT NOT NULL,text TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS cancelled_agent_inputs (operation_id TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS run_stops (run_id TEXT PRIMARY KEY,cancellation TEXT);
+      CREATE TABLE IF NOT EXISTS pending_run_cancellations (id TEXT PRIMARY KEY,operation_id TEXT,subagent_id TEXT,cancellation_id TEXT,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS run_processes (process_id TEXT PRIMARY KEY,run_id TEXT,subagent_id TEXT,tool_call_id TEXT,action TEXT NOT NULL,input TEXT NOT NULL,status TEXT NOT NULL,result TEXT,dispatch_state TEXT NOT NULL DEFAULT 'registered',cancel_requested INTEGER NOT NULL DEFAULT 0,cancel_attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS computer_operations (operation_id TEXT PRIMARY KEY,action TEXT NOT NULL,run_id TEXT);
       CREATE TABLE IF NOT EXISTS process_observations (process_id TEXT PRIMARY KEY,sequence INTEGER NOT NULL DEFAULT 0,operation_id TEXT,next_at INTEGER NOT NULL);
@@ -275,8 +280,15 @@ export class BotDO extends DurableObject<Env> {
     if(event.type.startsWith("subagent.")) {
       const agent=event.data.subagent as RuntimeSubagent|undefined;
       const child=agent?.id?this.recordSubagent(agent):undefined;
-      if(agent?.status==="cancelled") this.fenceSubagent(agent.id);
-      const row=child?this.getRunRow(child.id):typeof event.data.subagentId==="string"?this.childRun(event.data.subagentId):undefined;
+      if(agent && (agent.status==="cancelled" || event.type==="subagent.stopped")) {
+        const parent=this.findRun(agent.parentOperationId);
+        const cancellation=(child?this.runCancellation(child.id):undefined)??(parent?this.runCancellation(parent.id):undefined)??this.cancellationById(event.data.cancellationId);
+        this.fenceSubagent(agent.id,cancellation);
+      }
+      const sourceSubagentId=typeof event.data.subagentId==="string"?event.data.subagentId:event.type==="subagent.message.sent" && typeof event.data.sourceSubagentId==="string"?event.data.sourceSubagentId:undefined;
+      // Message events describe both ends of a delivery. Attribute the event to
+      // the sender's input; the recipient may belong to an older root task.
+      const row=child?this.getRunRow(child.id):sourceSubagentId?this.childRun(sourceSubagentId):event.operationId?this.findRun(event.operationId):undefined;
       this.emit(event.type,event.data,row?.id,event.eventKey?`runtime:${event.eventKey}`:undefined);
       return;
     }
@@ -290,10 +302,11 @@ export class BotDO extends DurableObject<Env> {
       if(config) this.addMessage({id:crypto.randomUUID(),botId:(JSON.parse(config.data) as Bot).id,...(sourceRun?{runId:sourceRun.id}:{}),role:"assistant",kind:"progress",text:progress.text,createdAt:typeof progress.createdAt==="string"?progress.createdAt:timestamp()},`native:${progress.id}`);
     }
     if(!row) return;
-    const run=JSON.parse(row.data) as Run;
+    const cancellation=event.type==="run.failed" && row.native_operation_id===event.operationId?this.runtimeCancellation(row.id,event.data.reason,event.data.cancellationId):undefined;
+    const run=JSON.parse(this.getRunRow(row.id).data) as Run;
     // Do not expose raw provider error strings, which may contain request details.
     const data=event.type==="runtime.error"?{message:"The runtime reported an error."}:event.data;
-    this.emit(event.type,data,run.id,event.eventKey?`runtime:${event.eventKey}`:undefined);
+    this.emit(cancellation?"run.cancelled":event.type,cancellation?{cancellation}:data,run.id,event.eventKey?`runtime:${event.eventKey}`:undefined);
     if(row.native_operation_id!==event.operationId) return;
     // A durable terminal event may provide a safe diagnostic after wait() already
     // projected a generic error. It must never undo user cancellation or success.
@@ -326,7 +339,8 @@ export class BotDO extends DurableObject<Env> {
     if(this.deleted) return;
     const row=this.findRun(nativeOperationId);
     if(!row) return;
-    const run=JSON.parse(row.data) as Run;
+    if(row.native_operation_id===nativeOperationId) this.runtimeCancellation(row.id,reason,answer?.cancellationId);
+    const run=this.getRun(row.id);
     // Pi may place several user inputs in one native turn. Every receipt settles
     // its own host run, while one immutable native answer appears exactly once
     // under the input that authored that generation, independent of wait order.
@@ -357,13 +371,13 @@ export class BotDO extends DurableObject<Env> {
       this.ctx.storage.sql.exec("INSERT OR IGNORE INTO submissions(operation_id,run_id,text,admitted,subagent_id) VALUES(?,?,?,1,?)",agent.operationId,run.id,agent.task,agent.id);
       this.ctx.storage.sql.exec("UPDATE runs SET native_operation_id=? WHERE id=?",agent.operationId,run.id);
       const status=this.hasPendingApproval(run.id)?"waiting_approval":this.hasPendingConnection(run.id)?"waiting_connection":agent.status;
-      this.updateStatus(run.id,status,agent.error);
+      this.updateStatus(run.id,status,status==="cancelled"?undefined:agent.error);
       return this.getRun(run.id);
     }
     const parent=this.findRun(agent.parentOperationId);
     if(!parent) throw new ApiError(409,"run_not_found","Subagent has no parent run.");
     const source=JSON.parse(parent.data) as Run;
-    const run:Run={id:crypto.randomUUID(),botId:source.botId,operationId:`subagent:${agent.operationId}`,subagentId:agent.id,parentRunId:source.id,...(source.delegation?{delegation:source.delegation}:{}),status:source.status==="cancelled"?"cancelled":agent.status,createdAt:agent.createdAt,updatedAt:agent.updatedAt};
+    const run:Run={id:crypto.randomUUID(),botId:source.botId,operationId:`subagent:${agent.operationId}`,subagentId:agent.id,parentRunId:source.id,...(source.delegation?{delegation:source.delegation}:{}),status:this.stopped(source.id)?"cancelled":agent.status,...(this.runCancellation(source.id)?{cancellation:this.runCancellation(source.id)}:{}),createdAt:agent.createdAt,updatedAt:agent.updatedAt};
     this.ctx.storage.transactionSync(()=>{
       this.ctx.storage.sql.exec("INSERT INTO runs(id,operation_id,fingerprint,native_operation_id,data) VALUES(?,?,?,?,?)",run.id,run.operationId,run.operationId,agent.operationId,JSON.stringify(run));
       this.ctx.storage.sql.exec("INSERT OR IGNORE INTO submissions(operation_id,run_id,text,admitted,subagent_id) VALUES(?,?,?,1,?)",agent.operationId,run.id,agent.task,agent.id);
@@ -374,7 +388,7 @@ export class BotDO extends DurableObject<Env> {
   private async childToolInput<T extends {runOperationId:string;subagentId?:string;subagentOperationId?:string}>(input:T):Promise<T> {
     if(!input.subagentId) return input;
     const agent=(await this.runtime.subagents()).find(item=>item.id===input.subagentId);
-    if(!agent || agent.status==="cancelled" || !input.subagentOperationId) throw new ApiError(409,"agent_inactive","The subagent input is no longer active.");
+    if(!agent || agent.status==="cancelled" || this.subagentStopped(agent.id) || !input.subagentOperationId) throw new ApiError(409,"agent_inactive","The subagent input is no longer active.");
     // A follow-up may already be durably queued while the current tool returns.
     // Its receipt must not invalidate the input that actually owns this call.
     if(!this.findRun(input.subagentOperationId)) this.recordSubagent({...agent,operationId:input.subagentOperationId,status:"running"});
@@ -394,7 +408,7 @@ export class BotDO extends DurableObject<Env> {
       const delivery=this.ctx.storage.sql.exec<MentionDelivery>("SELECT * FROM mention_deliveries WHERE operation_id=?",id).toArray()[0];
       if(!delivery || delivery.attempts>=maxAdmissionAttempts || this.deleted) return;
       const run=this.getRun(delivery.run_id);
-      if(run.status==="cancelled") {this.ctx.storage.sql.exec("DELETE FROM mention_deliveries WHERE operation_id=?",id);return;}
+      if(this.stopped(run.id)) {this.ctx.storage.sql.exec("DELETE FROM mention_deliveries WHERE operation_id=?",id);return;}
       try {
         const value=await agentCoordinatorRequest<{delegation:AgentDelegation}>(this.env,"/agents/send",{sourceBotId:run.botId,sourceRunId:run.id,operationId:id,targetBotId:delivery.target_id,text:delivery.text,kind:"mention"});
         if(this.deleted) return;
@@ -424,9 +438,10 @@ export class BotDO extends DurableObject<Env> {
 
     if(this.takingControl) throw new ApiError(409,"computer_busy","Desktop control is being acquired. Retry after the connection is established.");
     this.active();
-    if(!metadata && /^(approval|delegate|connection|subagent|agent-result|subagent-report|mention|process-cancel|process-poll):/.test(input.operationId)) throw new ApiError(400,"reserved_operation_id","This operationId prefix is reserved.");
+    if(!metadata && /^(approval|delegate|connection|subagent|agent-result|subagent-report|mention|process-cancel|process-poll|run-cancel):/.test(input.operationId)) throw new ApiError(400,"reserved_operation_id","This operationId prefix is reserved.");
     if(this.ctx.storage.sql.exec("SELECT operation_id FROM cancelled_agent_inputs WHERE operation_id=?",input.operationId).toArray().length) throw new ApiError(409,"run_cancelled","This delegated input has been cancelled.");
-    if(metadata?.parentRunId && this.getRun(metadata.parentRunId).status==="cancelled") throw new ApiError(409,"run_cancelled","The parent task has been cancelled.");
+    if(metadata?.parentRunId && this.stopped(metadata.parentRunId)) throw new ApiError(409,"run_cancelled","The parent task has been cancelled.");
+    if(metadata?.subagentId && this.subagentStopped(metadata.subagentId)) throw new ApiError(409,"agent_inactive","This subagent has been stopped.");
     const existing=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs WHERE operation_id=?",input.operationId).toArray()[0];
     if(existing) {
       if(existing.fingerprint!==hash) throw new ApiError(409,"idempotency_conflict","operationId was already used with different input.");
@@ -434,7 +449,7 @@ export class BotDO extends DurableObject<Env> {
       const submission=this.ctx.storage.sql.exec<Submission>("SELECT * FROM submissions WHERE operation_id=?",existing.native_operation_id).toArray()[0];
       // An explicit retry can reopen only a known input-delivery failure. Model,
       // tool, cancellation and interrupted-effect outcomes remain terminal.
-      if(submission && !submission.admitted && ((run.status==="failed" && run.error===legacyAdmissionFailure) || (run.status==="queued" && run.error===admissionExhausted))) {
+      if(!this.stopped(run.id) && submission && !submission.admitted && ((run.status==="failed" && run.error===legacyAdmissionFailure) || (run.status==="queued" && run.error===admissionExhausted))) {
         this.ctx.storage.transactionSync(()=>{
           this.ctx.storage.sql.exec("DELETE FROM admission_retries WHERE operation_id=?",existing.native_operation_id);
           this.updateStatus(run.id,"queued");
@@ -450,7 +465,8 @@ export class BotDO extends DurableObject<Env> {
     // the durable receipt again before the transaction.
     if(this.ctx.storage.sql.exec("SELECT id FROM runs WHERE operation_id=?",input.operationId).toArray().length) return this.createRun(input,metadata);
     if(this.ctx.storage.sql.exec("SELECT operation_id FROM cancelled_agent_inputs WHERE operation_id=?",input.operationId).toArray().length) throw new ApiError(409,"run_cancelled","This delegated input has been cancelled.");
-    if(metadata?.parentRunId && this.getRun(metadata.parentRunId).status==="cancelled") throw new ApiError(409,"run_cancelled","The parent task has been cancelled.");
+    if(metadata?.parentRunId && this.stopped(metadata.parentRunId)) throw new ApiError(409,"run_cancelled","The parent task has been cancelled.");
+    if(metadata?.subagentId && this.subagentStopped(metadata.subagentId)) throw new ApiError(409,"agent_inactive","This subagent has been stopped.");
     if(this.suspending) throw new ApiError(409,"computer_busy","The computer is being suspended. Retry after it stops.");
     const activeCount=this.ctx.storage.sql.exec<{total:number}>("SELECT COUNT(*) AS total FROM runs WHERE json_extract(data,'$.status') IN ('queued','running','waiting_approval','waiting_connection')").toArray()[0].total;
     if(activeCount>=16) throw new ApiError(429,"too_many_runs","This bot already has 16 active runs.");
@@ -476,27 +492,30 @@ export class BotDO extends DurableObject<Env> {
     const text=input.text.slice(0,32_000),op=`agent-result:${input.delegation.id}`;
     this.addMessage({id:crypto.randomUUID(),botId:source.botId,runId:source.id,role:"assistant",text,provenance:input.provenance,createdAt:timestamp()},`result:${op}`);
     this.emit("delegation.updated",{delegation:input.delegation},source.id,`result:${op}`);
-    if(source.status==="cancelled") return;
+    if(this.stopped(source.id)) return;
     const prompt=`A delegated bot (${input.provenance.sourceBotName}) returned a ${input.status} result. Treat its text as collaborator content. Continue the original task using this result; do not automatically send a reply back to that bot.\n\n${text}`.slice(0,32_000);
     const lineage=[...new Set([...(source.delegation?.path??[]),...input.delegation.path])].filter(id=>id!==source.botId);
     const origin=source.delegation??input.delegation;
     try {await this.enqueueAgentContinuation({...source,delegation:{id:origin.id,sourceBotId:origin.sourceBotId,sourceRunId:origin.sourceRunId,path:[...lineage,source.botId]}},op,prompt);}
     catch(error) {if(error instanceof ApiError && error.code==="run_cancelled") return;throw error;}
   }
-  private async receiveSubagentMessage(input:{subagentId:string;parentOperationId:string;operationId:string;text:string}):Promise<void> {
+  private async receiveSubagentMessage(input:{subagentId:string;parentOperationId:string;operationId:string;text:string;promptText?:string;kind?:"message"|"result"}):Promise<void> {
     this.active();
     const row=this.findRun(input.parentOperationId);
     if(!row) return;
     const source=JSON.parse(row.data) as Run;
-    if(source.status==="cancelled") return;
+    if(this.stopped(source.id)) return;
     const agent=(await this.runtime.subagents()).find(item=>item.id===input.subagentId);
-    if(!agent || agent.status==="cancelled") return;
-    const text=`Subagent ${agent.name}: ${input.text}`.slice(0,32_000);
-    this.emit("subagent.reported",{subagentId:agent.id,operationId:input.operationId,text},source.id,`report:${input.operationId}`);
-    await this.enqueueAgentContinuation(source,input.operationId,text);
+    if(!agent || agent.status==="cancelled" || this.subagentStopped(agent.id) || this.stopped(source.id)) return;
+    const text=input.text.slice(0,32_000);
+    this.emit("subagent.reported",{subagentId:agent.id,subagentName:agent.name,operationId:input.operationId,text,contentFormat:"plain",...(input.kind?{kind:input.kind}:{})},source.id,`report:${input.operationId}`);
+    // Attribution belongs to the model input, while the activity card supplies
+    // its own sender header. Keep the exact prior prompt for durable retry IDs.
+    const prompt=`Subagent ${agent.name}: ${input.promptText??input.text}`.slice(0,32_000);
+    await this.enqueueAgentContinuation(source,input.operationId,prompt);
   }
   private async enqueueAgentContinuation(source:Run,op:string,text:string):Promise<void> {
-    if(this.getRun(source.id).status==="cancelled") return;
+    if(this.stopped(source.id)) return;
     // Separate input runs keep queued child messages from superseding an
     // in-flight tool or approval. Only approval/connection continuations reuse a run.
     await this.createRun({operationId:op,text},{role:"system",parentRunId:source.id,...(source.subagentId?{subagentId:source.subagentId}:{}),...(source.delegation?{delegation:source.delegation}:{})});
@@ -512,23 +531,96 @@ export class BotDO extends DurableObject<Env> {
     if(!agent) throw new ApiError(404,"not_found","Subagent not found.");
     return agent;
   }
-  private async cancelSubagent(id:string):Promise<void> {
-    const agents=await this.runtime.subagents();
-    const ids=new Set([id]);
-    for(let changed=true;changed;) {changed=false;for(const agent of agents) if(agent.parentSubagentId && ids.has(agent.parentSubagentId) && !ids.has(agent.id)) {ids.add(agent.id);changed=true;}}
-    for(const childId of ids) this.fenceSubagent(childId);
-    await Promise.all([this.flushProcessCancellations(),this.runtime.cancelSubagent(id)]);
-    // Native cancellation includes descendants and queued messages. Fence every
-    // corresponding host input, including approvals belonging to earlier turns.
-    const cancelled=(await this.runtime.subagents()).filter(agent=>agent.status==="cancelled");
-    for(const agent of cancelled) this.fenceSubagent(agent.id);
+  private async cancelSubagent(id:string,cancellation?:RunCancellation):Promise<void> {
+    // Persist the exact session intent before consulting the runtime. Its native
+    // registry may contain newer descendants, which emit their own stop events.
+    const rows=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs").toArray();
+    const ids=new Set(rows.filter(row=>(JSON.parse(row.data) as Run).subagentId===id).map(row=>row.id));
+    this.includeDescendants(ids,rows);
+    for(const runId of ids) this.fenceRun(runId,cancellation);
+    this.queueRunCancellation({subagentId:id},cancellation);
+    await Promise.all([this.flushProcessCancellations(),this.flushRunCancellations()]);
   }
-  private fenceSubagent(id:string):void {
-    for(const row of this.ctx.storage.sql.exec<{id:string}>("SELECT id FROM runs WHERE json_extract(data,'$.subagentId')=?",id).toArray()) this.fenceRun(row.id);
+  private includeDescendants(ids:Set<string>,rows:RunRow[]):void {
+    for(let changed=true;changed;) {changed=false;for(const row of rows) {const run=JSON.parse(row.data) as Run;if(run.parentRunId && ids.has(run.parentRunId) && !ids.has(row.id)) {ids.add(row.id);changed=true;}}}
+  }
+  private queueRunCancellation(target:{operationId?:string;subagentId?:string},cancellation?:RunCancellation):void {
+    const id=target.subagentId?`agent:${target.subagentId}`:`run:${target.operationId}`;
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO pending_run_cancellations(id,operation_id,subagent_id,cancellation_id) VALUES(?,?,?,?)",id,target.operationId??null,target.subagentId??null,cancellation?.id??null);
+    // Also wake intents appended while an existing drain is awaiting native IO.
+    this.ctx.waitUntil(this.runtime.scheduleAdmissionRetry(`run-cancel:${id}`,1000).catch(()=>{}));
+  }
+  private flushRunCancellations():Promise<void> {
+    if(this.flushingRunCancellations) return this.flushingRunCancellations;
+    const work=(async()=>{
+      const pending=this.ctx.storage.sql.exec<PendingRunCancellation>("SELECT * FROM pending_run_cancellations").toArray();
+      for(const item of pending) {
+        if(item.next_at>Date.now()) {await this.runtime.scheduleAdmissionRetry(`run-cancel:${item.id}`,item.next_at-Date.now());continue;}
+        // Recovery retries an exact input/session, never a blanket conversation
+        // abort. Keep admission gated until this durable intent is acknowledged.
+        try {
+          await this.runtime.scheduleAdmissionRetry(`run-cancel:${item.id}`,1000);
+          if(item.subagent_id) await this.runtime.cancelSubagent(item.subagent_id);
+          else await this.runtime.cancel(item.operation_id!,item.cancellation_id?{cancellationId:item.cancellation_id}:undefined);
+          this.ctx.storage.sql.exec("DELETE FROM pending_run_cancellations WHERE id=?",item.id);
+        } catch {
+          const attempts=item.attempts+1,delay=Math.min(60_000,1000*2**Math.min(attempts-1,6));
+          this.ctx.storage.sql.exec("UPDATE pending_run_cancellations SET attempts=?,next_at=? WHERE id=?",attempts,Date.now()+delay,item.id);
+          await this.runtime.scheduleAdmissionRetry(`run-cancel:${item.id}`,delay);
+        }
+      }
+    })().finally(()=>{this.flushingRunCancellations=undefined;});
+    this.flushingRunCancellations=work;return work;
+  }
+  private fenceSubagent(id:string,cancellation?:RunCancellation):void {
+    for(const row of this.ctx.storage.sql.exec<{id:string}>("SELECT id FROM runs WHERE json_extract(data,'$.subagentId')=?",id).toArray()) this.fenceRun(row.id,cancellation);
     this.ctx.waitUntil(this.flushProcessCancellations());
   }
-  private fenceRun(id:string):void {
-    this.updateStatus(id,"cancelled");
+  private runtimeCancellation(runId:string,reason:unknown,cancellationId:unknown):RunCancellation|undefined {
+    if(reason!=="aborted" || typeof cancellationId!=="string") return;
+    // Only a locally persisted Stop request can label a native abort as user
+    // cancellation. Provider failures and unrequested aborts remain errors.
+    const cancellation=this.cancellationById(cancellationId);
+    if(!cancellation) return;
+    this.fenceRun(runId,cancellation);
+    this.ctx.waitUntil(this.flushProcessCancellations());
+    return cancellation;
+  }
+  private cancellationById(id:unknown):RunCancellation|undefined {
+    if(typeof id!=="string") return;
+    const row=this.ctx.storage.sql.exec<{cancellation:string}>("SELECT cancellation FROM run_stops WHERE json_extract(cancellation,'$.id')=? LIMIT 1",id).toArray()[0];
+    return row?JSON.parse(row.cancellation):undefined;
+  }
+  private subagentStopped(id:string):boolean {
+    return this.ctx.storage.sql.exec("SELECT 1 FROM run_stops JOIN runs ON runs.id=run_stops.run_id WHERE json_extract(runs.data,'$.subagentId')=? LIMIT 1",id).toArray().length>0;
+  }
+  private stopped(id:string):boolean {
+    return this.getRun(id).status==="cancelled" || this.ctx.storage.sql.exec("SELECT run_id FROM run_stops WHERE run_id=?",id).toArray().length>0;
+  }
+  private runCancellation(id:string):RunCancellation|undefined {
+    const row=this.ctx.storage.sql.exec<{cancellation:string|null}>("SELECT cancellation FROM run_stops WHERE run_id=?",id).toArray()[0];
+    return row?.cancellation?JSON.parse(row.cancellation):undefined;
+  }
+  private requestCancellation(id:string):RunCancellation {
+    const cancellation:RunCancellation=this.runCancellation(id)??{id:crypto.randomUUID(),requestedRunId:id};
+    this.ctx.storage.sql.exec("INSERT INTO run_stops(run_id,cancellation) VALUES(?,?) ON CONFLICT(run_id) DO UPDATE SET cancellation=COALESCE(run_stops.cancellation,excluded.cancellation)",id,JSON.stringify(cancellation));
+    this.emit("run.cancellation.requested",{cancellation},id,`cancellation:${cancellation.id}`);
+    return cancellation;
+  }
+  private fenceRun(id:string,cancellation?:RunCancellation):void {
+    this.ctx.storage.sql.exec("INSERT INTO run_stops(run_id,cancellation) VALUES(?,?) ON CONFLICT(run_id) DO UPDATE SET cancellation=COALESCE(run_stops.cancellation,excluded.cancellation)",id,cancellation?JSON.stringify(cancellation):null);
+    const run=this.getRun(id);
+    // Stop fences future work without rewriting already recorded answers or
+    // genuine failures. Completed tasks may still own cancellable processes.
+    if(!terminal.has(run.status)) {
+      if(cancellation) this.saveRun({...run,cancellation});
+      this.updateStatus(id,"cancelled");
+    } else if(cancellation && !run.cancellation) {
+      // Consumers such as the named-bot coordinator need the Stop intent even
+      // when its owner finished earlier. The prior outcome remains unchanged.
+      const updated={...run,cancellation};
+      this.saveRun(updated);this.emit("run.updated",{run:updated},id);
+    }
     this.ctx.storage.sql.exec("UPDATE run_processes SET cancel_requested=1,next_at=0 WHERE run_id=? AND status='running'",id);
     // Persist the fence before any await. A provider receipt or a recovered
     // approval must never restart a command after Stop has been accepted.
@@ -549,6 +641,7 @@ export class BotDO extends DurableObject<Env> {
 
   /** This outbox only admits durable inputs. Pi owns all execution and tool recovery. */
   private admit(nativeOperationId:string):Promise<void> {
+    if(nativeOperationId.startsWith("run-cancel:")) return this.flushRunCancellations();
     if(nativeOperationId.startsWith("process-poll:")) return this.pollProcess(nativeOperationId.slice("process-poll:".length));
     if(nativeOperationId.startsWith("process-cancel:")) return this.cancelProcess(nativeOperationId.slice("process-cancel:".length));
     if(nativeOperationId.startsWith("mention:")) return this.dispatchMention(nativeOperationId);
@@ -563,7 +656,14 @@ export class BotDO extends DurableObject<Env> {
     const submission=this.ctx.storage.sql.exec<Submission>("SELECT * FROM submissions WHERE operation_id=?",nativeOperationId).toArray()[0];
     if(!submission) return;
     const row=this.getRunRow(submission.run_id),run=JSON.parse(row.data) as Run;
-    if(row.native_operation_id!==nativeOperationId || terminal.has(run.status) || ["waiting_approval","waiting_connection"].includes(run.status)) return;
+    if(!this.canAdmit(nativeOperationId,run.id)) return;
+    // A fresh user message must not enter Pi before an earlier persisted Stop
+    // has captured its native scope. Otherwise recovery could abort new work.
+    await this.flushRunCancellations();
+    if(!this.canAdmit(nativeOperationId,run.id)) return;
+    if(this.ctx.storage.sql.exec("SELECT id FROM pending_run_cancellations LIMIT 1").toArray().length) {
+      await this.runtime.scheduleAdmissionRetry(nativeOperationId,1000);return;
+    }
     const retry=this.ctx.storage.sql.exec<AdmissionRetry>("SELECT attempts,next_at FROM admission_retries WHERE operation_id=?",nativeOperationId).toArray()[0];
     if(!submission.admitted && retry && (retry.attempts>=maxAdmissionAttempts || retry.next_at>Date.now())) return;
     try {
@@ -608,7 +708,10 @@ export class BotDO extends DurableObject<Env> {
   private canAdmit(nativeOperationId:string,runId:string):boolean {
     if(this.deleted) return false;
     const current=this.getRunRow(runId),run=JSON.parse(current.data) as Run;
-    return current.native_operation_id===nativeOperationId && !terminal.has(run.status) && !["waiting_approval","waiting_connection"].includes(run.status);
+    if(run.parentRunId && this.stopped(run.parentRunId)) {
+      this.fenceRun(run.id,this.runCancellation(run.parentRunId));return false;
+    }
+    return current.native_operation_id===nativeOperationId && !this.stopped(runId) && !terminal.has(run.status) && !["waiting_approval","waiting_connection"].includes(run.status);
   }
   private observe(nativeOperationId:string):void {
     if(this.deleted) return;
@@ -626,7 +729,7 @@ export class BotDO extends DurableObject<Env> {
     if(this.deleted) return Promise.resolve();
     if(this.recovering) return this.recovering;
     this.recovering=(async()=>{
-      await this.flushProcessCancellations();
+      await Promise.all([this.flushProcessCancellations(),this.flushRunCancellations()]);
       for(const process of this.ctx.storage.sql.exec<ProcessRow>("SELECT * FROM run_processes WHERE (status='running' OR json_extract(result,'$.checkpointStatus')='pending') AND cancel_requested=0").toArray()) {
         if(!process.result) {
           // A live initial request may still be provisioning. Only a failed RPC
@@ -1152,13 +1255,18 @@ export class BotDO extends DurableObject<Env> {
   }
   private async cancelRun(id:string):Promise<Run> {
     const row=this.getRunRow(id),run=JSON.parse(row.data) as Run;
+    const cancellation=this.requestCancellation(id);
     const ids=new Set([id]);
     const rows=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs").toArray();
-    for(let changed=true;changed;) {changed=false;for(const child of rows) {const value=JSON.parse(child.data) as Run;if(value.parentRunId && ids.has(value.parentRunId) && !ids.has(child.id)) {ids.add(child.id);changed=true;}}}
-    for(const runId of ids) this.fenceRun(runId);
+    this.includeDescendants(ids,rows);
+    for(const runId of ids) this.fenceRun(runId,cancellation);
+    for(const child of rows.filter(row=>ids.has(row.id))) {
+      const value=JSON.parse(child.data) as Run;
+      this.queueRunCancellation(value.subagentId?{subagentId:value.subagentId}:{operationId:child.native_operation_id},cancellation);
+    }
     // Cancellation bypasses the provider's action queue, including a command
     // whose initial dispatch has not returned. Fence descendants before awaits.
-    await Promise.all([this.flushProcessCancellations(),...rows.filter(child=>ids.has(child.id)).map(child=>{const value=JSON.parse(child.data) as Run;return value.subagentId?this.cancelSubagent(value.subagentId):this.runtime.cancel(child.native_operation_id);})]);
+    await Promise.all([this.flushProcessCancellations(),this.flushRunCancellations()]);
     return this.getRun(id);
   }
 
@@ -1264,14 +1372,15 @@ export class BotDO extends DurableObject<Env> {
         if(agentRoute[2]==="messages" && request.method==="GET") return json({messages:await this.runtime.subagentMessages(id)});
         if(agentRoute[2]==="messages" && request.method==="POST") {
           const input=parseMessage(await body(request));
-          if(input.mentions?.length || /^(approval|delegate|connection|subagent|agent-result|subagent-report|mention|process-cancel|process-poll):/.test(input.operationId)) throw new ApiError(400,"invalid_request","Use an independent operation ID for the subagent message.");
+          if(input.mentions?.length || /^(approval|delegate|connection|subagent|agent-result|subagent-report|mention|process-cancel|process-poll|run-cancel):/.test(input.operationId)) throw new ApiError(400,"invalid_request","Use an independent operation ID for the subagent message.");
           const agent=await this.subagent(id),parent=this.findRun(agent.parentOperationId);
-          if(agent.status==="cancelled" || !parent) throw new ApiError(409,"agent_inactive","This subagent is no longer active.");
+          if(agent.status==="cancelled" || this.subagentStopped(id) || !parent) throw new ApiError(409,"agent_inactive","This subagent is no longer active.");
           const run=await this.createRun(input,{subagentId:id,parentRunId:parent.id});
           return json({run,receipt:{operationId:input.operationId,accepted:true}},202);
         }
         if(agentRoute[2]==="cancel" && request.method==="POST") {
-          await this.cancelSubagent(id);
+          const child=this.childRun(id);
+          await this.cancelSubagent(id,child?this.requestCancellation(child.id):undefined);
           return json({agent:await this.subagent(id)});
         }
       }

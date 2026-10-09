@@ -167,7 +167,16 @@ describe("durable command ownership and Stop",()=>{
       target.runtime={...runtime,cancel:async()=>true,cancelSubagent:async()=>true,subagents:async()=>[]};
       target.computer={...provider,cancel:async(_bot,processId)=>{cancelled.push(processId);return {operationId:processId,processId,status:"cancelled"};}};
       for(const run of [parent,...children]) state.storage.sql.exec("INSERT INTO run_processes(process_id,run_id,subagent_id,action,input,status) VALUES(?,?,?,?,?,'running')",run.id,run.id,run.subagentId??null,JSON.stringify({type:"exec",command:"background work"}),JSON.stringify({command:"background work"}));
-      try {await target.cancelRun(parent.id);expect(new Set(cancelled)).toEqual(new Set([parent.id,...children.map(child=>child.id)]));expect(state.storage.sql.exec<{status:string}>("SELECT status FROM run_processes").toArray().every(row=>row.status==="cancelled")).toBe(true);}
+      try {
+        await target.cancelRun(parent.id);
+        expect(new Set(cancelled)).toEqual(new Set([parent.id,...children.map(child=>child.id)]));
+        expect(state.storage.sql.exec<{status:string}>("SELECT status FROM run_processes").toArray().every(row=>row.status==="cancelled")).toBe(true);
+        for(const run of [parent,...children]) {
+          const {cancellation,...outcome}=JSON.parse(state.storage.sql.exec<{data:string}>("SELECT data FROM runs WHERE id=?",run.id).one().data) as Run;
+          expect(outcome).toEqual(run);expect(cancellation).toMatchObject({requestedRunId:parent.id});
+        }
+        expect(eventRows(state).filter(event=>event.type==="run.cancellation.requested")).toHaveLength(1);
+      }
       finally {target.computer=provider;target.runtime=runtime;}
     });
   });

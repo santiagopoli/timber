@@ -6,7 +6,8 @@ export interface RunDelegation { id: string; sourceBotId: string; sourceRunId: s
 export interface AgentDelegation extends RunDelegation { sourceBotName: string; targetBotId: string; targetBotName: string; targetRunId?: string; status: RunStatus; createdAt: string; updatedAt: string; error?: string; }
 export interface ImageAttachment { artifactId: string; mimeType: "image/png" | "image/jpeg"; size: number; }
 export interface Message { attachments?: ImageAttachment[]; id: string; botId: string; runId?: string; role: "user" | "assistant" | "tool" | "system"; kind?: "progress" | "final"; text: string; provenance?: MessageProvenance; mentions?: string[]; createdAt: string; }
-export interface Run { id: string; botId: string; operationId: string; status: RunStatus; delegation?: RunDelegation; subagentId?: string; parentRunId?: string; createdAt: string; updatedAt: string; error?: string; }
+export interface RunCancellation { id: string; requestedRunId: string; }
+export interface Run { id: string; botId: string; operationId: string; status: RunStatus; delegation?: RunDelegation; subagentId?: string; parentRunId?: string; cancellation?: RunCancellation; createdAt: string; updatedAt: string; error?: string; }
 export interface Subagent { id: string; name: string; task: string; parentOperationId: string; parentSubagentId?: string; operationId: string; status: "queued" | "running" | "waiting_approval" | "waiting_connection" | "completed" | "failed" | "cancelled"; createdAt: string; updatedAt: string; result?: string; error?: string; }
 
 /** A newest-first history page plus all currently active runs, independent of pagination. */

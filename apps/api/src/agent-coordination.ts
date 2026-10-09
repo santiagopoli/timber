@@ -119,7 +119,7 @@ export class AgentCoordinator {
     const raced=this.previousDelivery(botId,op,hash);
     if(raced) {await this.rearm();return json({delegation:raced},202);}
     const target=this.bot(targetId);
-    if(source.run.status==="cancelled" || (kind!=="mention" && terminal.has(source.run.status))) throw new ApiError(409,"run_inactive","The source run is no longer active.");
+    if(source.run.cancellation || source.run.status==="cancelled" || (kind!=="mention" && terminal.has(source.run.status))) throw new ApiError(409,"run_inactive","The source run is no longer active.");
     const lineage=source.run.delegation?.path??[botId];
     if(lineage[lineage.length-1]!==botId || lineage.some(id=>!UUID.test(id))) throw new ApiError(409,"invalid_delegation_path","The source delegation path is invalid.");
     if(lineage.includes(targetId)) throw new ApiError(409,"delegation_cycle","A delegation cannot revisit a bot in its path.");
@@ -190,7 +190,7 @@ export class AgentCoordinator {
       if(row.phase==="submit" || row.phase==="observe") {
         const {run:sourceRun}=await this.botRequest<{run:Run}>(d.sourceBotId,`/runs/${d.sourceRunId}`);
         if(!this.unchanged(row)) return;
-        if(sourceRun.status==="cancelled") {
+        if(sourceRun.cancellation || sourceRun.status==="cancelled") {
           this.cancel(delivery,"The source run was cancelled.");return;
         }
       }
