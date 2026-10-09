@@ -1,10 +1,18 @@
 import { MAX_OUTPUT_CHARACTERS, TOOL_NAMESPACE } from '../src/chatgpt.js';
 
+export const SHARED_ALLOWANCE_MESSAGE='The ChatGPT user has reached their Subscription Sharing usage limit. Ask the user to try again after their usage limit resets or use an API key instead.';
+
 /** Wire-format OpenAI fixture. No model behavior, credentials, or Pi internals mocked. */
 export function responsesFixture(payload: { input: Record<string, unknown>[] }, requestNumber = 1): Response {
   const userIndex = payload.input.map(item => item.role === 'user').lastIndexOf(true);
   const user = payload.input[userIndex];
   const text = JSON.stringify(user);
+  if(text.includes('request-wire-allowance')) {
+    const error={message:SHARED_ALLOWANCE_MESSAGE,...(text.includes('foreign-code')?{code:'unrecognized_fixture_usage_code'}:{})};
+    const named=text.includes('named'),nested=text.includes('nested');
+    const data=nested?{error}:named?error:{type:'response.failed',response:{id:'resp_allowance_fixture',status:'failed',output:[],error}};
+    return new Response(`${named?'event: error\n':''}data: ${JSON.stringify(data)}\n\n`,{headers:{'content-type':'text/event-stream'}});
+  }
   const serverFailure=text.includes('request-sse-server-error'),fastFailure=text.includes('request-sse-fast-error');
   const contextFailure=text.includes('request-sse-context-error')&&!JSON.stringify(payload.input).includes('<summary>');
   if(serverFailure||fastFailure||contextFailure) {

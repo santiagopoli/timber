@@ -26,6 +26,7 @@ SELECT json_extract(r.data,'$.createdAt') AS run_created_at,
  CASE
  WHEN d.detail_type IS NULL THEN 'no_detail'
  WHEN d.detail_type<>'text' THEN 'non_string_detail'
+ WHEN instr(d.d,'The ChatGPT user has reached their Subscription Sharing usage limit.')>0 THEN 'chatgpt_subscription_sharing_usage_limit'
  WHEN d.d='model_request_failed: The model request failed before an answer completed. Your conversation and recorded tool results are preserved.' THEN 'sanitized_model_request_failed'
  WHEN instr(d.d,'model_request_failed')>0 THEN 'contains_fixed_model_request_failed'
  WHEN instr(d.d,'Value contains a non-JSON undefined')>0 THEN 'native_json_undefined'
@@ -76,7 +77,7 @@ FROM recent p LEFT JOIN submissions s ON s.operation_id=json_extract(p.record,'$
 const ENCRYPTION_CONTEXT='timber-api/native-failure-diagnostics/v1';
 
 const SCHEMA_NAMES = new Set(['pi_submissions','pi_tasks','runs','submissions','botspace_runtime_generations']);
-const SIGNATURES = new Set(['no_detail','non_string_detail','sanitized_model_request_failed','contains_fixed_model_request_failed','native_json_undefined','native_entry_visibility','sdk_unfinished_tool_call','sdk_unhandled_stop_reason','json_parse','missing_origin_operation','missing_conversation_identity','sqlite_error','javascript_type_error','chatgpt_connection_changed','chatgpt_invalid_tool_namespace','chatgpt_incomplete_response','chatgpt_output_limit','unclassified']);
+const SIGNATURES = new Set(['no_detail','non_string_detail','chatgpt_subscription_sharing_usage_limit','sanitized_model_request_failed','contains_fixed_model_request_failed','native_json_undefined','native_entry_visibility','sdk_unfinished_tool_call','sdk_unhandled_stop_reason','json_parse','missing_origin_operation','missing_conversation_identity','sqlite_error','javascript_type_error','chatgpt_connection_changed','chatgpt_invalid_tool_namespace','chatgpt_incomplete_response','chatgpt_output_limit','unclassified']);
 const REASONS = new Set(['model_error','faulted','aborted','no_model','reset','stale','tool_error','task_error','task_failed','budget_exceeded','other']);
 const STATUSES = new Set(['queued','running','waiting_approval','waiting_connection','completed','failed','interrupted','cancelled']);
 const TYPES = new Set(['text','integer','real','object','array','true','false','null']);

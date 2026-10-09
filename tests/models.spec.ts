@@ -1,5 +1,16 @@
 import {describe,expect,it} from 'vitest';
-import {normalizeModelCatalog,resolveModelSettings} from '@botspace/contracts';
+import {normalizeModelCatalog,resolveModelSettings,classifyModelFailure} from '@botspace/contracts';
+
+describe('subscription allowance diagnostics',()=>{
+  it('recognizes the production prose before generic HTTP rate limits without changing transient quota-independent errors',()=>{
+    const message='The ChatGPT user has reached their Subscription Sharing usage limit. Ask the user to try again after their usage limit resets or use an API key instead.';
+    for(const status of [undefined,400,429])expect(classifyModelFailure({status,message}).errorCode).toBe('chatgpt_allowance_exhausted');
+    expect(classifyModelFailure({status:429,message:'ChatGPT rate limit reached: tokens per minute.'}).errorCode).toBe('model_rate_limited');
+    expect(classifyModelFailure({status:429,message:'ChatGPT usage limit reached: requests per minute.'}).errorCode).toBe('model_rate_limited');
+    expect(classifyModelFailure({message:'A tool reached its usage limit.'}).errorCode).toBe('model_request_failed');
+    expect(classifyModelFailure({message:'Subscription Sharing is temporarily unavailable. Please retry your request.'}).errorCode).toBe('model_provider_unavailable');
+  });
+});
 
 describe('account-scoped model choices',()=>{
   it('keeps provider order and future model/effort names while excluding non-list entries and duplicates',()=>{

@@ -190,6 +190,19 @@ export class BotDO extends DurableObject<Env> {
     return row;
   }
   private getRun(id:string):Run {return JSON.parse(this.getRunRow(id).data);}
+  private runView(row:Pick<RunRow,'data'|'native_operation_id'>):Run {
+    const run=JSON.parse(row.data) as Run;
+    // Older deployments discarded the subscription error's code. Reclassify
+    // its saved native diagnostic for display, without resubmitting the input,
+    // changing terminal state/timestamps, or rewriting conversation history.
+    if(run.status!=='failed' || run.errorCode && run.errorCode!=='model_request_failed')return run;
+    const generic=[undefined,'The model could not complete this request.','The model request failed before an answer completed.',MODEL_FAILURES.model_request_failed];
+    if(!generic.includes(run.error))return run;
+    const failure=this.runtime.failureDiagnostic?.(row.native_operation_id);
+    return failure?.errorCode==='chatgpt_allowance_exhausted'
+      ? {...run,errorCode:'chatgpt_allowance_exhausted',error:MODEL_FAILURES.chatgpt_allowance_exhausted}
+      : run;
+  }
   private summary():{lastMessage?:{text:string;createdAt:string};status:RunStatus|"ready";activeRuns:number;activeAgents:number;activeProcesses:number} {
     const active=this.ctx.storage.sql.exec<{status:RunStatus;subagent_id:string|null}>("SELECT json_extract(data,'$.status') AS status,json_extract(data,'$.subagentId') AS subagent_id FROM runs WHERE json_extract(data,'$.status') IN ('queued','running','waiting_approval','waiting_connection')").toArray();
     const roots=active.filter(run=>!run.subagent_id);
@@ -214,17 +227,17 @@ export class BotDO extends DurableObject<Env> {
         throw new ApiError(400,"invalid_cursor","before must be a positive safe integer cursor.");
       }
     }
-    type PageRow = {cursor:number;data:string};
+    type PageRow = {cursor:number;data:string;native_operation_id:string};
     // One extra row determines whether another page exists, without COUNT(*) or OFFSET.
     const rows=before===undefined
-      ? this.ctx.storage.sql.exec<PageRow>("SELECT rowid AS cursor,data FROM runs ORDER BY rowid DESC LIMIT ?",limit+1).toArray()
-      : this.ctx.storage.sql.exec<PageRow>("SELECT rowid AS cursor,data FROM runs WHERE rowid<? ORDER BY rowid DESC LIMIT ?",before,limit+1).toArray();
+      ? this.ctx.storage.sql.exec<PageRow>("SELECT rowid AS cursor,data,native_operation_id FROM runs ORDER BY rowid DESC LIMIT ?",limit+1).toArray()
+      : this.ctx.storage.sql.exec<PageRow>("SELECT rowid AS cursor,data,native_operation_id FROM runs WHERE rowid<? ORDER BY rowid DESC LIMIT ?",before,limit+1).toArray();
     const page=rows.slice(0,limit);
     // Native children also project inputs here. Include every active input so
     // pagination/reconnection cannot hide an older parent or pending approval.
     const activeRows=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM runs WHERE json_extract(data,'$.status') IN ('queued','running','waiting_approval','waiting_connection') ORDER BY rowid DESC").toArray();
     return {
-      runs:page.map(row=>JSON.parse(row.data) as Run),
+      runs:page.map(row=>this.runView(row)),
       activeRuns:activeRows.map(row=>JSON.parse(row.data) as Run),
       nextCursor:rows.length>limit?String(page[page.length-1].cursor):null,
     };
@@ -1465,7 +1478,7 @@ export class BotDO extends DurableObject<Env> {
       if(path==="/runs" && request.method==="GET") return json(this.listRuns(url));
       const runRoute=/^\/runs\/([^/]+)(\/cancel)?$/.exec(path);
       if(runRoute && UUID.test(runRoute[1])) {
-        if(request.method==="GET" && !runRoute[2]) return json({run:this.getRun(runRoute[1])});
+        if(request.method==="GET" && !runRoute[2]) return json({run:this.runView(this.getRunRow(runRoute[1]))});
         if(request.method==="POST" && runRoute[2]) return json({run:await this.cancelRun(runRoute[1])});
       }
       if(path==="/events" && request.method==="GET") return this.events(request,url);

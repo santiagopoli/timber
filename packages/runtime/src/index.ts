@@ -501,6 +501,16 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
 
   return {
     memory: maintenance.memory, updateMemory: maintenance.updateMemory, compact: maintenance.compact, contextStatus: maintenance.status,
+    failureDiagnostic(operationId) {
+      assertActive();
+      if(!options.storage.sql.exec("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='pi_submissions'").toArray().length)return undefined;
+      // pi-durable encodes indexed strings as JSON; reading its existing receipt
+      // must not initialize the harness, resume a run, or send another request.
+      const row=options.storage.sql.exec<{record:string}>("SELECT record FROM pi_submissions WHERE request_id=? AND status='unanswered' ORDER BY id DESC LIMIT 1",JSON.stringify(operationId)).toArray()[0];
+      if(!row)return undefined;
+      const record=JSON.parse(row.record) as {type?:unknown;reason?:unknown;detail?:unknown};
+      return record.type==='input'&&typeof record.reason==='string'?classifyFailure(record.reason,record.detail):undefined;
+    },
     scheduleAdmissionRetry: (operationId, delayMs) => admissionRetries.schedule(operationId, delayMs),
     async submit(text: string, input: { operationId: string; modelSettings?: ModelSettings; images?: {data:string;mimeType:string}[]; whenBusy?: 'steer' | 'followUp' }): Promise<RuntimeReceipt> {
       assertActive();

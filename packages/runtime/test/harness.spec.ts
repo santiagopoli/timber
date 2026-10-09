@@ -5,6 +5,7 @@ import type { HarnessProbe } from './worker.js';
 import { createBudget } from '../src/budget.js';
 import { PiHarness } from 'agents/harness/pi';
 import {configure,ROOT_CONVERSATION_ID} from '@earendil-works/pi-durable';
+import {SHARED_ALLOWANCE_MESSAGE} from './responses-fixture.js';
 let probeId: string;
 beforeEach(() => { probeId = crypto.randomUUID(); });
 const request = (path: string, input?: unknown) => exports.default.fetch(`https://test${path}`, { headers: { 'content-type': 'application/json', 'x-probe-id': probeId }, ...(input ? { method: 'POST', body: JSON.stringify(input) } : {}) });
@@ -1059,6 +1060,39 @@ it.each([{text:'request-sse-server-error',attempts:3,errorCode:'model_provider_u
   expect(state.calls).toHaveLength(attempts);
   expect(state.events.map(row=>JSON.parse(row.event))).toContainEqual(expect.objectContaining({type:'run.failed',data:expect.objectContaining({errorCode})}));
   expect(JSON.stringify(state.events)).not.toContain('Private fixture provider details');
+});
+
+it.each(['named','nested foreign-code','response'])('settles the production subscription allowance error from %s SSE after one request',async shape=>{
+  await request('/submit',{text:`request-wire-allowance ${shape}`,operationId:'shared-quota',chatgpt:true,modelSettings:{model:'gpt-6-astra',reasoningEffort:'high',fast:true}});
+  expect(await(await request('/wait?id=shared-quota')).json()).toMatchObject({status:'unanswered'});
+  const state=await(await request('/inspect')).json<{calls:unknown[];toolCalls:unknown[];events:{event:string}[]}>();
+  expect(state.calls).toHaveLength(1);expect(state.toolCalls).toHaveLength(0);
+  const events=state.events.map(row=>JSON.parse(row.event));
+  expect(events).toContainEqual(expect.objectContaining({type:'run.failed',data:expect.objectContaining({errorCode:'chatgpt_allowance_exhausted'})}));
+  expect(events.some(event=>event.type==='run.retrying'||event.type==='run.completed')).toBe(false);
+  expect(JSON.stringify(events)).not.toContain('API key');
+});
+
+it('reads a historical subscription failure after eviction without initializing Pi or another model request',async()=>{
+  const namespace=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE;
+  await request('/submit',{text:'request-wire-allowance named',operationId:'historical-quota',chatgpt:true});
+  await request('/wait?id=historical-quota');
+  await runInDurableObject(namespace.getByName(probeId),(_instance,state)=>{
+    state.storage.sql.exec("UPDATE pi_submissions SET record=json_set(record,'$.detail',?) WHERE request_id=?",SHARED_ALLOWANCE_MESSAGE,JSON.stringify('historical-quota'));
+  });
+  await abortAllDurableObjects();
+  const original=PiHarness.prototype.pi;
+  PiHarness.prototype.pi=async()=>{throw new Error('Read-only diagnostic must not initialize Pi');};
+  try {
+    await runInDurableObject(namespace.getByName(probeId),(instance,state)=>{
+      expect(state.storage.sql.exec('SELECT id FROM calls').toArray()).toHaveLength(1);
+      expect(instance.runtime.failureDiagnostic?.('historical-quota')).toMatchObject({errorCode:'chatgpt_allowance_exhausted'});
+      expect(instance.runtime.failureDiagnostic?.('unknown-operation')).toBeUndefined();
+      expect(state.storage.sql.exec('SELECT id FROM calls').toArray()).toHaveLength(1);
+      const record=state.storage.sql.exec<{record:string}>('SELECT record FROM pi_submissions WHERE request_id=?',JSON.stringify('historical-quota')).toArray()[0]!;
+      expect(JSON.parse(record.record).detail).toBe(SHARED_ALLOWANCE_MESSAGE);
+    });
+  } finally {PiHarness.prototype.pi=original;}
 });
 
 it('native overflow compaction recovers a safe SSE context error without replaying recorded tool effects',async()=>{

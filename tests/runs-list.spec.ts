@@ -2,6 +2,8 @@ import { env, exports } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { Bot, Run, RunStatus } from "@botspace/contracts";
+import {MODEL_FAILURES} from "@botspace/contracts";
+import type {AgentRuntime} from "../packages/runtime/src/types";
 
 interface Page {runs: Run[]; activeRuns: Run[]; nextCursor: string | null;}
 const bindings = env as unknown as {BOT: DurableObjectNamespace};
@@ -37,6 +39,40 @@ async function seed(bot: Bot, statuses: RunStatus[]): Promise<Run[]> {
 }
 
 describe("durable bot run history", () => {
+  it('reveals the saved subscription failure in list and detail views without rewriting or retrying historical work',async()=>{
+    const bot=await createBot();
+    const [run]=await seed(bot,['failed']);
+    const historical={...run,errorCode:'model_request_failed',error:MODEL_FAILURES.model_request_failed};
+    await runInDurableObject(stubFor(bot),(instance,state)=>{
+      state.storage.sql.exec('UPDATE runs SET native_operation_id=?,data=? WHERE id=?','native-continuation',JSON.stringify(historical),run.id);
+      const runtime=(instance as unknown as {runtime:AgentRuntime}).runtime;
+      runtime.failureDiagnostic=operationId=>{
+        expect(operationId).toBe('native-continuation');
+        return {errorCode:'chatgpt_allowance_exhausted',publicMessage:'PRIVATE_PROVIDER_CANARY'};
+      };
+      runtime.submit=async()=>{throw new Error('History must never resubmit input');};
+    });
+    const expected={...historical,errorCode:'chatgpt_allowance_exhausted',error:MODEL_FAILURES.chatgpt_allowance_exhausted};
+    expect((await page(bot)).runs).toEqual([expected]);
+    expect(await (await api(`/v1/bots/${bot.id}/runs/${run.id}`)).json()).toEqual({run:expected});
+    await runInDurableObject(stubFor(bot),(_instance,state)=>{
+      expect(JSON.parse(state.storage.sql.exec<{data:string}>('SELECT data FROM runs WHERE id=?',run.id).toArray()[0].data)).toEqual(historical);
+      expect(state.storage.sql.exec('SELECT id FROM messages').toArray()).toHaveLength(0);
+      expect(state.storage.sql.exec('SELECT id FROM events').toArray()).toHaveLength(0);
+    });
+  });
+
+  it('does not replace cancelled, successful, or already specific failures with a historical quota diagnostic',async()=>{
+    const bot=await createBot();
+    const runs=await seed(bot,['cancelled','completed','failed','failed']);
+    const expected=runs.map((run,index)=>index===2?{...run,error:'Tool action failed.'}:index===3?{...run,errorCode:'model_fast_unsupported',error:MODEL_FAILURES.model_fast_unsupported}:run);
+    await runInDurableObject(stubFor(bot),(instance,state)=>{
+      for(const run of expected)state.storage.sql.exec('UPDATE runs SET data=? WHERE id=?',JSON.stringify(run),run.id);
+      (instance as unknown as {runtime:AgentRuntime}).runtime.failureDiagnostic=()=>{throw new Error('Specific outcomes must not be reclassified');};
+    });
+    expect((await page(bot)).runs).toEqual(expected.slice().reverse());
+  });
+
   it("requires authentication and registry membership before exposing history", async () => {
     const bot = await createBot();
     await seed(bot, ["completed"]);

@@ -2500,3 +2500,16 @@ test('transient model failure continuation preserves recorded results and starts
     const accepted=page.waitForResponse(response=>response.request().method()==='POST'&&response.url().endsWith('/messages'));await notice.getByRole('button',{name:'Continue',exact:true}).click();await accepted;const sent=sentMessages(state,BOT_A);assert.equal(sent.length,1);assert.notEqual(sent[0].body.operationId,run.operationId);assert.match(sent[0].body.text,/Inspect the saved build result/);assert.match(sent[0].body.text,/do not repeat completed work/);assert.equal(state.actions.length,0);
   });
 });
+
+for(const width of [1440,390])test(`ChatGPT allowance failure directs to usage and never blindly continues at ${width}px`,async()=>{
+  await withPage(async({page,context,state,login})=>{
+    const stamp=new Date().toISOString(),run={id:'quota-failure',botId:BOT_A,operationId:'quota-operation',status:'failed',admissionRetryable:true,error:'The model request failed before an answer completed.',...(width===1440?{errorCode:'chatgpt_allowance_exhausted'}:{}),createdAt:stamp,updatedAt:stamp};
+    state.runs.set(BOT_A,[run]);state.messages.set(BOT_A,[{id:'quota-request',botId:BOT_A,runId:run.id,role:'user',text:'Continue the project.',createdAt:stamp}]);if(width===390)state.emit(BOT_A,'run.failed',{errorCode:'chatgpt_allowance_exhausted'},run.id);
+    await context.route('https://chatgpt.com/settings/usage',route=>route.fulfill({status:200,contentType:'text/html',body:'<!doctype html><title>ChatGPT usage fixture</title><p>Usage details</p>'}));
+    await login();const notice=page.locator(`[data-run-outcome="${run.id}"]`);await notice.getByText('ChatGPT usage limit reached',{exact:true}).waitFor();await notice.getByText(MODEL_FAILURES.chatgpt_allowance_exhausted,{exact:true}).waitFor();assert.match(await notice.innerText(),/reset/i);assert.equal(await notice.getByRole('button',{name:/^(Continue|Try again|Retry sending)$/}).count(),0);assert.equal(sentMessages(state,BOT_A).length,0);
+    await page.reload();await notice.getByText('ChatGPT usage limit reached',{exact:true}).waitFor();await page.locator('#message').fill('Keep this draft for later');
+    const link=notice.getByRole('link',{name:'Open ChatGPT usage',exact:true});assert.equal(await link.getAttribute('href'),'https://chatgpt.com/settings/usage');assert.equal(await link.getAttribute('rel'),'noopener noreferrer');
+    if(process.env.TIMBER_CAPTURE_UI)await page.screenshot({path:`/tmp/timber-quota-${width}.png`,animations:'disabled'});
+    const popupReady=page.waitForEvent('popup');await link.click();const popup=await popupReady;await popup.waitForLoadState();assert.equal(popup.url(),'https://chatgpt.com/settings/usage');assert.equal(await popup.evaluate(()=>window.opener===null),true);await popup.close();assert.equal(await page.locator('#message').inputValue(),'Keep this draft for later');assert.equal(sentMessages(state,BOT_A).length,0);
+  },{viewport:{width,height:900},...(width<760?{isMobile:true,hasTouch:true}:{})});
+});

@@ -42,6 +42,12 @@ test('real SQLite queries decode native indexed strings and correlate failures t
     const privateRows=db.prepare(PRIVATE_FAILURE_QUERY).all();
     assert.equal(privateRows[0].detail,detail);
     assert.deepEqual(Object.keys(privateRows[0]),['run_created_at','run_updated_at','native_reason','detail_type','detail']);
+    const quota='The ChatGPT user has reached their Subscription Sharing usage limit. Ask the user to try again after their usage limit resets or use an API key instead.';
+    db.prepare('UPDATE pi_submissions SET record=json_set(record,\'$.detail\',?)').run(quota);
+    db.prepare('UPDATE pi_tasks SET record=json_set(record,\'$.state.outcome.error.message\',?)').run(quota);
+    assert.equal(quota.length,152);
+    assert.equal(summarizeFailures(db.prepare(FAILURE_QUERY).all(),window).failures[0].signature,'chatgpt_subscription_sharing_usage_limit');
+    assert.equal(summarizeTasks(db.prepare(TASK_QUERY).all(),window).tasks[0].signature,'chatgpt_subscription_sharing_usage_limit');
   }finally{db.close();}
 });
 

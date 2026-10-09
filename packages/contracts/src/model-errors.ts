@@ -2,7 +2,7 @@
  * Provider text is inspected only to classify a failure, never returned. */
 export const MODEL_FAILURES = {
   chatgpt_not_connected: 'Reconnect ChatGPT in Settings before continuing this conversation.',
-  chatgpt_allowance_exhausted: 'ChatGPT usage quota exceeded. Check ChatGPT Settings → Usage before retrying.',
+  chatgpt_allowance_exhausted: 'ChatGPT shared usage quota exceeded. Check ChatGPT Settings → Usage and wait for the limit to reset before trying again.',
   chatgpt_usage_unavailable: 'ChatGPT account or usage information is temporarily unavailable. Please retry your request later.',
   model_unavailable: 'The selected model is not available to this account. Choose another available model.',
   model_reasoning_unsupported: 'The provider rejected the selected reasoning level. Review the model settings before retrying.',
@@ -31,7 +31,13 @@ export function classifyModelFailure({status,code,param,message}:{status?:number
   const field=typeof param==='string'?param:'';
   const text=typeof message==='string'?message.slice(0,32_000):'';
   if(/chatgpt_(?:not_connected|reauthorization_required|reauthentication_required|connection_expired)|subscription_sharing_invalid_user/.test(name)||status===401)return modelFailure('chatgpt_not_connected');
-  if(/subscription_sharing_usage_limit_exceeded|chatgpt_allowance_exhausted|insufficient_quota/.test(name))return modelFailure('chatgpt_allowance_exhausted');
+  // Some subscription SSE errors carry only this prose: the SDK can discard
+  // their code before the durable runtime sees them. Account allowance is
+  // different from transient requests/tokens-per-minute rate limits.
+  const sharedAllowance=/\b(?:chatgpt|subscription[\s_-]+sharing)\b/i.test(text)
+    && !/\b(?:tokens?|requests?) per minute\b/i.test(text)
+    && /\b(?:usage (?:quota|limit)[\s\S]{0,80}(?:reached|exceeded|exhausted)|(?:reached|exceeded|exhausted)[\s\S]{0,80}usage (?:quota|limit))\b/i.test(text);
+  if(/subscription_sharing_usage_limit_exceeded|chatgpt_allowance_exhausted|insufficient_quota/.test(name)||sharedAllowance)return modelFailure('chatgpt_allowance_exhausted');
   if(/subscription_sharing_(?:usage|user)_unavailable|chatgpt_(?:usage_unavailable|refresh_pending|refresh_failed)/.test(name))return modelFailure('chatgpt_usage_unavailable');
   if(/rate_limit/.test(name))return modelFailure('model_rate_limited');
   if(/context_(?:length|window)_exceeded|too_many_tokens/.test(name))return modelFailure('model_context_length_exceeded');

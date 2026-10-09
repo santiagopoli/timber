@@ -1,4 +1,4 @@
-import type { Model, SimpleStreamOptions, TranscriptContext } from '@earendil-works/pi-ai';
+import {createAssistantMessageEventStream,type AssistantMessage,type Model,type SimpleStreamOptions,type TranscriptContext} from '@earendil-works/pi-ai';
 import { streamSimple } from '@earendil-works/pi-ai/api/openai-responses';
 import { createProvider } from '@earendil-works/pi-ai/models';
 import {classifyModelFailure,type ModelOption,type ModelSettings} from '@botspace/contracts';
@@ -115,7 +115,7 @@ export function createChatGPTProvider(transport: PiRuntimeOptions<object>['chatg
       const previous=outputSizes.get(index)??{delta:0,snapshot:0};
       outputSizes.set(index,{delta:previous.delta+delta,snapshot:Math.max(previous.snapshot,snapshot)});
     };
-    return streamSimple({...model,id:settings.model}, context, {
+    const upstream=streamSimple({...model,id:settings.model}, context, {
       // Deliberately do not forward apiKey, base URL, headers, env, fetch or payload hooks.
       apiKey: SDK_SENTINEL, signal, timeoutMs: options?.timeoutMs ?? 1_800_000,
       maxRetries: 0, cacheRetention: 'none', env: {},
@@ -170,6 +170,37 @@ export function createChatGPTProvider(transport: PiRuntimeOptions<object>['chatg
         }
       },
     });
+    const output=createAssistantMessageEventStream();
+    const normalizeAllowance=(message:AssistantMessage):AssistantMessage=>{
+      const failure=message.stopReason==='error'?classifyModelFailure({message:message.errorMessage}):undefined;
+      return failure?.errorCode==='chatgpt_allowance_exhausted'
+        ?{...message,errorMessage:`${failure.errorCode}: ${failure.publicMessage}`}:message;
+    };
+    void (async()=>{
+      let partial:AssistantMessage|undefined,terminal=false;
+      try {
+        for await(const event of upstream) {
+          // OpenAI's SSE decoder throws for `event: error` and top-level
+          // `data.error` before onProviderStreamEvent runs. Classify its terminal
+          // message too, so a subscription quota is never treated as throttling.
+          if(event.type==='error'||event.type==='done')terminal=true;
+          else partial=event.partial;
+          output.push(event.type==='error'?{...event,error:normalizeAllowance(event.error)}:event);
+        }
+        if(!terminal)throw new Error('chatgpt_incomplete_response: stream ended without a terminal response');
+      } catch(error) {
+        const reason=signal.aborted||partial?.stopReason==='aborted'?'aborted':'error';
+        const message:AssistantMessage={...(partial??{
+          role:'assistant',api:model.api,provider:model.provider,model:settings.model,
+          content:[],timestamp:Date.now(),
+          usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},
+        }),stopReason:reason,errorMessage:error instanceof Error?error.message:typeof error==='string'?error:'ChatGPT response stream failed'};
+        output.push({type:'error',reason,error:normalizeAllowance(message)});
+      } finally {
+        output.end();
+      }
+    })();
+    return output;
   };
   const provider=createProvider<'openai-responses'>({
     id: 'openai', name: 'Sign in with ChatGPT', baseUrl: chatgptModel.baseUrl,

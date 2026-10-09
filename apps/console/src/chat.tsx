@@ -117,14 +117,15 @@ function MessageRunStatus({ model, runId, callbacks }: { model: ChatModel; runId
 function TaskOutcome({model, run, callbacks, kind, cancellationId}: {model:ChatModel;run:ChatModel['runs'][number];callbacks:ChatCallbacks;kind:'stopped'|'failure';cancellationId?:string}) {
   if (kind === 'stopped') return <article className="timber-work-status" data-run-outcome={run.id} data-cancellation-id={cancellationId} data-task-outcome-kind="stopped" role="status"><SquareIcon aria-hidden="true"/><span>Task stopped</span></article>;
   const request = model.messages.find(message=>message.runId===run.id && message.role==='user');
-  const failure=failureRecovery(run,model.events),retryable=canRetryAdmission(run);
+  const failure=failureRecovery(run,model.events),allowanceExhausted=failure.code==='chatgpt_allowance_exhausted',retryable=canRetryAdmission(run)&&!allowanceExhausted;
   const canContinue=Boolean(request)&&!retryable&&['continue','retry'].includes(failure.action);
   const recoveryTarget=['model','connection','context'].includes(failure.action)?failure.action as 'model'|'connection'|'context':undefined;
   return <article className="timber-task-outcome" data-run-outcome={run.id} role="status">
-    <div className="timber-task-outcome-heading"><CircleAlertIcon aria-hidden="true"/><span>{retryable?'Message not started':run.status==='failed'?'Request failed':'Response interrupted'}</span></div>
+    <div className="timber-task-outcome-heading"><CircleAlertIcon aria-hidden="true"/><span>{allowanceExhausted?'ChatGPT usage limit reached':retryable?'Message not started':run.status==='failed'?'Request failed':'Response interrupted'}</span></div>
     {failure.message && <p>{failure.message}</p>}
     {failure.code&&<details className="timber-failure-details"><summary>Details</summary><code>{failure.code}</code>{run.model&&<p>{run.model}{run.reasoningEffort?` · ${run.reasoningEffort} reasoning`:''}{run.fast?' · Fast':''}</p>}</details>}
     {recoveryTarget&&<Button type="button" variant="outline" size="sm" onClick={()=>callbacks.onRecovery(model.bot.id,recoveryTarget)}>{recoveryTarget==='model'?'Review model settings':recoveryTarget==='connection'?'Open Settings':'Review context'}</Button>}
+    {allowanceExhausted&&<Button asChild variant="outline" size="sm"><a href="https://chatgpt.com/settings/usage" target="_blank" rel="noopener noreferrer" title="Open ChatGPT usage in a new tab">Open ChatGPT usage<ExternalLinkIcon aria-hidden="true"/></a></Button>}
     {retryable && request && <Button type="button" variant="outline" size="sm" disabled={model.sending} onClick={()=>callbacks.onRetry(model.bot.id,run.operationId)}>Retry sending</Button>}
     {canContinue && request && <Button type="button" variant="outline" size="sm" disabled={model.sending || model.runs.some(item=>!item.subagentId && !terminal.has(item.status))} onClick={()=>callbacks.onSend(model.bot.id, `Continue this task:\n\n${bounded(request.text,6000)}\n\nUse the results already recorded in this conversation. Check the last outcome before taking another action; do not repeat completed work. Explain the result or any remaining blocker.`)}>{failure.action==='retry'?'Try again':'Continue'}</Button>}
   </article>;

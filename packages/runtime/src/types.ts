@@ -127,6 +127,8 @@ export interface AgentRuntime {
   pending(): Promise<RuntimePendingOperation[]>;
   cancel(operationId?: string, options?: { cancellationId?: string }): Promise<boolean>;
   operation(operationId: string): Promise<RuntimeOperation>;
+  /** Classify an existing terminal record without initializing Pi or scheduling work. */
+  failureDiagnostic?(operationId:string):{errorCode:string;publicMessage:string}|undefined;
   messages(): Promise<RuntimeMessage[]>;
   subagents(): Promise<RuntimeSubagent[]>;
   subagentMessages(id: string): Promise<RuntimeMessage[]>;

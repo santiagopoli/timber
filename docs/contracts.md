@@ -154,6 +154,12 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   error. The console uses this category to open connection, model or context
   settings for failures that need a change; transient failures retain an explicit
   continuation. HTTP and streaming provider errors use the same categories.
+  Subscription Sharing allowance errors, including SDK errors that retain only
+  provider prose, show `chatgpt_allowance_exhausted` and a ChatGPT Usage link.
+  They do not offer an unchanged retry or switch to API-key billing. The provider
+  controls the reset time; Timber does not invent one. List/detail reads can
+  reclassify a saved generic model failure from its existing native receipt,
+  without running inference, rewriting timestamps or changing terminal status.
   Production diagnostics log only the category, stage and optional HTTP status,
   never provider error bodies, conversation text or credentials.
 - GET /v1/bots/:id/computer -> {computer:ComputerStatus}. `starting` means an

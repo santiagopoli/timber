@@ -261,6 +261,18 @@ describe("ChatGPT refresh ownership, billing route and verification", () => {
     } finally {log.mockRestore();}
   });
 
+  it.each([400,429])('recognizes the production subscription allowance message without a provider code (%s)',async status=>{
+    const stub=newStub();expect((await connect(stub)).status).toBe(200);
+    inference=()=>Response.json({error:{message:'The ChatGPT user has reached their Subscription Sharing usage limit. Ask the user to try again after their usage limit resets or use an API key instead.'}},{status});
+    const response=await infer(stub);
+    expect(response.status).toBe(status);
+    const data=await response.json<{error:{code:string;message:string}}>();
+    expect(data.error.code).toBe('chatgpt_allowance_exhausted');
+    expect(data.error.message).toContain('wait for the limit to reset');
+    expect(data.error.message).not.toContain('use an API key');
+    expect(responseCalls).toHaveLength(1);
+  });
+
   it.each([
     ["truncated", 'data: {"type":"response.output_text.delta","delta":"hello"}\n\n'],
     ["failed", 'data: {"type":"response.failed","response":{"status":"failed"}}\n\n'],
