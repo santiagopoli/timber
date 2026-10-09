@@ -2,7 +2,7 @@ import {Type} from '@earendil-works/pi-ai';
 import {estimateMessageTokens} from '@earendil-works/pi-ai/utils/estimate';
 import {
   CompactionTask, defineDoc, defineDocFamily, defineTool, LiveDoc, ROOT_CONVERSATION_ID,
-  type Conversation, type ConversationId, type Cursor, type EntryRecord, type Harness,
+  type Conversation, type ConversationId, type Cursor, type EntryRecord, type Harness, type CompactionHooks,
   type Storage, type TaskId, type ToolExecutionApi, type Tx,
 } from '@earendil-works/pi-durable';
 import type {PiHarnessContext} from 'agents/harness/pi';
@@ -12,6 +12,10 @@ import {normalizeEntries} from './normalize.js';
 type Context = PiHarnessContext['context'];
 type MemoryValue = {content:string;revision:number;updatedAt?:string};
 const MAX_MEMORY = 16_000;
+type CompactionDetails={createdAt?:string;startedAt?:string;firstKeptEntryId?:number;summarizedEntries?:number;estimatedTokensBefore?:number};
+// Conversation-scoped family survives native task-document retirement at settlement.
+// Stores only durable display metadata, never private summary or instructions.
+const CompactDetails=defineDocFamily<CompactionDetails,string>({kind:'timber.compact-details',version:1,scope:'conversation',history:'latest',fork:'initial',family:true,initial:()=>({})});
 const Notes = defineDoc<MemoryValue>({kind:'timber.memory',version:1,scope:'conversation',history:'latest',fork:'initial',initial:()=>({content:'',revision:0})});
 const MemoryWrite = defineDoc<{result?:MemoryValue}>({kind:'timber.memory-write',version:1,scope:'task',initial:()=>({})});
 const Manual = defineDocFamily<{instructions:string;taskId?:number},string>({kind:'timber.compact-request',version:1,scope:'conversation',history:'latest',fork:'initial',family:true,initial:instructions=>({instructions})});
@@ -73,16 +77,24 @@ export function createMaintenance(host:MaintenanceHost) {
     const task=await host.storage().task(taskId,host.context());
     if(!task||task.kind!=='pi.compaction') throw new Error('Compaction not found');
     const reason=(task.input as {reason:CompactionReceipt['reason']}).reason;
-    const base={id:`compact:${taskId}`,reason,summaryApplied:false};
+    const details=await host.native().snapshot(CompactDetails,ROOT_CONVERSATION_ID,String(taskId),host.context());
+    const base={id:`compact:${taskId}`,reason,summaryApplied:false,historyRetained:true as const,...details};
+    const applied=async(entryId:number):Promise<CompactionReceipt>=>{
+      const entry=(await host.storage().entry(entryId as EntryRecord['id'],host.context()))?.entry;
+      const timestamp=entry?.kind==='pi.compaction'?entry.model?.find(message=>'timestamp' in message)?.timestamp:undefined;
+      return {...base,status:'completed',summaryApplied:true,
+        ...(typeof timestamp==='number'&&Number.isFinite(timestamp)?{summaryCreatedAt:new Date(timestamp).toISOString()}:{}),
+        ...(entry?.head===undefined?{}:{firstKeptEntryId:entry.head})};
+    };
     if(task.state.status!=='terminal') return {...base,status:'running'};
     const outcome=task.state.outcome;
     if(outcome.status==='aborted') return {...base,status:'cancelled'};
     if(outcome.status!=='completed') return {...base,status:'failed',error:'Context compaction could not finish. Your conversation history is unchanged.'};
     const result=outcome.result as {entryId?:number;submissionId?:number};
-    if(result.entryId!==undefined) return {...base,status:'completed',summaryApplied:true};
+    if(result.entryId!==undefined) return applied(result.entryId);
     if(result.submissionId!==undefined) {
       const write=await host.storage().submission(result.submissionId as Parameters<Storage['submission']>[0],host.context());
-      if(write?.status==='done')return {...base,status:'completed',summaryApplied:true};
+      if(write?.status==='done')return applied(write.entry);
       if(write?.status==='queued')return {...base,status:'running'};
       if(write?.status==='unanswered'&&write.reason==='stale')return {...base,status:'unchanged'};
       if(write?.status==='unanswered'&&write.reason==='aborted')return {...base,status:'cancelled'};
@@ -119,6 +131,17 @@ export function createMaintenance(host:MaintenanceHost) {
   ];
   return {
     tools,
+    beforeCompact: (async (compaction,api,context)=>{
+      // Capture the actual native selection, once. Retries/recovery never restamp it.
+      await host.native().commit(async tx=>{
+        const details=await tx.doc(CompactDetails,api.conversationId,String(api.taskId),String(api.taskId));
+        if(details.startedAt)return;
+        details.startedAt=new Date().toISOString();
+        details.firstKeptEntryId=compaction.firstKept;
+        details.summarizedEntries=compaction.entries.length;
+        details.estimatedTokensBefore=compaction.messages.reduce((sum,message)=>sum+estimateMessageTokens(message),0);
+      },context);
+    }) satisfies CompactionHooks['beforeCompact'],
     async memory():Promise<BotMemory> {await conversation();return notes();},
     async updateMemory(content:string,revision:number):Promise<BotMemory> {
       validateMemory(content,revision);await conversation();
@@ -140,6 +163,7 @@ export function createMaintenance(host:MaintenanceHost) {
         // Use Pi's built-in state machine and live status, atomically with our
         // request receipt. Pi owns range selection, summary, retries and placement.
         const id=await tx.createTask(CompactionTask,{reason:'manual' as const,...(instructions?{instructions}:{})},{conversationId:own.id,ownership:{kind:'conversation'},background:false});
+        const details=await tx.doc(CompactDetails,own.id,String(id),String(id));details.createdAt=new Date().toISOString();
         const live=await tx.doc(LiveDoc,own.id);
         (live.compactions??=[]).push({taskId:id,reason:'manual',blocking:false,attempt:1});
         request.taskId=id;
@@ -151,9 +175,9 @@ export function createMaintenance(host:MaintenanceHost) {
     async status():Promise<BotContextStatus> {
       const own=await conversation(),view=await own.context(host.context());
       let cursor:Cursor|undefined;
-      let recent:TaskId[]=[];
-      do {const page=await host.storage().scanTasks({conversationId:own.id,kind:'pi.compaction'},100,cursor,host.context());recent=[...recent,...page.items.map(task=>task.id)].slice(-20);cursor=page.next;} while(cursor);
-      return {automatic:true,estimatedTokens:view.messages.reduce((total,message)=>total+estimateMessageTokens(message),0),activeEntries:view.entries.length,contextWindow:await host.contextWindow(own.id),historyRetained:true,compactions:await Promise.all(recent.reverse().map(receipt))};
+      const retained:TaskId[]=[];
+      do {const page=await host.storage().scanTasks({conversationId:own.id,kind:'pi.compaction'},100,cursor,host.context());retained.push(...page.items.map(task=>task.id));cursor=page.next;} while(cursor);
+      return {automatic:true,estimatedTokens:view.messages.reduce((total,message)=>total+estimateMessageTokens(message),0),activeEntries:view.entries.length,contextWindow:await host.contextWindow(own.id),historyRetained:true,compactions:await Promise.all(retained.reverse().map(receipt))};
     },
     async hasWork():Promise<boolean> {return (await host.native().inspect(host.context())).tasks.some(task=>task.record.kind==='pi.compaction');},
   };

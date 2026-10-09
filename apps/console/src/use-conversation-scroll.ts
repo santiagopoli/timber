@@ -8,13 +8,35 @@ export function useConversationScroll() {
   const following = useRef(true);
   const [isAtBottom, setIsAtBottom] = useState(true);
   const measured = useRef({top: 0, height: 0, width: 0, content: 0});
+  const anchor = useRef<{element: Element; offset: number} | null>(null);
   const setFollowing = useCallback((value: boolean) => {
+    if (following.current === value) return;
     following.current = value;
     setIsAtBottom(value);
   }, []);
-  const measure = useCallback(() => {
+  const measure = useCallback((captureAnchor = true) => {
     const node = scrollRef.current;
-    if (node) measured.current = {top: node.scrollTop, height: node.clientHeight, width: node.clientWidth, content: node.scrollHeight};
+    if (!node) return;
+    measured.current = {top: node.scrollTop, height: node.clientHeight, width: node.clientWidth, content: node.scrollHeight};
+    if (following.current) {anchor.current = null; return;}
+    // Streaming growth below a reader's anchor needs no history lookup.
+    if (!captureAnchor && anchor.current?.element.isConnected) return;
+    const content = contentRef.current;
+    if (!content || !node.clientHeight) return;
+    const top = node.getBoundingClientRect().top, children = content.children;
+    // Timeline entries are ordered direct siblings. Binary search avoids an
+    // all-history query/scan on every touch/scroll while keeping a real DOM
+    // anchor for automatic archive prepends and images that finish loading.
+    let low = 0, high = children.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (children[middle].getBoundingClientRect().bottom < top) low = middle + 1;
+      else high = middle;
+    }
+    // Loading captions are transient; anchor the first actual history row.
+    while (low < children.length && !children[low].hasAttribute('data-timeline-key')) low++;
+    const element = children[low];
+    anchor.current = element ? {element, offset: element.getBoundingClientRect().top - top} : null;
   }, []);
   const scrollToBottom = useCallback(() => {
     setFollowing(true);
@@ -30,8 +52,15 @@ export function useConversationScroll() {
     const resized = () => {
       if (!node.clientHeight) return;
       if (following.current) node.scrollTop = node.scrollHeight;
-      else if (nearBottom()) setFollowing(true);
-      measure();
+      else {
+        const previous = anchor.current;
+        if (previous?.element.isConnected && node.contains(previous.element)) {
+          const offset = previous.element.getBoundingClientRect().top - node.getBoundingClientRect().top;
+          if (Math.abs(offset - previous.offset) > 1) node.scrollTop += offset - previous.offset;
+        }
+        if (nearBottom()) setFollowing(true);
+      }
+      measure(false);
     };
     const onScroll = () => {
       if (!node.clientHeight) return;
@@ -41,8 +70,9 @@ export function useConversationScroll() {
       if (previous.height !== node.clientHeight || previous.width !== node.clientWidth || previous.content !== node.scrollHeight) {
         resized();
       } else {
-        if (Math.abs(previous.top - node.scrollTop) > 1) setFollowing(nearBottom());
-        measure();
+        const moved = Math.abs(previous.top - node.scrollTop) > 1;
+        if (moved) setFollowing(nearBottom());
+        measure(moved);
       }
     };
     const scrollsConversation = (target: EventTarget | null, delta: number) => {

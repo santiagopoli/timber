@@ -2,7 +2,7 @@ import {env,exports} from 'cloudflare:workers';
 import {abortAllDurableObjects,runInDurableObject} from 'cloudflare:test';
 import {expect,it} from 'vitest';
 import {PiHarness} from 'agents/harness/pi';
-import {AssistantEntry,ROOT_CONVERSATION_ID,UserEntry,type Harness} from '@earendil-works/pi-durable';
+import {AssistantEntry,defineDocFamily,ROOT_CONVERSATION_ID,UserEntry,type Harness} from '@earendil-works/pi-durable';
 import type {Bot,BotContextStatus,BotMemory,CompactionReceipt,Message,Run,Subagent} from '@botspace/contracts';
 import type {AgentRuntime} from '@botspace/runtime';
 import type {Env} from '../../apps/api/src/env';
@@ -64,10 +64,15 @@ it('manually compacts an idle native conversation once while retaining every arc
   const settled=await until(()=>context(bot),value=>value.compactions.some(item=>item.id===first.id&&item.status==='completed'));
   expect(settled.activeEntries).toBeLessThan(activeBefore);
   expect(settled.historyRetained).toBe(true);
+  const detail=settled.compactions.find(item=>item.id===first.id)!;
+  expect(detail.createdAt).toBe(first.createdAt);expect(Number.isFinite(Date.parse(detail.createdAt!))).toBe(true);
+  expect(Number.isFinite(Date.parse(detail.startedAt!))).toBe(true);expect(Number.isFinite(Date.parse(detail.summaryCreatedAt!))).toBe(true);
+  expect(detail.summarizedEntries).toBeGreaterThan(0);expect(detail.estimatedTokensBefore).toBeGreaterThan(0);expect(detail.firstKeptEntryId).toBeGreaterThan(0);
+  expect(JSON.stringify(detail)).not.toContain('Retain exact decisions');expect(JSON.stringify(detail)).not.toContain('<summary>');
   expect((await (await api(`/v1/bots/${bot.id}/context/compact`,input)).json<{compaction:CompactionReceipt}>()).compaction.id).toBe(first.id);
   expect((await api(`/v1/bots/${bot.id}/context/compact`,{...input,instructions:'Different request'})).status).toBe(409);
   await abortAllDurableObjects();
-  expect((await context(bot)).compactions.filter(item=>item.reason==='manual')).toHaveLength(1);
+  expect((await context(bot)).compactions.filter(item=>item.reason==='manual')).toEqual([detail]);
   expect(await runInDurableObject(stub(bot),instance=>runtime(instance).messages())).toEqual(before);
   expect(await messages(bot)).toEqual(publicBefore);
   await say(bot,'Continue after manual compaction.');
@@ -79,6 +84,7 @@ it('native threshold compaction runs automatically and keeps the immutable trans
   const before=await runInDurableObject(stub(bot),instance=>runtime(instance).messages());
   await say(bot,'Continue when the prior provider reports a nearly full context.');
   const status=await until(()=>context(bot),value=>value.compactions.some(item=>item.reason==='threshold'&&item.status==='completed'));
+  expect(status.compactions.find(item=>item.reason==='threshold')).toEqual(expect.objectContaining({startedAt:expect.any(String),summaryCreatedAt:expect.any(String),summarizedEntries:expect.any(Number)}));
   expect(status.automatic).toBe(true);expect(status.activeEntries).toBeLessThan(before.length);
   const after=await runInDurableObject(stub(bot),instance=>runtime(instance).messages());
   expect(after.filter(message=>before.some(prior=>prior.id===message.id))).toEqual(before);
@@ -154,4 +160,37 @@ it('native child memory tools inherit root notes read-only and retain their own 
   await abortAllDurableObjects();expect((await memory(bot)).content).toBe(rootNotes);
   const childHistory=(await(await api(`/v1/bots/${bot.id}/agents/${children[0]!.id}/messages`)).json<{messages:Message[]}>()).messages;
   expect(childHistory.some(message=>message.text==='Child memory retained; parent notes are read-only.')).toBe(true);
+});
+
+it('retains every compaction beyond twenty with stable native identities and honest metadata across recovery and bot isolation',async()=>{
+  const bot=await createBot('All compactions'),other=await createBot('Isolated compactions');
+  const ids:string[]=[];
+  for(let i=0;i<25;i++){
+    const input={operationId:crypto.randomUUID()};
+    const response=await api(`/v1/bots/${bot.id}/context/compact`,input);
+    expect(response.status).toBe(202);const receipt=(await response.json<{compaction:CompactionReceipt}>()).compaction;ids.push(receipt.id);
+    await until(()=>context(bot),value=>value.compactions.some(item=>item.id===receipt.id&&item.status==='unchanged'));
+  }
+  const before=await context(bot);expect(before.compactions.map(item=>item.id)).toEqual(ids.slice().reverse());
+  expect(before.compactions).toHaveLength(25);for(const receipt of before.compactions){expect(receipt.createdAt).toEqual(expect.any(String));expect(receipt.startedAt).toBeUndefined();expect(receipt.summaryCreatedAt).toBeUndefined();expect(receipt.historyRetained).toBe(true);}
+  expect((await context(other)).compactions).toEqual([]);
+  expect((await exports.default.fetch(`https://timber.test/v1/bots/${bot.id}/context`)).status).toBe(401);
+  expect((await api(`/v1/bots/${crypto.randomUUID()}/context`)).status).toBe(404);
+  await abortAllDurableObjects();expect((await context(bot)).compactions).toEqual(before.compactions);
+});
+
+it('reports historical applied summary timestamps but does not fabricate missing legacy request or start metadata',async()=>{
+  const bot=await createBot('Legacy compaction');await say(bot,'Historical public input.');await seedArchive(bot);
+  const response=await api(`/v1/bots/${bot.id}/context/compact`,{operationId:crypto.randomUUID()});
+  const {compaction}=await response.json<{compaction:CompactionReceipt}>();
+  const settled=await until(()=>context(bot),value=>value.compactions.some(item=>item.id===compaction.id&&item.status==='completed'));
+  const original=settled.compactions.find(item=>item.id===compaction.id)!;
+  // A legacy task has no Timber metadata document. Keep its native task and immutable summary intact.
+  const legacy=defineDocFamily<{createdAt?:string;startedAt?:string},string>({kind:'timber.compact-details',version:1,scope:'conversation',history:'latest',fork:'initial',family:true,initial:()=>({})});
+  await withNative(bot,native=>native.commit(tx=>tx.retireDoc(legacy,ROOT_CONVERSATION_ID,compaction.id.slice('compact:'.length)),background));
+  await abortAllDurableObjects();
+  const receipt=(await context(bot)).compactions.find(item=>item.id===compaction.id)!;
+  expect(receipt).toEqual({id:original.id,reason:'manual',status:'completed',summaryApplied:true,historyRetained:true,summaryCreatedAt:original.summaryCreatedAt,firstKeptEntryId:original.firstKeptEntryId});
+  expect(receipt.createdAt).toBeUndefined();expect(receipt.startedAt).toBeUndefined();expect(receipt.summaryCreatedAt).toEqual(expect.any(String));
+  expect(JSON.stringify(receipt)).not.toContain('<summary>');expect(JSON.stringify(receipt)).not.toContain('Archive fact');
 });

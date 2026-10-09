@@ -1,7 +1,7 @@
 import { Type, createAssistantMessageEventStream, type AssistantMessage } from '@earendil-works/pi-ai';
 import { createModels } from '@earendil-works/pi-ai/models';
 import {
-  AgentDoc, configure, createRegistry, defineDoc, defineTool, GenerationTask, Harness, hook, InboxDoc, LiveDoc, ProviderDoc, ROOT_CONVERSATION_ID,
+  AgentDoc, configure, createRegistry, defineDoc, defineTool, GenerationTask, CompactionTask, Harness, hook, InboxDoc, LiveDoc, ProviderDoc, ROOT_CONVERSATION_ID,
   type AgentEvent, type AgentEventStream, type ConversationId, type HookApi, type Storage, type SubmissionId, type TaskId, type Tx,
 } from '@earendil-works/pi-durable';
 import { PiHarness, type PiHarnessContext } from 'agents/harness/pi';
@@ -242,7 +242,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
             requestFailures.set(marker,{error});
             return {messages:[marker,...request.messages.slice(1)]};
           }
-        }})],
+        }}),hook(CompactionTask,{beforeCompact:maintenance.beforeCompact})],
         sections: [{key:'durable_memory',render:input=>maintenance.prompt(input.conversationId)}, { key: 'preamble', tag: false, render: async input => {
           const bot = await options.getBot();
           const child = await subagents.forConversation(input.conversationId);

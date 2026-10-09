@@ -32,6 +32,174 @@ import './src/layout.css';
   let lastWorkspacePanel = panelNames.includes(preferences.workspacePanel) && preferences.workspacePanel !== 'conversation' ? preferences.workspacePanel : 'computer';
   const saveLayout = () => {preferences = {botsCollapsed, workspacePanel: lastWorkspacePanel, workspaceOpen: currentPanel !== 'conversation'}; try {localStorage.setItem('timber.layout', JSON.stringify(preferences));} catch {}};
   const streamedMessages = new Map();
+  const emptyList = [];
+  let historyState = {cursor: null, initialized: false, loading: false, error: '', retryAt: 0, promise: null, controller: new AbortController()};
+  let historyRetryTimer, compactions = [], compactionsTimer, compactionsRequest = 0, compactionsLastLoaded = 0, compactionsInFlight;
+  function resetConversationHistory() {
+    historyState.controller.abort(); clearTimeout(historyRetryTimer); clearTimeout(compactionsTimer);
+    historyState = {cursor: null, initialized: false, loading: false, error: '', retryAt: 0, promise: null, controller: new AbortController()};
+    compactions = []; compactionsRequest++; compactionsLastLoaded = 0; compactionsInFlight = null;
+  }
+  function mergeMessagePage(incoming, older = false) {
+    indexMessages();
+    const changed = new Map(), added = [], seen = new Set();
+    for (const item of incoming) {
+      if (seen.has(item.id)) continue; seen.add(item.id);
+      const previous = messageIds.get(item.id);
+      if (!previous) added.push(item);
+      // An older page must never overwrite a more recent REST/SSE version.
+      else if (!older && !sameRecord(previous, item)) changed.set(item.id, item);
+      streamedMessages.delete(item.id);
+    }
+    const retained = changed.size ? messages.map(item => changed.get(item.id) || item) : messages;
+    messages = added.length ? older ? [...added, ...retained] : [...retained, ...added] : retained;
+  }
+  function loadOlderMessages(version = generation) {
+    const state = historyState, id = selected?.id;
+    if (!id || !validView(version) || !state.initialized || !state.cursor || document.hidden || Date.now() < state.retryAt) return Promise.resolve();
+    if (state.promise) return state.promise;
+    state.loading = true; state.error = ''; renderMessages();
+    state.promise = (async () => {
+      await Promise.resolve(); // Publish the single-flight promise before starting the drain.
+      try {
+        while (state.cursor && historyState === state && validView(version) && !document.hidden) {
+          const before = state.cursor;
+          const result = await request(`${botPath(id)}/messages?${new URLSearchParams({limit: '100', before})}`, {signal: state.controller.signal});
+          if (historyState !== state || !validView(version)) return;
+          if (result.nextCursor != null && (!/^\d+$/.test(result.nextCursor) || !Number.isSafeInteger(Number(result.nextCursor)) || Number(result.nextCursor) <= 0 || Number(result.nextCursor) >= Number(before))) throw new Error('History cursor did not advance. Reconnect to continue reading older messages.');
+          mergeMessagePage(result.messages, true); state.cursor = result.nextCursor ?? null;
+          reconcileDeliveries(); renderMessages();
+        }
+      } catch (error) {
+        if (historyState !== state || !validView(version) || error.name === 'AbortError') return;
+        state.error = errorText(error); state.retryAt = Date.now() + 10000;
+        clearTimeout(historyRetryTimer);
+        historyRetryTimer = setTimeout(() => {if (historyState === state && validView(version)) void loadOlderMessages(version);}, 10000);
+      } finally {
+        if (historyState === state && validView(version)) {state.loading = false; state.promise = null; renderMessages();}
+      }
+    })();
+    return state.promise;
+  }
+  const compactionTerminal = new Set(['completed', 'unchanged', 'failed', 'cancelled']);
+  function mergeCompactions(incoming) {
+    const receipts = new Map(compactions.map(item => [item.id, item]));
+    for (const receipt of incoming) {
+      if (!receipt || typeof receipt.id !== 'string') continue;
+      const prior = receipts.get(receipt.id);
+      if (prior && compactionTerminal.has(prior.status) && receipt.status === 'running') continue;
+      // Only documented public receipt fields enter the transcript model.
+      const item = {...prior};
+      for (const key of ['id', 'reason', 'status', 'summaryApplied', 'error', 'createdAt', 'startedAt', 'summaryCreatedAt', 'firstKeptEntryId', 'summarizedEntries', 'estimatedTokensBefore', 'historyRetained']) if (receipt[key] !== undefined) item[key] = receipt[key];
+      receipts.set(receipt.id, sameRecord(prior, item) ? prior : item);
+    }
+    compactions = sameArray(compactions, [...receipts.values()]);
+  }
+  function scheduleCompactions(version = generation) {
+    clearTimeout(compactionsTimer);
+    if (!selected || !validView(version) || document.hidden) return;
+    compactionsTimer = setTimeout(() => void loadCompactions(version), compactions.some(item => item.status === 'running') ? 15000 : 30000);
+  }
+  function loadCompactions(version = generation, force = false) {
+    const id = selected?.id;
+    if (!id || !validView(version) || document.hidden && !force) return Promise.resolve();
+    if (compactionsInFlight?.version === version) return compactionsInFlight.promise;
+    if (!force && compactionsLastLoaded && Date.now() - compactionsLastLoaded < 15000) {scheduleCompactions(version); return Promise.resolve();}
+    const sequence = ++compactionsRequest, pending = {version, promise: null};
+    pending.promise = (async () => {
+      try {
+        const result = await request(`${botPath(id)}/context`);
+        if (!validView(version) || sequence !== compactionsRequest) return;
+        mergeCompactions(result.context?.compactions || []); compactionsLastLoaded = Date.now(); renderMessages();
+      } catch { /* Keep confirmed historical receipts through a connection gap. */ }
+      finally {if (validView(version) && compactionsInFlight === pending) {compactionsInFlight = null; scheduleCompactions(version);}}
+    })();
+    compactionsInFlight = pending;
+    return pending.promise;
+  }
+  async function contextRequest(botId, path, options) {
+    const version = generation, result = await request(`${botPath(botId)}${path}`, options);
+    if (!validView(version) || selected?.id !== botId) return result;
+    if (path === '/context' && result.context) {compactionsRequest++; mergeCompactions(result.context.compactions || []); compactionsLastLoaded = Date.now(); renderMessages(); scheduleCompactions(version);}
+    if (path === '/context/compact' && result.compaction) {compactionsRequest++; mergeCompactions([result.compaction]); renderMessages(); scheduleCompactions(version);}
+    return result;
+  }
+  // These are projections, not a second transcript: all history stays available.
+  let indexedMessages, messageIds = new Map(), userMessagesByRun = new Map(), latestConversationMessage;
+  let runsValueRevision = 0, cachedRunsMap, cachedRunsGeneration = -1, cachedRunsRevision = -1, cachedRunValues = [], cachedSortedRuns = [];
+  let projectedEventSource, projectedEventCount = 0, projectedEvents = [];
+  let processOwnersCache;
+  let renderedApprovals = [], renderedConnections = [], renderedDeliveries = [];
+  let recordingStreamEvent = false, streamRenderBatch = null;
+  function sameRecord(a, b) { return a === b || Boolean(a && b && JSON.stringify(a) === JSON.stringify(b)); }
+  function sameArray(previous, next) { return previous.length === next.length && next.every((item, index) => item === previous[index]) ? previous : next; }
+  function reuseRecords(previous, incoming) {
+    const byId = new Map(previous.map(item => [item.id, item]));
+    return sameArray(previous, incoming.map(item => {const prior = byId.get(item.id); return sameRecord(prior, item) ? prior : item;}));
+  }
+  function stableProjection(previous, next) {
+    return sameArray(previous, next.map((item, index) => {
+      const prior = previous[index], keys = Object.keys(item);
+      return prior && keys.length === Object.keys(prior).length && keys.every(key => Object.is(item[key], prior[key])) ? prior : item;
+    }));
+  }
+  function indexMessages() {
+    if (indexedMessages === messages) return;
+    indexedMessages = messages; messageIds = new Map(); userMessagesByRun = new Map(); latestConversationMessage = undefined;
+    for (const message of messages) {
+      messageIds.set(message.id, message);
+      if (message.role === 'user' && !userMessagesByRun.has(message.runId)) userMessagesByRun.set(message.runId, message);
+      if (message.role === 'user' || message.role === 'assistant') latestConversationMessage = message;
+    }
+  }
+  function appendMessage(message) {
+    indexMessages();
+    if (messageIds.has(message.id)) return false;
+    messages = [...messages, message]; indexedMessages = messages; messageIds.set(message.id, message);
+    if (message.role === 'user' && !userMessagesByRun.has(message.runId)) userMessagesByRun.set(message.runId, message);
+    if (message.role === 'user' || message.role === 'assistant') latestConversationMessage = message;
+    return true;
+  }
+  function transcriptEvents() {
+    if (projectedEventSource !== events) {projectedEventSource = events; projectedEventCount = 0; projectedEvents = [];}
+    if (projectedEventCount !== events.length) {
+      projectedEvents = [...projectedEvents, ...events.slice(projectedEventCount).map(event => ({...event, data: redact(event.data)}))];
+      projectedEventCount = events.length;
+    }
+    return projectedEvents;
+  }
+  function runValues() {
+    if (cachedRunsMap !== runs || cachedRunsGeneration !== generation || cachedRunsRevision !== runsValueRevision) {
+      cachedRunsMap = runs; cachedRunsGeneration = generation; cachedRunsRevision = runsValueRevision;
+      cachedRunValues = [...runs.values()]; cachedSortedRuns = [...cachedRunValues].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    }
+    return cachedRunValues;
+  }
+  function cancelStreamRender() {
+    if (!streamRenderBatch) return;
+    cancelAnimationFrame(streamRenderBatch.frame); clearTimeout(streamRenderBatch.timer); streamRenderBatch = null;
+  }
+  function deferStreamRender(kind) {
+    if (!recordingStreamEvent) return false;
+    if (streamRenderBatch && streamRenderBatch.version !== generation) cancelStreamRender();
+    if (!streamRenderBatch) {
+      const batch = {version: generation, messages: false, runs: false, agents: false, frame: 0, timer: null};
+      streamRenderBatch = batch;
+      const flush = () => {
+        if (streamRenderBatch !== batch) return;
+        cancelStreamRender();
+        if (!validView(batch.version)) return;
+        if (batch.agents) renderAgents();
+        // renderRuns already updates currentRun and the conversation.
+        if (batch.runs) renderRuns(); else if (batch.messages) renderMessages();
+      };
+      batch.frame = requestAnimationFrame(flush);
+      // requestAnimationFrame pauses in hidden tabs; state must still settle.
+      batch.timer = setTimeout(flush, 100);
+    }
+    streamRenderBatch[kind] = true;
+    return true;
+  }
   let subagents = [], delegations = [], agentEvents = [], collaborationEvents = [], agentsLoading = false, agentsError = '', agentsRequest = 0, agentsRevision = 0, selectedAgentId = null, agentsTimer;
   let messages = [], approvals = [], connections = [], workspaceApps = [], connectionsRequest = 0, appsRequest = 0, runs = new Map(), activeRunIds = new Set(), nextCursor = null, olderPagesLoaded = false, loadingOlderRuns = false, runFilter = null, runRevision = 0, runsRequest = 0, messagesRequest = 0, approvalsRequest = 0;
   let cursor = 0, boundary = '', events = [], streamDrafts = new Map(), chatLoading = false, focusApproval = 0, screenUrl = null, artifact = null, directoryPath = '.';
@@ -51,13 +219,14 @@ import './src/layout.css';
     onOpenAgents: openAgents,
     onModelSettings:updateModelSettings,
     onRefreshModels:()=>void loadModelCatalog(),
-    onContextRequest:(botId,path,options)=>request(`${botPath(botId)}${path}`,options),
+    onContextRequest:contextRequest,
+    onHistoryNearTop:botId=>{if(selected?.id===botId)void loadOlderMessages();},
     onRecovery:(botId,target)=>{if(selected?.id!==botId||!authenticated)return;const control=target==='connection'?$('settings-button'):document.querySelector(target==='model'?'.timber-model-trigger':'.timber-memory-trigger');control?.click();},
 
     onRetry: (botId, operationId) => {
       if (selected?.id !== botId || !authenticated) return;
       const run = [...runs.values()].find(item => item.operationId === operationId && canRetryAdmission(item));
-      const message = run && messages.find(item => item.role === 'user' && item.runId === run.id);
+      const message = run && (indexMessages(), userMessagesByRun.get(run.id));
       const delivery = pendingMessages.get(operationId);
       if (run && (message || delivery?.botId === botId)) { void retryAdmission(botId, run, message ? message.text : delivery.text, message?.mentions || delivery?.mentions); return; }
       if (delivery?.botId === botId) void sendMessage(botId, delivery.text, operationId, delivery.mentions || [], delivery.files || []).catch(() => {});
@@ -163,7 +332,7 @@ import './src/layout.css';
   }
   function disconnect(message = '') {
     desktop.disconnect(); workspace.clear();
-    stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId=null; generation++; authSession++; authenticated = false; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
+    stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId=null; cancelStreamRender(); resetConversationHistory(); generation++; authSession++; authenticated = false; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
     selected = null; currentRun = null; stoppableRun = null; bots = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
     clearTimeout(botSummaryTimer);botSummaries.clear();botSummaryLoading=false;botSummaryPending=false;botRenderKey='';
     removedBots.clear(); deletionPending.clear(); deleteTarget = null; deleteBusy = false; editBotId = null; drafts.clear(); draftMentions.clear(); pendingMessages.clear(); acceptedImageIds.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); connectionWork.clear(); appWork.clear(); closeDialogs(); clearScreen();
@@ -188,7 +357,8 @@ import './src/layout.css';
       const saved=botSummaries.get(bot.id),isSelected=bot.id===selected?.id;
       const active=isSelected?[...runs.values()].filter(run=>!run.subagentId&&!terminal.has(run.status)):[];
       const activity=isSelected&&!chatLoading?['waiting_approval','waiting_connection','running','queued'].find(status=>active.some(run=>run.status===status))||(processRunIds().size?'running':'ready'):saved?.status;
-      const latest=isSelected?messages.filter(message=>['user','assistant'].includes(message.role)).at(-1):undefined;
+      if(isSelected)indexMessages();
+      const latest=isSelected?latestConversationMessage:undefined;
       const activeAgents=isSelected&&!chatLoading?subagents.filter(agent=>!terminal.has(agent.status)).length:saved?.activeAgents||0;
       const latestText=latest?.text?.trim()||(latest?.attachments?.length?(latest.attachments.length===1?'Image':`${latest.attachments.length} images`):'');
       return {bot,activity,activeAgents,preview:(latestText||saved?.lastMessage?.text||bot.instructions||'Start a conversation').trim().replace(/\s+/g,' ').slice(0,180)};
@@ -283,7 +453,7 @@ import './src/layout.css';
     }
     desktop.disconnect(); workspace.clear();
     if (!$('panel-files').hidden) workspace.setBot(bot.id);
-    stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId = chosenHash() === bot.id ? new URLSearchParams(location.hash.slice(1)).get('agent') : null;agentsLoading=true;agentsError=''; generation++; const version = generation; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
+    stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId = chosenHash() === bot.id ? new URLSearchParams(location.hash.slice(1)).get('agent') : null;agentsLoading=true;agentsError=''; cancelStreamRender(); resetConversationHistory(); generation++; const version = generation; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
     selected = bot; chatLoading = true; currentRun = null; stoppableRun = null; cursor = 0; boundary = ''; events = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs = new Map(); activeRunIds = new Set(); streamDrafts = new Map(); nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; runFilter = null; runRevision = 0;
     $('refresh-apps').disabled = false; $('refresh-apps').textContent = 'Refresh';
     history[replace ? 'replaceState' : 'pushState'](null, '', `${location.pathname}${location.search}#bot=${encodeURIComponent(bot.id)}`);
@@ -294,15 +464,16 @@ import './src/layout.css';
     $('computer-status').textContent = 'Checking…'; $('file-path').value = '.'; directoryPath = '.';
     $('file-content').value = ''; $('type-text').value = ''; $('file-list').replaceChildren(el('p', 'hint', 'No files loaded'));
     $('app-error').textContent = ''; $('approval-shortcut').hidden = true; renderCurrentRun(); renderStreamDraft(); renderProgress();
-    try { await Promise.all([loadMessages(version), loadRuns(version), loadApprovals(version), loadConnections(version), loadApps(version), loadAgents(version)]); }
+    try { await Promise.all([loadMessages(version), loadRuns(version), loadApprovals(version), loadConnections(version), loadApps(version), loadAgents(version), loadCompactions(version)]); }
     finally { if (validView(version)) { chatLoading = false; renderMessages(); startStream(); if (!$('panel-computer').hidden) void guarded(computerStatus); } }
   }
   function effectiveApprovals() {
-    return approvals.map(approval => {
+    renderedApprovals = stableProjection(renderedApprovals, approvals.map(approval => {
       const work = approvalWork.get(`${selected.id}:${approval.id}`), cached = work?.approval;
       const value = cached && (approval.status === 'pending' || (approval.status === 'executing' && cached.status !== 'pending')) ? cached : approval;
       return { ...value, status: value.status === 'pending' && Date.parse(value.expiresAt) <= Date.now() ? 'expired' : value.status, busy: work?.busy === true };
-    });
+    }));
+    return renderedApprovals;
   }
   const acceptedImageIds = new Map();
   function acceptDeliveryImages(delivery) {
@@ -319,24 +490,28 @@ import './src/layout.css';
         delivery.runId = run.id; delivery.runStatus = run.status; delivery.state = 'accepted'; delete delivery.error;
         if (newlyAccepted && (drafts.get(delivery.botId) || '').trim() === delivery.text && JSON.stringify(draftMentions.get(delivery.botId) || []) === JSON.stringify(delivery.mentions || [])) {drafts.delete(delivery.botId);draftMentions.delete(delivery.botId);}
       }
-      if (delivery.runId && messages.some(message => message.role === 'user' && message.runId === delivery.runId)) pendingMessages.delete(operationId);
+      if (delivery.runId && (indexMessages(), userMessagesByRun.has(delivery.runId))) pendingMessages.delete(operationId);
     }
   }
   function renderMessages() {
+    if (deferStreamRender('messages')) return;
     if (!selected || !authenticated) return;
     renderBots();
     const visibleApprovals = effectiveApprovals(), pending = visibleApprovals.filter(approval => approval.status === 'pending');
     $('approval-count').textContent = String(pending.length); $('approval-shortcut').hidden = !pending.length;
     const stream = [...streamDrafts.entries()].find(([id, text]) => text && activeRunIds.has(id) && !terminal.has(runs.get(id)?.status) && (!runFilter || id === runFilter));
-    const model = { acceptedImageIds: acceptedImageIds.get(selected.id) || [], bot: selected, messages, runs: [...runs.values()], approvals: visibleApprovals, connections: connections.map(item => ({...item, ...connectionWork.get(`${selected.id}:${item.id}`)})), events: events.map(event => ({...event, data: redact(event.data)})),
-      deliveries: [...pendingMessages.values()].filter(delivery => delivery.botId === selected.id).map(delivery => ({...delivery})), draft: drafts.get(selected.id) || '', mentionBots: bots, subagents, delegations, collaborationEvents, draftMentions: draftMentions.get(selected.id) || [], sending: sendBusy.has(selected.id)||modelSettingsWork.has(selected.id), loading: chatLoading,modelSettings:modelSettingsState(),
+    renderedConnections = stableProjection(renderedConnections, connections.map(item => ({...item, ...connectionWork.get(`${selected.id}:${item.id}`)})));
+    renderedDeliveries = stableProjection(renderedDeliveries, [...pendingMessages.values()].filter(delivery => delivery.botId === selected.id).map(delivery => ({...delivery})));
+    const model = { acceptedImageIds: acceptedImageIds.get(selected.id) || emptyList, bot: selected, messages, runs: runValues(), approvals: visibleApprovals, connections: renderedConnections, events: transcriptEvents(),
+      deliveries: renderedDeliveries, draft: drafts.get(selected.id) || '', mentionBots: bots, subagents, delegations, collaborationEvents, draftMentions: draftMentions.get(selected.id) || emptyList, sending: sendBusy.has(selected.id)||modelSettingsWork.has(selected.id), loading: chatLoading,compactions,historyLoading:historyState.loading,historyHasMore:Boolean(historyState.cursor),historyError:historyState.error || undefined,modelSettings:modelSettingsState(),
       currentRun, runFilter, focusApproval, stream: stream ? {runId: stream[0], text: stream[1]} : null, feedback: approvalFeedback.get(selected.id) };
     chat.update(model); activity.update({...model, runFilter: null});
   }
   function renderAgents() {
+    if (deferStreamRender('agents')) return;
     if (!selected || !authenticated) return;
     $('agent-count').textContent = String(subagents.length);
-    agentsView.update({botId:selected.id,botName:selected.name,botModel:selected.model,agents:subagents,namedAgents:bots.filter(bot=>bot.createdByBotId===selected.id),delegations,loading:agentsLoading,error:agentsError,selectedAgentId,revision:agentsRevision,events:agentEvents,runs:[...runs.values()],collaborationEvents});
+    agentsView.update({botId:selected.id,botName:selected.name,botModel:selected.model,agents:subagents,namedAgents:bots.filter(bot=>bot.createdByBotId===selected.id),delegations,loading:agentsLoading,error:agentsError,selectedAgentId,revision:agentsRevision,events:agentEvents,runs:runValues(),collaborationEvents});
   }
   async function loadAgents(version = generation) {
     const id = selected?.id, sequence = ++agentsRequest;
@@ -345,7 +520,7 @@ import './src/layout.css';
     try {
       const [temporary, named] = await Promise.all([request(`${botPath(id)}/agents`),request(`${botPath(id)}/delegations`)]);
       if (!validView(version) || sequence !== agentsRequest) return;
-      const mergeLatest=(existing,incoming)=>{const merged=new Map(existing.map(item=>[item.id,item]));for(const item of incoming){const prior=merged.get(item.id);if(!prior||item.updatedAt>=prior.updatedAt)merged.set(item.id,item);}return [...merged.values()];};
+      const mergeLatest=(existing,incoming)=>{const merged=new Map(existing.map(item=>[item.id,item]));for(const item of incoming){const prior=merged.get(item.id);if(!prior||item.updatedAt>=prior.updatedAt)merged.set(item.id,sameRecord(prior,item)?prior:item);}return sameArray(existing,[...merged.values()]);};
       subagents=mergeLatest(subagents,temporary.agents);delegations=mergeLatest(delegations,named.delegations);agentsLoading=false;agentsError='';agentsRevision++;
       renderAgents();renderMessages();
     } catch(error) {
@@ -395,7 +570,7 @@ import './src/layout.css';
     if (!authenticated || selected?.id !== botId || sendBusy.has(botId)||modelSettingsWork.has(botId)) return;
     const session = authSession; sendBusy.add(botId); renderMessages();
     try {
-      const result = await request(`${botPath(botId)}/messages`, {method: 'POST', body: {text, operationId: run.operationId, attachments: messages.find(message => message.runId === run.id && message.role === 'user')?.attachments?.map(image => image.artifactId), ...(mentions?.length ? {mentions} : {})}});
+      const result = await request(`${botPath(botId)}/messages`, {method: 'POST', body: {text, operationId: run.operationId, attachments: (indexMessages(), userMessagesByRun.get(run.id))?.attachments?.map(image => image.artifactId), ...(mentions?.length ? {mentions} : {})}});
 
       if (session !== authSession) return;
       if (result.run?.id !== run.id || result.run.botId !== botId || result.run.operationId !== run.operationId || !['queued', 'running', 'waiting_approval', 'waiting_connection', ...terminal].includes(result.run.status)) throw new Error('Delivery retry was not confirmed. Inspect this run before trying again.');
@@ -404,14 +579,15 @@ import './src/layout.css';
     finally {if (session === authSession) {sendBusy.delete(botId); if (selected?.id === botId) renderMessages();}}
   }
   async function loadMessages(version = generation) {
-    const id = selected?.id, sequence = ++messagesRequest; if (!id) return;
-    const result = await request(`${botPath(id)}/messages`);
-    if (!validView(version) || sequence !== messagesRequest) return;
-    // A REST snapshot may have started before a newer message arrived by SSE.
-    // Keep that message until a snapshot actually contains it.
-    for (const message of result.messages) streamedMessages.delete(message.id);
-    messages = [...result.messages, ...streamedMessages.values()];
+    const id = selected?.id, sequence = ++messagesRequest, state = historyState; if (!id) return;
+    const result = await request(`${botPath(id)}/messages`, {signal: state.controller.signal});
+    if (!validView(version) || sequence !== messagesRequest || historyState !== state) return;
+    // Refresh only updates known records and appends new ones. Previously loaded
+    // archive pages and messages received during this request are never dropped.
+    mergeMessagePage(result.messages);
+    if (!state.initialized) {state.initialized = true; state.cursor = result.nextCursor ?? null;}
     reconcileDeliveries(); renderMessages();
+    void loadOlderMessages(version);
   }
   function mergeRun(run, source = 'snapshot') {
     if (!run?.id || run.botId !== selected?.id) return false;
@@ -424,10 +600,12 @@ import './src/layout.css';
       if (Date.parse(run.updatedAt) < Date.parse(prior.updatedAt)) return false;
       if (source === 'event' && run.updatedAt === prior.updatedAt && run.status !== prior.status && prior.status !== 'queued' && !terminal.has(run.status)) return false;
     }
-    runs.set(run.id, run); if (terminal.has(run.status)) { activeRunIds.delete(run.id); streamDrafts.delete(run.id); } return true;
+    if (sameRecord(prior, run)) return false;
+    runs.set(run.id, run); runsValueRevision++; if (terminal.has(run.status)) { activeRunIds.delete(run.id); streamDrafts.delete(run.id); } return true;
   }
-  const sortedRuns = () => [...runs.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const sortedRuns = () => {runValues(); return cachedSortedRuns;};
   function processRunIds() {
+    if (processOwnersCache?.generation === generation && processOwnersCache.runsRevision === runsValueRevision && processOwnersCache.approvals === approvals && processOwnersCache.events === events && processOwnersCache.eventCount === events.length) return processOwnersCache.owners;
     const processes = new Map();
     for (const approval of approvals) if (approval.result?.processId) processes.set(approval.result.processId, {runId: approval.runId, status: approval.result.status});
     const observations = new Set();
@@ -443,6 +621,7 @@ import './src/layout.css';
       let id = process.runId;
       while (id && !owners.has(id)) {owners.add(id); id = runs.get(id)?.parentRunId;}
     }
+    processOwnersCache = {generation, runsRevision: runsValueRevision, approvals, events, eventCount: events.length, owners};
     return owners;
   }
   function renderCurrentRun() {
@@ -458,6 +637,7 @@ import './src/layout.css';
     $('run-error').textContent = ''; $('run-error').hidden = true; renderStreamDraft();
   }
   function renderRuns() {
+    if (deferStreamRender('runs')) return;
     $('run-list').replaceChildren(); const ordered = sortedRuns(), processOwners = processRunIds();
     if (!ordered.length) $('run-list').append(emptyState('No runs yet', 'Send a message to start this bot’s first task.'));
     for (const run of ordered) {
@@ -529,13 +709,13 @@ import './src/layout.css';
   function renderApprovals() { renderMessages(); }
   async function loadApprovals(version = generation) {
     const id = selected?.id, sequence = ++approvalsRequest; if (!id) return; const result = await request(`${botPath(id)}/approvals`); if (!validView(version) || sequence !== approvalsRequest) return;
-    approvals = result.approvals; renderApprovals();
+    approvals = reuseRecords(approvals, result.approvals); renderApprovals();
   }
   async function loadConnections(version = generation) {
     const id = selected?.id, sequence = ++connectionsRequest; if (!id) return;
     const result = await request(`${botPath(id)}/connections`);
     if (!validView(version) || sequence !== connectionsRequest) return;
-    connections = result.connections;
+    connections = reuseRecords(connections, result.connections);
     for (const item of connections) if (item.status !== 'pending') connectionWork.delete(`${id}:${item.id}`);
     renderMessages();
   }
@@ -688,7 +868,7 @@ import './src/layout.css';
     catch (error) {if (session === authSession && error.name !== 'AbortError') $('github-error').textContent = errorText(error);}
     finally {if (session === authSession) $('disconnect-github').disabled = false;}
   }
-  function scheduleRefresh(version) { clearTimeout(refreshTimer); refreshTimer = setTimeout(() => { if (validView(version)) void guarded(() => Promise.all([loadMessages(version), loadRuns(version), loadApprovals(version), loadConnections(version), loadApps(version), loadAgents(version)])); }, 300); }
+  function scheduleRefresh(version) { clearTimeout(refreshTimer); refreshTimer = setTimeout(() => { if (validView(version)) void guarded(() => Promise.all([loadMessages(version), loadRuns(version), loadApprovals(version), loadConnections(version), loadApps(version), loadAgents(version), loadCompactions(version)])); }, 300); }
   function redact(value, key = '') {
     if (/token|secret|password|authorization|credential/i.test(key)) return '[hidden]';
     if (Array.isArray(value)) return value.map((item) => redact(item));
@@ -696,6 +876,11 @@ import './src/layout.css';
   }
   function renderStreamDraft() { renderMessages(); }
   function recordEvent(event, version) {
+    // Apply every event in order immediately. Only derived/UI work is batched.
+    const previous = recordingStreamEvent; recordingStreamEvent = true;
+    try { applyStreamEvent(event, version); } finally { recordingStreamEvent = previous; }
+  }
+  function applyStreamEvent(event, version) {
     if (!validView(version) || !Number.isSafeInteger(event.id) || event.id <= cursor) return;
     if (event.type === 'computer.suspended') desktop.disconnect();
     if (['computer.action', 'computer.suspended', 'tool.started', 'tool.completed', 'process.updated', 'approval.updated'].includes(event.type)) queueComputerStatus();
@@ -704,7 +889,7 @@ import './src/layout.css';
     // Only the separate diagnostic log is capped; SSE replay restores history.
     if (['process.updated','tool.started','tool.completed','subagent.tool.started','subagent.tool.completed','run.retrying','run.failed','run.cancellation.requested'].includes(event.type)) events.push(event);
     if(['subagent.created','subagent.updated','subagent.stopped','subagent.reported','subagent.message.sent','agent.named.created','delegation.updated'].includes(event.type)) {
-      collaborationEvents.push({...event,data:redact(event.data)});
+      collaborationEvents = [...collaborationEvents, {...event,data:redact(event.data)}];
       const agent=event.data.subagent;
       if(agent && typeof agent.id==='string' && typeof agent.name==='string') {
         const old=subagents.find(item=>item.id===agent.id);
@@ -714,7 +899,7 @@ import './src/layout.css';
       if(delegation && typeof delegation.id==='string')delegations=[...delegations.filter(item=>item.id!==delegation.id),delegation];
       renderAgents();renderMessages();
     }
-    if (event.data.subagentId && (event.type.startsWith('subagent.') || ['tool.started','tool.completed','process.updated'].includes(event.type))) {agentEvents.push({...event,type:event.type.startsWith('subagent.')?event.type:`subagent.${event.type}`,data:redact(event.data)});renderAgents();}
+    if (event.data.subagentId && (event.type.startsWith('subagent.') || ['tool.started','tool.completed','process.updated'].includes(event.type))) {agentEvents = [...agentEvents, {...event,type:event.type.startsWith('subagent.')?event.type:`subagent.${event.type}`,data:redact(event.data)}];renderAgents();}
     if (event.type === 'bot.created' || event.type === 'agent.bot_created' || event.type === 'agent.named.created' || event.type === 'tool.completed' && event.data.toolName === 'create_bot') void guarded(loadBots);
     const row = el('article', 'event'), title = el('div', 'event-title'); title.append(el('span', '', event.type.replaceAll('.', ' · ')), el('span', 'muted', `#${event.id} · ${time(event.createdAt)}`));
     const detail = el('details'); detail.append(el('summary', '', 'Event details')); const serialized = JSON.stringify(redact(event.data), null, 2); detail.append(el('pre', '', serialized.length > 8000 ? `${serialized.slice(0, 8000)}\n…` : serialized)); row.append(title, detail); $('activity-list').prepend(row); while ($('activity-list').children.length > 200) $('activity-list').lastElementChild.remove();
@@ -724,7 +909,7 @@ import './src/layout.css';
       if (message?.botId === selected?.id && typeof message.id === 'string' && message.id && typeof message.text === 'string' &&
           ['user', 'assistant', 'tool', 'system'].includes(message.role) && Number.isFinite(Date.parse(message.createdAt)) &&
           (!message.runId || message.runId === event.runId)) {
-        if (!messages.some(item => item.id === message.id)) {streamedMessages.set(message.id, message); messages.push(message);}
+        if (appendMessage(message)) streamedMessages.set(message.id, message);
         if (message.role === 'assistant') streamDrafts.delete(event.runId);
         reconcileDeliveries([...runs.values()]); renderMessages();
       }
@@ -882,7 +1067,7 @@ import './src/layout.css';
     if (editBotId === id) {editBotId = null; $('edit-form').reset(); $('edit-dialog').close();}
     const wasSelected = selected?.id === id;
     if (wasSelected) {
-      stopComputerStatus(); generation++; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
+      stopComputerStatus(); cancelStreamRender(); resetConversationHistory(); generation++; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
       for (const runId of runs.keys()) stopping.delete(runId);
       selected = null; currentRun = null; stoppableRun = null; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
       cursor = 0; boundary = ''; runFilter = null; nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; chatLoading = false; chat.clear(); activity.clear();
@@ -1069,7 +1254,7 @@ import './src/layout.css';
   $('approval-shortcut').addEventListener('click', () => { runFilter = null; focusApproval++; showPanel('conversation'); renderMessages(); });
   const tabs = [...document.querySelectorAll('[data-panel]')];
   tabs.forEach((button, index) => {button.addEventListener('click', () => showPanel(button.dataset.panel)); button.addEventListener('keydown', event => {if (!button.closest('#panel-menu')) return; const menuTabs = tabs.filter(tab => tab.closest('#panel-menu')); index = menuTabs.indexOf(button); let next; if (event.key === 'ArrowDown') next = (index + 1) % menuTabs.length; if (event.key === 'ArrowUp') next = (index + menuTabs.length - 1) % menuTabs.length; if (event.key === 'Home') next = 0; if (event.key === 'End') next = menuTabs.length - 1; if (next !== undefined) {event.preventDefault(); menuTabs[next].focus();}});});
-  $('refresh-history').addEventListener('click', () => guarded(() => Promise.all([loadMessages(), loadRuns(), loadApprovals(), loadConnections(), loadApps(), loadAgents()]))); $('reconnect-stream').addEventListener('click', startStream);
+  $('refresh-history').addEventListener('click', () => guarded(() => Promise.all([loadMessages(), loadRuns(), loadApprovals(), loadConnections(), loadApps(), loadAgents(), loadCompactions()]))); $('reconnect-stream').addEventListener('click', startStream);
   $('refresh-computer').addEventListener('click', () => guarded(computerStatus)); $('take-screenshot').addEventListener('click', () => guarded(() => computerAction({ type: 'screenshot' })));
   $('checkpoint').addEventListener('click', () => guarded(() => computerAction({ type: 'checkpoint' }))); $('suspend-computer').addEventListener('click', () => guarded(suspendComputer));
   $('click-mode').addEventListener('change', () => document.querySelector('.screen').classList.toggle('click-enabled', $('click-mode').checked));
@@ -1096,8 +1281,12 @@ import './src/layout.css';
   $('disconnect-github').addEventListener('click', () => {void disconnectGitHub();});
   window.addEventListener('focus', () => {if (authenticated && $('settings-dialog').open) void loadGitHubStatus(); if (authenticated && selected && connections.some(item => item.status === 'pending')) void guarded(() => Promise.all([loadConnections(), loadRuns()]));});
   document.addEventListener('visibilitychange', () => { desktop.setActive(!$('panel-computer').hidden && (!matchMedia('(max-width: 760px)').matches || document.body.dataset.mobileView === 'bot')); });
-  window.addEventListener('pagehide', () => {stopComputerStatus(); streamController?.abort();});
-  window.addEventListener('pageshow', event => {if (event.persisted && authenticated) {startStream(); void guarded(loadBots);}});
+  window.addEventListener('pagehide', () => {cancelStreamRender();clearTimeout(compactionsTimer);clearTimeout(historyRetryTimer);stopComputerStatus(); streamController?.abort();});
+  window.addEventListener('pageshow', event => {if (event.persisted && authenticated) {startStream(); void guarded(loadBots);void loadOlderMessages();void loadCompactions();}});
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {clearTimeout(compactionsTimer);clearTimeout(historyRetryTimer);}
+    else if (authenticated && selected) {void loadOlderMessages();void loadCompactions();}
+  });
   let viewportFrame = 0;
   const updateViewport = () => {
     viewportFrame = 0;

@@ -1,4 +1,4 @@
-import type { AgentDelegation, Approval, Bot, BotEvent, ConnectionRequest, Message, Run, Subagent } from '../../../packages/contracts/src/index';
+import type { AgentDelegation, Approval, Bot, BotEvent, CompactionReceipt, ConnectionRequest, Message, Run, Subagent } from '../../../packages/contracts/src/index';
 import type {ModelSelection, ModelSettingsState} from './model-settings';
 import type {ContextMemoryRequest} from './context-memory';
 
@@ -16,6 +16,8 @@ export type ChatModel = {
   modelSettings:ModelSettingsState;
   subagents: Subagent[]; delegations: AgentDelegation[];
   collaborationEvents: BotEvent[];
+  compactions?: readonly CompactionReceipt[];
+  historyLoading?: boolean; historyHasMore?: boolean; historyError?: string;
   currentRun: Run | null; runFilter: string | null; focusApproval: number;
   stream: { runId: string; text: string } | null;
   feedback?: { createdAt: string; runId?: string; error: boolean; text: string };
@@ -33,6 +35,7 @@ export type ChatCallbacks = {
   onRetry(botId: string, operationId: string): void;
   onDecision(botId: string, approvalId: string, decision: 'approve' | 'deny', allowComputer?: boolean): void;
   onClearFilter(): void;
+  onHistoryNearTop?(botId: string): void;
   onStop(botId: string, runId: string): void;
   onConnect(botId: string, requestId: string): void;
 };

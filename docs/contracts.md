@@ -62,7 +62,13 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   access remains disabled, the deletion alarm retries, and another DELETE resumes
   cleanup. Minimal ID/status tombstones prevent resurrection. Shared ChatGPT
   credentials are not deleted.
-- GET /v1/bots/:id/messages -> {messages:Message[]}
+- GET /v1/bots/:id/messages?limit=500&before=<cursor> -> {messages:Message[],nextCursor:string|null}
+  Retained public transcript pages are chronological within each newest/older
+  page. Default limit is 500; digit-string integer bounds 1..500 and positive safe
+  integer `before` cursors are required, or 400. Pass `nextCursor` unchanged to
+  read the next older page; null means no older page remains. Stable SQLite rowid
+  pagination preserves older page boundaries while new messages arrive and does
+  not depend on timestamps. No messages are deleted by context compaction.
   Assistant messages may carry `kind: "progress" | "final"`. Progress is public
   assistant commentary accompanying native tool calls; it is durably deduplicated
   by its native message identity. Final answers are deduplicated by their native
@@ -707,7 +713,13 @@ product-level concepts without adopting CUA as the cloud compute provider.
 Owner-authenticated bot routes expose `GET /context`, `POST /context/compact`
 `{operationId,instructions?}`, and `GET` / `PUT /memory` `{content,revision}`.
 Manual compaction returns 202 with a durable receipt; automatic compaction uses
-Pi's threshold and overflow policies. Both retain the complete archived history.
+Pi's threshold and overflow policies. Both retain the complete archived history. `GET /context` returns every native
+root-conversation compaction, not a last-20 slice; stable `compact:<taskId>`
+receipts expose reason/status/summaryApplied/historyRetained and optional actual
+createdAt/startedAt/summaryCreatedAt, firstKeptEntryId, summarizedEntries and
+estimatedTokensBefore (selected-prefix estimate, not billed usage). Unrecorded
+historical times/details are omitted; private summaries/instructions/checkpoints
+are never exposed. See [context-memory.md](context-memory.md) for field semantics.
 Memory updates use revisions to reject concurrent overwrites. Each child has
 isolated editable notes and read-only inherited bot notes. Native `memory_read`,
 `memory_update` and `recall_history` tools remain scoped to that conversation.

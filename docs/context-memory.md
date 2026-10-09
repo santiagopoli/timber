@@ -26,8 +26,9 @@ the existing lifecycle scheduler recover unfinished maintenance after eviction.
 Timber reads the immutable native entry archive for public runtime transcripts.
 Pi's `PiHarness.messages()` returns only active context and is deliberately not
 used for full-history retrieval. Internal compaction summaries are not rendered
-as user messages. The existing public conversation endpoint still returns its
-bounded recent page; stored older messages remain retained. The `recall_history`
+as user messages. The public conversation endpoint returns a bounded recent page plus `nextCursor`;
+clients can read every older public message with stable cursor pages, without
+changing the model context or rerunning work. Stored older messages remain retained. The `recall_history`
 tool searches bounded pages of the calling conversation's public archive.
 
 ## Durable notes
@@ -58,6 +59,7 @@ membership checks.
 
 | Method and path | Request | Result |
 | --- | --- | --- |
+| `GET /messages` | `?limit=500&before=<cursor>` | `{messages, nextCursor}`; chronological within each page |
 | `GET /context` | — | `{context: {automatic, estimatedTokens, activeEntries, contextWindow, historyRetained, compactions}}` |
 | `POST /context/compact` | `{operationId, instructions?}` | `202 {compaction}` |
 | `GET /memory` | — | `{memory: {content, revision, updatedAt?, maxCharacters}}` |
@@ -67,8 +69,47 @@ A compaction receipt contains `id`, `reason` (`manual`, `threshold`, `overflow`)
 `status` (`running`, `completed`, `unchanged`, `failed`, `cancelled`) and
 `summaryApplied`. Repeating the same manual operation ID returns the same native
 task receipt. Changing its instructions returns `409 compaction_conflict`.
-Estimated token counts are estimates, not billed usage. The last 20 compaction
-receipts are reported, including automatic maintenance.
+`GET /context` reports **every** root-conversation compaction, newest native task
+first, including manual, threshold and overflow maintenance. IDs remain stable
+through running/terminal updates and reload; compaction never becomes an ordinary
+user message. Each receipt also includes `historyRetained:true` and only recorded,
+allowlisted display metadata:
+
+- `createdAt`: admission time of new manual requests, persisted atomically with
+  their native task. This is absent for older/manual and automatic tasks.
+- `startedAt`: native range-selection hook time for new manual/automatic work;
+  first-writer-wins persistence preserves it through retries and recovery.
+- `summaryCreatedAt`: timestamp stored in the native applied summary entry,
+  including historical compactions. This is summary creation time, **not** an
+  invented completion time.
+- `firstKeptEntryId`: the actual native entry boundary retained verbatim, from
+  the summary entry or recorded range selection.
+- `summarizedEntries` and `estimatedTokensBefore`: the selected prefix entry
+  count and token estimate recorded at range selection. The estimate covers only
+  that selected prefix, not the entire conversation, and is not billed usage.
+
+Unavailable historical metadata is omitted, never replaced with the current time,
+zero counters or fictional savings. Raw instructions, internal summaries, reasoning,
+system prompts, native checkpoints and provider errors are never included.
+Historical failed/unchanged/cancelled tasks without any recorded time remain in
+the complete receipt list with their stable ID and actual outcome.
+
+`GET /messages` keeps the backward-compatible 500-message default and supports
+`limit` integers 1..500 and `before`, a positive safe integer rowid cursor. It
+returns `{messages,nextCursor}` with chronological messages inside each page;
+`nextCursor:null` means all older public messages have been read. Pass a returned
+cursor unchanged to read the next older page. Cursor pagination does not use
+OFFSET or timestamps, so new messages and equal dates cannot shift older pages.
+Invalid bounds/cursors return 400. Pages use only the owner's selected bot's
+public projection; internal native summaries and private reasoning are excluded.
+The HTTP archive is the durable host `messages` projection: admitted user inputs,
+public assistant progress and final answers, with host IDs, attachments, provenance
+and run attribution. Those records persist before and after compaction; pagination
+removes the old last-500 visibility limit. This route is deliberately not a raw
+native-entry export. Native-only bookkeeping, test-seeded entries, reasoning,
+private tool payloads and context summary entries do not become new HTTP messages.
+The runtime's separate immutable native archive and `recall_history` remain intact.
+
 
 ## Prior art and sources
 

@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, useId, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, useId, memo, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
 import { XIcon, PaperclipIcon, ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon, HistoryIcon, SquareIcon } from 'lucide-react';
@@ -17,10 +17,11 @@ import {ArtifactPreview, ArtifactProvider, type ArtifactLoader} from './artifact
 import './chat.css';
 import {hasBotMention} from './mentions';
 import {agentColor} from './agent-colors';
-import {AgentCreationCard, AgentMessageNotice, collectCollaboration, provenanceNotice} from './collaboration-timeline';
+import {AgentCreationCard, AgentMessageNotice, collectCollaboration, type CollaborationItem} from './collaboration-timeline';
 import {ModelSettings} from './model-settings';
 import {ModelBadge} from './model-identity';
 import {ContextMemoryControl} from './context-memory';
+import {collectCompactions, CompactionPill, type CompactionItem} from './compaction-timeline';
 import {mergeToolResult, mergeToolStatus, runOutcomes, toolActivityState, toolFailureSummary} from './cancellation-presentation';
 
 const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
@@ -33,13 +34,14 @@ const responseComponents = { img: () => null };
 // Keep Streamdown's URL sanitization, but use native links instead of its
 // confirmation buttons so browser navigation and long-press actions work.
 const responseLinkSafety = { enabled: false };
+const responsePlugins = {};
 const responseUrlTransform: UrlTransform = (url, key, node) => url === 'streamdown:incomplete-link' ? undefined : defaultUrlTransform(url, key, node);
 
-function Response({ text, streaming = false }: { text: string; streaming?: boolean }) {
-  return <MessageResponse className="timber-markdown" mode={streaming ? 'streaming' : 'static'} isAnimating={streaming} parseIncompleteMarkdown skipHtml plugins={{}} components={responseComponents} linkSafety={responseLinkSafety} urlTransform={responseUrlTransform} controls={false}>{text}</MessageResponse>;
-}
+const Response = memo(function Response({ text, streaming = false }: { text: string; streaming?: boolean }) {
+  return <MessageResponse className="timber-markdown" mode={streaming ? 'streaming' : 'static'} isAnimating={streaming} parseIncompleteMarkdown skipHtml plugins={responsePlugins} components={responseComponents} linkSafety={responseLinkSafety} urlTransform={responseUrlTransform} controls={false}>{text}</MessageResponse>;
+});
 
-function CopyMessage({ text, kind = 'message', createdAt }: { text: string; kind?: 'message' | 'pending' | 'streaming'; createdAt?: string }) {
+const CopyMessage = memo(function CopyMessage({ text, kind = 'message', createdAt }: { text: string; kind?: 'message' | 'pending' | 'streaming'; createdAt?: string }) {
   const [state, setState] = useState<'idle' | 'copying' | 'copied' | 'failed'>('idle');
   const busy = useRef(false), mounted = useRef(true), reset = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const name = kind === 'streaming' ? 'Copy response so far' : kind === 'pending' ? 'Copy pending message' : 'Copy message';
@@ -61,10 +63,9 @@ function CopyMessage({ text, kind = 'message', createdAt }: { text: string; kind
     <span className={state === 'failed' ? 'timber-copy-feedback timber-copy-error' : 'timber-copy-feedback'} role="status">{state === 'copied' ? 'Copied' : state === 'failed' ? 'Couldn’t copy. Try again.' : ''}</span>
     {createdAt && <time dateTime={createdAt} title={new Date(createdAt).toLocaleString()}>{time(createdAt)}</time>}
   </MessageActions>;
-}
+});
 
-function ApprovalEntry({ approval, current, automatic, callbacks, agentName, events = [] }: { approval: ChatApproval; current: boolean; automatic: boolean; callbacks: ChatCallbacks; agentName?:string; events?: ChatModel['events'] }) {
-  const process = processUpdate(events, approval.result?.processId || approval.operationId);
+const ApprovalEntry = memo(function ApprovalEntry({ approval, current, automatic, callbacks, agentName, process }: { approval: ChatApproval; current: boolean; automatic: boolean; callbacks: ChatCallbacks; agentName?:string; process?: ChatModel['events'][number] }) {
   if (process) approval = {...approval, result: mergeToolResult(approval.result, process.data.result as ChatApproval['result'], {snapshot:true})};
   const saving = approval.result?.checkpointStatus === 'pending';
   const pending = approval.status === 'pending';
@@ -100,37 +101,35 @@ function ApprovalEntry({ approval, current, automatic, callbacks, agentName, eve
       <div {...attributes}>{content}</div>
     </details>}
   </article>;
-}
+});
 
-function MessageRunStatus({ model, runId, callbacks }: { model: ChatModel; runId?: string; callbacks: ChatCallbacks }) {
-  const run = model.runs.find(item => item.id === runId);
+function MessageRunStatus({ run, botId, sending, callbacks }: { run?: ChatModel['runs'][number]; botId: string; sending: boolean; callbacks: ChatCallbacks }) {
   // The inline request or activity already explains an active task. Keep the
   // receipt only when it adds delivery, failure or cancellation information.
   if (!run || run.status !== 'queued') return null;
   return <div className="timber-message-run" data-message-run-status={run.status}>
     <span className="timber-delivery-status"><ClockIcon />Queued</span>
-    {run.error && <div className="timber-delivery-error"><p>{run.error}</p>{canRetryAdmission(run) && <Button variant="outline" size="sm" disabled={model.sending} onClick={() => callbacks.onRetry(model.bot.id, run.operationId)}>Retry sending</Button>}</div>}
+    {run.error && <div className="timber-delivery-error"><p>{run.error}</p>{canRetryAdmission(run) && <Button variant="outline" size="sm" disabled={sending} onClick={() => callbacks.onRetry(botId, run.operationId)}>Retry sending</Button>}</div>}
   </div>;
 }
 
-function TaskOutcome({model, run, callbacks, kind, cancellationId}: {model:ChatModel;run:ChatModel['runs'][number];callbacks:ChatCallbacks;kind:'stopped'|'failure';cancellationId?:string}) {
+const TaskOutcome = memo(function TaskOutcome({botId, run, request, failure, sending, active, callbacks, kind, cancellationId}: {botId:string;run:ChatModel['runs'][number];request?:ChatModel['messages'][number];failure:ReturnType<typeof failureRecovery>;sending:boolean;active:boolean;callbacks:ChatCallbacks;kind:'stopped'|'failure';cancellationId?:string}) {
   if (kind === 'stopped') return <article className="timber-work-status" data-run-outcome={run.id} data-cancellation-id={cancellationId} data-task-outcome-kind="stopped" role="status"><SquareIcon aria-hidden="true"/><span>Task stopped</span></article>;
-  const request = model.messages.find(message=>message.runId===run.id && message.role==='user');
-  const failure=failureRecovery(run,model.events),allowanceExhausted=failure.code==='chatgpt_allowance_exhausted',retryable=canRetryAdmission(run)&&!allowanceExhausted;
+  const allowanceExhausted=failure.code==='chatgpt_allowance_exhausted',retryable=canRetryAdmission(run)&&!allowanceExhausted;
   const canContinue=Boolean(request)&&!retryable&&['continue','retry'].includes(failure.action);
   const recoveryTarget=['model','connection','context'].includes(failure.action)?failure.action as 'model'|'connection'|'context':undefined;
   return <article className="timber-task-outcome" data-run-outcome={run.id} role="status">
     <div className="timber-task-outcome-heading"><CircleAlertIcon aria-hidden="true"/><span>{allowanceExhausted?'ChatGPT usage limit reached':retryable?'Message not started':run.status==='failed'?'Request failed':'Response interrupted'}</span></div>
     {failure.message && <p>{failure.message}</p>}
     {failure.code&&<details className="timber-failure-details"><summary>Details</summary><code>{failure.code}</code>{run.model&&<p>{run.model}{run.reasoningEffort?` · ${run.reasoningEffort} reasoning`:''}{run.fast?' · Fast':''}</p>}</details>}
-    {recoveryTarget&&<Button type="button" variant="outline" size="sm" onClick={()=>callbacks.onRecovery(model.bot.id,recoveryTarget)}>{recoveryTarget==='model'?'Review model settings':recoveryTarget==='connection'?'Open Settings':'Review context'}</Button>}
+    {recoveryTarget&&<Button type="button" variant="outline" size="sm" onClick={()=>callbacks.onRecovery(botId,recoveryTarget)}>{recoveryTarget==='model'?'Review model settings':recoveryTarget==='connection'?'Open Settings':'Review context'}</Button>}
     {allowanceExhausted&&<Button asChild variant="outline" size="sm"><a href="https://chatgpt.com/settings/usage" target="_blank" rel="noopener noreferrer" title="Open ChatGPT usage in a new tab">Open ChatGPT usage<ExternalLinkIcon aria-hidden="true"/></a></Button>}
-    {retryable && request && <Button type="button" variant="outline" size="sm" disabled={model.sending} onClick={()=>callbacks.onRetry(model.bot.id,run.operationId)}>Retry sending</Button>}
-    {canContinue && request && <Button type="button" variant="outline" size="sm" disabled={model.sending || model.runs.some(item=>!item.subagentId && !terminal.has(item.status))} onClick={()=>callbacks.onSend(model.bot.id, `Continue this task:\n\n${bounded(request.text,6000)}\n\nUse the results already recorded in this conversation. Check the last outcome before taking another action; do not repeat completed work. Explain the result or any remaining blocker.`)}>{failure.action==='retry'?'Try again':'Continue'}</Button>}
+    {retryable && request && <Button type="button" variant="outline" size="sm" disabled={sending} onClick={()=>callbacks.onRetry(botId,run.operationId)}>Retry sending</Button>}
+    {canContinue && request && <Button type="button" variant="outline" size="sm" disabled={sending || active} onClick={()=>callbacks.onSend(botId, `Continue this task:\n\n${bounded(request.text,6000)}\n\nUse the results already recorded in this conversation. Check the last outcome before taking another action; do not repeat completed work. Explain the result or any remaining blocker.`)}>{failure.action==='retry'?'Try again':'Continue'}</Button>}
   </article>;
-}
+});
 
-function ConnectionEntry({ connection, callbacks }: { connection: ChatConnection; callbacks: ChatCallbacks }) {
+const ConnectionEntry = memo(function ConnectionEntry({ connection, callbacks }: { connection: ChatConnection; callbacks: ChatCallbacks }) {
   const pending = connection.status === 'pending';
   return <article className="timber-connection-entry" data-connection-id={connection.id} data-connection-status={connection.status} data-run-id={connection.runId}>
     <div className="timber-connection-heading"><GitBranchIcon aria-hidden="true" /><strong>{pending ? 'Connect GitHub to continue' : connection.status === 'connected' ? 'GitHub access connected' : 'GitHub request cancelled'}</strong><time>{time(connection.createdAt)}</time></div>
@@ -142,9 +141,9 @@ function ConnectionEntry({ connection, callbacks }: { connection: ChatConnection
     </>}
     {connection.error && <p className="timber-inline-error" role="alert">{connection.error}</p>}
   </article>;
-}
+});
 
-function DeliveryEntry({ delivery, busy, callbacks }: { delivery: MessageDelivery; busy: boolean; callbacks: ChatCallbacks }) {
+const DeliveryEntry = memo(function DeliveryEntry({ delivery, busy, callbacks }: { delivery: MessageDelivery; busy: boolean; callbacks: ChatCallbacks }) {
   const state = delivery.state === 'sending' ? 'Sending' : delivery.state === 'unknown' ? 'Delivery unknown' : delivery.state === 'rejected' ? 'Not accepted' : delivery.runStatus === 'queued' ? 'Queued' : label(delivery.runStatus || 'queued').replace(/^./, character => character.toUpperCase());
   return <Message from="user" data-operation-id={delivery.operationId} className="timber-message timber-delivery">
     <MessageContent className="timber-message-content"><Response text={delivery.text} /></MessageContent>
@@ -155,16 +154,44 @@ function DeliveryEntry({ delivery, busy, callbacks }: { delivery: MessageDeliver
     </div>
     {delivery.error && <div className="timber-delivery-error"><p>{delivery.error}</p>{delivery.canRetry && <Button variant="outline" size="sm" disabled={busy} onClick={() => callbacks.onRetry(delivery.botId, delivery.operationId)}>Retry sending</Button>}</div>}
   </Message>;
-}
+});
 
 type TimelineEntry = { key: string; at: number; order: number; node: ReactNode; tool?: ToolActivity };
 type ToolActivity = { key: string; runId?: string; at: number; name: string; aliases: Set<string>; returned: boolean; status?: string; result?: {status?: string; processId?: string; checkpointStatus?: 'pending'|'saved'|'failed'; output?: string; error?: string; exitCode?: number; artifactId?: string}; process?: ChatModel['events'][number]; data: Record<string, unknown> };
 type ActivityStep = {at: number; key: string; tool: ToolActivity};
 type ActivityModel = Pick<ChatModel, 'bot' | 'events' | 'runs' | 'approvals' | 'runFilter' | 'subagents' | 'delegations' | 'mentionBots' | 'messages' | 'collaborationEvents'>;
+const activityFields = ['bot', 'events', 'runs', 'approvals', 'runFilter', 'subagents', 'delegations', 'mentionBots', 'messages', 'collaborationEvents'] as const;
+const sameActivityModel = (left: ActivityModel | null, right: ActivityModel) => Boolean(left && activityFields.every(key => left[key] === right[key]));
+
 const toolNames: Record<string, string> = {exec: 'Run command', read_file: 'Read file', readFile: 'Read file', write_file: 'Write file', writeFile: 'Write file', list_files: 'Browse files', listFiles: 'Browse files', desktop_screenshot: 'Capture desktop', screenshot: 'Capture desktop', browser_navigate: 'Open', navigate: 'Open', desktop_click: 'Click', click: 'Click', desktop_move: 'Move pointer', move: 'Move pointer', desktop_double_click: 'Double click', doubleClick: 'Double click', desktop_drag: 'Drag', drag: 'Drag', desktop_type: 'Type text', type: 'Type text', desktop_key: 'Press', key: 'Press', desktop_scroll: 'Scroll', scroll: 'Scroll', checkpoint: 'Save workspace', github_clone: 'Clone', gitClone: 'Clone', github_push: 'Push', gitPush: 'Push', github_connect: 'Connect GitHub', github_create_pull_request: 'Create pull request', github_list_pull_requests: 'List pull requests', github_list_repositories: 'List repositories', load_skill: 'Load skill', list_tools: 'Available tools', publish_app: 'Publish app', list_apps: 'List apps', remove_app: 'Remove app', spawn_subagent:'Create subagent', list_subagents:'View subagents', send_subagent_message:'Message subagent', wait_subagent:'Wait for subagent', cancel_subagent:'Stop subagent', send_to_bot:'Message bot', create_bot:'Create named bot', list_bots:'View bots'};
 const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 Object.assign(toolNames, {exec_poll: 'Check command', execPoll: 'Check command', exec_cancel: 'Stop command', execCancel: 'Stop command'});
-const processUpdate = (events: ChatModel['events'], processId: string) => [...events].reverse().find(event => event.type === 'process.updated' && event.data.processId === processId);
+// Build these once per history revision, not once per message/tool/approval.
+function historyIndexes(model: ActivityModel) {
+  const runs = new Map(model.runs.map(run => [run.id, run]));
+  const operations = new Map(model.runs.map(run => [run.operationId, run]));
+  const agents = new Map(model.subagents.map(agent => [agent.id, agent]));
+  const bots = new Map(model.mentionBots.map(bot => [bot.id, bot]));
+  const processes = new Map<string, ChatModel['events'][number]>();
+  const eventsByRun = new Map<string | undefined, ChatModel['events']>();
+  const latestAt = new Map<string | undefined, number>();
+  const retries = new Map<string | undefined, string | null>();
+  const requests = new Map<string, ChatModel['messages'][number]>();
+  for (const message of model.messages) {
+    latestAt.set(message.runId, Math.max(latestAt.get(message.runId) || 0, timestamp(message.createdAt)));
+    if (message.role === 'user' && message.runId && !requests.has(message.runId)) requests.set(message.runId, message);
+  }
+  for (const event of model.events) {
+    if (event.type === 'process.updated' && typeof event.data.processId === 'string') processes.set(event.data.processId, event);
+    const group = eventsByRun.get(event.runId) || [];
+    group.push(event); eventsByRun.set(event.runId, group);
+    latestAt.set(event.runId, Math.max(latestAt.get(event.runId) || 0, timestamp(event.createdAt)));
+    if (event.type === 'run.retrying') retries.set(event.runId, `Retrying response · ${event.data.attempt}/${event.data.maxRetries}`);
+    else if (event.type === 'tool.started') retries.set(event.runId, null);
+  }
+  return {runs, operations, agents, bots, processes, eventsByRun, latestAt, retries, requests};
+}
+type HistoryIndexes = ReturnType<typeof historyIndexes>;
 // The host publishes an allowlisted input summary. Historical events may have
 // no input at all; never invent the command from its result or operation ID.
 const toolInput = (tool: ToolActivity) => record(tool.data.input || tool.data.action || tool.data.arguments);
@@ -177,11 +204,11 @@ function publicToolData(tool: ToolActivity) {
   return {...tool.data, ...Object.fromEntries(['input', 'action', 'arguments'].filter(key => tool.data[key]).map(key => [key, Object.fromEntries(Object.entries(record(tool.data[key])).map(([name, value]) => [name, privateInput.test(name) ? '[hidden]' : value]))]))};
 }
 
-function collectTools(model: ActivityModel, includeApprovals = false): ToolActivity[] {
+function collectTools(model: ActivityModel, includeApprovals = false, collaboration = collectCollaboration(model), indexes = historyIndexes(model)): ToolActivity[] {
   // A host event bridges the native call ID and the durable computer operation ID.
   // Merge those explicit aliases only: identical command text is not identity.
   const aliases = new Map<string, ToolActivity>();
-  const collaborationIdentities=collectCollaboration(model).toolIdentities;
+  const collaborationIdentities=collaboration.toolIdentities;
   for (const event of model.events) {
     if (!['tool.started', 'tool.completed', 'process.updated'].includes(event.type) || event.data.subagentId || model.runFilter && event.runId !== model.runFilter) continue;
     const data = event.data, ids = [data.operationId, data.toolCallId, event.type === 'process.updated' ? data.processId : undefined].filter((id): id is string => typeof id === 'string' && Boolean(id));
@@ -223,7 +250,7 @@ function collectTools(model: ActivityModel, includeApprovals = false): ToolActiv
     aliases.set(key, value);
   }
   return [...new Set(aliases.values())].filter(tool=>!['spawn_subagent','create_bot','send_subagent_message','send_to_bot'].includes(tool.name) || tool.name!=='send_subagent_message'&&['failed','interrupted','cancelled'].includes(tool.result?.status||tool.status||'') || ![...tool.aliases].some(alias=>collaborationIdentities.has(alias))).map(tool => {
-    const process = tool.process || processUpdate(model.events, tool.result?.processId || displayText(tool.data.operationId));
+    const process = tool.process || indexes.processes.get(tool.result?.processId || displayText(tool.data.operationId));
     if (!process) return tool;
     // Process observations outlive the original tool/approval receipt. Keep the
     // original operation and timeline position while applying the latest state.
@@ -267,13 +294,9 @@ function toolPresentation(tool: ToolActivity) {
   return {title: bounded(title, 900), parameters: parameters.join(' · '), command};
 }
 
-function toolState(tool: ToolActivity, model: ActivityModel) {
-  return toolActivityState(tool, model.runs.find(item => item.id === tool.runId));
-}
-
-function ToolActivityRow({tool, model, panel = false}: {tool: ToolActivity; model: ActivityModel; panel?: boolean}) {
+const ToolActivityRow = memo(function ToolActivityRow({tool, run, botId, panel = false}: {tool: ToolActivity; run?: ChatModel['runs'][number]; botId: string; panel?: boolean}) {
   const [expanded, setExpanded] = useState(false), [detail, setDetail] = useState<'output'|'command'|'details'|null>(null);
-  const state = toolState(tool, model), presentation = toolPresentation(tool), input = toolInput(tool);
+  const state = toolActivityState(tool, run), presentation = toolPresentation(tool), input = toolInput(tool);
   const command = presentation.command ? displayText(input.command) : '';
   const identity = activityIdentity(tool.name, command), Icon = identity.Icon;
   const StatusIcon = state.running ? LoaderCircleIcon : state.cancelled ? SquareIcon : state.failed || state.unknown ? CircleAlertIcon : state.pending ? ShieldCheckIcon : CheckIcon;
@@ -297,7 +320,7 @@ function ToolActivityRow({tool, model, panel = false}: {tool: ToolActivity; mode
         <div className={`timber-tool-command${presentation.command ? ' is-command' : ''}`}>{command ? <ActivityCode code={command} language="bash" compact/> : presentation.title}</div>
         <div className="timber-tool-meta"><span className={state.pending || state.cancelled || state.unknown ? 'timber-tool-parameters' : 'timber-sr-only'}>{statusLabel}</span>{tool.result?.exitCode !== undefined && tool.result.exitCode !== 0 && !state.cancelled && <span className="timber-tool-exit">exit {tool.result.exitCode}</span>}{presentation.parameters && <span className="timber-tool-parameters">{presentation.parameters}</span>}{tool.result?.checkpointStatus==='pending' && <span className="timber-tool-parameters" data-checkpoint-status="pending">Saving files…</span>}</div>
         {(preview || showOutput) && <div className="timber-tool-preview" data-tool-result-preview>{preview && <div className={`timber-tool-preview${error && diagnosticClass ? ` ${diagnosticClass}` : ''}`}>{bounded(preview,420)}</div>}{showOutput && <ActivityOutput format={format} compact/>}</div>}
-        {tool.result?.artifactId && <ArtifactPreview key={`${model.bot.id}:${tool.result.artifactId}`} botId={model.bot.id} artifactId={tool.result.artifactId}/>}
+        {tool.result?.artifactId && <ArtifactPreview key={`${botId}:${tool.result.artifactId}`} botId={botId} artifactId={tool.result.artifactId}/>}
       </div>
       <span className="timber-tool-corner"><span className="timber-tool-status" role="status" aria-label={statusLabel} title={statusLabel}><StatusIcon className={state.running ? 'timber-spinner' : ''} aria-hidden="true"/></span><ChevronDownIcon className="timber-tool-chevron" aria-hidden="true"/></span>
     </summary>
@@ -309,44 +332,76 @@ function ToolActivityRow({tool, model, panel = false}: {tool: ToolActivity; mode
       {error && <p className={diagnosticClass}>{error}</p>}
     </div>}
   </details>;
-}
+}, (previous, next) => previous.botId === next.botId && previous.panel === next.panel && previous.run === next.run && sameValue(previous.tool, next.tool));
 
-function responseRetry(model: ActivityModel, runId?: string) {
-  const events = model.events.filter(event=>event.runId===runId && ['run.retrying','tool.started'].includes(event.type));
-  const last = events.at(-1);
-  return last?.type==='run.retrying' ? `Retrying response · ${last.data.attempt}/${last.data.maxRetries}` : null;
-}
-
-function ActivityGroup({model, runId, steps, latest}: {model: ActivityModel; runId?: string; steps: ActivityStep[]; latest: boolean}) {
-  const run = model.runs.find(item => item.id === runId);
-  const working = steps.some(step => toolState(step.tool, model).running) || latest && run?.status === 'running';
+const ActivityGroup = memo(function ActivityGroup({botId, run, runId, steps, latest, retry}: {botId:string; run?:ChatModel['runs'][number]; runId?: string; steps: ActivityStep[]; latest: boolean; retry?:string|null}) {
+  const working = steps.some(step => toolActivityState(step.tool, run).running) || latest && run?.status === 'running';
   return <section className="timber-activity-group" data-run-activity={runId || 'unassigned'} aria-label="Activity">
-    <div className="timber-activity-header"><ActivityIcon aria-hidden="true" /><span>Activity</span><span className="timber-activity-count">{steps.length} {steps.length === 1 ? 'action' : 'actions'}</span>{working && <span className="timber-activity-status" role="status"><LoaderCircleIcon className="timber-spinner" aria-hidden="true" />{responseRetry(model,runId) || 'Working'}</span>}</div>
-    <div className="timber-activity-content">{[...steps].sort((a, b) => a.at - b.at).map(step => <ToolActivityRow key={step.key} tool={step.tool} model={model} />)}</div>
+    <div className="timber-activity-header"><ActivityIcon aria-hidden="true" /><span>Activity</span><span className="timber-activity-count">{steps.length} {steps.length === 1 ? 'action' : 'actions'}</span>{working && <span className="timber-activity-status" role="status"><LoaderCircleIcon className="timber-spinner" aria-hidden="true" />{retry || 'Working'}</span>}</div>
+    <div className="timber-activity-content">{steps.map(step => <ToolActivityRow key={step.key} tool={step.tool} run={run} botId={botId} />)}</div>
   </section>;
-}
+}, (previous, next) => previous.botId === next.botId && previous.run === next.run && previous.latest === next.latest && previous.retry === next.retry && sameValue(previous.steps, next.steps));
 
 function ActivityPanel({model,callbacks}: {model: ActivityModel;callbacks:Pick<ChatCallbacks,'onOpenBot'|'onOpenAgents'>}) {
-  const tools=collectTools(model,true),collaboration=collectCollaboration(model);
+  const indexes = useMemo(() => historyIndexes(model), [model]);
+  const collaboration = useMemo(() => collectCollaboration(model), [model]);
+  const tools = useMemo(() => collectTools(model, true, collaboration, indexes), [model, collaboration, indexes]);
   const entries=[
-    ...tools.map(tool=>({key:`tool:${tool.key}`,at:tool.at,running:toolState(tool,model).running,node:<ToolActivityRow tool={tool} model={model} panel/>})),
-    ...collaboration.items.map(item=>({key:item.key,at:timestamp(item.createdAt),running:['queued','running','waiting_approval','waiting_connection'].includes(item.notice?.status||item.creation?.status||''),node:item.notice?<AgentMessageNotice notice={item.notice} callbacks={callbacks} eventKey={item.key} context="activity"/>:item.creation?<AgentCreationCard creation={item.creation} callbacks={callbacks} context="activity"/>:null})),
+    ...tools.map(tool=>({key:`tool:${tool.key}`,at:tool.at,running:toolActivityState(tool,indexes.runs.get(tool.runId || '')).running,node:<ToolActivityRow tool={tool} run={indexes.runs.get(tool.runId || '')} botId={model.bot.id} panel/>})),
+    ...collaboration.items.map(item=>({key:item.key,at:timestamp(item.createdAt),running:['queued','running','waiting_approval','waiting_connection'].includes(item.notice?.status||item.creation?.status||''),node:<TimelineCollaboration item={item} callbacks={callbacks} context="activity"/>})),
   ].sort((a,b)=>Number(b.running)-Number(a.running)||b.at-a.at);
   return <div className="timber-activity-panel">{entries.length?entries.map(entry=><div key={entry.key}>{entry.node}</div>):<p className="timber-activity-empty">No actions yet.</p>}</div>;
 }
 
-function timeline(model: ChatModel, callbacks: ChatCallbacks): TimelineEntry[] {
+// Tool projections are freshly assembled only on a history revision. Compare
+// their small structured receipts, never the entire conversation snapshot.
+function sameValue(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (!left || !right || typeof left !== 'object' || typeof right !== 'object') return false;
+  if (left instanceof Set && right instanceof Set) return left.size === right.size && [...left].every(value => right.has(value));
+  if (Array.isArray(left) !== Array.isArray(right)) return false;
+  const a = Object.keys(left), b = Object.keys(right);
+  return a.length === b.length && a.every(key => Object.prototype.hasOwnProperty.call(right, key) && sameValue((left as Record<string, unknown>)[key], (right as Record<string, unknown>)[key]));
+}
+
+const HistoryMessage = memo(function HistoryMessage({message, botId, botName, run, sending, sourceModel, callbacks}: {message:ChatModel['messages'][number];botId:string;botName:string;run?:ChatModel['runs'][number];sending:boolean;sourceModel?:string;callbacks:ChatCallbacks}) {
+  if (message.provenance) return <AgentMessageNotice notice={{direction:'from',agent:{id:message.provenance.sourceBotId,name:message.provenance.sourceBotName,kind:'bot',model:sourceModel},text:message.text,messageId:message.id,status:run?.status}} callbacks={callbacks} eventKey={`message:${message.id}`}/>;
+  return <Message from={message.role === 'user' ? 'user' : 'assistant'} data-message-id={message.id} data-message-kind={message.kind} data-progress-message-id={message.kind === 'progress' ? message.id : undefined} data-run-id={message.runId} className={`timber-message timber-message-${message.role}`}>
+    {message.role !== 'user' && <div className="timber-message-meta"><span>{message.role === 'assistant' ? botName : label(message.role)}</span></div>}
+    <MessageContent className="timber-message-content"><Response text={message.text} />{message.attachments?.map(image=><ArtifactPreview key={image.artifactId} botId={botId} artifactId={image.artifactId} compact />)}</MessageContent>
+    {['user', 'assistant'].includes(message.role) && <CopyMessage text={message.text} createdAt={message.createdAt} />}
+    {message.role === 'user' && <MessageRunStatus run={run} botId={botId} sending={sending} callbacks={callbacks} />}
+  </Message>;
+});
+
+const TimelineCompaction = memo(function TimelineCompaction({item}: {item:CompactionItem}) {return <CompactionPill item={item}/>;}, (previous, next) => sameValue(previous.item, next.item));
+
+const TimelineCollaboration = memo(function TimelineCollaboration({item, callbacks, context = 'timeline'}: {item:CollaborationItem;callbacks:Pick<ChatCallbacks,'onOpenBot'|'onOpenAgents'>;context?:'timeline'|'activity'|'preview'}) {
+  return item.notice ? <AgentMessageNotice notice={item.notice} callbacks={callbacks} eventKey={item.key} context={context}/> : item.creation ? <AgentCreationCard creation={item.creation} callbacks={callbacks} context={context === 'preview' ? 'timeline' : context}/> : null;
+}, (previous, next) => previous.callbacks === next.callbacks && previous.context === next.context && sameValue(previous.item, next.item));
+
+// All transcript text stays in the DOM: native find, selection, copy and
+// assistive technology never depend on a virtual viewport or "load more".
+const TimelineHistory = memo(function TimelineHistory({entries}: {entries: TimelineEntry[]}) {
+  return <>{entries.map(entry => <div className="timber-timeline-entry" data-timeline-key={entry.key} key={entry.key}>{entry.node}</div>)}</>;
+});
+
+function timeline(model: ChatModel, callbacks: ChatCallbacks) {
+  const indexes = historyIndexes(model);
   const collaboration = collectCollaboration(model);
   const messages = model.messages.filter(message => !model.runFilter || message.runId === model.runFilter);
   const approvals = model.approvals.filter(approval => !model.runFilter || approval.runId === model.runFilter);
-  const current = [...approvals].filter(approval => ['pending', 'executing', 'approved'].includes(approval.status)).sort((a, b) => timestamp(b.createdAt) - timestamp(a.createdAt))[0];
+  const pendingApprovals = approvals.filter(approval => ['pending', 'executing', 'approved'].includes(approval.status));
+  const current = pendingApprovals.reduce<ChatApproval | undefined>((latest, approval) => !latest || timestamp(approval.createdAt) > timestamp(latest.createdAt) ? approval : latest, undefined);
+  const pendingApprovalRuns = new Set(pendingApprovals.map(approval => approval.runId));
+  const pendingConnectionRuns = new Set(model.connections.filter(connection => connection.status === 'pending').map(connection => connection.runId));
   // The server run identifies a request even before its transcript row loads.
   // Device clock skew and equal timestamps must never put an effect before it.
   const deliveries = model.deliveries.map(delivery => {
-    const run = model.runs.find(run => run.operationId === delivery.operationId);
+    const run = indexes.operations.get(delivery.operationId);
     return {...delivery, runId: delivery.runId || run?.id, createdAt: run?.createdAt || delivery.createdAt};
   }).filter(delivery => (!model.runFilter || delivery.runId === model.runFilter) &&
-    !messages.some(message => message.role === 'user' && message.runId && message.runId === delivery.runId));
+    !indexes.requests.has(delivery.runId || ''));
   const requests = new Map<string, {at: number; order: number}>();
   messages.forEach((message, index) => {if (message.role === 'user' && message.runId) requests.set(message.runId, {at: timestamp(message.createdAt), order: index * 2});});
   deliveries.forEach((delivery, index) => {if (delivery.runId) requests.set(delivery.runId, {at: timestamp(delivery.createdAt), order: (messages.length + index) * 2});});
@@ -355,46 +410,50 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks): TimelineEntry[] {
     const at = Math.max(timestamp(message.createdAt), request?.at || 0);
     return {at, order: Math.max(index * 2, request && request.at === at ? request.order + 2 : 0)};
   };
-  const assistantPositions = messages.flatMap((message,index) => message.role === 'assistant'
-    ? [{runId:message.runId,kind:message.kind,...messagePosition(message,index)}] : []);
+  const assistantPositions = new Map<string, {introduction?:number;answer?:number}>();
+  messages.forEach((message, index) => {
+    if (message.role !== 'assistant' || !message.runId) return;
+    const position = messagePosition(message, index), key = `${message.runId}:${position.at}`;
+    const tied = assistantPositions.get(key) || {};
+    if (message.kind === 'progress') tied.introduction = Math.max(tied.introduction ?? -Infinity, position.order);
+    else tied.answer = Math.min(tied.answer ?? Infinity, position.order);
+    assistantPositions.set(key, tied);
+  });
   const afterRequest = (runId: string | undefined, createdAt: number) => {
     const request = runId ? requests.get(runId) : undefined;
     const at = Math.max(createdAt, request?.at || 0);
     // Tool-calling commentary introduces its actions, even if the clocks tie.
     // Final answers keep their transcript position after those actions.
-    const tied = assistantPositions.filter(message => runId && message.runId === runId && message.at === at);
-    const introductions = tied.filter(message=>message.kind === 'progress'), answers = tied.filter(message=>message.kind !== 'progress');
-    const order = introductions.length ? Math.max(...introductions.map(message=>message.order)) + 1
-      : answers.length ? Math.min(...answers.map(message=>message.order)) - 1
+    const tied = runId ? assistantPositions.get(`${runId}:${at}`) : undefined;
+    const order = tied?.introduction !== undefined ? tied.introduction + 1
+      : tied?.answer !== undefined ? tied.answer - 1
       : request && request.at === at ? request.order + 1 : (messages.length + deliveries.length) * 2 + 1;
     return {at, order};
   };
   const entries: TimelineEntry[] = [];
   messages.forEach((message, index) => {
-    const notice = provenanceNotice(message,model);
-    if(notice){entries.push({key:`message:${message.id}`,...messagePosition(message,index),node:<AgentMessageNotice notice={notice} callbacks={callbacks} eventKey={`message:${message.id}`}/>});return;}
-    // Progress is public assistant text accompanying a tool call. It belongs in
-    // the transcript just like a final answer, never in a reasoning disclosure.
-    entries.push({key: `message:${message.id}`, ...messagePosition(message,index), node: <Message from={message.role === 'user' && !message.provenance ? 'user' : 'assistant'} data-message-id={message.id} data-message-kind={message.kind} data-progress-message-id={message.kind === 'progress' ? message.id : undefined} data-run-id={message.runId} className={`timber-message timber-message-${message.role}`}>
-      {message.role !== 'user' && <div className="timber-message-meta"><span>{message.role === 'assistant' ? model.bot.name : label(message.role)}</span></div>}
-      <MessageContent className="timber-message-content"><Response text={message.text} />{message.attachments?.map(image=><ArtifactPreview key={image.artifactId} botId={model.bot.id} artifactId={image.artifactId} compact />)}</MessageContent>
-      {['user', 'assistant'].includes(message.role) && <CopyMessage text={message.text} createdAt={message.createdAt} />}
-      {message.role === 'user' && <MessageRunStatus model={model} runId={message.runId} callbacks={callbacks} />}
-    </Message>});
+    const run = indexes.runs.get(message.runId || '');
+    entries.push({key: `message:${message.id}`, ...messagePosition(message,index), node: <HistoryMessage message={message} botId={model.bot.id} botName={model.bot.name} run={(message.role === 'user' && run?.status === 'queued') || message.provenance ? run : undefined} sending={message.role === 'user' && run?.status === 'queued' && Boolean(run.error) ? model.sending : false} sourceModel={message.provenance ? indexes.bots.get(message.provenance.sourceBotId)?.model : undefined} callbacks={callbacks}/>});
   });
-  for (const approval of approvals) entries.push({key: `approval:${approval.id}`, ...afterRequest(approval.runId, timestamp(approval.createdAt)), node: <ApprovalEntry approval={approval} events={model.events} agentName={model.subagents.find(agent=>agent.id===model.runs.find(run=>run.id===approval.runId)?.subagentId)?.name} current={approval.id === current?.id} automatic={model.bot.computerApprovalMode === 'automatic'} callbacks={callbacks} />});
+  for (const approval of approvals) entries.push({key: `approval:${approval.id}`, ...afterRequest(approval.runId, timestamp(approval.createdAt)), node: <ApprovalEntry approval={approval} process={indexes.processes.get(approval.result?.processId || approval.operationId)} agentName={indexes.agents.get(indexes.runs.get(approval.runId)?.subagentId || '')?.name} current={approval.id === current?.id} automatic={model.bot.computerApprovalMode === 'automatic'} callbacks={callbacks} />});
   for (const connection of model.connections.filter(item => !model.runFilter || item.runId === model.runFilter)) {
     entries.push({key: `connection:${connection.id}`, ...afterRequest(connection.runId, timestamp(connection.createdAt)), node: <ConnectionEntry connection={connection} callbacks={callbacks} />});
   }
   deliveries.forEach((delivery, index) => entries.push({key: `delivery:${delivery.operationId}`, at: timestamp(delivery.createdAt), order: (messages.length + index) * 2, node: <DeliveryEntry delivery={delivery} busy={model.sending} callbacks={callbacks} />}));
-  for(const item of collaboration.items)entries.push({key:`collaboration:${item.key}`,...afterRequest(item.runId,timestamp(item.createdAt)),node:item.creation?<AgentCreationCard creation={item.creation} callbacks={callbacks}/>:item.notice?<AgentMessageNotice notice={item.notice} callbacks={callbacks} eventKey={item.key}/>:null});
-  for (const tool of collectTools(model)) {
+  for(const item of collaboration.items)entries.push({key:`collaboration:${item.key}`,...afterRequest(item.runId,timestamp(item.createdAt)),node:<TimelineCollaboration item={item} callbacks={callbacks}/>});
+  const compactions = collectCompactions(model), unpositioned = compactions.filter(item => item.unpositioned);
+  if (unpositioned.length) entries.push({key:'unpositioned-compactions',at:-Infinity,order:-1,node:<section className="timber-compaction-history" aria-label="Compaction history with unavailable dates"><p className="timber-history-caption">Earlier compactions · dates unavailable</p>{unpositioned.map(item => <TimelineCompaction key={item.key} item={item}/>)}</section>});
+  for (const item of compactions) if (!item.unpositioned) entries.push({key:item.key,...afterRequest(item.runId,timestamp(item.createdAt)),node:<TimelineCompaction item={item}/>});
+  const tools = collectTools(model, false, collaboration, indexes);
+  const toolRuns = new Set(tools.map(tool => tool.runId));
+  for (const tool of tools) {
     entries.push({key:`activity:${tool.key}`, ...afterRequest(tool.runId,tool.at), node:null, tool});
   }
+  const active = model.runs.some(run => !run.subagentId && !terminal.has(run.status));
   for (const outcome of runOutcomes(model.runs, model.events, model.runFilter)) {
     const {run} = outcome;
-    const at = Math.max(requests.get(run.id)?.at || 0, timestamp(run.updatedAt), timestamp(outcome.createdAt), ...messages.filter(message=>message.runId===run.id).map(message=>timestamp(message.createdAt)), ...model.events.filter(event=>event.runId===run.id).map(event=>timestamp(event.createdAt)));
-    entries.push({key:`outcome:${outcome.key}`,at,order:(messages.length + deliveries.length)*2+4,node:<TaskOutcome model={model} run={run} kind={outcome.kind} cancellationId={outcome.cancellationId} callbacks={callbacks}/>});
+    const at = Math.max(requests.get(run.id)?.at || 0, timestamp(run.updatedAt), timestamp(outcome.createdAt), indexes.latestAt.get(run.id) || 0);
+    entries.push({key:`outcome:${outcome.key}`,at,order:(messages.length + deliveries.length)*2+4,node:<TaskOutcome botId={model.bot.id} run={run} request={indexes.requests.get(run.id)} failure={failureRecovery(run, indexes.eventsByRun.get(run.id) || [])} sending={model.sending} active={active} kind={outcome.kind} cancellationId={outcome.cancellationId} callbacks={callbacks}/>});
   }
   // Group only adjacent actions after ordering the complete conversation.
   // A single run can contain several replies; later actions must not be moved
@@ -406,7 +465,7 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks): TimelineEntry[] {
   const flush = () => {
     if (!group) return;
     const {entry,runId,steps} = group;
-    ordered.push({...entry,node:<ActivityGroup model={model} runId={runId} steps={steps} latest={steps.some(step=>step.key===lastTool.get(runId))}/>});
+    ordered.push({...entry,node:<ActivityGroup botId={model.bot.id} run={indexes.runs.get(runId || '')} retry={indexes.retries.get(runId)} runId={runId} steps={steps} latest={steps.some(step=>step.key===lastTool.get(runId))}/>});
     group = undefined;
   };
   for (const entry of sorted) {
@@ -416,7 +475,7 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks): TimelineEntry[] {
     group.steps.push({tool:entry.tool,key:entry.tool.key,at:entry.at});
   }
   flush();
-  return ordered;
+  return {entries: ordered, indexes, toolRuns, pendingApprovalRuns, pendingConnectionRuns};
 }
 
 function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: ChatCallbacks }) {
@@ -441,18 +500,31 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
     card?.scrollIntoView({block: 'center', behavior: 'instant'});
     card?.querySelector<HTMLButtonElement>('button')?.focus({preventScroll: true});
   }, [model.focusApproval, scrollRef]);
-  const entries = timeline(model, callbacks);
+  useEffect(() => {
+    const node = scrollRef.current;
+    if (!node || model.runFilter || !model.historyHasMore || !callbacks.onHistoryNearTop) return;
+    const nearTop = () => {if (node.scrollTop <= Math.max(600, node.clientHeight * 2)) callbacks.onHistoryNearTop?.(model.bot.id);};
+    // Background archive loading normally has the page ready already; this
+    // also resumes after a transient failure without a user-facing load button.
+    node.addEventListener('scroll', nearTop, {passive:true});
+    nearTop();
+    return () => node.removeEventListener('scroll', nearTop);
+  }, [model.bot.id, model.runFilter, model.historyHasMore, model.historyLoading, model.historyError, callbacks, scrollRef]);
+  // Drafts and response chunks never invalidate the completed history. The
+  // transport supplies immutable, referentially stable collection revisions.
+  const {entries, indexes, toolRuns, pendingApprovalRuns, pendingConnectionRuns} = useMemo(() => timeline(model, callbacks), [model.bot.id, model.bot.name, model.bot.model, model.bot.computerApprovalMode, model.messages, model.runs, model.approvals, model.connections, model.events, model.deliveries, model.subagents, model.delegations, model.mentionBots, model.collaborationEvents, model.compactions, model.runFilter, model.sending, callbacks]);
   const visibleRun = model.currentRun && (!model.runFilter || model.runFilter === model.currentRun.id) ? model.currentRun : null;
   const hasInlineStatus = visibleRun && (
-    model.approvals.some(item => item.runId === visibleRun.id && ['pending', 'executing', 'approved'].includes(item.status)) ||
-    model.connections.some(item => item.runId === visibleRun.id && item.status === 'pending') ||
-    (visibleRun.status === 'queued' && model.messages.some(item => item.runId === visibleRun.id && item.role === 'user')) ||
-    (visibleRun.status === 'running' && collectTools(model).some(item => item.runId === visibleRun.id))
+    pendingApprovalRuns.has(visibleRun.id) ||
+    pendingConnectionRuns.has(visibleRun.id) ||
+    (visibleRun.status === 'queued' && indexes.requests.has(visibleRun.id)) ||
+    (visibleRun.status === 'running' && toolRuns.has(visibleRun.id))
   );
   return <>
     <ConversationContent className="timber-conversation-content">
+      {!model.runFilter && (model.historyLoading || model.historyError) && <p className={`timber-history-caption${model.historyError ? ' timber-inline-error' : ''}`} data-conversation-history-status role="status">{model.historyError ? 'Reconnecting to older conversation history…' : 'Loading earlier conversation…'}</p>}
       {!entries.length && <ConversationEmptyState className="timber-chat-empty" title={model.loading ? 'Loading…' : `Ask ${model.bot.name}`} description="" />}
-      {entries.map(entry => <div className="timber-timeline-entry" key={entry.key}>{entry.node}</div>)}
+      <TimelineHistory entries={entries}/>
       {model.feedback && (!model.runFilter || model.feedback.runId === model.runFilter) && <div id="approval-feedback" role="status" className={model.feedback.error ? 'timber-feedback timber-inline-error' : 'timber-feedback'}>{model.feedback.text}</div>}
       {model.stream && <Message from="assistant" id="streaming-message" className="timber-message" data-run-id={model.stream.runId}>
         <div className="timber-message-meta"><span>{model.bot.name}</span><span className="timber-responding"><LoaderCircleIcon className="timber-spinner" /> Responding</span></div>
@@ -461,9 +533,9 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
       </Message>}
       {!model.stream && visibleRun && !terminal.has(visibleRun.status) && !hasInlineStatus && <div className="timber-work-status" role="status">
         {visibleRun.status === 'waiting_connection' ? <GitBranchIcon /> : visibleRun.status === 'waiting_approval' ? <ShieldCheckIcon /> : visibleRun.status === 'queued' ? <ClockIcon /> : <LoaderCircleIcon className="timber-spinner" />}
-        <span>{visibleRun.status === 'waiting_connection' ? 'Waiting for GitHub access' : visibleRun.status === 'waiting_approval' ? 'Waiting for your approval' : visibleRun.status === 'queued' ? 'Queued' : responseRetry(model,visibleRun.id) || `${model.bot.name} is working`}</span>
+        <span>{visibleRun.status === 'waiting_connection' ? 'Waiting for GitHub access' : visibleRun.status === 'waiting_approval' ? 'Waiting for your approval' : visibleRun.status === 'queued' ? 'Queued' : indexes.retries.get(visibleRun.id) || `${model.bot.name} is working`}</span>
       </div>}
-      {visibleRun?.error && !model.messages.some(message => message.role === 'user' && message.runId === visibleRun.id) && <div className="timber-delivery-error" role="status"><p>{visibleRun.error}</p>{canRetryAdmission(visibleRun) && <Button variant="outline" size="sm" disabled={model.sending} onClick={() => callbacks.onRetry(model.bot.id, visibleRun.operationId)}>Retry sending</Button>}</div>}
+      {visibleRun?.error && !indexes.requests.has(visibleRun.id) && <div className="timber-delivery-error" role="status"><p>{visibleRun.error}</p>{canRetryAdmission(visibleRun) && <Button variant="outline" size="sm" disabled={model.sending} onClick={() => callbacks.onRetry(model.bot.id, visibleRun.operationId)}>Retry sending</Button>}</div>}
     </ConversationContent>
     <ConversationScrollButton aria-label="Jump to latest message" className="timber-jump-bottom" />
   </>;
@@ -567,17 +639,29 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
 
 function MiniActivity({model, historyOpen, onHistory, callbacks}: {model: ChatModel; historyOpen: boolean; onHistory(value:boolean): void;callbacks:ChatCallbacks}) {
   const [collapsed,setCollapsed] = useState(false);
-  const notices=collectCollaboration({...model,runFilter:null}).items.filter(item=>item.notice).sort((a,b)=>timestamp(a.createdAt)-timestamp(b.createdAt)).slice(-2);
-  const tools = collectTools({...model, runFilter: null}, true).sort((a,b) => b.at - a.at);
-  const active = tools.filter(tool => toolState(tool, model).running);
-  const run = model.currentRun, latestRun = model.runs.filter(run=>!run.subagentId).sort((a,b) => timestamp(b.updatedAt) - timestamp(a.updatedAt))[0];
-  const visible = active.length ? active.slice(0,2) : tools.filter(tool=>!run || tool.runId===run.id).slice(0,1);
+  const activityModel = useMemo<ActivityModel>(() => ({...model, runFilter: null}), [model.bot, model.events, model.runs, model.approvals, model.subagents, model.delegations, model.mentionBots, model.messages, model.collaborationEvents]);
+  const data = useMemo(() => {
+    const indexes = historyIndexes(activityModel), collaboration = collectCollaboration(activityModel);
+    const notices = collaboration.items.filter(item => item.notice).sort((a,b) => timestamp(a.createdAt)-timestamp(b.createdAt)).slice(-2);
+    const tools = collectTools(activityModel, true, collaboration, indexes).sort((a,b) => b.at-a.at);
+    const active = tools.filter(tool => toolActivityState(tool, indexes.runs.get(tool.runId || '')).running);
+    const latestRun = model.runs.reduce<ChatModel['runs'][number] | undefined>((latest, run) => !run.subagentId && (!latest || timestamp(run.updatedAt) > timestamp(latest.updatedAt)) ? run : latest, undefined);
+    return {indexes, notices, tools, active, latestRun};
+  }, [activityModel]);
+  const {indexes, notices, tools, active, latestRun} = data;
+  const run = model.currentRun;
+  const visible = useMemo(() => active.length ? active.slice(0,2) : tools.filter(tool=>!run || tool.runId===run.id).slice(0,1), [active, tools, run?.id]);
   const waiting = run?.status === 'waiting_approval' || run?.status === 'waiting_connection';
   const failed = !run && latestRun && ['failed','interrupted'].includes(latestRun.status);
-  const lastReply = [...model.messages].reverse().find(message => message.role === 'assistant' && (!run || message.runId === run.id));
+  const lastReply = useMemo(() => {
+    for (let index = model.messages.length - 1; index >= 0; index--) {
+      const message = model.messages[index];
+      if (message.role === 'assistant' && (!run || message.runId === run.id)) return message;
+    }
+  }, [model.messages, run?.id]);
   const reply = model.stream?.text || lastReply?.text;
   const delivery = model.deliveries.find(item => ['unknown','rejected'].includes(item.state));
-  const heading = delivery ? 'Not delivered' : waiting ? 'Needs attention' : failed ? 'Interrupted' : run || active.length ? responseRetry(model,run?.id) || (model.stream ? 'Responding' : 'Working') : '';
+  const heading = delivery ? 'Not delivered' : waiting ? 'Needs attention' : failed ? 'Interrupted' : run || active.length ? indexes.retries.get(run?.id) || (model.stream ? 'Responding' : 'Working') : '';
   const warning = delivery?.error || (failed ? latestRun?.error : '');
   const screenshot = visible.find(tool=>tool.result?.artifactId)?.result?.artifactId;
   return <section className="timber-mini-activity" data-mini-activity aria-label={`${model.bot.name} conversation preview`}>
@@ -595,9 +679,9 @@ function MiniActivity({model, historyOpen, onHistory, callbacks}: {model: ChatMo
         <div className={`timber-mini-reply${warning?' timber-inline-error':''}`} data-mini-reply>{warning?<p>{warning}</p>:reply?<Response text={reply} streaming={Boolean(model.stream)}/>:null}</div>
         {screenshot && <ArtifactPreview key={`${model.bot.id}:${screenshot}`} botId={model.bot.id} artifactId={screenshot} compact/>}
       </div>}
-      {notices.map(item=>item.notice&&<AgentMessageNotice key={item.key} notice={item.notice} callbacks={callbacks} eventKey={item.key} context="preview"/>)}
+      {notices.map(item=><TimelineCollaboration key={item.key} item={item} callbacks={callbacks} context="preview"/>)}
       {visible.map(tool=>{
-        const state=toolState(tool,model),presentation=toolPresentation(tool),identity=activityIdentity(tool.name,presentation.command?displayText(toolInput(tool).command):'');
+        const state=toolActivityState(tool,indexes.runs.get(tool.runId || '')),presentation=toolPresentation(tool),identity=activityIdentity(tool.name,presentation.command?displayText(toolInput(tool).command):'');
         const Icon=identity.Icon,StatusIcon=state.running?LoaderCircleIcon:state.cancelled?SquareIcon:state.failed||state.unknown?CircleAlertIcon:state.pending?ShieldCheckIcon:CheckIcon;
         return <div className="timber-mini-step" key={tool.key} title={`${presentation.title} · ${state.text}`}><Icon aria-hidden="true"/><span className={presentation.command?'is-command':''}>{presentation.title}</span><span className="timber-mini-step-status" role="status" aria-label={state.text}><StatusIcon className={state.running?'timber-spinner':''}/><span className="timber-sr-only">{state.text}</span></span></div>;
       })}
@@ -663,7 +747,7 @@ export function mountToolActivity(element: HTMLElement, loadArtifact: ArtifactLo
   return {
     // Keep the latest data without duplicating the conversation's code blocks
     // and screenshot previews in a hidden panel.
-    update(value: ActivityModel) {model = value; if (active) render();},
+    update(value: ActivityModel) {if (!sameActivityModel(model, value)) {model = value; if (active) render();}},
     setActive(value: boolean) {if (active !== value) {active = value; render();}},
     clear() {model = null; render();},
   };

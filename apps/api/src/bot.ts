@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import type { ModelCatalog, ModelSettings, AgentDelegation, Approval, Bot, BotEvent, ComputerAction, ComputerResult, ComputerStatus, ConnectionRequest, Message, MessageProvenance, Run, RunDelegation, RunPage, RunStatus } from "@botspace/contracts";
+import type { ModelCatalog, ModelSettings, AgentDelegation, Approval, Bot, BotEvent, ComputerAction, ComputerResult, ComputerStatus, ConnectionRequest, Message, MessageProvenance, MessagePage, Run, RunDelegation, RunPage, RunStatus } from "@botspace/contracts";
 import {isModelErrorCode, MODEL_FAILURES} from "@botspace/contracts";
 import { createCloudComputerProvider, touchCloudComputer, suspendCloudComputer, deleteCloudComputer, ComputerProviderError } from "@botspace/computer";
 import { createPiRuntime, parseRuntimeLimit, ModelConfigurationError, type AgentRuntime, type RuntimeApprovalContext, type RuntimeApprovalSummary, type RuntimeToolResult, type RuntimeHostToolRequest, type RuntimeSubagent } from "@botspace/runtime";
@@ -212,6 +212,21 @@ export class BotDO extends DurableObject<Env> {
     const preview=latest?.text.trim() ? latest.text : latest?.attachments?.length ? (latest.attachments.length===1 ? "Image" : `${latest.attachments.length} images`) : latest?.text;
     const activeProcesses=this.ctx.storage.sql.exec<{total:number}>("SELECT COUNT(*) AS total FROM run_processes WHERE status='running'").toArray()[0].total;
     return {status:priority.find(status=>roots.some(run=>run.status===status))??(activeProcesses?"running":"ready"),activeRuns:roots.length,activeAgents:new Set(active.flatMap(run=>run.subagent_id?[run.subagent_id]:[])).size,activeProcesses,...(latest?{lastMessage:{text:(preview??"").slice(0,240),createdAt:latest.createdAt}}:{})};
+  }
+  private listMessages(url:URL):MessagePage {
+    const raw=url.searchParams.get("limit"),limit=raw===null?500:Number(raw);
+    if((raw!==null&&!/^\d+$/.test(raw))||!Number.isSafeInteger(limit)||limit<1||limit>500)
+      throw new ApiError(400,"invalid_limit","limit must be an integer from 1 to 500.");
+    const cursor=url.searchParams.get("before"),before=cursor===null?undefined:Number(cursor);
+    if(cursor!==null&&(!/^\d+$/.test(cursor)||!Number.isSafeInteger(before)||Number(before)<=0))
+      throw new ApiError(400,"invalid_cursor","before must be a positive safe integer cursor.");
+    type Row={cursor:number;data:string};
+    // One extra row determines the end without OFFSET or an archive-wide scan.
+    const rows=before===undefined
+      ?this.ctx.storage.sql.exec<Row>("SELECT rowid AS cursor,data FROM messages ORDER BY rowid DESC LIMIT ?",limit+1).toArray()
+      :this.ctx.storage.sql.exec<Row>("SELECT rowid AS cursor,data FROM messages WHERE rowid<? ORDER BY rowid DESC LIMIT ?",before,limit+1).toArray();
+    const page=rows.slice(0,limit);
+    return {messages:page.slice().reverse().map(row=>JSON.parse(row.data) as Message),nextCursor:rows.length>limit?String(page[page.length-1].cursor):null};
   }
   private listRuns(url:URL):RunPage {
     const limitRaw=url.searchParams.get("limit");
@@ -1471,8 +1486,7 @@ export class BotDO extends DurableObject<Env> {
       const upload=/^\/attachments\/([^/]+)$/.exec(path);
       if(upload && UUID.test(upload[1]) && request.method==="PUT") return await uploadChatImage(request,this.env.FILES,this.bot().id,upload[1]);
       if(path==="/messages" && request.method==="GET") {
-        const messages=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM messages ORDER BY rowid DESC LIMIT 500").toArray().reverse().map(row=>JSON.parse(row.data));
-        return json({messages});
+        return json(this.listMessages(url));
       }
       if(path==="/messages" && request.method==="POST") return json({run:await this.createRun(parseMessage(await body(request)))},202);
       if(path==="/runs" && request.method==="GET") return json(this.listRuns(url));

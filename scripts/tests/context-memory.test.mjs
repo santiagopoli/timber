@@ -43,10 +43,11 @@ test('context and memory keeps a conflicting draft, saves with revision, and com
     await dialog.getByRole('button',{name:'Reload saved notes',exact:true}).click();await page.waitForFunction(()=>document.querySelector('#timber-memory-notes').value==='Use concise answers.');
     await notes.fill('Retain verified decisions.');await dialog.getByRole('button',{name:'Save notes',exact:true}).click();await dialog.getByRole('status').filter({hasText:'Memory saved.'}).waitFor();
     assert.deepEqual(writes.map(item=>item.revision),[1,2]);assert.equal(memory.content,'Retain verified decisions.');
-    const historyBefore=await page.locator('#messages').innerText();
+    const historySnapshot=()=>page.locator('#messages [data-message-id]').evaluateAll(nodes=>nodes.map(node=>({id:node.getAttribute('data-message-id'),text:node.querySelector('.timber-message-content')?.textContent})));
+    const historyBefore=await historySnapshot();
     await dialog.getByRole('button',{name:'Compact now',exact:true}).click();await dialog.locator('[data-compaction-status="completed"]').waitFor();
     assert.equal(compactions.length,1);assert.ok(compactions[0].operationId);
-    assert.equal(await page.locator('#messages').innerText(),historyBefore);
+    assert.deepEqual(await historySnapshot(),historyBefore,'Compaction preserves every visible message; maintenance pills may be added.');
     assert.match(await dialog.innerText(),/Full history retained/);
     const geometry=await dialog.boundingBox();assert.ok(geometry.x>=0&&geometry.x+geometry.width<=width);
     if(process.env.CONSOLE_SCREENSHOT_DIR){await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/context-memory-${width}.png`,animations:'disabled'});}

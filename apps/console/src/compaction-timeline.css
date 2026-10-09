@@ -1,0 +1,21 @@
+/* Match collaboration's content-sized capsule without consuming a whole row. */
+.timber-compaction{display:flex;flex-direction:column;align-items:center;gap:6px;min-width:0;width:100%;padding:3px 0}
+.timber-compaction>.timber-compaction-pill{display:flex;align-items:center;gap:8px;box-sizing:border-box;min-width:0;min-height:44px;width:fit-content;max-width:min(100%,360px);margin:0;padding:4px 12px;border:1px solid var(--line);border-radius:999px;background:var(--surface);box-shadow:none;color:var(--ink);font:inherit;text-align:left;white-space:normal;cursor:pointer}
+.timber-compaction>.timber-compaction-pill:hover{background:var(--soft);filter:none}
+.timber-compaction>.timber-compaction-pill:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+.timber-compaction-icon{width:24px;height:24px;box-sizing:border-box;padding:3px;flex:none;color:var(--muted)}
+.timber-compaction-label{display:flex;flex:0 1 auto;flex-direction:column;min-width:0;max-width:260px;overflow-wrap:anywhere}
+.timber-compaction-label>strong{font-size:13px;font-weight:500;line-height:18px}
+.timber-compaction-label>span{font-size:11px;font-weight:400;line-height:16px;color:var(--muted)}
+.timber-compaction-toggle{width:15px;height:15px;flex:none;margin-left:auto;color:var(--muted);transition:transform .15s}
+.timber-compaction-toggle.is-expanded{transform:rotate(180deg)}
+.timber-compaction[data-compaction-status=failed] .timber-compaction-label>strong,.timber-compaction-error{color:var(--danger)}
+.timber-compaction-details{box-sizing:border-box;min-width:0;width:min(100%,600px);padding:4px 12px 12px;font-size:13px;line-height:1.6;color:var(--ink);text-align:left;overflow-wrap:anywhere}
+.timber-compaction-details p{margin:0 0 8px}
+.timber-compaction-details dl{display:flex;flex-direction:column;gap:4px;margin:8px 0;font-size:12px}
+.timber-compaction-details dl>div{display:flex;flex-wrap:wrap;gap:2px 8px;min-width:0}
+.timber-compaction-details dt{flex:none;color:var(--muted)}
+.timber-compaction-details dd{min-width:0;margin:0;overflow-wrap:anywhere}
+.timber-compaction-details h4{margin:8px 0 4px;font-size:13px;font-weight:500}
+.timber-compaction-unavailable{color:var(--muted);font-size:12px}
+@media(prefers-reduced-motion:reduce){.timber-compaction-toggle{transition:none}}

@@ -2,10 +2,12 @@
 .timber-chat{--chat-width:780px;display:flex;flex:1;min-width:0;min-height:0;color:var(--ink)}
 .timber-chat-layout{display:flex;flex-direction:column;flex:1;height:100%;min-height:0;min-width:0}
 .timber-conversation{flex:1;min-height:0;min-width:0;scrollbar-width:thin}
-/* The follow controller owns scroll positioning, including optimistic-message replacement. */
+/* The follow controller owns scroll positioning and real DOM anchors for archive prepends; do not virtualize or estimate transcript heights. */
 .timber-conversation-scroll{height:100%;width:100%;overflow:auto;overflow-anchor:none;scrollbar-gutter:stable both-edges;overscroll-behavior-y:contain;-webkit-overflow-scrolling:touch;scrollbar-width:thin;scrollbar-color:var(--line) transparent}
 .timber-conversation-content{width:100%;max-width:var(--chat-width);min-height:100%;margin:0 auto;gap:26px;padding:28px 28px 18px}
 .timber-timeline-entry{min-width:0}
+.timber-history-caption{margin:0;color:var(--muted);font-size:12px;line-height:1.5}
+.timber-compaction-history{display:flex;flex-direction:column;gap:14px}
 .timber-chat-empty{min-height:160px;height:auto;flex:1;margin:auto;color:var(--muted);gap:0;padding:24px}
 .timber-chat-empty h3{font-size:27px;line-height:1.25;letter-spacing:-.8px;color:var(--ink);margin:0;font-weight:500}
 .timber-message{max-width:100%;gap:7px;min-width:0}

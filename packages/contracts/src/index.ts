@@ -13,6 +13,8 @@ export interface Run { admissionRetryable?: boolean; model?: string; reasoningEf
 export interface Subagent { model?: string; reasoningEffort?: string; fast?: boolean; id: string; name: string; task: string; parentOperationId: string; parentSubagentId?: string; operationId: string; status: "queued" | "running" | "waiting_approval" | "waiting_connection" | "completed" | "failed" | "cancelled"; createdAt: string; updatedAt: string; result?: string; error?: string; }
 
 /** A newest-first history page plus all currently active runs, independent of pagination. */
+/** Stable rowid pages of the retained public transcript, chronological within each page. */
+export interface MessagePage { messages: Message[]; nextCursor: string | null; }
 export interface RunPage { runs: Run[]; activeRuns: Run[]; nextCursor: string | null; }
 export interface BotEvent { id: number; botId: string; runId?: string; type: string; data: Record<string, unknown>; createdAt: string; }
 export type ComputerAction =
@@ -45,5 +47,5 @@ export interface ConnectionRequest {id:string;botId:string;runId:string;nativeOp
 
 /** Curated notes, separate from the full transcript and the compacted model context. */
 export interface BotMemory {content:string;revision:number;updatedAt?:string;maxCharacters:number;}
-export interface CompactionReceipt {id:string;reason:"manual"|"threshold"|"overflow";status:"running"|"completed"|"unchanged"|"failed"|"cancelled";summaryApplied:boolean;error?:string;}
+export interface CompactionReceipt {id:string;reason:"manual"|"threshold"|"overflow";status:"running"|"completed"|"unchanged"|"failed"|"cancelled";summaryApplied:boolean;error?:string;createdAt?:string;startedAt?:string;summaryCreatedAt?:string;firstKeptEntryId?:number;summarizedEntries?:number;estimatedTokensBefore?:number;historyRetained?:true;}
 export interface BotContextStatus {automatic:true;estimatedTokens:number;activeEntries:number;contextWindow:number;compactions:CompactionReceipt[];historyRetained:true;}
