@@ -1,3 +1,5 @@
+import type { Api, Model } from '@earendil-works/pi-ai';
+import type { ModelSettings } from '@botspace/contracts';
 import { Type } from '@earendil-works/pi-ai';
 import {
   configure, defineDoc, defineTask, defineTool, InboxDoc, LiveDoc, ROOT_CONVERSATION_ID,
@@ -7,6 +9,7 @@ import {
 import type { PiHarness, PiHarnessContext } from 'agents/harness/pi';
 import { classifyFailure, normalizeEntries, textContent, toolCompletion } from './normalize.js';
 import { computerToolOperationId } from './tools.js';
+import { archivedEntries } from './maintenance.js';
 import type { RuntimeEvent, RuntimePause, RuntimeReceipt, RuntimeSubagent } from './types.js';
 
 type Context = PiHarnessContext['context'];
@@ -32,6 +35,8 @@ export interface SubagentHost {
   context(): Context;
   assertActive(): void;
   botName(): Promise<string>;
+  modelFor(api:ToolExecutionApi):Promise<ModelSettings>;
+  configureModel(input:ModelSettings):Promise<{settings:ModelSettings;model:Model<Api>}>;
   emit(event: RuntimeEvent): Promise<void>;
   operationForCall(api: ToolExecutionApi, context: Context): Promise<string>;
   consume(operationId: string, kind: 'generation' | 'tool', itemId: string): void;
@@ -361,11 +366,15 @@ export function createSubagents(host: SubagentHost) {
     };
     const id = Type.String({ minLength: 1, maxLength: 160 });
     return [
-      defineTool({ name: 'spawn_subagent', description: 'Create a temporary native Pi subagent with its own context. It shares this bot’s computer and approval policy. Give a concrete self-contained task. Work runs concurrently; inspect or wait for its result. At most 8 active agents and 3 levels.', replay: 'safe',
-        parameters: Type.Object({ name: Type.String({ minLength: 1, maxLength: 80 }), task: Type.String({ minLength: 1, maxLength: 20_000 }) }),
+      defineTool({ name: 'spawn_subagent', description: 'Create a temporary native Pi subagent with its own context. It shares this bot’s computer and approval policy. Give a concrete self-contained task. Work runs concurrently; inspect or wait for its result. Optionally choose model, reasoningEffort or fast from list_models; omit them to inherit your current model configuration. At most 8 active agents and 3 levels.', replay: 'safe',
+        parameters: Type.Object({ name: Type.String({ minLength: 1, maxLength: 80 }), task: Type.String({ minLength: 1, maxLength: 20_000 }), model:Type.Optional(Type.String({maxLength:128})), reasoningEffort:Type.Optional(Type.String({maxLength:40})), fast:Type.Optional(Type.Boolean()) }),
         execute: (input, api, context) => guarded(api, context, async (parentOperationId, operationId) => {
           await host.scheduleWake();
           const parent = await forConversation(api.conversationId);
+          const inherited=await host.modelFor(api);
+          const replay=Object.values((await state()).agents).find(agent=>agent.spawnOperationId===operationId);
+          const selection=replay?.model?{model:replay.model,reasoningEffort:replay.reasoningEffort,fast:replay.fast}:{...(input.model&&input.model!==inherited.model?{model:input.model}:inherited),...(input.reasoningEffort!==undefined?{reasoningEffort:input.reasoningEffort}:{}),...(input.fast!==undefined?{fast:input.fast}:{})};
+          const selected=replay?undefined:await host.configureModel(selection);
           const agent = await api.commit(async tx => {
             if (await host.stopped(parentOperationId, tx)) throw new Error('Parent operation was stopped');
             const registry = await tx.doc(Registry);
@@ -376,9 +385,9 @@ export function createSubagents(host: SubagentHost) {
             if (depth > MAX_DEPTH) throw new Error('Subagents may be nested at most 3 levels');
             const anchor = await tx.createTask(Anchor, null, { ownership: { kind: 'conversation' }, conversationId: api.conversationId, background: true });
             const child = await tx.createConversation({ ownership: { kind: 'task', taskId: anchor } });
-            await configure(tx, child.id, { instructions: `You are temporary subagent ${input.name}. Complete your assigned task. Coordinate with other temporary agents using send_subagent_message; use targetId "parent" to contact your parent. Share only public findings, never private reasoning. You share the parent bot’s computer and must coordinate file edits.` });
+            await configure(tx, child.id, { model:{provider:selected!.model.provider,modelId:selected!.model.id}, thinkingLevel:null, instructions: `You are temporary subagent ${input.name}. Complete your assigned task. Coordinate with other temporary agents using send_subagent_message; use targetId "parent" to contact your parent. Share only public findings, never private reasoning. You share the parent bot’s computer and must coordinate file edits.` });
             const now = new Date().toISOString();
-            const record: StoredAgent = { id: crypto.randomUUID(), name: input.name, task: input.task,
+            const record: StoredAgent = { ...selected!.settings, id: crypto.randomUUID(), name: input.name, task: input.task,
               parentOperationId, ...(parent ? { parentSubagentId: parent.id } : {}),
               operationId, status: 'queued', createdAt: now, updatedAt: now, conversationId: String(child.id), depth, spawnOperationId: operationId };
             registry.agents[record.id] = record;
@@ -470,7 +479,7 @@ export function createSubagents(host: SubagentHost) {
     async stop() { stopped = true; await Promise.all([...streams.values()].map(stream => stream.stop())); },
     async hasDeliveries() { return (await host.native().inspect(host.context())).tasks.some(task => task.record.kind === 'timber.subagent-delivery'); },
     async list() { return Object.values((await state()).agents).map(publicAgent); },
-    async messages(id: string) { const agent = await find(id); return normalizeEntries(await host.harness().session(agent.conversationId).messages()).filter(message => message.role !== 'tool' && message.role !== 'system'); },
+    async messages(id: string) { const agent = await find(id); const conversation=await host.native().conversation(Number(agent.conversationId) as ConversationId,host.context()); return conversation?normalizeEntries(await archivedEntries(conversation,host.context())).filter(message => message.role !== 'tool' && message.role !== 'system'):[]; },
     send, cancel, finishStops,
     async markParentStopped(operationId: string, cancellationId?: string) {
       const agents = Object.values((await state()).agents);

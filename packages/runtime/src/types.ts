@@ -1,5 +1,5 @@
 import type { DurableObject } from 'cloudflare:workers';
-import type { Approval, Bot, ComputerAction, ComputerResult } from '@botspace/contracts';
+import type { ModelCatalog, ModelSettings, Approval, Bot, BotContextStatus, BotMemory, CompactionReceipt, ComputerAction, ComputerResult } from '@botspace/contracts';
 import type { AISettings } from 'agents/models/pi-ai';
 
 export type PendingApproval = {
@@ -68,6 +68,7 @@ export interface RuntimeMessage {
   createdAt?: string;
 }
 export type RuntimeSubagent = {
+  model?: string; reasoningEffort?: string; fast?: boolean;
   id: string;
   name: string;
   task: string;
@@ -96,8 +97,8 @@ export interface PiRuntimeOptions<Env extends object> {
   storage: DurableObjectStorage;
   ai: AISettings['binding'];
   /** Host-owned OAuth transport; the runtime never receives account credentials. */
-  chatgpt?: { fetch(request: Request): Promise<Response> };
-  getBot(): Promise<Pick<Bot, 'name' | 'instructions' | 'model' | 'computerApprovalMode'>>;
+  chatgpt?: { fetch(request: Request): Promise<Response>; models?(): Promise<ModelCatalog> };
+  getBot(): Promise<Pick<Bot, 'name' | 'instructions' | 'model' | 'reasoningEffort' | 'fast' | 'computerApprovalMode'>>;
   getApprovalContext?(): Promise<RuntimeApprovalContext>;
   tools: RuntimeTools;
   onEvent?(event: RuntimeEvent): void | Promise<void>;
@@ -119,7 +120,7 @@ export interface RuntimeOperationResult { operationId: string; status: 'done' | 
 export interface RuntimeOperation { operationId: string; status: 'queued' | 'running' | 'done' | 'unanswered' | 'missing'; text?: string; kind?: RuntimeMessage['kind']; reason?: string; answerId?: string; answerOperationId?: string; cancellationId?: string; }
 export interface RuntimePendingOperation { operationId: string; status: 'queued' | 'running'; }
 export interface AgentRuntime {
-  submit(text: string, input: { operationId: string; images?: {data:string;mimeType:string}[]; whenBusy?: 'steer' | 'followUp' }): Promise<RuntimeReceipt>;
+  submit(text: string, input: { operationId: string; modelSettings?: ModelSettings; images?: {data:string;mimeType:string}[]; whenBusy?: 'steer' | 'followUp' }): Promise<RuntimeReceipt>;
   /** Persist one replaceable wake for this input; never replay a tool or await inference. */
   scheduleAdmissionRetry(operationId: string, delayMs: number): Promise<void>;
   wait(operationId: string): Promise<RuntimeOperationResult>;
@@ -131,6 +132,10 @@ export interface AgentRuntime {
   subagentMessages(id: string): Promise<RuntimeMessage[]>;
   sendSubagent(id: string, text: string, input: { operationId: string }): Promise<RuntimeReceipt>;
   cancelSubagent(id: string): Promise<boolean>;
+  contextStatus(): Promise<BotContextStatus>;
+  compact(input: {operationId:string;instructions?:string}): Promise<CompactionReceipt>;
+  memory(): Promise<BotMemory>;
+  updateMemory(content:string,revision:number): Promise<BotMemory>;
   dispose(): Promise<void>;
   /** Permanently fence new work and await quiescence before host storage deletion.
    * Rejects if shutdown exceeds its bounded wait; retain the tombstone and retry. */

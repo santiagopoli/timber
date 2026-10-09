@@ -11,12 +11,16 @@ import { Tool, ToolContent } from '@/components/ai-elements/tool';
 import { Confirmation, ConfirmationAction, ConfirmationActions } from '@/components/ai-elements/confirmation';
 import { Button } from '@/components/ui/button';
 import type { ChatApproval, ChatCallbacks, ChatModel, ChatConnection, MessageDelivery } from './chat-types';
+import {canRetryAdmission} from './run-recovery';
 import {ActivityCode, ActivityOutput, activityIdentity, outputFormat} from './activity-content';
 import {ArtifactPreview, ArtifactProvider, type ArtifactLoader} from './artifact-preview';
 import './chat.css';
 import {hasBotMention} from './mentions';
 import {agentColor} from './agent-colors';
 import {AgentCreationCard, AgentMessageNotice, collectCollaboration, provenanceNotice} from './collaboration-timeline';
+import {ModelSettings} from './model-settings';
+import {ModelBadge} from './model-identity';
+import {ContextMemoryControl} from './context-memory';
 import {mergeToolResult, mergeToolStatus, runOutcomes, toolActivityState, toolFailureSummary} from './cancellation-presentation';
 
 const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
@@ -105,17 +109,18 @@ function MessageRunStatus({ model, runId, callbacks }: { model: ChatModel; runId
   if (!run || run.status !== 'queued') return null;
   return <div className="timber-message-run" data-message-run-status={run.status}>
     <span className="timber-delivery-status"><ClockIcon />Queued</span>
-    {run.error && <div className="timber-delivery-error"><p>{run.error}</p>{run.status === 'queued' && run.error.includes('Retry this message') && <Button variant="outline" size="sm" disabled={model.sending} onClick={() => callbacks.onRetry(model.bot.id, run.operationId)}>Retry sending</Button>}</div>}
+    {run.error && <div className="timber-delivery-error"><p>{run.error}</p>{canRetryAdmission(run) && <Button variant="outline" size="sm" disabled={model.sending} onClick={() => callbacks.onRetry(model.bot.id, run.operationId)}>Retry sending</Button>}</div>}
   </div>;
 }
 
 function TaskOutcome({model, run, callbacks, kind, cancellationId}: {model:ChatModel;run:ChatModel['runs'][number];callbacks:ChatCallbacks;kind:'stopped'|'failure';cancellationId?:string}) {
   if (kind === 'stopped') return <article className="timber-work-status" data-run-outcome={run.id} data-cancellation-id={cancellationId} data-task-outcome-kind="stopped" role="status"><SquareIcon aria-hidden="true"/><span>Task stopped</span></article>;
   const request = model.messages.find(message=>message.runId===run.id && message.role==='user');
-  const canContinue = Boolean(request);
+  const retryable = canRetryAdmission(run), canContinue = Boolean(request) && !retryable;
   return <article className="timber-task-outcome" data-run-outcome={run.id} role="status">
-    <div className="timber-task-outcome-heading"><CircleAlertIcon aria-hidden="true"/><span>Response interrupted</span></div>
+    <div className="timber-task-outcome-heading"><CircleAlertIcon aria-hidden="true"/><span>{retryable ? 'Message not started' : 'Response interrupted'}</span></div>
     {run.error && <p>{run.error}</p>}
+    {retryable && request && <Button type="button" variant="outline" size="sm" disabled={model.sending} onClick={()=>callbacks.onRetry(model.bot.id,run.operationId)}>Retry sending</Button>}
     {canContinue && request && <Button type="button" variant="outline" size="sm" disabled={model.sending || model.runs.some(item=>!item.subagentId && !terminal.has(item.status))} onClick={()=>callbacks.onSend(model.bot.id, `Continue this task:\n\n${bounded(request.text,6000)}\n\nUse the results already recorded in this conversation. Check the last outcome before taking another action; do not repeat completed work. Explain the result or any remaining blocker.`)}>Continue</Button>}
   </article>;
 }
@@ -445,7 +450,7 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
         {visibleRun.status === 'waiting_connection' ? <GitBranchIcon /> : visibleRun.status === 'waiting_approval' ? <ShieldCheckIcon /> : visibleRun.status === 'queued' ? <ClockIcon /> : <LoaderCircleIcon className="timber-spinner" />}
         <span>{visibleRun.status === 'waiting_connection' ? 'Waiting for GitHub access' : visibleRun.status === 'waiting_approval' ? 'Waiting for your approval' : visibleRun.status === 'queued' ? 'Queued' : responseRetry(model,visibleRun.id) || `${model.bot.name} is working`}</span>
       </div>}
-      {visibleRun?.error && !model.messages.some(message => message.role === 'user' && message.runId === visibleRun.id) && <div className="timber-delivery-error" role="status"><p>{visibleRun.error}</p>{visibleRun.status === 'queued' && visibleRun.error.includes('Retry this message') && <Button variant="outline" size="sm" disabled={model.sending} onClick={() => callbacks.onRetry(model.bot.id, visibleRun.operationId)}>Retry sending</Button>}</div>}
+      {visibleRun?.error && !model.messages.some(message => message.role === 'user' && message.runId === visibleRun.id) && <div className="timber-delivery-error" role="status"><p>{visibleRun.error}</p>{canRetryAdmission(visibleRun) && <Button variant="outline" size="sm" disabled={model.sending} onClick={() => callbacks.onRetry(model.bot.id, visibleRun.operationId)}>Retry sending</Button>}</div>}
     </ConversationContent>
     <ConversationScrollButton aria-label="Jump to latest message" className="timber-jump-bottom" />
   </>;
@@ -516,9 +521,10 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
   return <div className="timber-composer-wrap">
       {choices.length > 0 && <div className="timber-mention-menu" id="bot-mentions" role="listbox" aria-label="Mention a bot">
         <span className="timber-mention-heading">Send this message to another bot</span>
-        {choices.map((bot, index) => <button type="button" key={bot.id} id={`mention-${bot.id}`} role="option" aria-selected={index === Math.min(mentionIndex, choices.length - 1)} data-mention-bot={bot.id} onMouseDown={event => event.preventDefault()} onClick={() => chooseMention(bot)}><span className="timber-mini-avatar" data-agent-color={agentColor(bot.id)} aria-hidden="true">{bot.name.slice(0, 1)}</span><span><strong>{mentionName(bot)}</strong><small>{bot.instructions?.split('\n')[0] || 'Named bot'}</small></span></button>)}
+        {choices.map((bot, index) => <button type="button" key={bot.id} id={`mention-${bot.id}`} role="option" aria-selected={index === Math.min(mentionIndex, choices.length - 1)} data-mention-bot={bot.id} title={bot.model} onMouseDown={event => event.preventDefault()} onClick={() => chooseMention(bot)}><span className="timber-mini-avatar timber-model-avatar" data-agent-color={agentColor(bot.id)} aria-hidden="true">{bot.name.slice(0, 1)}<ModelBadge model={bot.model}/></span><span><strong>{mentionName(bot)}</strong><small>{bot.instructions?.split('\n')[0] || 'Named bot'}</small></span></button>)}
       </div>}
       {selectedMentions.length > 0 && <div className="timber-selected-mentions" aria-label="Message recipients">{selectedMentions.map(bot => <span key={bot.id}>To {mentionName(bot)}<button type="button" aria-label={`Remove ${mentionName(bot)} recipient`} onClick={() => callbacks.onDraft(model.bot.id, model.draft, model.draftMentions.filter(id => id !== bot.id))}>×</button></span>)}</div>}
+      <div className="timber-composer-controls"><ModelSettings value={model.bot} state={model.modelSettings} disabled={model.sending} onChange={value=>callbacks.onModelSettings(model.bot.id,value)} onRefresh={callbacks.onRefreshModels}/><ContextMemoryControl botId={model.bot.id} request={callbacks.onContextRequest} refreshKey={model.events.at(-1)?.id}/></div>
       <PromptInput id="message-form" className="timber-composer" accept="image/png,image/jpeg" multiple maxFiles={4} maxFileSize={5_000_000} onError={error=>setAttachmentError(error.message)} onReset={event => event.preventDefault()} onSubmit={async ({text,files}) => {
         if(model.sending || (!text.trim() && !files.length)) throw new Error('Not ready');
         if(files.length && selectedMentions.length) {setAttachmentError('Image messages cannot mention other bots yet.');throw new Error('Unsupported recipients');}
@@ -559,7 +565,7 @@ function MiniActivity({model, historyOpen, onHistory, callbacks}: {model: ChatMo
   const screenshot = visible.find(tool=>tool.result?.artifactId)?.result?.artifactId;
   return <section className="timber-mini-activity" data-mini-activity aria-label={`${model.bot.name} conversation preview`}>
     <div className="timber-mini-heading">
-      <span className="timber-mini-avatar" data-agent-color={agentColor(model.bot.id)} aria-hidden="true">{model.bot.name.slice(0,1)}</span><strong>{model.bot.name}</strong>
+      <span className="timber-mini-avatar timber-model-avatar" data-agent-color={agentColor(model.bot.id)} title={model.bot.model} aria-hidden="true">{model.bot.name.slice(0,1)}<ModelBadge model={model.bot.model}/></span><strong>{model.bot.name}</strong>
       {heading && <span className={`timber-mini-status${waiting || failed || delivery?' needs-attention':''}`} role="status">{(run || active.length) && !waiting && !failed && !delivery ? <LoaderCircleIcon className="timber-spinner"/> : waiting || failed || delivery ? <CircleAlertIcon/> : null}{heading}</span>}
       <div className="timber-mini-controls">
         <button type="button" data-open-history onClick={()=>{setCollapsed(false);onHistory(!historyOpen);}} aria-expanded={historyOpen} aria-label={historyOpen?'Close conversation history':'Open conversation history'} title={historyOpen?'Close history':'Conversation history'}><HistoryIcon/><span>History</span></button>

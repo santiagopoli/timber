@@ -1,0 +1,29 @@
+.timber-model-avatar{position:relative;overflow:visible}
+.timber-model-badge{position:absolute;left:50%;bottom:-6px;transform:translateX(-50%);min-width:21px;max-width:38px;overflow:hidden;padding:1px 3px;border:1px solid var(--line);border-radius:5px;background:var(--surface);color:var(--ink);font:500 9px/1.15 ui-sans-serif,system-ui,sans-serif;letter-spacing:-.1px;text-align:center;white-space:nowrap;pointer-events:none}
+.timber-collaborator-avatar>.timber-model-badge,.timber-mini-avatar>.timber-model-badge{font-size:8px;min-width:17px;bottom:-5px;padding:1px 2px}
+.timber-composer-controls{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0;padding:0 8px}
+.timber-model-settings{display:flex;align-items:center;min-width:0;min-height:30px;padding:1px 2px 0}
+.timber-model-trigger{display:inline-flex;align-items:center;gap:7px;max-width:100%;min-height:28px;padding:3px 2px;border:0;background:transparent;color:var(--muted);font-size:11px;font-weight:400;box-shadow:none;text-align:left}
+.timber-model-trigger:hover,.timber-model-trigger[data-state=open]{background:transparent;color:var(--ink)}
+.timber-model-trigger>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.timber-model-trigger>small{flex:none;font-size:10px}
+.timber-model-trigger>svg{width:12px;height:12px;flex:none}
+.timber-model-popover{z-index:80;width:320px;max-width:calc(100vw - 24px);max-height:min(460px,var(--radix-popover-content-available-height));overflow:auto;border:1px solid var(--line);border-radius:15px;padding:14px;background:var(--surface);color:var(--ink);box-shadow:0 10px 40px #0002;outline:none}
+.timber-model-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:13px}
+.timber-model-heading>strong{font-weight:550}
+.timber-model-heading>button{display:flex;align-items:center;justify-content:center;width:30px;min-height:30px;padding:4px;border:0;background:transparent;color:var(--muted);border-radius:7px}
+.timber-model-heading svg{width:15px;height:15px}
+.timber-model-caption,.timber-model-help{font-size:11px;line-height:1.6;color:var(--muted);margin:3px 0 12px}
+.timber-model-help{display:flex;align-items:center;gap:6px;margin-top:9px}
+.timber-model-help>svg{width:12px;height:12px;flex:none}
+.timber-model-field{display:flex;flex-direction:column;gap:6px;margin:14px 0;color:var(--muted);font-size:11px}
+.timber-model-field>select{width:100%;min-height:40px;margin:0;padding:8px 10px;border:1px solid var(--line);border-radius:9px;background:var(--bg);color:var(--ink);font-size:13px;line-height:1.5}
+.timber-model-fast{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 0 2px;border-top:1px solid var(--line);font-size:12px;color:var(--ink)}
+.timber-model-fast>span{display:flex;align-items:center;gap:7px}
+.timber-model-fast strong{font-weight:500}
+.timber-model-fast svg{width:14px;height:14px;color:var(--muted)}
+.timber-model-fast>input{width:17px;height:17px;margin:0;accent-color:var(--ink)}
+.timber-model-error{font-size:12px;color:var(--danger);line-height:1.5;margin:10px 0 0}
+.timber-model-error p{margin:0 0 6px}
+.timber-model-error button{background:transparent;border:0;padding:3px 0;min-height:30px;color:var(--ink);text-decoration:underline;font-size:12px}
+@media(max-width:760px){.timber-model-settings{min-height:34px;padding-top:0}.timber-model-trigger{min-height:34px;font-size:11px}.timber-model-heading>button{width:36px;min-height:36px}.timber-model-field>select{font-size:16px;min-height:44px}.timber-model-fast{min-height:44px}}

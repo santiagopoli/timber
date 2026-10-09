@@ -7,7 +7,7 @@ run recovery, and wake-up scheduling. The backend owns the product projection an
 an outbox for admitting user inputs with stable operation IDs.
 
 The default model is `gpt-6.1-sol` through the user's connected ChatGPT plan.
-The host supplies `chatgpt: { fetch(request): Promise<Response> }`, which receives
+The host supplies `chatgpt: { fetch(request): Promise<Response>, models(): Promise<ModelCatalog> }`, which receives
 only credential-free POST requests to `https://api.openai.com/v1/responses` and
 injects OAuth in its separate authentication object. The runtime never reads
 tokens or environment API keys. An absent connection or exhausted allowance
@@ -15,7 +15,8 @@ fails explicitly; there is no billed fallback. Explicit `@cf/` model IDs retain
 Workers AI. Named bot instructions are rendered before every request. Pi and
 Agents packages are pinned because the durable harness is beta.
 
-The native Pi Responses adapter receives the entire durable history, developer
+The native Pi Responses adapter receives the active context (including summaries
+after compaction), developer
 instructions, `store:false`, `stream:true`, and functions under the
 `timber_computer` namespace. Its parser preserves namespace and call identity
 across tool results and restart. Screenshot pixels use image tool outputs. No
@@ -118,3 +119,14 @@ can print workerd teardown exceptions during tests; assertions determine result.
 This package does not implement Hermes, routine scheduling, native
 iOS, local execution, or a secrets-entry UI. Its host interfaces leave those
 separate from the Pi integration.
+
+
+Model choices are account-scoped. Native model references include a persisted,
+immutable configuration so prepared generations, compaction and recovered child
+conversations retain the selected model, reasoning and Fast tier. The adapter
+sends the public provider model ID on the wire; internal configuration IDs and
+OAuth credentials never enter the request payload. New runs snapshot bot settings
+before admission, while retries keep the original snapshot.
+
+Pi owns automatic/manual compaction; the host preserves the immutable archive and
+curated notes independently. See [context and memory](../../docs/context-memory.md).

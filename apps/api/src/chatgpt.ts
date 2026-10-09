@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { normalizeModelCatalog, resolveModelSettings, type ModelCatalog, type ModelOption, type ModelSettings } from "@botspace/contracts";
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 import type { Env } from "./env";
 import { ApiError, errorResponse, json } from "./errors";
@@ -7,6 +8,9 @@ import { body, string } from "./validation";
 const ISSUER = "https://auth.openai.com";
 const RESOURCE = "https://api.openai.com/v1";
 const MODEL = "gpt-6.1-sol";
+const MODEL_CACHE_MS = 5 * 60_000;
+const INFERENCE_TIMEOUT_MS = 30 * 60_000;
+interface CachedModels {revision:string;expiresAt:number;models:ModelOption[];}
 const TOKEN_ENDPOINT = `${ISSUER}/api/accounts/oauth/token`;
 const PLAN_SCOPE = "chatgpt.tokens.use.direct";
 const encoder = new TextEncoder();
@@ -56,6 +60,7 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
   private jwks?:ReturnType<typeof createRemoteJWKSet>;
   private key?:CryptoKey;
   private active=new Set<AbortController>();
+  private catalogPending?:{revision:string;promise:Promise<ModelOption[]>};
 
   constructor(ctx:DurableObjectState,env:Env) {
     super(ctx,env);
@@ -125,6 +130,7 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
     if(previous && await this.ctx.storage.get("credentials") && (previous.account.subject!==identity.sub || previous.account.clientId!==clientId)) throw new ApiError(409,"chatgpt_account_mismatch","Disconnect the existing ChatGPT account before connecting another registration.");
     const earliestRefreshAt=typeof data.earliest_refresh_at==="number"?data.earliest_refresh_at*1000:undefined;
     const tokens:Tokens={accessToken,refreshToken,idToken,scopes:granted,expiresAt:access.exp!*1000,...(earliestRefreshAt?{earliestRefreshAt}:{})};
+    await this.ctx.storage.delete("modelCatalog");this.catalogPending=undefined;
     await this.saveTokens(tokens,{revision:crypto.randomUUID(),account:{clientId,subject:identity.sub!,...(typeof identity.email==="string"?{email:identity.email}:{})}});
     for(const controller of this.active) controller.abort();this.active.clear();
     return json(await this.status());
@@ -163,14 +169,85 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
     await this.saveTokens(replacement);
     return accessToken;
   }
+  private revision(connection:Connection):string {return connection.revision??`${connection.account.clientId}:${connection.account.subject}`;}
+  private async modelList():Promise<ModelOption[]> {
+    const initial=await this.lock(async()=>{
+      const token=await this.token();
+      const connection=(await this.ctx.storage.get<Connection>("connection"))!;
+      const revision=this.revision(connection),cached=await this.ctx.storage.get<CachedModels>("modelCatalog");
+      return {token,revision,cached:cached?.revision===revision && cached.expiresAt>Date.now()?cached.models:undefined};
+    });
+    if(initial.cached) return initial.cached;
+    if(this.catalogPending?.revision===initial.revision) return this.catalogPending.promise;
+    const promise=(async()=>{
+      const controller=new AbortController();this.active.add(controller);
+      try {
+        let response:Response;
+        try {response=await fetch(`${RESOURCE}/models`,{headers:{Authorization:`Bearer ${initial.token}`,"User-Agent":"Timber/0.1.0"},redirect:"manual",signal:AbortSignal.any([controller.signal,AbortSignal.timeout(15_000)])});}
+        catch {throw new ApiError(503,"model_catalog_unavailable","The connected account's model catalogue could not be loaded. Refresh and try again.");}
+        if(!response.ok) {
+          await response.body?.cancel();
+          throw new ApiError(503,"model_catalog_unavailable",response.status===401?"The model catalogue rejected this ChatGPT connection. Reconnect ChatGPT.":"The connected account's model catalogue is unavailable. Refresh and try again.");
+        }
+        let raw:unknown;
+        const reader=response.body?.getReader();let bytes=0,text="";
+        try {
+          if(!reader) throw new Error("empty");
+          const decoder=new TextDecoder();
+          while(true) {const part=await reader.read();if(part.done)break;bytes+=part.value.byteLength;if(bytes>2_000_000)throw new Error("large");text+=decoder.decode(part.value,{stream:true});}
+          text+=decoder.decode();raw=JSON.parse(text);
+        } catch {throw new ApiError(503,"model_catalog_invalid","The connected account returned an unreadable model catalogue.");}
+        finally {await reader?.cancel().catch(()=>{});}
+        let models:ModelOption[];
+        try {models=normalizeModelCatalog(raw);} catch {throw new ApiError(503,"model_catalog_invalid","The connected account returned an unsupported model catalogue.");}
+        await this.lock(async()=>{
+          const current=await this.ctx.storage.get<Connection>("connection");
+          if(!current || current.needsReauth || this.revision(current)!==initial.revision || !await this.ctx.storage.get("credentials")) throw new ApiError(409,"chatgpt_connection_changed","The ChatGPT connection changed. Refresh the model catalogue.");
+          await this.ctx.storage.put<CachedModels>("modelCatalog",{revision:initial.revision,expiresAt:Date.now()+MODEL_CACHE_MS,models});
+        });
+        return models;
+      } finally {this.active.delete(controller);}
+    })();
+    this.catalogPending={revision:initial.revision,promise};
+    try {return await promise;} finally {if(this.catalogPending?.promise===promise)this.catalogPending=undefined;}
+  }
+  private async catalog():Promise<ModelCatalog> {
+    const current=await this.status(),fallback=this.env.BOTSPACE_DEFAULT_MODEL??MODEL;
+    if(!current.connected)return {models:[],connected:false,defaultModel:fallback};
+    try {
+      const models=await this.modelList();
+      return {models,connected:true,defaultModel:models.find(model=>model.id===fallback)?.id??models[0]?.id??fallback};
+    } catch(error) {
+      return {models:[],connected:(await this.status()).connected,defaultModel:fallback,error:error instanceof ApiError?error.message:"The model catalogue is unavailable. Refresh and try again."};
+    }
+  }
+  private async validateSettings(input:ModelSettings):Promise<{settings:ModelSettings;model:ModelOption}> {
+    const models=await this.modelList();
+    let settings:ModelSettings;
+    try {settings=resolveModelSettings(input,models);}
+    catch(error) {throw new ApiError(400,"invalid_model_settings",error instanceof Error?error.message:"Invalid model settings.");}
+    return {settings,model:models.find(model=>model.id===settings.model)!};
+  }
   private async provider(request:Request):Promise<Response> {
     const payload=await request.json<Record<string,unknown>>();
-    if(payload.model!==MODEL || payload.store!==false || payload.stream!==true || !Array.isArray(payload.input)) throw new ApiError(400,"chatgpt_invalid_request","The ChatGPT plan route requires gpt-6.1-sol with streaming and client-owned history.");
-    const unsupported=["background","conversation","max_output_tokens","max_tool_calls","metadata","moderation","multi_agent","prompt","prompt_cache_retention","safety_identifier","temperature","top_logprobs","top_p","truncation","user","previous_response_id","service_tier"];
+    if(typeof payload.model!=="string" || payload.store!==false || payload.stream!==true || !Array.isArray(payload.input)) throw new ApiError(400,"chatgpt_invalid_request","The ChatGPT plan route requires an account-supported model with streaming and client-owned history.");
+    const unsupported=["background","conversation","max_output_tokens","max_tool_calls","metadata","moderation","multi_agent","prompt","prompt_cache_retention","safety_identifier","temperature","top_logprobs","top_p","truncation","user","previous_response_id"];
     if(unsupported.some(key=>payload[key]!==undefined)) throw new ApiError(400,"chatgpt_invalid_request","Unsupported options on the ChatGPT subscription route.");
+    const reasoning=payload.reasoning;
+    if(reasoning!==undefined && (!reasoning || typeof reasoning!=="object" || Array.isArray(reasoning))) throw new ApiError(400,"invalid_model_settings","reasoning must be an object.");
+    const effort=(reasoning as {effort?:unknown}|undefined)?.effort;
+    if(effort!==undefined && typeof effort!=="string") throw new ApiError(400,"invalid_model_settings","Reasoning effort must be a catalogue option.");
+    if(payload.service_tier!==undefined && !["fast","priority"].includes(String(payload.service_tier))) throw new ApiError(400,"invalid_model_settings","Only an advertised Fast mode tier may be selected.");
+    const initial=await this.ctx.storage.get<Connection>("connection");
+    const {settings}=await this.validateSettings({model:payload.model,...(effort===undefined?{}:{reasoningEffort:effort as string}),fast:payload.service_tier!==undefined});
+    if(settings.reasoningEffort) payload.reasoning={...(reasoning as Record<string,unknown>??{}),effort:settings.reasoningEffort};
     const controller=new AbortController();
-    const token=await this.lock(async()=>{const token=await this.token();this.active.add(controller);return token;});
-    const timer=setTimeout(()=>controller.abort(),120_000);
+    const token=await this.lock(async()=>{
+      const token=await this.token(),current=(await this.ctx.storage.get<Connection>("connection"))!;
+      if(!initial || this.revision(current)!==this.revision(initial)) throw new ApiError(409,"chatgpt_connection_changed","The ChatGPT connection changed. Retry with the current connection.");
+      this.active.add(controller);return token;
+    });
+    const timer=setTimeout(()=>controller.abort(),INFERENCE_TIMEOUT_MS);
     const signal=AbortSignal.any([request.signal,controller.signal]);
     const cleanup=()=>{clearTimeout(timer);this.active.delete(controller);};
     let response:Response;
@@ -193,7 +270,10 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
   }
   private async verify():Promise<Response> {
     const initial=await this.ctx.storage.get<Connection>("connection");
-    const response=await this.provider(new Request("https://chatgpt/responses",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({model:MODEL,input:[{role:"user",content:"Reply with exactly TIMBER_CONNECTED."}],store:false,stream:true,reasoning:{effort:"low"}})}));
+    const models=await this.modelList();
+    const model=models.find(model=>model.id===(this.env.BOTSPACE_DEFAULT_MODEL??MODEL))?.id??models[0]?.id;
+    if(!model)throw new ApiError(409,"model_unavailable","No model is available in this ChatGPT account.");
+    const response=await this.provider(new Request("https://chatgpt/responses",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({model,input:[{role:"user",content:"Reply with exactly TIMBER_CONNECTED."}],store:false,stream:true})}));
     if(!response.ok) return response;
     const reader=response.body!.getReader(),decoder=new TextDecoder();let buffer="",bytes=0,completed=false;
     try {
@@ -221,7 +301,7 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
       if(!initial || !connection || connection.revision!==initial.revision || connection.needsReauth || !await this.ctx.storage.get("credentials")) throw new ApiError(409,"chatgpt_connection_changed","The ChatGPT connection changed during verification. Verify the current connection again.");
       await this.ctx.storage.put("connection",{...connection,verifiedAt:new Date().toISOString()});
     });
-    return json({ok:true,model:MODEL});
+    return json({ok:true,model});
   }
   private async disconnect():Promise<Response> {
     for(const controller of this.active) controller.abort();this.active.clear();
@@ -236,6 +316,7 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
       }
     } catch { /* Local disconnection must still succeed. Report unconfirmed revocation. */ }
     await this.ctx.storage.delete("credentials");
+    await this.ctx.storage.delete("modelCatalog");this.catalogPending=undefined;
     if(connection) await this.ctx.storage.put("connection",{account:connection.account});
     return json({...await this.status(),revoked});
   }
@@ -245,6 +326,12 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
       if(path==="/" && request.method==="GET") return json(await this.status());
       if(path==="/" && request.method==="POST") return await this.lock(()=>this.import(request));
       if(path==="/" && request.method==="DELETE") return await this.lock(()=>this.disconnect());
+      if(path==="/models" && request.method==="GET") return json(await this.catalog());
+      if(path==="/validate-model" && request.method==="POST") {
+        const data=await body(request);
+        if(typeof data.model!=="string" || (data.reasoningEffort!==undefined && typeof data.reasoningEffort!=="string") || (data.fast!==undefined && typeof data.fast!=="boolean")) throw new ApiError(400,"invalid_model_settings","Invalid model settings.");
+        return json(await this.validateSettings({model:data.model,...(data.reasoningEffort===undefined?{}:{reasoningEffort:data.reasoningEffort as string}),...(data.fast===undefined?{}:{fast:data.fast as boolean})}));
+      }
       if(path==="/responses" && request.method==="POST") return await this.provider(request);
       if(path==="/verify" && request.method==="POST") return await this.verify();
       throw new ApiError(404,"not_found","Connection endpoint not found.");

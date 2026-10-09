@@ -5,9 +5,10 @@ import type {ChatCallbacks, ChatModel} from './chat-types';
 import {MessageResponse} from './components/ai-elements/message';
 import {agentColor} from './agent-colors';
 import {collectLegacyAgentMessages} from './legacy-agent-messages';
+import {ModelBadge} from './model-identity';
 import './collaboration-timeline.css';
 
-export type AgentLink = {id:string;name:string;kind:'bot'|'subagent'};
+export type AgentLink = {id:string;name:string;kind:'bot'|'subagent';model?:string};
 type Creation = {agent:AgentLink;status:string;task?:string;creator?:AgentLink};
 type Notice = {direction:'from'|'to'|'between';agent:AgentLink;recipient?:AgentLink;text?:string;status?:string;messageId?:string;label?:string;error?:string;historical?:boolean};
 export type CollaborationItem = {key:string;runId?:string;createdAt:string;creation?:Creation;notice?:Notice};
@@ -32,14 +33,14 @@ function reportBody(event:BotEvent,sourceName?:string):string {
 }
 
 function AgentAvatar({agent}: {agent:AgentLink}) {
-  return <span className={`timber-collaborator-avatar is-${agent.kind}`} data-agent-color={agentColor(agent.id)} aria-hidden="true">{agent.name.slice(0,1).toUpperCase()}</span>;
+  return <span className={`timber-collaborator-avatar timber-model-avatar is-${agent.kind}`} data-agent-color={agentColor(agent.id)} aria-hidden="true">{agent.name.slice(0,1).toUpperCase()}<ModelBadge model={agent.model}/></span>;
 }
 function openAgent(agent:AgentLink,callbacks:Pick<ChatCallbacks,'onOpenBot'|'onOpenAgents'>) {
   if(agent.kind==='subagent') callbacks.onOpenAgents(agent.id);else callbacks.onOpenBot(agent.id);
 }
 export function AgentMessageNotice({notice,callbacks,eventKey,context='timeline'}: {notice:Notice;callbacks:Pick<ChatCallbacks,'onOpenBot'|'onOpenAgents'>;eventKey:string;context?:'timeline'|'activity'|'preview'}) {
   const [expanded,setExpanded]=useState(false);
-  const identity=(agent:AgentLink)=><button type="button" className="timber-collaborator-link" aria-label={`Open ${agent.name} conversation`} title={agent.name} onClick={()=>openAgent(agent,callbacks)}><AgentAvatar agent={agent}/><strong>{agent.name}</strong></button>;
+  const identity=(agent:AgentLink)=><button type="button" className="timber-collaborator-link" aria-label={`Open ${agent.name} conversation`} aria-description={agent.model?`Model: ${agent.model}`:undefined} title={`${agent.name}${agent.model?` · ${agent.model}`:''}`} onClick={()=>openAgent(agent,callbacks)}><AgentAvatar agent={agent}/><strong>{agent.name}</strong></button>;
   const detail=Boolean(notice.text||notice.error),attributes=context==='activity'?{'data-activity-collaboration-notice':eventKey}:context==='preview'?{'data-preview-collaboration-notice':eventKey}:{'data-collaboration-notice':eventKey};
   return <article className="timber-collaboration-message" {...attributes} data-message-id={context==='timeline'?notice.messageId:undefined}>
     <div className="timber-collaboration-message-row timber-agent-source">
@@ -57,12 +58,13 @@ export function AgentCreationCard({creation,callbacks,context='timeline'}: {crea
   const kind=creation.agent.kind==='subagent'?'subagent':'named agent';
   return <article className="timber-agent-created" {...(context==='activity'?{'data-activity-agent-created':creation.agent.id}:{'data-agent-created':creation.agent.id})} data-agent-kind={creation.agent.kind}>
     <div className="timber-agent-created-pill">
-      <button type="button" className="timber-agent-created-link" onClick={()=>openAgent(creation.agent,callbacks)} aria-label={`Open ${creation.agent.name} conversation`} title={`Created ${kind}${creation.task?` · ${creation.task}`:''}`}><GitBranchIcon className="timber-agent-created-icon" aria-hidden="true"/><AgentAvatar agent={creation.agent}/><strong>{creation.agent.name}</strong></button>
+      <button type="button" className="timber-agent-created-link" onClick={()=>openAgent(creation.agent,callbacks)} aria-label={`Open ${creation.agent.name} conversation`} aria-description={creation.agent.model?`Model: ${creation.agent.model}`:undefined} title={`Created ${kind}${creation.agent.model?` · ${creation.agent.model}`:''}${creation.task?` · ${creation.task}`:''}`}><GitBranchIcon className="timber-agent-created-icon" aria-hidden="true"/><AgentAvatar agent={creation.agent}/><strong>{creation.agent.name}</strong></button>
       <span className="status" data-status={creation.status}>{statusLabel(creation.status)}</span>
       <button type="button" className="timber-agent-created-toggle" onClick={()=>setExpanded(value=>!value)} aria-expanded={expanded} aria-label={`${expanded?'Hide':'Show'} ${creation.agent.name} agent details`}><ChevronDownIcon className={expanded?'is-expanded':''}/></button>
     </div>
     {expanded && <div className="timber-agent-created-details">
       <span className="timber-agent-created-caption">Created {kind}{creation.creator?` · by ${creation.creator.name}`:''}</span>
+      {creation.agent.model&&<span className="timber-agent-created-caption">{creation.agent.model}</span>}
       {creation.task && <p className="timber-agent-created-task">{creation.task}</p>}
       <button type="button" className="timber-agent-created-open" onClick={()=>openAgent(creation.agent,callbacks)}>Open conversation<ChevronRightIcon aria-hidden="true"/></button>
     </div>}
@@ -71,11 +73,11 @@ export function AgentCreationCard({creation,callbacks,context='timeline'}: {crea
 
 export function provenanceNotice(message:Message,model:ChatModel):Notice | undefined {
   if(!message.provenance)return;
-  return {direction:'from',agent:{id:message.provenance.sourceBotId,name:message.provenance.sourceBotName,kind:'bot'},text:message.text,messageId:message.id,status:model.runs.find(run=>run.id===message.runId)?.status};
+  return {direction:'from',agent:{id:message.provenance.sourceBotId,name:message.provenance.sourceBotName,kind:'bot',model:model.mentionBots.find(bot=>bot.id===message.provenance?.sourceBotId)?.model},text:message.text,messageId:message.id,status:model.runs.find(run=>run.id===message.runId)?.status};
 }
 
 /** Project durable product events. Never infer a sender from model-authored text. */
-type CollaborationModel = Pick<ChatModel,'events'|'subagents'|'runs'|'mentionBots'|'delegations'|'messages'|'collaborationEvents'|'runFilter'> & {bot:Pick<ChatModel['bot'],'id'|'name'>};
+type CollaborationModel = Pick<ChatModel,'events'|'subagents'|'runs'|'mentionBots'|'delegations'|'messages'|'collaborationEvents'|'runFilter'> & {bot:Pick<ChatModel['bot'],'id'|'name'>&{model?:string}};
 export function collectCollaboration(model:CollaborationModel,scopeSubagentId?:string) {
   const items=new Map<string,CollaborationItem>(),toolIdentities=new Set<string>();
   const events=model.collaborationEvents;
@@ -85,9 +87,9 @@ export function collectCollaboration(model:CollaborationModel,scopeSubagentId?:s
     return current;
   };
   const parentRun=(agent:Subagent,event?:BotEvent)=>rootRun(event?.runId || model.runs.find(run=>run.operationId===agent.parentOperationId || run.operationId===`subagent:${agent.parentOperationId}`)?.id);
-  const childLink=(id:string,name?:string):AgentLink=>({id,name:name||model.subagents.find(agent=>agent.id===id)?.name||'Subagent',kind:'subagent'});
+  const childLink=(id:string,name?:string):AgentLink=>({id,name:name||model.subagents.find(agent=>agent.id===id)?.name||'Subagent',kind:'subagent',model:model.subagents.find(agent=>agent.id===id)?.model});
   const namedStatus=(id:string)=>model.delegations.filter(delegation=>delegation.targetBotId===id).sort((left,right)=>right.updatedAt.localeCompare(left.updatedAt))[0]?.status||'created';
-  const rootLink:AgentLink={id:model.bot.id,name:model.bot.name,kind:'bot'};
+  const rootLink:AgentLink={id:model.bot.id,name:model.bot.name,kind:'bot',model:model.bot.model};
   const belongsToScope=(runId?:string)=>!scopeSubagentId || model.runs.some(run=>run.id===runId&&run.subagentId===scopeSubagentId);
   const correlation=(event:BotEvent,sourceRunId=event.runId)=>{
     const operation=text(event.data.operationId),call=text(event.data.toolCallId);
@@ -109,13 +111,13 @@ export function collectCollaboration(model:CollaborationModel,scopeSubagentId?:s
     if(event){const source=model.runs.find(run=>run.operationId===agent.parentOperationId||run.operationId===`subagent:${agent.parentOperationId}`);const eventRun=model.runs.find(run=>run.id===event.runId);correlation(event,source?.id||(eventRun?.subagentId?eventRun.parentRunId:event.runId));}
   }
   for(const bot of model.mentionBots.filter(bot=>!scopeSubagentId&&bot.createdByBotId===model.bot.id)){
-    items.set(`created:bot:${bot.id}`,{key:`created:bot:${bot.id}`,createdAt:bot.createdAt,creation:{agent:{id:bot.id,name:bot.name,kind:'bot'},status:namedStatus(bot.id),task:bot.instructions}});
+    items.set(`created:bot:${bot.id}`,{key:`created:bot:${bot.id}`,createdAt:bot.createdAt,creation:{agent:{id:bot.id,name:bot.name,kind:'bot',model:bot.model},status:namedStatus(bot.id),task:bot.instructions}});
   }
   for(const event of events)if(event.type==='agent.named.created'){
     if(!belongsToScope(event.runId))continue;
     const bot=record(event.data.bot),id=text(bot.id);if(!id)continue;
     const saved=items.get(`created:bot:${id}`),sourceRun=model.runs.find(run=>run.id===event.runId);
-    items.set(`created:bot:${id}`,{key:`created:bot:${id}`,createdAt:saved?.createdAt||event.createdAt,runId:rootRun(event.runId),creation:{agent:{id,name:text(bot.name)||saved?.creation?.agent.name||'Named agent',kind:'bot'},status:namedStatus(id),task:saved?.creation?.task,...(sourceRun?.subagentId?{creator:childLink(sourceRun.subagentId)}:{})}});correlation(event);
+    items.set(`created:bot:${id}`,{key:`created:bot:${id}`,createdAt:saved?.createdAt||event.createdAt,runId:rootRun(event.runId),creation:{agent:{id,name:text(bot.name)||saved?.creation?.agent.name||'Named agent',kind:'bot',model:text(bot.model)||saved?.creation?.agent.model},status:namedStatus(id),task:saved?.creation?.task,...(sourceRun?.subagentId?{creator:childLink(sourceRun.subagentId)}:{})}});correlation(event);
   }
   const reports=new Map<string,BotEvent>();
   for(const event of events)if(event.type==='subagent.reported'&&typeof event.data.subagentId==='string')reports.set(text(event.data.operationId)||`event:${event.id}`,event);
@@ -146,7 +148,7 @@ export function collectCollaboration(model:CollaborationModel,scopeSubagentId?:s
     if(delegation.sourceBotId!==model.bot.id||!belongsToScope(delegation.sourceRunId))continue;
     const origin=events.find(event=>event.type==='delegation.updated'&&record(event.data.delegation).id===delegation.id);
     const sourceMessage=model.messages.find(message=>message.runId===delegation.sourceRunId&&message.role==='user'&&message.mentions?.includes(delegation.targetBotId));
-    items.set(`delegation:${delegation.id}`,{key:`delegation:${delegation.id}`,createdAt:delegation.createdAt,runId:rootRun(delegation.sourceRunId),notice:{direction:'to',agent:{id:delegation.targetBotId,name:delegation.targetBotName,kind:'bot'},text:text(origin?.data.text)||sourceMessage?.text,status:delegation.status}});
+    items.set(`delegation:${delegation.id}`,{key:`delegation:${delegation.id}`,createdAt:delegation.createdAt,runId:rootRun(delegation.sourceRunId),notice:{direction:'to',agent:{id:delegation.targetBotId,name:delegation.targetBotName,kind:'bot',model:model.mentionBots.find(bot=>bot.id===delegation.targetBotId)?.model},text:text(origin?.data.text)||sourceMessage?.text,status:delegation.status}});
   }
   const historical=collectLegacyAgentMessages(model,scopeSubagentId);
   for(const identity of historical.toolIdentities)toolIdentities.add(identity);
@@ -158,6 +160,8 @@ export function collectCollaboration(model:CollaborationModel,scopeSubagentId?:s
     else if(message.source.kind==='bot')notice={...common,direction:'to',agent:message.target};
     else if(message.target.kind==='bot')notice={...common,direction:'from',agent:message.source};
     else notice={...common,direction:'between',agent:message.source,recipient:message.target};
+    const withModel=(agent:AgentLink):AgentLink=>({...agent,model:agent.kind==='subagent'?model.subagents.find(item=>item.id===agent.id)?.model:agent.id===model.bot.id?model.bot.model:model.mentionBots.find(item=>item.id===agent.id)?.model});
+    notice.agent=withModel(notice.agent);if(notice.recipient)notice.recipient=withModel(notice.recipient);
     items.set(message.key,{key:message.key,runId:scopeSubagentId?message.runId:rootRun(message.runId),createdAt:message.createdAt,notice});
   }
   return {items:[...items.values()].filter(item=>!model.runFilter||item.runId===model.runFilter),toolIdentities};

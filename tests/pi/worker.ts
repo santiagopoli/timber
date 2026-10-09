@@ -5,6 +5,7 @@ import type { Env } from "../../apps/api/src/env";
 import { nativeSubagentFixture } from "./subagent-fixture";
 import { nativeExecFixture } from "./exec-fixture";
 import { steeringFixture } from "./steering-fixture";
+import { maintenanceFixture } from "./maintenance-fixture";
 
 // Actual API, BotDO, registry, Pi lifecycle and SQLite. Only the external model
 // transport and computer effect provider are deterministic test doubles.
@@ -22,10 +23,19 @@ export class ChatGPTFixture extends DurableObject {
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS inference_calls(id INTEGER PRIMARY KEY AUTOINCREMENT,input TEXT)");
   }
   async fetch(request:Request):Promise<Response> {
+    const path=new URL(request.url).pathname;
+    const model={id:"gpt-6.1-sol",name:"GPT-6.1 Sol",provider:"openai",reasoningEfforts:["low","medium","high","xhigh","max"],defaultReasoningEffort:"medium",supportsFast:true,fastServiceTier:"fast",contextWindow:1050000,maxOutputTokens:128000,inputModalities:["text","image"]};
+    if(path==="/models")return Response.json({models:[model],connected:true,defaultModel:model.id});
+    if(path==="/validate-model") {
+      const settings=await request.json<{model:string;reasoningEffort?:string;fast?:boolean}>();
+      return Response.json({settings:{...settings,reasoningEffort:settings.reasoningEffort??"medium",fast:settings.fast??false},model});
+    }
     const input=await request.json<{input:Record<string,unknown>[]}>();
     this.ctx.storage.sql.exec("INSERT INTO inference_calls(input) VALUES(?)",JSON.stringify(input));
     const lastUser=input.input.filter(item=>item.role==="user").at(-1);
     if(inferenceFixtureControl.gate && JSON.stringify(lastUser).includes(inferenceFixtureControl.matches??"")) await inferenceFixtureControl.gate;
+    const maintenance=maintenanceFixture(input.input);
+    if(maintenance)return maintenance;
     const steering=steeringFixture(input.input);
     if(steering) return steering;
     const subagent=nativeSubagentFixture(input.input);

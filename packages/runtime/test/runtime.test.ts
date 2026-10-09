@@ -277,3 +277,13 @@ describe('ChatGPT subscription boundary', () => {
     expect(() => chatgptPayload({ input: [{ type: 'function_call', namespace: 'other' }] })).toThrow('chatgpt_invalid_tool_namespace');
   });
 });
+
+
+it('restores only registered host tool namespaces after switching models',()=>{
+  const tool={type:'function',name:'exec',parameters:{type:'object'}};
+  const input={type:'function_call',name:'exec',call_id:'call_existing',arguments:'{}'};
+  const payload=chatgptPayload({input:[input],tools:[tool]},{model:'gpt-6-astra',reasoningEffort:'ultra',fast:true},{id:'gpt-6-astra',name:'Astra',provider:'openai',reasoningEfforts:['ultra'],supportsFast:true,fastServiceTier:'priority'});
+  expect(payload).toMatchObject({model:'gpt-6-astra',reasoning:{effort:'ultra'},service_tier:'priority',input:[{...input,namespace:'timber_computer'}]});
+  expect(()=>chatgptPayload({input:[{...input,namespace:'foreign'}],tools:[tool]})).toThrow('chatgpt_invalid_tool_namespace');
+  expect(()=>chatgptPayload({input:[{...input,name:'unknown'}],tools:[tool]})).toThrow('chatgpt_invalid_tool_namespace');
+});

@@ -2,6 +2,7 @@
 import type { PiRuntimeOptions, RuntimeMessage, RuntimeSubagent } from "../../packages/runtime/src/types";
 export const DEFAULT_MODEL = "@cf/test/mock";
 export { parseRuntimeLimit } from "../../packages/runtime/src/budget";
+export { ModelConfigurationError } from "../../packages/runtime/src/model-settings";
 export type { RuntimeEvent, RuntimeToolRequest } from "../../packages/runtime/src/types";
 
 type Result = {operationId: string; session: "1"; status: "done" | "unanswered"; text?: string; reason?: string};

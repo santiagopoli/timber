@@ -44,14 +44,17 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   with revoked:boolean. A failed remote revocation is explicit.
 - POST /v1/connections/chatgpt/verify performs one small real inference and only
   returns {ok:true,model} after response.completed.
+- GET /v1/models -> {models:ModelOption[],connected,defaultModel,error?}. Returns
+  the connected account's selectable models and supported reasoning/Fast options.
+  A disconnected or unavailable catalogue has no invented model entries.
 - GET /v1/bots -> {bots:Bot[]}
-- POST /v1/bots {name,instructions?,model?,computerApprovalMode?,allowNamedAgents?} -> 201 {bot:Bot}
+- POST /v1/bots {name,instructions?,model?,reasoningEffort?,fast?,computerApprovalMode?,allowNamedAgents?} -> 201 {bot:Bot}
 - GET /v1/bots/:id -> {bot:Bot}
 - GET /v1/bots/:id/summary -> {summary:{status,activeRuns,activeAgents,activeProcesses,lastMessage?}}.
   A passive SQL-only sidebar snapshot; it does not admit work, call inference or
   wake a computer. The latest user/assistant text is limited to 240 characters.
   Root work, temporary agents and managed processes have independent counts.
-- PATCH /v1/bots/:id {name?,instructions?,computerApprovalMode?,allowNamedAgents?} -> {bot:Bot}
+- PATCH /v1/bots/:id {name?,instructions?,model?,reasoningEffort?,fast?,computerApprovalMode?,allowNamedAgents?} -> {bot:Bot}
 - DELETE /v1/bots/:id -> 200 {botId,deleted:true}. Repeated deletion of the same
   known bot is idempotent; an unknown ID returns 404. Registry access is removed
   before cleanup. The agent and computer are stopped before their data and R2
@@ -95,6 +98,15 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   duplicating its message. This only resets unadmitted delivery failures, including
   the exact legacy admission-failure state. It never resets actual model/tool
   failures or replays cancelled or interrupted effects.
+  Model configuration failures before native admission have specific safe errors:
+  disconnected accounts, unsupported model/reasoning/Fast settings and unsupported
+  image input fail without scheduling inference. Temporary catalogue failures keep
+  the same bounded automatic retries and their actionable catalogue error. An
+  identical POST after correcting settings may refresh that saved input's model
+  snapshot only while a durable configuration-failure marker exists and native
+  state confirms the input was never admitted. Stop remains a permanent fence.
+  `Run.admissionRetryable:true` exposes this safe resend option in REST and run
+  events; admission, Stop or a genuine execution outcome removes it.
 - GET /v1/bots/:id/runs?limit=30&before=<cursor>
   -> {runs:Run[],activeRuns:Run[],nextCursor:string|null}. Runs are newest-created
   first, with stable SQLite rowid pagination. `limit` defaults to 30 and accepts
@@ -176,6 +188,43 @@ and workspace archives, serializes rotating-token refresh, and injects tokens on
 in requests to api.openai.com. It exposes no token-read route. Pi receives a fetch
 transport port, never OAuth credentials. OAuth is completed on the user's local
 loopback callback and imported over the authenticated HTTPS API. No iOS app.
+
+### Account model settings
+ChatGPT model discovery calls `GET https://api.openai.com/v1/models` using the
+same OAuth connection as inference. Only entries with `visibility:"list"` appear,
+in provider order. Public options contain the model ID/name, supported reasoning
+efforts, advertised default effort, Fast support and available context/input
+capabilities; raw account metadata and credentials are never returned. This is
+the account's catalogue, not a hardcoded list of model or effort names.
+
+The catalogue cache lasts five minutes and belongs to a connection revision.
+Import and disconnect invalidate it. Network discovery runs outside the token
+refresh lock; a delayed response from an old connection cannot populate the new
+cache or authorize inference under a replacement account. Catalogue failures are
+explicit and never trigger another provider or separately billed API access.
+
+`Bot.model`, `Bot.reasoningEffort?` and `Bot.fast?` are persisted configuration.
+Explicit selections on creation or PATCH must be available to the connected
+account. Changing the model clears omitted reasoning/Fast settings before applying
+that model's default reasoning effort and `fast:false`. Legacy bots without an
+explicit effort use the provider's advertised default; Timber does not force
+`low`. Creation without explicit model settings remains possible before connecting
+ChatGPT; inference still requires a valid connection and account-supported model.
+Explicit `@cf/` models retain Workers AI and cannot use ChatGPT reasoning/Fast
+settings.
+
+Fast is opt-in and accepted only when the catalogue advertises `fast` or its
+`priority` alias. The Responses proxy preserves the selected model, reasoning
+effort and supported speed tier with `store:false`, streaming and client-owned
+history. The model request has a 30-minute transport deadline; disconnect and
+user Stop can abort earlier. This deadline is separate from managed shell process
+lifetimes and optional generation/tool budgets.
+
+Run records retain their admitted model settings. Temporary subagents inherit
+their parent's selection by default and may choose another supported model,
+reasoning effort or Fast setting at spawn; existing child selections remain
+independent of later bot configuration edits. `list_models` exposes the same
+account options to the model.
 
 Shared types live in @botspace/contracts. Runtime implementer owns its concrete
 types and exports createPiRuntime({owner,ai,model,instructions,tools,...}) or agrees
@@ -447,7 +496,8 @@ host-owned; delegation does not copy credentials or another bot's workspace.
 bots. The owner may change it through bot configuration. Only `create_bot` requires
 this permission; messaging existing bots and temporary subagents do not. Creation
 checks the current registry permission and persists the new bot and operation
-receipt atomically. A bot-created named agent inherits the source model, records
+receipt atomically. A bot-created named agent inherits the source model, reasoning
+effort and Fast setting, records
 `createdByBotId`, starts with `computerApprovalMode:"ask"` and has
 `allowNamedAgents:false`. It does not inherit standing computer authorization.
 Replaying a completed creation returns its existing identity even after permission
@@ -564,6 +614,17 @@ readiness, base path and stable URL. See [workspace-apps.md](workspace-apps.md).
 `publish_app`, `list_apps` and `remove_app` are engine-independent host tools. The
 model explicitly probes readiness via list_apps; console polling reads stored state
 and does not wake or keep a machine alive.
+Publishing registers and probes a server; it does not install dependencies or
+start that server. The startup skill directs the agent to inspect the repository,
+use the returned base path, start one managed process and poll its existing
+process identity while checking readiness.
+
+Unavailable apps may include `readiness:{code,httpStatus?,message}`. Codes are
+`http_error`, `computer_unavailable`, `timeout` or `connection_failed`; messages
+are fixed troubleshooting hints, never raw server output. A five-second root probe
+requires HTTP 2xx/3xx. HTTP 404 is unavailable and points to base-path/router
+configuration; successful or missing assets cannot overwrite root readiness.
+Success clears the previous readiness error.
 
 - GET /v1/bots/:id/apps returns {apps}.
 - POST /v1/bots/:id/apps/refresh explicitly probes existing apps without starting a VM.
@@ -628,3 +689,15 @@ live observation/control from model screenshots and from the Files explorer.
 The live connection uses standard noVNC/RFB. The agent runtime remains separately
 replaceable: Pi, another harness and a future local computer can use the same
 product-level concepts without adopting CUA as the cloud compute provider.
+
+## Context compaction and durable memory
+
+Owner-authenticated bot routes expose `GET /context`, `POST /context/compact`
+`{operationId,instructions?}`, and `GET` / `PUT /memory` `{content,revision}`.
+Manual compaction returns 202 with a durable receipt; automatic compaction uses
+Pi's threshold and overflow policies. Both retain the complete archived history.
+Memory updates use revisions to reject concurrent overwrites. Each child has
+isolated editable notes and read-only inherited bot notes. Native `memory_read`,
+`memory_update` and `recall_history` tools remain scoped to that conversation.
+See [context and memory](context-memory.md) for receipt states, limits, recovery
+and the Hermes/OpenClaw research informing this behavior.

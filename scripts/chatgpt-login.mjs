@@ -71,7 +71,7 @@ export async function cloudRequest(config, { method = 'GET', suffix = '', body, 
       chatpass_v2_scope_not_authorized: 'The ChatGPT authorization does not permit this request. Sign in again and enable plan use.',
       chatpass_v2_invalid_authorization_context: 'The ChatGPT authorization context does not permit this request.',
       chatgpt_insufficient_scope: 'ChatGPT plan use was not granted. Authorize Timber to use your ChatGPT plan.',
-      chatgpt_model_unavailable: 'gpt-6.1-sol is not available to this ChatGPT account or workspace.',
+      chatgpt_model_unavailable: 'The selected model is not available to this ChatGPT account or workspace.',
       chatgpt_rate_limited: 'ChatGPT usage is currently limited. Review your plan usage and try verification later.',
       chatgpt_identity_mismatch: 'The returned ChatGPT account differs from the saved registration. The connection was not replaced.',
     };
@@ -283,10 +283,10 @@ export async function runLogin({ noOpen = false } = {}) {
     if (!imported.connected) fail('Timber did not confirm the imported connection. Check npm run chatgpt:status before signing in again.');
     console.log('ChatGPT connected. The cloud backend now owns token refresh; no tokens were saved on this computer.');
     checkCancelled();
-    console.log(`Verifying access with one small ${MODEL} request…`);
+    console.log('Verifying access with one small request to an available account model…');
     const verified = await cloudRequest(config, { method: 'POST', suffix: '/verify', body: {} });
-    if (verified.ok !== true || verified.model !== MODEL) fail(`ChatGPT is connected, but access to ${MODEL} was not confirmed.`);
-    console.log(`Verified: ${MODEL} completed a real request using the connected ChatGPT plan.`);
+    if (verified.ok !== true || typeof verified.model !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(verified.model)) fail('ChatGPT is connected, but model access was not confirmed.');
+    console.log(`Verified: ${verified.model} completed a real request using the connected ChatGPT plan.`);
   } finally {
     listener.stop(); process.removeListener('SIGINT', cancel); process.removeListener('SIGTERM', cancel);
     if (tokens) for (const key of Object.keys(tokens)) delete tokens[key];
@@ -296,7 +296,7 @@ export async function runLogin({ noOpen = false } = {}) {
 async function main() {
   const args = new Set(process.argv.slice(2));
   if (args.has('--help')) {
-    console.log('Run locally on the computer with your browser:\n  npm run access:setup\n  npm run chatgpt:login [-- --no-open]\n\nUses official ChatGPT authorization with a temporary 127.0.0.1 callback. Transfers credentials securely to your configured Timber backend, which owns refresh. Saves only registration metadata locally. Performs one small gpt-6.1-sol verification request after connecting.');
+    console.log('Run locally on the computer with your browser:\n  npm run access:setup\n  npm run chatgpt:login [-- --no-open]\n\nUses official ChatGPT authorization with a temporary 127.0.0.1 callback. Transfers credentials securely to your configured Timber backend, which owns refresh. Saves only registration metadata locally. Performs one small verification request using an available account model after connecting.');
     return;
   }
   for (const arg of args) if (arg !== '--no-open') fail('Unknown option. Use npm run chatgpt:login -- --help.');

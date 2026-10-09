@@ -119,12 +119,14 @@ product interface. Packages and environment variables retain the internal
 ## Bots and subagents
 
 Ask a bot to delegate work to temporary subagents. Pi creates each with a separate
-conversation and a concrete task. They share the bot's computer, files, model and
+conversation and a concrete task. They share the bot's computer, files and
 computer permission, so agents working on the same project should coordinate file
 ownership. The **Agents** panel lists their status and parent relationships. Open
 an agent to read its public conversation, send a follow-up or stop it. Completed
 and failed agents can receive follow-ups; a cancelled agent stays cancelled.
-Private model reasoning is never displayed.
+Private model reasoning is never displayed. The composer selects a model, reasoning
+effort and Fast mode from the connected account catalogue. Subagents inherit these
+settings or explicitly choose another available model; avatar badges identify it.
 
 Agents can exchange messages, contact their parent and wait for another agent's
 result. There can be eight active temporary agents per bot, nested up to three
@@ -146,10 +148,20 @@ eight pending deliveries per source bot.
 
 Enable **Allow creating named agents** in a bot's configuration to let that bot create
 persistent named bots. The setting is off by default. A newly created bot uses
-the creator's model, starts with **Ask for each action**, and has named-agent
+the creator's model, reasoning and Fast settings, starts with **Ask for each action**, and has named-agent
 creation disabled. Temporary subagents and messages to existing bots do not need
 this setting. Deleting a creator does not delete the named bots it previously
 created; cancelling or deleting a source stops its outstanding delegated tasks.
+
+## Context and memory
+
+Open **Context** beside the composer to compact older model context or edit the
+bot's durable notes. Pi also compacts automatically near the selected model's
+context limit. Compaction preserves the full conversation archive and recent
+messages; it does not delete your history. Agents can search older public messages
+with `recall_history` and retain useful preferences and project facts with
+`memory_read` / `memory_update`. Child notes stay separate from the parent and
+siblings. See [context and memory](docs/context-memory.md) for recovery and limits.
 
 ## Task execution limits
 
@@ -171,8 +183,8 @@ restarts, including when a cap is enabled later; replaying an already recorded
 logical operation does not count it again. There is no hidden 100/200 clamp.
 Budget exhaustion does not automatically restart or replay the task.
 
-Inference retains two retries for transient failures, a 120-second model stream
-timeout and the existing response-size cap. Shell commands have no execution
+Inference retains two retries for transient failures, a 30-minute maximum model stream
+timeout (to accommodate longer reasoning) and the existing response-size cap. Shell commands have no execution
 deadline unless one is explicitly requested. `exec` can return a running process;
 `exec_poll` observes it without restarting it, and `exec_cancel` terminates its
 process group. The console's Stop action also cancels the task's managed processes.
@@ -325,7 +337,7 @@ npm run chatgpt:status -- --verify
 The login opens OpenAI's consent screen and requests permission to use your plan.
 It uses PKCE, a one-time state and nonce, and verifies the signed OpenAI identity.
 After consent, the CLI transfers the session directly to your authenticated
-Timber backend and tests a real `gpt-6.1-sol` response. A successful OAuth login
+Timber backend and tests a real response using an available account model. A successful OAuth login
 alone does not mark model access as verified. No password or token is pasted into
 chat. The CLI retains only registration metadata, not OAuth tokens.
 
@@ -339,7 +351,10 @@ the console tells you to revoke access in ChatGPT settings.
 The subscription allowance is shared and limited. Exhaustion, unsupported access
 or a revoked session stops the run with an explicit error; Timber does not switch
 to API billing or another model. Existing bots retain their model selection;
-new bots default to `gpt-6.1-sol`. Explicit `@cf/...` model IDs remain available
+new bots use the configured default (`gpt-6.1-sol` unless changed). The model
+picker lists the connected account’s actual available models. Fast uses the
+provider’s Fast/Priority tier and may consume allowance faster; reasoning levels
+are model-specific. Explicit `@cf/...` model IDs remain available
 through the API and smoke command for deliberate Workers AI usage.
 
 This is a personal, self-hosted integration using the documented

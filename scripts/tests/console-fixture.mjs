@@ -29,6 +29,7 @@ export async function createConsoleFixture({port = 0} = {}) {
   await readFile(resolve(consoleRoot, 'index.html'));
   const date = '2026-10-05T10:00:00.000Z';
   const state = {
+    modelCatalog:{connected:true,defaultModel:'gpt-6.1-sol',models:[{id:'gpt-6.1-sol',name:'GPT-6.1 Sol',provider:'openai',reasoningEfforts:['low','medium','high'],defaultReasoningEffort:'medium',supportsFast:true}]},modelsError:null,
     sessions: new Set(), sessionCalls: [], requestAuth: [],
     githubConnected: false, connectionGate: null, appOpenGate: null, appRefreshStates: new Map(), appRefreshGate: null, previewCalls: [], rejectAuth: false, actionGate: null, readsGate: null, messageGates: new Map(), messageResponseGates: new Map(), messageOperations: new Map(), patchGate: null, patchError: null, deleteGates: new Map(), deleteError: null, deletingBots: new Set(), deletedBots: new Set(), approvalGate: null, approvalError: null, approvalStatus: null, computerStates: new Map(), computerStatusGate: null, failures: [], actions: [], calls: [], streams: new Set(), events: [],
     bots: [
@@ -99,9 +100,10 @@ export async function createConsoleFixture({port = 0} = {}) {
       if (path === '/v1/connections/github/connect' && request.method === 'POST') return json({url: '/github-connect', connected: false});
       if (path === '/v1/connections/github') {if (request.method === 'DELETE') state.githubConnected = false; return json({connected: state.githubConnected});}
       if (path === '/v1/connections/chatgpt') return json({connected: true, status: 'verified', model: 'gpt-6.1-sol', verifiedAt: date});
+      if(path==='/v1/models')return state.modelsError?json({error:state.modelsError},503):json(state.modelCatalog);
       if (path === '/v1/bots') {
         if (request.method === 'GET') return json({bots: state.bots.filter(bot => !state.deletingBots.has(bot.id))});
-        const bot = {id: randomUUID(), ...body, runtime: 'pi', createdAt: date, updatedAt: date}; state.bots.unshift(bot); state.messages.set(bot.id, []); state.runs.set(bot.id, []); state.approvals.set(bot.id, []); state.connections.set(bot.id, []); state.apps.set(bot.id, []); return json({bot}, 201);
+        const bot = {id: randomUUID(),model:state.modelCatalog.defaultModel, ...body, runtime: 'pi', createdAt: date, updatedAt: date}; state.bots.unshift(bot); state.messages.set(bot.id, []); state.runs.set(bot.id, []); state.approvals.set(bot.id, []); state.connections.set(bot.id, []); state.apps.set(bot.id, []); return json({bot}, 201);
       }
       const match = /^\/v1\/bots\/([^/]+)(.*)$/.exec(path); if (!match) return json({}, 404);
       const [, id, tail] = match, bot = state.bots.find(bot => bot.id === id);
@@ -124,7 +126,7 @@ export async function createConsoleFixture({port = 0} = {}) {
         const lastMessage=(state.messages.get(id)||[]).filter(message=>['user','assistant'].includes(message.role)).at(-1);
         return json({summary:{status:['waiting_approval','waiting_connection','running','queued'].find(status=>activeRuns.some(run=>run.status===status))||'ready',activeRuns:activeRuns.length,activeAgents:(state.agents.get(id)||[]).filter(agent=>active.has(agent.status)).length,...(lastMessage?{lastMessage:{text:lastMessage.text.slice(0,240),createdAt:lastMessage.createdAt}}:{})}});
       }
-      if (!tail) {if (request.method === 'PATCH') {if (state.patchGate) await state.patchGate; if (state.patchError) return json({error: state.patchError}, state.patchError.status || 503); Object.assign(bot, body);} return json({bot});}
+      if (!tail) {if (request.method === 'PATCH') {if (state.patchGate) await state.patchGate; if (state.patchError) return json({error: state.patchError}, state.patchError.status || 503);if(body.model&&body.model!==bot.model)delete bot.reasoningEffort;Object.assign(bot, body,{updatedAt:new Date().toISOString()});} return json({bot});}
       if (tail === '/messages') {
         if (request.method === 'GET') {const snapshot = structuredClone(state.messages.get(id)); if (state.readsGate) await state.readsGate; return json({messages: snapshot});}
         if (state.messageGates.has(id)) await state.messageGates.get(id);
@@ -134,7 +136,7 @@ export async function createConsoleFixture({port = 0} = {}) {
           if (previous.text !== body.text || JSON.stringify(previous.mentions || []) !== JSON.stringify(body.mentions || [])) return json({error: {code: 'operation_conflict', message: 'This operation ID belongs to another message.'}}, 409);
           return json({run: previous.run}, 202);
         }
-        const run = {id: randomUUID(), botId: id, operationId: body.operationId, status: 'queued', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()};
+        const run = {id: randomUUID(), botId: id, operationId: body.operationId,model:bot.model,reasoningEffort:bot.reasoningEffort,fast:bot.fast, status: 'queued', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()};
         state.messageOperations.set(key, {run, text: body.text, mentions: body.mentions}); state.runs.get(id).unshift(run); state.messages.get(id).push({id: randomUUID(), botId: id, runId: run.id, role: 'user', text: body.text, mentions: body.mentions, createdAt: run.createdAt});
         if (state.messageResponseGates.has(id)) await state.messageResponseGates.get(id);
         return json({run}, 202);

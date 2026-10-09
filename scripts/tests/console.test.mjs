@@ -721,6 +721,27 @@ test('an accepted queued message can retry admission after reconnect without dup
   });
 });
 
+for (const status of ['failed','queued']) test(`a ${status} model admission failure retries the original message after settings are corrected`,async()=>{
+  await withPage(async({page,login,state})=>{
+    state.modelCatalog.models.push({id:'account-fixed',name:'Account fixed',provider:'openai',reasoningEfforts:[],supportsFast:false});
+    const stamp=new Date().toISOString(),text=status==='failed'?'':'@Linus Review this image',mentions=text?[BOT_B]:[],attachment={artifactId:'saved-model-input',mimeType:'image/png',size:68};
+    const run={id:`model-admission-${status}`,botId:BOT_A,operationId:`model-admission-operation-${status}`,status:'running',model:'gpt-6.1-sol',createdAt:stamp,updatedAt:stamp};
+    const message={id:`model-admission-message-${status}`,botId:BOT_A,runId:run.id,role:'user',text,mentions,attachments:[attachment],createdAt:stamp};
+    state.runs.set(BOT_A,[run]);state.messages.set(BOT_A,[message]);state.messageOperations.set(`${BOT_A}:${run.operationId}`,{text,mentions,run});
+    await login();Object.assign(run,{status,admissionRetryable:true,error:'Choose an available model, then retry this message.',updatedAt:new Date(Date.now()+1000).toISOString()});state.emit(BOT_A,'run.updated',{run},run.id);
+    const retry=page.getByRole('button',{name:'Retry sending',exact:true});await retry.waitFor();await page.reload();await retry.waitFor();
+    assert.equal(sentMessages(state,BOT_A).length,0,'restoring a configuration failure does not resubmit automatically');assert.equal(await page.getByRole('button',{name:'Continue',exact:true}).count(),0);
+    await page.locator('#message').fill('Keep my next draft');await page.getByRole('button',{name:/^Model settings:/}).click();
+    const settings=page.getByRole('dialog',{name:'Model settings',exact:true});await settings.getByRole('combobox',{name:'Model',exact:true}).selectOption('account-fixed');await page.getByRole('button',{name:'Model settings: Account fixed',exact:true}).waitFor();await settings.getByRole('button',{name:'Close model settings'}).click();
+    await page.route(`**/v1/bots/${BOT_A}/messages`,route=>{if(route.request().method()==='POST'){Object.assign(run,{status:'running',admissionRetryable:false,model:state.bots.find(bot=>bot.id===BOT_A).model,updatedAt:new Date(Date.now()+2000).toISOString()});delete run.error;}return route.continue();});
+    await retry.click();await retry.waitFor({state:'hidden'});
+    assert.deepEqual(sentMessages(state,BOT_A).map(call=>call.body),[{text,operationId:run.operationId,attachments:[attachment.artifactId],...(mentions.length?{mentions}:{})}]);
+    assert.equal(run.model,'account-fixed');assert.equal(state.runs.get(BOT_A).length,1);assert.equal(state.messages.get(BOT_A).length,1);assert.equal(await page.locator(`[data-message-id="${message.id}"]`).count(),1);assert.equal(await page.locator('#message').inputValue(),'Keep my next draft');
+    Object.assign(run,{status:'failed',admissionRetryable:false,error:'The model could not complete this request.',updatedAt:new Date(Date.now()+3000).toISOString()});state.emit(BOT_A,'run.updated',{run},run.id);
+    await page.getByRole('button',{name:'Continue',exact:true}).waitFor();assert.equal(await retry.count(),0,'a failure after admission cannot replay the original request');
+  });
+});
+
 test('runtime admission can be retried from a new accepted receipt before history finishes syncing', async () => {
   await withPage(async ({page, login, state}) => {
     await login(); let refresh, first = true;
@@ -2367,5 +2388,81 @@ test('subagent activity preserves completed effects and clears recovered checkpo
     assert.equal(await activity.locator('[data-status="completed"]').count(),2);
     await page.reload();await page.locator(`[data-agent-detail="${agent.id}"]`).waitFor();await activity.locator('summary').click();
     assert.equal(await activity.locator('[data-status="completed"]').count(),2);assert.equal(await activity.locator('.error,.timber-save-warning').count(),0);
+  });
+});
+
+for(const viewport of [{width:1440,height:1050},{width:390,height:844}])test(`promptbox model settings use account capabilities and preserve drafts at ${viewport.width}px`,async()=>{
+  await withPage(async({page,state,login})=>{
+    state.modelCatalog.models.push({id:'account-reviewer',name:'Account reviewer',provider:'openai',reasoningEfforts:['high','xhigh'],defaultReasoningEffort:'high',supportsFast:true},{id:'account-basic',name:'Account basic',provider:'openai',reasoningEfforts:[],supportsFast:false});
+    await page.route('**/attachments/*',route=>route.fulfill({status:200,contentType:'application/json',body:'{}'}));
+    await login();await page.locator('#message').fill('Keep this draft and its image.');
+    const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=','base64');
+    await page.locator('input[type=file][accept="image/png,image/jpeg"]').setInputFiles({name:'model-review.png',mimeType:'image/png',buffer:png});
+    const color=await page.locator('#selected-avatar').getAttribute('data-agent-color');
+    const trigger=page.getByRole('button',{name:/^Model settings:/});await trigger.click();
+    const settings=page.getByRole('dialog',{name:'Model settings',exact:true}),model=settings.getByRole('combobox',{name:'Model',exact:true});
+    await model.selectOption('account-reviewer');await trigger.filter({hasText:'Account reviewer'}).waitFor();
+    assert.equal(await settings.getByRole('combobox',{name:'Reasoning effort'}).inputValue(),'high','a new model uses its declared default rather than a hardcoded low setting');
+    await settings.getByRole('switch',{name:'Fast mode'}).click();await trigger.locator('[aria-label="Fast mode"]').waitFor();assert.equal(await settings.getByRole('switch',{name:'Fast mode'}).isChecked(),true,'Fast is displayed after the server acknowledges the setting');
+    await settings.getByRole('combobox',{name:'Reasoning effort'}).selectOption('xhigh');await trigger.filter({hasText:'Extra high'}).waitFor();
+    assert.deepEqual(state.calls.filter(call=>call.method==='PATCH').map(call=>Object.keys(call.body).sort()),Array.from({length:3},()=>['fast','model','reasoningEffort']),'model changes never resend unrelated bot fields');
+    assert.equal(await page.locator('#selected-avatar').getAttribute('data-agent-color'),color,'model identity does not replace the stable bot color');
+    assert.equal(await page.locator('#selected-avatar .timber-model-badge').getAttribute('data-model'),'account-reviewer');
+    assert.equal(await page.locator('#message').inputValue(),'Keep this draft and its image.');assert.equal(await page.locator('.timber-image-attachments img').count(),1);
+    if(process.env.TIMBER_CAPTURE_UI){await page.screenshot({path:`/tmp/timber-model-settings-${viewport.width}.png`,animations:'disabled'});await page.emulateMedia({colorScheme:'dark'});await page.screenshot({path:`/tmp/timber-model-settings-${viewport.width}-dark.png`,animations:'disabled'});await page.emulateMedia({colorScheme:'light'});await settings.getByRole('button',{name:'Close model settings'}).click();await page.screenshot({path:`/tmp/timber-model-controls-${viewport.width}.png`,animations:'disabled'});await trigger.click();}
+    state.patchError={code:'settings_unavailable',message:'Model settings could not be saved.'};
+    await model.selectOption('account-basic');await settings.getByRole('alert').filter({hasText:'Model settings could not be saved.'}).waitFor();
+    assert.equal(await model.inputValue(),'account-reviewer');assert.equal(await page.locator('.timber-image-attachments img').count(),1);assert.equal(await page.locator('#message').inputValue(),'Keep this draft and its image.');
+    state.patchError=null;let release;state.patchGate=new Promise(resolve=>{release=resolve;});
+    try{await model.selectOption('account-basic');await settings.getByRole('status').filter({hasText:'Saving…'}).waitFor();assert.equal(await page.locator('#message-form [type=submit]').isDisabled(),true,'sending waits for a model change to be acknowledged');}finally{release();state.patchGate=null;}
+    await trigger.filter({hasText:'Account basic'}).waitFor();assert.equal(await settings.getByRole('switch',{name:'Fast mode'}).count(),0);assert.equal(await settings.getByRole('combobox',{name:'Reasoning effort'}).count(),0);
+    await settings.getByRole('button',{name:'Close model settings'}).click();await sendMessage(page);await page.locator('#message').filter({hasText:''}).waitFor();
+    await page.waitForFunction(()=>document.querySelector('#message').value==='');
+    const accepted=state.runs.get(BOT_A).find(run=>run.model==='account-basic');assert.ok(accepted);assert.equal(accepted.fast,false);assert.equal(accepted.reasoningEffort,undefined,'unsupported reasoning is cleared when choosing another model');
+    await page.reload();await trigger.filter({hasText:'Account basic'}).waitFor();assert.equal(await page.locator('#selected-avatar').getAttribute('data-agent-color'),color);
+    await openPanel(page,'runs');await page.locator(`[data-run-id="${accepted.id}"] [data-run-model="account-basic"]`).waitFor();
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+  },{viewport,...(viewport.width<760?{isMobile:true,hasTouch:true}:{})});
+});
+
+test('unavailable model catalogs keep the saved model readable and allow a deliberate retry',async()=>{
+  await withPage(async({page,state,login})=>{
+    state.modelsError={code:'catalog_unavailable',message:'The model catalog is temporarily unavailable.'};await login();
+    const trigger=page.getByRole('button',{name:/^Model settings:/});await trigger.click();
+    const settings=page.getByRole('dialog',{name:'Model settings',exact:true});await settings.getByRole('alert').filter({hasText:'temporarily unavailable'}).waitFor();
+    const model=settings.getByRole('combobox',{name:'Model',exact:true});assert.equal(await model.isDisabled(),true);assert.equal(await model.inputValue(),'gpt-6.1-sol');assert.equal(await model.locator('option').count(),1);assert.equal(await settings.getByRole('switch').count(),0);
+    state.modelsError=null;await settings.getByRole('button',{name:'Try again'}).click();await page.waitForFunction(()=>!document.querySelector('.timber-model-popover select').disabled);assert.equal(await model.locator('option').count(),1);
+    await page.keyboard.press('Escape');await settings.waitFor({state:'hidden'});assert.equal(await trigger.evaluate(node=>node===document.activeElement),true,'Escape restores keyboard focus to the settings control');
+  });
+});
+
+test('disconnecting ChatGPT immediately makes model controls read-only',async()=>{
+  await withPage(async({page,login})=>{
+    await page.route('**/v1/connections/chatgpt',route=>route.request().method()==='DELETE'?route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:false,status:'disconnected',revoked:true})}):route.continue());
+    await login();await page.locator('#settings-button').click();await page.locator('#disconnect-chatgpt').click();await page.locator('#chatgpt-status').filter({hasText:'Not connected'}).waitFor();await page.getByRole('button',{name:'Close settings',exact:true}).click();
+    await page.getByRole('button',{name:/^Model settings:/}).click();const settings=page.getByRole('dialog',{name:'Model settings',exact:true});await settings.getByText('Connect ChatGPT in Settings to choose a model.',{exact:true}).waitFor();
+    assert.equal(await settings.getByRole('combobox',{name:'Model',exact:true}).isDisabled(),true);assert.equal(await settings.getByRole('switch',{name:'Fast mode'}).count(),0);
+  });
+});
+
+test('ChatGPT verification shows the model confirmed by the account rather than a fixed default',async()=>{
+  await withPage(async({page,login})=>{
+    let verified=0;await page.route('**/v1/connections/chatgpt/verify',route=>{assert.equal(route.request().method(),'POST');verified++;return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({ok:true,model:'gpt-6-astra'})});});
+    await login();await page.locator('#settings-button').click();await page.locator('#verify-chatgpt').click();await page.locator('#chatgpt-verification').filter({hasText:'Verified: gpt-6-astra completed a real request.'}).waitFor();assert.equal(verified,1);assert.equal(await page.locator('#chatgpt-error').innerText(),'');
+  });
+});
+
+test('create and edit bot forms share the account model catalog and temporary agents show their own model',async()=>{
+  await withPage(async({page,state,login})=>{
+    state.modelCatalog.models.push({id:'account-reviewer',name:'Account reviewer',provider:'openai',reasoningEfforts:['high','xhigh'],defaultReasoningEffort:'high',supportsFast:true});
+    const stamp=new Date().toISOString(),agent={id:'model-child',name:'Specialist',task:'Use the selected model for this review.',parentOperationId:'model-parent',operationId:'model-child-op',status:'completed',model:'account-reviewer',reasoningEffort:'xhigh',fast:true,createdAt:stamp,updatedAt:stamp};
+    state.agents.set(BOT_A,[agent]);await login();
+    const pill=page.locator(`[data-agent-created="${agent.id}"]`);await pill.locator('[data-model="account-reviewer"]').waitFor();await pill.getByRole('button',{name:'Open Specialist conversation',exact:true}).click();
+    await page.locator(`[data-agent-model="account-reviewer"]`).filter({hasText:'xhigh reasoning · Fast'}).waitFor();await openPanel(page,'conversation');
+    await openBotEditor(page);await page.locator('#edit-model').selectOption('account-reviewer');assert.equal(await page.locator('#edit-reasoning').inputValue(),'high');await page.locator('#edit-fast').check();await page.locator('#edit-form [type=submit]').click();await page.locator('#edit-dialog').waitFor({state:'hidden'});
+    assert.equal(state.bots.find(bot=>bot.id===BOT_A).model,'account-reviewer');assert.equal(state.bots.find(bot=>bot.id===BOT_A).fast,true);
+    await page.locator('#new-bot').click();await page.locator('#bot-name').fill('Model-aware helper');await page.locator('#bot-model').selectOption('account-reviewer');await page.locator('#bot-reasoning').selectOption('xhigh');await page.locator('#bot-fast').check();await page.locator('#create-form [type=submit]').click();await page.locator('#bot-dialog').waitFor({state:'hidden'});
+    const created=state.bots.find(bot=>bot.name==='Model-aware helper');assert.ok(created);assert.equal(created.model,'account-reviewer');assert.equal(created.reasoningEffort,'xhigh');assert.equal(created.fast,true);
+    await page.reload();await page.locator('#selected-avatar .timber-model-badge[data-model="account-reviewer"]').waitFor();
   });
 });

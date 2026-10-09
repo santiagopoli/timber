@@ -18,6 +18,12 @@ let revocations: URLSearchParams[];
 let inference: () => Response;
 let refreshError: string | undefined;
 let revocationFails: boolean;
+let modelCalls: string[];
+let catalogResponse:()=>Response|Promise<Response>;
+const defaultModels={models:[
+  {slug:"gpt-6.1-sol",display_name:"GPT-6.1 Sol",visibility:"list",supported_reasoning_levels:[{effort:"low"},{effort:"medium"},{effort:"high"},{effort:"max"}],default_reasoning_level:"medium",service_tiers:[{id:"fast"}],input_modalities:["text","image"]},
+  {slug:"gpt-6-luna",display_name:"GPT-6 Luna",visibility:"list",supported_reasoning_levels:[],service_tiers:[]},
+]};
 
 function completedStream() {
   return new Response('event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n', {headers: {"content-type": "text/event-stream"}});
@@ -63,7 +69,7 @@ beforeAll(async () => {
   jwk = {...await exportJWK(keys.publicKey), kid: "test-key", alg: "ES256", use: "sig"};
 });
 beforeEach(() => {
-  refreshCalls = []; responseCalls = []; revocations = []; refreshedTokens = {};
+  refreshCalls = []; responseCalls = []; revocations = []; refreshedTokens = {};modelCalls=[];catalogResponse=()=>Response.json(defaultModels);
   refreshError = undefined; revocationFails = false; inference = completedStream;
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
@@ -76,6 +82,7 @@ beforeEach(() => {
       refreshCalls.push(params.get("refresh_token")!);
       return refreshError ? Response.json({error: refreshError}, {status: 400}) : Response.json(refreshedTokens);
     }
+    if(url===`${RESOURCE}/models`) {modelCalls.push(new Headers(init?.headers).get("authorization")??"");return catalogResponse();}
     if (url === `${RESOURCE}/responses`) {
       responseCalls.push({authorization: new Headers(init?.headers).get("authorization") ?? "", payload: JSON.parse(String(init?.body)), signal: init?.signal ?? undefined});
       return inference();
@@ -334,5 +341,121 @@ describe("ChatGPT refresh ownership, billing route and verification", () => {
     const response = await verification;
     expect(response.status).toBe(409); await response.text();
     expect(await status(stub)).toMatchObject({connected: true, status: "connected_unverified"});
+  });
+});
+
+describe('account model catalogues and model settings',()=>{
+  it('requires owner authentication for model discovery and returns no invented models when disconnected',async()=>{
+    expect((await exports.default.fetch('https://timber.test/v1/models')).status).toBe(401);
+    const response=await newStub().fetch('https://chatgpt/models');
+    expect(await response.json()).toMatchObject({models:[],connected:false});
+    expect(modelCalls).toHaveLength(0);
+  });
+
+  it('uses the account token, preserves display ordering and caches only the current connection across eviction',async()=>{
+    const stub=newStub();
+    const credential=await credentials(String((await status(stub)).hostId));
+    await connect(stub,credential);
+    catalogResponse=()=>Response.json({models:[defaultModels.models[1],{slug:'hidden-internal',display_name:'Hidden',visibility:'hide'},defaultModels.models[0]]});
+    const [a,b]=await Promise.all([stub.fetch('https://chatgpt/models'),stub.fetch('https://chatgpt/models')]);
+    const catalog=await a.json<{models:{id:string}[];defaultModel:string}>();await b.text();
+    expect(catalog.models.map(model=>model.id)).toEqual(['gpt-6-luna','gpt-6.1-sol']);
+    expect(catalog.defaultModel).toBe('gpt-6-luna');
+    expect(modelCalls).toEqual([`Bearer ${credential.access_token}`]);
+    await abortAllDurableObjects();
+    const recovered=bindings.CHATGPT.get(stub.id);
+    expect((await (await recovered.fetch('https://chatgpt/models')).json<{models:unknown[]}>()).models).toHaveLength(2);
+    expect(modelCalls).toHaveLength(1);
+    await (await recovered.fetch('https://chatgpt/',{method:'DELETE'})).text();
+    expect((await stored(recovered)).modelCatalog).toBeUndefined();
+    expect((await (await recovered.fetch('https://chatgpt/models')).json<{models:unknown[]}>()).models).toEqual([]);
+    await connect(recovered);
+    await (await recovered.fetch('https://chatgpt/models')).text();
+    expect(modelCalls).toHaveLength(2);
+  });
+
+  it('rejects a stale catalogue from a disconnected account and never saves or displays it for its replacement',async()=>{
+    const stub=newStub();await connect(stub);
+    let release!:(response:Response)=>void;
+    catalogResponse=()=>new Promise<Response>(resolve=>{release=resolve;});
+    const pending=stub.fetch('https://chatgpt/models');
+    await expect.poll(()=>modelCalls.length).toBe(1);
+    await (await stub.fetch('https://chatgpt/',{method:'DELETE'})).text();
+    await connect(stub,await credentials(String((await status(stub)).hostId),{identity:{sub:'replacement'},access:{sub:'replacement'}}));
+    await runInDurableObject(stub,()=>release(Response.json({models:[{slug:'old-account-private',display_name:'Old account',visibility:'list'}]})));
+    const result=await (await pending).json<{models:unknown[];error:string}>();
+    expect(result.models).toEqual([]);expect(result.error).toContain('connection changed');
+    expect((await stored(stub)).modelCatalog).toBeUndefined();
+    catalogResponse=()=>Response.json(defaultModels);
+    const fresh=await (await stub.fetch('https://chatgpt/models')).json();
+    expect(JSON.stringify(fresh)).not.toContain('old-account-private');
+  });
+
+  it('fails closed on catalogue errors without returning provider metadata or using a fallback',async()=>{
+    const stub=newStub();await connect(stub);
+    catalogResponse=()=>Response.json({private:'secret model provider details'},{status:503});
+    const result=await (await stub.fetch('https://chatgpt/models')).json<{connected:boolean;models:unknown[];error:string}>();
+    expect(result.connected).toBe(true);expect(result.models).toEqual([]);expect(result.error).toContain('unavailable');
+    expect(JSON.stringify(result)).not.toContain('secret model provider');
+    const response=await infer(stub);expect(response.status).toBe(503);await response.text();
+    expect(responseCalls).toHaveLength(0);
+  });
+
+  it('cannot send an already validated request under a replacement account',async()=>{
+    const stub=newStub();await connect(stub);
+    let validated=false,resume!:()=>void;
+    await runInDurableObject(stub,instance=>{
+      const auth=instance as unknown as {validateSettings:(input:unknown)=>Promise<unknown>};
+      const original=auth.validateSettings.bind(auth);
+      auth.validateSettings=async input=>{
+        const result=await original(input);validated=true;
+        await new Promise<void>(resolve=>{resume=resolve;});return result;
+      };
+    });
+    const pending=infer(stub);
+    await expect.poll(()=>validated).toBe(true);
+    await (await stub.fetch('https://chatgpt/',{method:'DELETE'})).text();
+    await connect(stub,await credentials(String((await status(stub)).hostId),{identity:{sub:'new-inference-account'},access:{sub:'new-inference-account'}}));
+    await runInDurableObject(stub,()=>resume());
+    const response=await pending;expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({error:{code:'chatgpt_connection_changed'}});
+    expect(responseCalls).toHaveLength(0);
+  });
+
+  it('forwards the selected model, reasoning and supported Fast mode instead of forcing low',async()=>{
+    const stub=newStub();await connect(stub);
+    const selected=await infer(stub,{reasoning:{effort:'max',summary:'auto'},service_tier:'priority'});
+    expect(selected.status).toBe(200);await selected.text();
+    expect(responseCalls[0].payload).toMatchObject({model:'gpt-6.1-sol',reasoning:{effort:'max'},service_tier:'priority'});
+    const other=await infer(stub,{model:'gpt-6-luna'});expect(other.status).toBe(200);await other.text();
+    expect(responseCalls[1].payload.model).toBe('gpt-6-luna');expect(responseCalls[1].payload).not.toHaveProperty('reasoning');
+    const automatic=await infer(stub);await automatic.text();
+    expect(responseCalls[2].payload.reasoning).toMatchObject({effort:'medium'});
+    for(const extra of [{reasoning:{effort:'ultra'}},{model:'gpt-6-luna',reasoning:{effort:'low'}},{model:'gpt-6-luna',service_tier:'fast'},{service_tier:'flex'}]) {
+      const response=await infer(stub,extra);expect(response.status).toBe(400);await response.text();
+    }
+    expect(responseCalls).toHaveLength(3);
+  });
+
+  it('validates and persists bot model changes while clearing incompatible settings and preserving unrelated edits',async()=>{
+    const stub=bindings.CHATGPT.get(bindings.CHATGPT.idFromName('owner'));
+    await connect(stub);
+    const api=(path:string,method='GET',body?:unknown)=>exports.default.fetch(`https://timber.test${path}`,{method,headers:{authorization:`Bearer ${API_TOKEN}`,'content-type':'application/json'},...(body?{body:JSON.stringify(body)}:{})});
+    try {
+      const models=await api('/v1/models');expect(models.status).toBe(200);
+      expect((await models.json<{models:unknown[]}>()).models).toHaveLength(2);
+      const creation=await api('/v1/bots','POST',{name:'Model selection',model:'gpt-6.1-sol',reasoningEffort:'max',fast:true});
+      expect(creation.status).toBe(201);
+      const {bot}=await creation.json<{bot:{id:string}}>();
+      const url=`/v1/bots/${bot.id}`;
+      const invalid=await api(url,'PATCH',{reasoningEffort:'ultra'});expect(invalid.status).toBe(400);await invalid.text();
+      const changed=await api(url,'PATCH',{model:'gpt-6-luna',fast:false});
+      expect(changed.status).toBe(200);const value=await changed.json<{bot:Record<string,unknown>}>();
+      expect(value.bot.model).toBe('gpt-6-luna');expect(value.bot.fast).toBe(false);expect(value.bot).not.toHaveProperty('reasoningEffort');
+      const responses=await Promise.all([api(url,'PATCH',{name:'Renamed'}),api(url,'PATCH',{model:'gpt-6.1-sol',reasoningEffort:'high'})]);
+      for(const response of responses){expect(response.status).toBe(200);await response.text();}
+      await abortAllDurableObjects();
+      expect((await (await api(url)).json<{bot:unknown}>()).bot).toMatchObject({name:'Renamed',model:'gpt-6.1-sol',reasoningEffort:'high',fast:false});
+    } finally {await (await bindings.CHATGPT.get(stub.id).fetch('https://chatgpt/',{method:'DELETE'})).text();}
   });
 });

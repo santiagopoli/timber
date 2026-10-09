@@ -1,3 +1,4 @@
+import type {ModelSettings} from '@botspace/contracts';
 import { DurableObject } from 'cloudflare:workers';
 import { createPiRuntime, DEFAULT_MODEL, type RuntimeApprovalContext } from '../src/index.js';
 import { responsesFixture } from './responses-fixture.js';
@@ -30,7 +31,10 @@ export class HarnessProbe extends DurableObject {
       owner: this, storage: ctx.storage, defaultModel: CF_MODEL,
       maxGenerations: JSON.parse(this.setting('maxGenerations') ?? 'null'),
       maxToolCalls: JSON.parse(this.setting('maxToolCalls') ?? 'null'),
-      chatgpt: { fetch: async request => {
+      chatgpt: { models:async()=>({connected:true,defaultModel:DEFAULT_MODEL,models:[
+        {id:DEFAULT_MODEL,name:'Sol fixture',provider:'openai',reasoningEfforts:['low','medium','high'],defaultReasoningEffort:'medium',supportsFast:true,fastServiceTier:'fast',contextWindow:1_050_000,inputModalities:['text','image']},
+        {id:'gpt-6-astra',name:'Astra fixture',provider:'openai',reasoningEfforts:['high','ultra'],defaultReasoningEffort:'high',supportsFast:true,fastServiceTier:'priority',contextWindow:128_000,inputModalities:['text','image']},
+      ]}), fetch: async request => {
         const input = await request.json<{ input: Record<string, unknown>[] }>();
         const call = ctx.storage.sql.exec<{id:number}>('INSERT INTO calls(input) VALUES(?) RETURNING id', JSON.stringify({ ...input, fixtureUrl: request.url, fixtureHeaders: Object.fromEntries(request.headers) })).one();
         if (input.input.filter(item => item.type === 'function_call_output').length === this.holdInferenceAfterToolCount) {
@@ -62,7 +66,7 @@ export class HarnessProbe extends DurableObject {
         let toolRequest = text.includes('request-exec') || text.includes('request-loop') || (isSubagent && !hasTool) || childTool || (!!existingAction && !hasTool) || (!!peer && !hasTool);
         const readCall = { index: 0, id: 'call-read-1', type: 'function', function: { name: 'read_file', arguments: '{"path":"/workspace/test.txt"}' } };
         const execCall = { index: text.includes('mixed') ? 1 : 0, id: 'call-fixture-1', type: 'function', function: { name: 'exec', arguments: '{"command":"echo fixture"}' } };
-        const spawnCall = { index: 0, id: text.includes('second-task') ? 'call-spawn-second' : 'call-spawn-1', type: 'function', function: { name: 'spawn_subagent', arguments: JSON.stringify({ name: text.includes('second-task') ? 'Second reader' : 'Reader', task: text.includes('nested') ? 'request-subagent nested' : text.includes('child-exec') ? 'child-fixture-exec' : 'child-fixture-read' }) } };
+        const spawnCall = { index: 0, id: text.includes('second-task') ? 'call-spawn-second' : 'call-spawn-1', type: 'function', function: { name: 'spawn_subagent', arguments: JSON.stringify({ ...(text.includes('choose-astra')?{model:'gpt-6-astra',reasoningEffort:'ultra',fast:true}:{}), name: text.includes('second-task') ? 'Second reader' : 'Reader', task: text.includes('nested') ? 'request-subagent nested' : text.includes('child-exec') ? 'child-fixture-exec' : 'child-fixture-read' }) } };
         let calls = isSubagent ? [spawnCall] : isChild ? text.includes('exec') ? [execCall] : [readCall] : text.includes('request-loop') ? [readCall] : text.includes('mixed') ? [readCall, execCall] : [execCall];
         if (text.includes('request-subagent-peers') && toolResults.length === 1) {
           const toolContent = toolResults[0]!.content;
@@ -168,9 +172,9 @@ export class HarnessProbe extends DurableObject {
       return Response.json({ ok: true });
     }
     if (path === '/submit') {
-      const input = await request.json<{ text: string; operationId: string; images?: {data:string;mimeType:string}[]; chatgpt?: boolean }>();
+      const input = await request.json<{ text: string; operationId: string; images?: {data:string;mimeType:string}[]; chatgpt?: boolean; modelSettings?:ModelSettings }>();
       if (input.chatgpt) this.ctx.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)', 'model', DEFAULT_MODEL);
-      return Response.json(await this.runtime.submit(input.text, { operationId: input.operationId, images:input.images }));
+      return Response.json(await this.runtime.submit(input.text, { operationId: input.operationId, images:input.images, modelSettings:input.modelSettings }));
     }
     if (path === '/wait') return Response.json(await this.runtime.wait(new URL(request.url).searchParams.get('id')!));
     if (path === '/inspect') return Response.json({

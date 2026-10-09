@@ -48,19 +48,24 @@ export function parseMessage(value:unknown):{text:string;operationId:string;ment
   return {text,operationId:operationId(data.operationId),...(ids?.length?{attachments:ids}:{}),...(data.mentions===undefined?{}:{mentions:data.mentions as string[]})};
 
 }
-export function parseBotInput(value:unknown,patch=false):{name?:string;instructions?:string;model?:string;computerApprovalMode?:ComputerApprovalMode;allowNamedAgents?:boolean} {
+export function parseBotInput(value:unknown,patch=false):{name?:string;instructions?:string;model?:string;reasoningEffort?:string;fast?:boolean;computerApprovalMode?:ComputerApprovalMode;allowNamedAgents?:boolean} {
   const data=object(value);
-  const output:{name?:string;instructions?:string;model?:string;computerApprovalMode?:ComputerApprovalMode;allowNamedAgents?:boolean}={};
+  if(data.runtime!==undefined && data.runtime!=="pi") invalid("runtime must be pi.");
+  const output:{name?:string;instructions?:string;model?:string;reasoningEffort?:string;fast?:boolean;computerApprovalMode?:ComputerApprovalMode;allowNamedAgents?:boolean}={};
   if(data.name!==undefined || !patch) {
     output.name=string(data.name,"name",80).trim();
     if(!output.name) invalid("name cannot be blank.");
   }
   if(data.instructions!==undefined) output.instructions=string(data.instructions,"instructions",16_000,0);
   if(data.model!==undefined) {
-    if(patch) invalid("model cannot be changed in this milestone.");
     output.model=string(data.model,"model",180);
-    if(output.model!=="gpt-6.1-sol" && !/^@cf\/[A-Za-z0-9._/-]+$/.test(output.model)) invalid("model must be gpt-6.1-sol or an explicit Workers AI @cf/ model identifier.");
+    if(!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(output.model) && !/^@cf\/[A-Za-z0-9._/-]+$/.test(output.model)) invalid("model must be an account model identifier or an explicit Workers AI @cf/ model identifier.");
   }
+  if(data.reasoningEffort!==undefined) {
+    output.reasoningEffort=string(data.reasoningEffort,"reasoningEffort",128);
+    if(!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(output.reasoningEffort)) invalid("reasoningEffort must be a supported reasoning option.");
+  }
+  if(data.fast!==undefined) {if(typeof data.fast!=="boolean")invalid("fast must be a boolean.");output.fast=data.fast;}
   if(data.computerApprovalMode!==undefined) {
     if(data.computerApprovalMode!=="ask" && data.computerApprovalMode!=="automatic") invalid("computerApprovalMode must be ask or automatic.");
     output.computerApprovalMode=data.computerApprovalMode;
@@ -69,7 +74,7 @@ export function parseBotInput(value:unknown,patch=false):{name?:string;instructi
     if(typeof data.allowNamedAgents!=="boolean") invalid("allowNamedAgents must be a boolean.");
     output.allowNamedAgents=data.allowNamedAgents;
   }
-  if(patch && !Object.keys(output).length) invalid("Provide name, instructions, computerApprovalMode or allowNamedAgents.");
+  if(patch && !Object.keys(output).length) invalid("Provide name, instructions, model, reasoningEffort, fast, computerApprovalMode or allowNamedAgents.");
   return output;
 }
 function finite(value:unknown,name:string,min:number,max:number):number {

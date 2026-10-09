@@ -492,7 +492,7 @@ it('recovers after a saved running exec result by polling without launching the 
 });
 it.each(['recover-empty-once','recover-incomplete-once','recover-stream-once'])('recovers %s after a saved tool result without another user message or tool execution',async failure=>{
   await request('/host-context',{mode:'automatic'});
-  const stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+  let stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
   if(failure==='recover-empty-once') await runInDurableObject(stub,instance=>{instance.toolFailure=true;});
   await request('/submit',{text:`request-exec ${failure}`,operationId:'recover-result',chatgpt:true});
   const result=await (await request('/wait?id=recover-result')).json<{status:string;text:string}>();
@@ -971,4 +971,55 @@ it('sends attached image bytes through the real PiHarness to the ChatGPT transpo
   expect(state.calls).toHaveLength(1);
   expect(state.calls[0].input).toContain('input_image');
   expect(state.calls[0].input).toContain(`data:image/png;base64,${data}`);
+});
+
+it('snapshots selected model, arbitrary account reasoning and Fast across native recovery', async()=>{
+  const selected={model:'gpt-6-astra',reasoningEffort:'ultra',fast:true};
+  await request('/submit',{text:'hello',operationId:'selected-model',chatgpt:true,modelSettings:selected});
+  expect(await(await request('/wait?id=selected-model')).json()).toMatchObject({status:'done'});
+  const inspect=async()=>await(await request('/inspect')).json<{calls:{input:string}[]}>();
+  expect(JSON.parse((await inspect()).calls[0]!.input)).toMatchObject({model:'gpt-6-astra',reasoning:{effort:'ultra'},service_tier:'priority'});
+  await abortAllDurableObjects();
+  // Retrying an admitted input must neither rerun it nor restore its settings
+  // over another new input. Provider credentials never enter durable configs.
+  expect(await(await request('/submit',{text:'hello',operationId:'selected-model',chatgpt:true,modelSettings:selected})).json()).toMatchObject({accepted:false});
+  await request('/submit',{text:'next',operationId:'default-model',chatgpt:true});
+  expect(await(await request('/wait?id=default-model')).json()).toMatchObject({status:'done'});
+  const calls=(await inspect()).calls.map(row=>JSON.parse(row.input));
+  expect(calls).toHaveLength(2);
+  expect(calls[1]).toMatchObject({model:'gpt-6.1-sol',reasoning:{effort:'medium'}});
+  expect(calls[1]).not.toHaveProperty('service_tier');
+});
+
+it.each([false,true])('temporary agents inherit settings or explicitly select their own model (override=%s)',async override=>{
+  await request('/submit',{text:`request-model-child ${override?'override':''}`,operationId:'model-parent',chatgpt:true,modelSettings:{model:'gpt-6.1-sol',reasoningEffort:'high',fast:true}});
+  await request('/wait?id=model-parent');
+  let stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+  await expect.poll(()=>runInDurableObject(stub,async instance=>(await instance.runtime.subagents())[0]?.status)).toBe('completed');
+  const child=await runInDurableObject(stub,async instance=>(await instance.runtime.subagents())[0]!);
+  expect(child).toMatchObject(override?{model:'gpt-6-astra',reasoningEffort:'ultra',fast:true}:{model:'gpt-6.1-sol',reasoningEffort:'high',fast:true});
+  await abortAllDurableObjects();
+  stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+  await runInDurableObject(stub,async instance=>{await instance.runtime.sendSubagent(child.id,'follow up',{operationId:'model-child-followup'});});
+  await expect.poll(()=>runInDurableObject(stub,async instance=>(await instance.runtime.subagents())[0]?.status)).toBe('completed');
+  const state=await(await request('/inspect')).json<{calls:{input:string}[]}>();
+  const last=JSON.parse(state.calls.at(-1)!.input);
+  expect(last).toMatchObject({model:child.model,reasoning:{effort:child.reasoningEffort},service_tier:override?'priority':'fast'});
+});
+
+it('a pending spawn inherits its generating request when a newer steer selects another model',async()=>{
+  const stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+  await runInDurableObject(stub,instance=>{instance.holdInferenceAfterToolCount=0;instance.heldInference=new Promise(resolve=>{instance.releaseHeldInference=resolve;});});
+  try {
+    await request('/submit',{text:'request-model-child',operationId:'original-model',chatgpt:true,modelSettings:{model:'gpt-6.1-sol',reasoningEffort:'high',fast:true}});
+    await expect.poll(()=>runInDurableObject(stub,(_instance,state)=>state.storage.sql.exec('SELECT id FROM calls').toArray().length)).toBe(1);
+    await request('/submit',{text:'continue with the new model',operationId:'changed-model',chatgpt:true,modelSettings:{model:'gpt-6-astra',reasoningEffort:'ultra',fast:false}});
+    await runInDurableObject(stub,instance=>{instance.releaseHeldInference?.();});
+    expect(await(await request('/wait?id=changed-model')).json()).toMatchObject({status:'done'});
+    await expect.poll(()=>runInDurableObject(stub,async instance=>(await instance.runtime.subagents())[0]?.status)).toBe('completed');
+    const agents=await runInDurableObject(stub,instance=>instance.runtime.subagents());
+    expect(agents[0]).toMatchObject({model:'gpt-6.1-sol',reasoningEffort:'high',fast:true});
+    const state=await(await request('/inspect')).json<{calls:{input:string}[]}>();
+    expect(state.calls.map(row=>{const call=JSON.parse(row.input);return {model:call.model,reasoning:call.reasoning?.effort,fast:call.service_tier};})).toContainEqual({model:'gpt-6-astra',reasoning:'ultra',fast:undefined});
+  } finally {await runInDurableObject(stub,instance=>{instance.releaseHeldInference?.();});}
 });

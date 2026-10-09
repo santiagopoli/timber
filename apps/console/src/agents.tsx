@@ -5,13 +5,15 @@ import type {AgentDelegation, Bot, BotEvent, Run, Subagent} from '../../../packa
 import {MessageResponse} from './components/ai-elements/message';
 import {AgentCreationCard, AgentMessageNotice, collectCollaboration} from './collaboration-timeline';
 import {mergeToolResult, mergeToolStatus} from './cancellation-presentation';
+import {ModelBadge} from './model-identity';
+import {agentColor} from './agent-colors';
 import './agents.css';
 
 const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
 const label = (value: string) => value.replaceAll('_', ' ');
 const date = (value: string) => new Date(value).toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'});
 type AgentMessage = {id:string;role:'user'|'assistant'|'tool'|'system';text:string;createdAt?:string};
-type AgentsModel = {botId: string; botName: string; agents: Subagent[]; namedAgents:Bot[]; delegations: AgentDelegation[]; loading: boolean; error?: string; selectedAgentId: string | null; revision: number;events:BotEvent[];runs:Run[];collaborationEvents:BotEvent[]};
+type AgentsModel = {botId: string; botName: string;botModel?:string; agents: Subagent[]; namedAgents:Bot[]; delegations: AgentDelegation[]; loading: boolean; error?: string; selectedAgentId: string | null; revision: number;events:BotEvent[];runs:Run[];collaborationEvents:BotEvent[]};
 type AgentRequest = (botId: string, path: string, options?: {method?: string; body?: unknown; signal?: AbortSignal}) => Promise<unknown>;
 type Callbacks = {request: AgentRequest; onSelect(id: string | null): void; onRefresh(): void; onOpenBot(botId: string): void};
 
@@ -83,14 +85,14 @@ function AgentConversation({model, agent, callbacks}: {model: AgentsModel; agent
     catch (reason) {if (mounted.current) setError(reason instanceof Error ? reason.message : 'Could not stop this agent.');}
     finally {if (mounted.current) setStopping(false);}
   };
-  const collaboration=collectCollaboration({bot:{id:model.botId,name:model.botName},events:model.events,subagents:model.agents,runs:model.runs,mentionBots:model.namedAgents,delegations:model.delegations,messages:[],collaborationEvents:model.collaborationEvents,runFilter:null},agent.id);
+  const collaboration=collectCollaboration({bot:{id:model.botId,name:model.botName,model:model.botModel},events:model.events,subagents:model.agents,runs:model.runs,mentionBots:model.namedAgents,delegations:model.delegations,messages:[],collaborationEvents:model.collaborationEvents,runFilter:null},agent.id);
   const collaborationCallbacks={onOpenBot:callbacks.onOpenBot,onOpenAgents:(id?:string)=>callbacks.onSelect(id??null)};
   const timeline=[...messages.map((message,index)=>({key:`message:${message.id||index}`,createdAt:message.createdAt||agent.createdAt,node:<article className={`timber-agent-message timber-agent-message-${message.role}`} data-agent-message={message.id}>
     <div className="timber-message-meta"><strong>{(message.role === 'assistant' ? agent.name : message.role === 'user' ? 'Task / message' : label(message.role))}</strong>{message.createdAt && <time>{date(message.createdAt)}</time>}</div>
     <MessageResponse className="timber-markdown" mode="static" skipHtml plugins={{}} components={{img: () => null}} linkSafety={{enabled:false}} controls={false}>{message.text}</MessageResponse>
   </article>})),...collaboration.items.map(item=>({key:item.key,createdAt:item.createdAt,node:item.creation?<AgentCreationCard creation={item.creation} callbacks={collaborationCallbacks}/>:item.notice?<AgentMessageNotice notice={item.notice} callbacks={collaborationCallbacks} eventKey={item.key}/>:null}))].sort((left,right)=>(Date.parse(left.createdAt)||0)-(Date.parse(right.createdAt)||0));
   return <div className="timber-agent-detail" data-agent-detail={agent.id}>
-    <div className="timber-agent-detail-heading"><button type="button" className="quiet icon-button" aria-label="Back to agents" onClick={() => callbacks.onSelect(null)}><ArrowLeftIcon/></button><div><h2>{agent.name}</h2><p className="hint">Temporary subagent · {model.botName}</p></div><span className="spacer"/><span className="status" data-status={agent.status}>{label(agent.status)}</span></div>
+    <div className="timber-agent-detail-heading"><button type="button" className="quiet icon-button" aria-label="Back to agents" onClick={() => callbacks.onSelect(null)}><ArrowLeftIcon/></button><span className="timber-collaborator-avatar timber-model-avatar is-subagent" data-agent-color={agentColor(agent.id)} title={agent.model} aria-hidden="true">{agent.name.slice(0,1)}<ModelBadge model={agent.model}/></span><div><h2>{agent.name}</h2><p className="hint">Temporary subagent · {model.botName}</p>{agent.model&&<p className="hint" data-agent-model={agent.model}>{agent.model}{agent.reasoningEffort?` · ${label(agent.reasoningEffort)} reasoning`:''}{agent.fast?' · Fast':''}</p>}</div><span className="spacer"/><span className="status" data-status={agent.status}>{label(agent.status)}</span></div>
     <div className="timber-agent-detail-actions"><button type="button" className="quiet" onClick={callbacks.onRefresh}><RefreshCwIcon/>Refresh</button>{!terminal.has(agent.status) && <button type="button" className="quiet" disabled={stopping} onClick={() => void cancel()}>{stopping ? 'Stopping…' : 'Stop agent'}</button>}</div>
     {['waiting_approval','waiting_connection'].includes(agent.status) && <p className="hint">This agent needs attention. <button type="button" className="text-button" onClick={() => callbacks.onOpenBot(model.botId)}>Open {model.botName}’s conversation</button></p>}
     {agent.error && <p className="error" role="status">{agent.error}</p>}
@@ -119,8 +121,9 @@ function Agents({model, callbacks}: {model: AgentsModel; callbacks: Callbacks}) 
     <h3>Temporary subagents</h3>
     {!model.agents.length && <p className="hint">{model.loading ? 'Loading agents…' : 'Subagents created for this bot’s tasks appear here, with their conversations and progress.'}</p>}
     <div className="timber-agent-list">{model.agents.map(agent => <button type="button" key={agent.id} className="timber-agent-card" data-agent-id={agent.id} onClick={() => callbacks.onSelect(agent.id)}>
-      <span className="timber-agent-card-heading"><GitBranchIcon aria-hidden="true"/><strong>{agent.name}</strong><span className="status" data-status={agent.status}>{label(agent.status)}</span></span>
+      <span className="timber-agent-card-heading"><span className="timber-collaborator-avatar timber-model-avatar is-subagent" data-agent-color={agentColor(agent.id)} title={agent.model} aria-hidden="true">{agent.name.slice(0,1)}<ModelBadge model={agent.model}/></span><strong>{agent.name}</strong><span className="status" data-status={agent.status}>{label(agent.status)}</span></span>
       <span className="hint">{agent.parentSubagentId ? `Subagent of ${model.agents.find(item => item.id === agent.parentSubagentId)?.name || 'another agent'}` : `Created by ${model.botName}`}</span>
+      {agent.model&&<span className="hint" data-agent-model={agent.model}>{agent.model}</span>}
       <span className="timber-agent-task">{agent.task}</span>
       {agent.error && <span className="error">{agent.error}</span>}<span className="timber-agent-card-footer"><time>{date(agent.updatedAt)}</time><span>Open conversation →</span></span>
     </button>)}</div>

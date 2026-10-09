@@ -1,14 +1,15 @@
+export * from './models.js';
 export type RunStatus = "queued" | "running" | "waiting_approval" | "waiting_connection" | "completed" | "failed" | "cancelled" | "interrupted";
 export type ComputerApprovalMode = "ask" | "automatic";
-export interface Bot { id: string; name: string; instructions: string; runtime: "pi"; model: string; computerApprovalMode?: ComputerApprovalMode; allowNamedAgents?: boolean; createdByBotId?: string; createdAt: string; updatedAt: string; }
+export interface Bot { id: string; name: string; instructions: string; runtime: "pi"; model: string; reasoningEffort?: string; fast?: boolean; computerApprovalMode?: ComputerApprovalMode; allowNamedAgents?: boolean; createdByBotId?: string; createdAt: string; updatedAt: string; }
 export interface MessageProvenance { kind: "bot" | "mention" | "delegation_result"; sourceBotId: string; sourceBotName: string; sourceRunId?: string; delegationId?: string; }
 export interface RunDelegation { id: string; sourceBotId: string; sourceRunId: string; path: string[]; }
 export interface AgentDelegation extends RunDelegation { sourceBotName: string; targetBotId: string; targetBotName: string; targetRunId?: string; status: RunStatus; createdAt: string; updatedAt: string; error?: string; }
 export interface ImageAttachment { artifactId: string; mimeType: "image/png" | "image/jpeg"; size: number; }
 export interface Message { attachments?: ImageAttachment[]; id: string; botId: string; runId?: string; role: "user" | "assistant" | "tool" | "system"; kind?: "progress" | "final"; text: string; provenance?: MessageProvenance; mentions?: string[]; createdAt: string; }
 export interface RunCancellation { id: string; requestedRunId: string; }
-export interface Run { id: string; botId: string; operationId: string; status: RunStatus; delegation?: RunDelegation; subagentId?: string; parentRunId?: string; cancellation?: RunCancellation; createdAt: string; updatedAt: string; error?: string; }
-export interface Subagent { id: string; name: string; task: string; parentOperationId: string; parentSubagentId?: string; operationId: string; status: "queued" | "running" | "waiting_approval" | "waiting_connection" | "completed" | "failed" | "cancelled"; createdAt: string; updatedAt: string; result?: string; error?: string; }
+export interface Run { admissionRetryable?: boolean; model?: string; reasoningEffort?: string; fast?: boolean; id: string; botId: string; operationId: string; status: RunStatus; delegation?: RunDelegation; subagentId?: string; parentRunId?: string; cancellation?: RunCancellation; createdAt: string; updatedAt: string; error?: string; }
+export interface Subagent { model?: string; reasoningEffort?: string; fast?: boolean; id: string; name: string; task: string; parentOperationId: string; parentSubagentId?: string; operationId: string; status: "queued" | "running" | "waiting_approval" | "waiting_connection" | "completed" | "failed" | "cancelled"; createdAt: string; updatedAt: string; result?: string; error?: string; }
 
 /** A newest-first history page plus all currently active runs, independent of pagination. */
 export interface RunPage { runs: Run[]; activeRuns: Run[]; nextCursor: string | null; }
@@ -40,3 +41,8 @@ export interface ComputerProvider {exec(botId:string,operationId:string,action:C
 export interface ApiError {error:{code:string;message:string};}
 
 export interface ConnectionRequest {id:string;botId:string;runId:string;nativeOperationId?:string;provider:"github";repository?:string;permission:"read"|"write";status:"pending"|"connected"|"cancelled";createdAt:string;}
+
+/** Curated notes, separate from the full transcript and the compacted model context. */
+export interface BotMemory {content:string;revision:number;updatedAt?:string;maxCharacters:number;}
+export interface CompactionReceipt {id:string;reason:"manual"|"threshold"|"overflow";status:"running"|"completed"|"unchanged"|"failed"|"cancelled";summaryApplied:boolean;error?:string;}
+export interface BotContextStatus {automatic:true;estimatedTokens:number;activeEntries:number;contextWindow:number;compactions:CompactionReceipt[];historyRetained:true;}

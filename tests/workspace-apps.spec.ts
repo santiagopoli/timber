@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { ComputerProviderError } from "@botspace/computer";
 import { WorkspaceApps, parseWorkspaceApp, type WorkspaceApp } from "../apps/api/src/workspace-apps";
 
 const ORIGINS={previewOrigin:"https://preview.test",consoleOrigin:"https://timber.test"};
@@ -57,6 +58,56 @@ describe("workspace apps",()=>{
     const app=await apps.publish({name:"Dashboard",port:5173,operationId:"dashboard"});
     expect(app.state).toBe("unavailable");expect(app.url).toBe(ORIGINS.previewOrigin+app.basePath);
     expect((await apps.list())[0]).toEqual(app);
+  }));
+
+  it("preserves actionable HTTP readiness and clears it after recovery without retaining private responses",async()=>isolated(async(store,botId)=>{
+    let status=404;
+    const privateBody="PRIVATE_SERVER_ERROR_TOKEN_AND_STACK";
+    const apps=new WorkspaceApps(store,computer(()=>new Response(privateBody,{status})),botId,ORIGINS);
+    const app=await apps.publish({name:"Frontend",port:5173,operationId:"readiness"});
+    expect(app.readiness).toMatchObject({code:"http_error",httpStatus:404});
+    expect(app.readiness?.message).toContain("basePath");
+    expect(JSON.stringify(app)).not.toContain(privateBody);
+    status=500;
+    const failed=(await apps.refresh())[0]!;
+    expect(failed.state).toBe("unavailable");expect(failed.readiness).toMatchObject({code:"http_error",httpStatus:500});
+    expect(failed.readiness?.message).toContain("server process");
+    expect((await apps.list())[0]?.readiness?.httpStatus).toBe(500);
+    status=200;
+    const ready=(await apps.refresh())[0]!;
+    expect(ready.state).toBe("ready");expect(ready).not.toHaveProperty("readiness");
+    expect(JSON.stringify([...(await store.list()).values()])).not.toContain(privateBody);
+  }));
+
+  it("distinguishes fixed timeout, connection and computer readiness diagnostics",async()=>isolated(async(store,botId)=>{
+    let error:Error=new DOMException("private timeout detail","TimeoutError");
+    const apps=new WorkspaceApps(store,computer(()=>{throw error;}),botId,ORIGINS);
+    const app=await apps.publish({name:"App",port:3000,operationId:"transport"});
+    expect(app.readiness?.code).toBe("timeout");
+    expect(app.readiness?.message).toContain("existing startup process");
+    error=new Error("private credential and transport details");
+    expect((await apps.refresh())[0]?.readiness?.code).toBe("connection_failed");
+    error=new ComputerProviderError("computer_app_not_running");
+    expect((await apps.refresh())[0]?.readiness?.code).toBe("computer_unavailable");
+    expect(JSON.stringify([...(await store.list()).values()])).not.toContain("private");
+  }));
+
+  it("does not report a broken root route as ready or let an asset overwrite root readiness",async()=>isolated(async(store,botId)=>{
+    let status=404;
+    const apps=new WorkspaceApps(store,computer(()=>new Response("body",{status})),botId,ORIGINS);
+    const app=await apps.publish({name:"Router",port:3000,operationId:"router"});
+    const {cookie}=await authorize(apps,app);
+    expect((await apps.preview(new Request(app.url,{headers:{cookie}}),app.id,app.basePath)).status).toBe(404);
+    expect((await apps.list())[0]?.state).toBe("unavailable");
+    status=200;
+    await apps.preview(new Request(app.url+"asset.js",{headers:{cookie}}),app.id,app.basePath+"asset.js");
+    expect((await apps.list())[0]?.readiness?.httpStatus).toBe(404);
+    await apps.preview(new Request(app.url,{headers:{cookie}}),app.id,app.basePath);
+    expect((await apps.list())[0]?.state).toBe("ready");
+    status=404;
+    await apps.preview(new Request(app.url+"missing.png",{headers:{cookie}}),app.id,app.basePath+"missing.png");
+    expect((await apps.list())[0]?.state).toBe("ready");
+    expect((await apps.list())[0]).not.toHaveProperty("readiness");
   }));
 
   it("keeps preview on a separate HTTPS origin and rejects control or arbitrary port inputs",()=>{

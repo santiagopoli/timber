@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import type { Bot } from "@botspace/contracts";
+import type { Bot, ModelSettings } from "@botspace/contracts";
 import type { Env } from "./env";
 import { ApiError, errorResponse, json } from "./errors";
 import { body, parseBotInput, UUID } from "./validation";
@@ -8,11 +8,27 @@ import { AgentCoordinator } from "./agent-coordination";
 export class WorkspaceDO extends DurableObject<Env> {
   private deleting=new Map<string,Promise<void>>();
   private agents:AgentCoordinator;
+  private configuring:Promise<unknown>=Promise.resolve();
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx,env);
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS bots (id TEXT PRIMARY KEY, data TEXT NOT NULL)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS bot_deletions (id TEXT PRIMARY KEY,completed INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL)");
     this.agents=new AgentCoordinator(ctx,env,()=>this.rearmDeletion());
+  }
+  private serializeConfiguration<T>(change:()=>Promise<T>):Promise<T> {
+    const pending=this.configuring.then(change,change);this.configuring=pending.catch(()=>{});return pending;
+  }
+  private async modelSettings(input:ModelSettings):Promise<ModelSettings> {
+    if(input.model.startsWith("@cf/")) {
+      if(input.reasoningEffort!==undefined || input.fast) throw new ApiError(400,"invalid_model_settings","ChatGPT reasoning and Fast mode options require a model from the connected ChatGPT account.");
+      return {model:input.model,fast:false};
+    }
+    if(!this.env.CHATGPT) throw new ApiError(503,"chatgpt_not_configured","Connect ChatGPT before selecting model settings.");
+    const response=await this.env.CHATGPT.get(this.env.CHATGPT.idFromName("owner")).fetch("https://chatgpt/validate-model",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(input)});
+    const result=await response.json<{settings?:ModelSettings;error?:{code:string;message:string}}>();
+    if(!response.ok) throw new ApiError(response.status,result.error?.code??"invalid_model_settings",result.error?.message??"The model settings could not be validated.");
+    if(!result.settings || result.settings.model!==input.model) throw new ApiError(502,"invalid_model_settings","The model settings could not be validated.");
+    return result.settings;
   }
   private async rearmDeletion():Promise<void> {
     const next=this.ctx.storage.sql.exec<{next_at:number}>("SELECT next_at FROM bot_deletions WHERE completed=0 ORDER BY next_at LIMIT 1").toArray()[0];
@@ -83,8 +99,10 @@ export class WorkspaceDO extends DurableObject<Env> {
       }
       if(path==="/" && request.method==="POST") {
         const input=parseBotInput(await body(request));
+        const requested:ModelSettings={model:input.model??this.env.BOTSPACE_DEFAULT_MODEL??"gpt-6.1-sol",...(input.reasoningEffort===undefined?{}:{reasoningEffort:input.reasoningEffort}),...(input.fast===undefined?{}:{fast:input.fast})};
+        const settings=input.model!==undefined || input.reasoningEffort!==undefined || input.fast!==undefined?await this.modelSettings(requested):requested;
         const now=new Date().toISOString();
-        const bot:Bot={id:crypto.randomUUID(),name:input.name!,instructions:input.instructions??"",model:input.model??this.env.BOTSPACE_DEFAULT_MODEL??"gpt-6.1-sol",runtime:"pi",computerApprovalMode:input.computerApprovalMode??"ask",allowNamedAgents:input.allowNamedAgents??false,createdAt:now,updatedAt:now};
+        const bot:Bot={id:crypto.randomUUID(),name:input.name!,instructions:input.instructions??"",...settings,runtime:"pi",computerApprovalMode:input.computerApprovalMode??"ask",allowNamedAgents:input.allowNamedAgents??false,createdAt:now,updatedAt:now};
         this.ctx.storage.sql.exec("INSERT INTO bots (id,data) VALUES (?,?)",bot.id,JSON.stringify(bot));
         return json({bot},201);
       }
@@ -95,15 +113,24 @@ export class WorkspaceDO extends DurableObject<Env> {
       if(request.method==="GET") return json({bot:JSON.parse(row.data)});
       if(request.method==="PATCH") {
         const input=parseBotInput(await body(request),true);
-        // Re-read after the body await, so concurrent updates cannot erase a newer field.
-        const current=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",id).toArray()[0];
-        if(!current) throw new ApiError(404,"not_found","Bot not found.");
-        const previous:Bot=JSON.parse(current.data);
-        // BotDO uses this version to reject delayed configuration snapshots.
-        const updatedAt=new Date(Math.max(Date.now(),Date.parse(previous.updatedAt)+1)).toISOString();
-        const bot:Bot={...previous,...input,updatedAt};
-        this.ctx.storage.sql.exec("UPDATE bots SET data=? WHERE id=?",JSON.stringify(bot),id);
-        return json({bot});
+        return await this.serializeConfiguration(async()=>{
+          const current=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",id).toArray()[0];
+          if(!current) throw new ApiError(404,"not_found","Bot not found.");
+          const previous:Bot=JSON.parse(current.data),candidate:Bot={...previous,...input};
+          if(input.model!==undefined && input.model!==previous.model) {
+            // Options from another model never leak into this selection.
+            if(input.reasoningEffort===undefined)delete candidate.reasoningEffort;
+            if(input.fast===undefined)delete candidate.fast;
+          }
+          const changed=input.model!==undefined || input.reasoningEffort!==undefined || input.fast!==undefined;
+          const settings=changed?await this.modelSettings({model:candidate.model,...(candidate.reasoningEffort===undefined?{}:{reasoningEffort:candidate.reasoningEffort}),...(candidate.fast===undefined?{}:{fast:candidate.fast})}):undefined;
+          if(!this.ctx.storage.sql.exec("SELECT id FROM bots WHERE id=?",id).toArray().length) throw new ApiError(404,"not_found","Bot not found.");
+          const updatedAt=new Date(Math.max(Date.now(),Date.parse(previous.updatedAt)+1)).toISOString();
+          const bot:Bot={...candidate,...settings,updatedAt};
+          if(settings && settings.reasoningEffort===undefined)delete bot.reasoningEffort;
+          this.ctx.storage.sql.exec("UPDATE bots SET data=? WHERE id=?",JSON.stringify(bot),id);
+          return json({bot});
+        });
       }
       throw new ApiError(405,"method_not_allowed","Method not allowed.");
     } catch(error) {return errorResponse(error);}

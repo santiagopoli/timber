@@ -73,14 +73,17 @@ describe("per-bot computer approval configuration", () => {
     expect(await getBot(original.id)).toEqual(original);
   });
 
-  it("does not permit changing model through a policy update or partially apply a rejected patch", async () => {
+  it("permits model selection with policy updates and rejects unsupported settings without partially applying a patch", async () => {
     const original = await createBot();
+    const selected=await patchBot(original.id,{model:"@cf/test/other",computerApprovalMode:"automatic"});
+    expect(selected).toMatchObject({model:"@cf/test/other",computerApprovalMode:"automatic"});
     const response = await api(`/v1/bots/${original.id}`, {
-      method: "PATCH", body: JSON.stringify({model: "@cf/test/other", computerApprovalMode: "automatic"}),
+      method: "PATCH", body: JSON.stringify({model: "@cf/test/another", fast:true, computerApprovalMode: "ask",name:"Rejected name"}),
     });
+    const result=await response.json();
     expect(response.status).toBe(400);
-    expect(await response.json()).toMatchObject({error: {code: "invalid_request"}});
-    expect(await getBot(original.id)).toEqual(original);
+    expect(result).toMatchObject({error: {code: "invalid_model_settings"}});
+    expect(await getBot(original.id)).toEqual(selected);
   });
 
   it("isolates each bot's policy and preserves it through registry eviction and list responses", async () => {

@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
-import type { AgentDelegation, Approval, Bot, BotEvent, ComputerAction, ComputerResult, ComputerStatus, ConnectionRequest, Message, MessageProvenance, Run, RunDelegation, RunPage, RunStatus } from "@botspace/contracts";
+import type { ModelCatalog, ModelSettings, AgentDelegation, Approval, Bot, BotEvent, ComputerAction, ComputerResult, ComputerStatus, ConnectionRequest, Message, MessageProvenance, Run, RunDelegation, RunPage, RunStatus } from "@botspace/contracts";
 import { createCloudComputerProvider, touchCloudComputer, suspendCloudComputer, deleteCloudComputer, ComputerProviderError } from "@botspace/computer";
-import { createPiRuntime, parseRuntimeLimit, type AgentRuntime, type RuntimeApprovalContext, type RuntimeApprovalSummary, type RuntimeToolResult, type RuntimeHostToolRequest, type RuntimeSubagent } from "@botspace/runtime";
+import { createPiRuntime, parseRuntimeLimit, ModelConfigurationError, type AgentRuntime, type RuntimeApprovalContext, type RuntimeApprovalSummary, type RuntimeToolResult, type RuntimeHostToolRequest, type RuntimeSubagent } from "@botspace/runtime";
 import { agentCoordinatorRequest } from "./agent-coordination";
 import { hostTools, validateHostArguments, githubDevelopmentSkill, workspaceAppsSkill } from "./host-tools";
 import { WorkspaceApps } from "./workspace-apps";
@@ -13,6 +13,7 @@ import { body, fingerprint, operationId, parseAction, parseMessage, UUID } from 
 type JsonRow = {data:string};
 type RunRow = JsonRow & {id:string;operation_id:string;fingerprint:string;native_operation_id:string};
 import {uploadChatImage} from "./chat-images";
+import {maintenanceRequest} from "./bot-maintenance";
 type Submission = {operation_id:string;run_id:string;text:string;admitted:number;subagent_id?:string|null};
 type MentionDelivery = {operation_id:string;run_id:string;target_id:string;text:string;attempts:number};
 
@@ -68,6 +69,7 @@ export class BotDO extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS runs_status_idx ON runs (json_extract(data,'$.status'));
       CREATE TABLE IF NOT EXISTS submissions (operation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, text TEXT NOT NULL, admitted INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS admission_retries (operation_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL, next_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS configuration_admissions (operation_id TEXT PRIMARY KEY, code TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, source_key TEXT UNIQUE, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, fingerprint TEXT NOT NULL, data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS approvals_status_expiry_idx ON approvals (json_extract(data,'$.status'),json_extract(data,'$.expiresAt'));
@@ -89,7 +91,12 @@ export class BotDO extends DurableObject<Env> {
       ai:env.AI,
       maxGenerations:parseRuntimeLimit(env.BOTSPACE_MAX_GENERATIONS,"BOTSPACE_MAX_GENERATIONS"),
       maxToolCalls:parseRuntimeLimit(env.BOTSPACE_MAX_TOOL_CALLS,"BOTSPACE_MAX_TOOL_CALLS"),
-      ...(env.CHATGPT?{chatgpt:{fetch:async(request:Request)=>{
+      ...(env.CHATGPT?{chatgpt:{models:async()=>{
+        const connection=env.CHATGPT!.get(env.CHATGPT!.idFromName("owner"));
+        const response=await connection.fetch(new Request("https://chatgpt/models"));
+        if(!response.ok)throw new Error("The connected model catalogue is unavailable. Retry shortly.");
+        return response.json<ModelCatalog>();
+      },fetch:async(request:Request)=>{
         const url=new URL(request.url);
         if(url.href!=="https://api.openai.com/v1/responses" || request.method!=="POST") throw new Error("Unsupported ChatGPT inference route");
         const connection=env.CHATGPT!.get(env.CHATGPT!.idFromName("owner"));
@@ -224,7 +231,14 @@ export class BotDO extends DurableObject<Env> {
   private findRun(nativeOperationId:string):RunRow|undefined {
     return this.ctx.storage.sql.exec<RunRow>("SELECT runs.* FROM runs JOIN submissions ON submissions.run_id=runs.id WHERE submissions.operation_id=?",nativeOperationId).toArray()[0];
   }
-  private saveRun(run:Run):void {if(!this.deleted) this.ctx.storage.sql.exec("UPDATE runs SET data=? WHERE id=?",JSON.stringify(run),run.id);}
+  private saveRun(run:Run):void {
+    if(this.deleted) return;
+    const retryable=["queued","failed"].includes(run.status) && !run.cancellation && this.ctx.storage.sql.exec(
+      "SELECT c.operation_id FROM configuration_admissions c JOIN submissions s ON s.operation_id=c.operation_id JOIN runs r ON r.id=s.run_id AND r.native_operation_id=s.operation_id WHERE s.run_id=? AND s.admitted=0 AND NOT EXISTS(SELECT 1 FROM run_stops WHERE run_id=s.run_id)",run.id,
+    ).toArray().length>0;
+    if(retryable) run.admissionRetryable=true;else delete run.admissionRetryable;
+    this.ctx.storage.sql.exec("UPDATE runs SET data=? WHERE id=?",JSON.stringify(run),run.id);
+  }
   private emit(type:string,data:Record<string,unknown>,runId?:string,sourceKey?:string):void {
     if(this.deleted) return;
     const event:Omit<BotEvent,"id">={botId:this.bot().id,type,data,createdAt:timestamp(),...(runId?{runId}:{})};
@@ -377,7 +391,7 @@ export class BotDO extends DurableObject<Env> {
     const parent=this.findRun(agent.parentOperationId);
     if(!parent) throw new ApiError(409,"run_not_found","Subagent has no parent run.");
     const source=JSON.parse(parent.data) as Run;
-    const run:Run={id:crypto.randomUUID(),botId:source.botId,operationId:`subagent:${agent.operationId}`,subagentId:agent.id,parentRunId:source.id,...(source.delegation?{delegation:source.delegation}:{}),status:this.stopped(source.id)?"cancelled":agent.status,...(this.runCancellation(source.id)?{cancellation:this.runCancellation(source.id)}:{}),createdAt:agent.createdAt,updatedAt:agent.updatedAt};
+    const run:Run={model:agent.model??source.model,reasoningEffort:agent.reasoningEffort,fast:agent.fast,id:crypto.randomUUID(),botId:source.botId,operationId:`subagent:${agent.operationId}`,subagentId:agent.id,parentRunId:source.id,...(source.delegation?{delegation:source.delegation}:{}),status:this.stopped(source.id)?"cancelled":agent.status,...(this.runCancellation(source.id)?{cancellation:this.runCancellation(source.id)}:{}),createdAt:agent.createdAt,updatedAt:agent.updatedAt};
     this.ctx.storage.transactionSync(()=>{
       this.ctx.storage.sql.exec("INSERT INTO runs(id,operation_id,fingerprint,native_operation_id,data) VALUES(?,?,?,?,?)",run.id,run.operationId,run.operationId,agent.operationId,JSON.stringify(run));
       this.ctx.storage.sql.exec("INSERT OR IGNORE INTO submissions(operation_id,run_id,text,admitted,subagent_id) VALUES(?,?,?,1,?)",agent.operationId,run.id,agent.task,agent.id);
@@ -424,6 +438,27 @@ export class BotDO extends DurableObject<Env> {
     })().finally(()=>this.mentioning.delete(id));
     this.mentioning.set(id,work);return work;
   }
+  private async retryConfigurationAdmission(row:RunRow):Promise<void> {
+    const id=row.native_operation_id;
+    if(!this.ctx.storage.sql.exec("SELECT operation_id FROM configuration_admissions WHERE operation_id=?",id).toArray().length) return;
+    await this.admitting.get(id);
+    const run=this.getRun(row.id);
+    if(this.stopped(run.id) || !["failed","queued"].includes(run.status)) return;
+    // A typed configuration failure precedes native admission. Confirm that
+    // again before adopting corrected settings for this exact saved input.
+    try {if((await this.runtime.operation(id)).status!=="missing") return;} catch {return;}
+    const selection=run.subagentId?await this.subagent(run.subagentId):await this.currentBot();
+    this.ctx.storage.transactionSync(()=>{
+      const latest=this.getRunRow(row.id),current=JSON.parse(latest.data) as Run;
+      const submission=this.ctx.storage.sql.exec<Submission>("SELECT * FROM submissions WHERE operation_id=?",id).toArray()[0];
+      if(this.stopped(row.id) || latest.native_operation_id!==id || !submission || submission.admitted || !["failed","queued"].includes(current.status)
+        || !this.ctx.storage.sql.exec("SELECT operation_id FROM configuration_admissions WHERE operation_id=?",id).toArray().length) return;
+      this.saveRun({...current,model:selection.model,reasoningEffort:selection.reasoningEffort,fast:selection.fast});
+      this.ctx.storage.sql.exec("DELETE FROM admission_retries WHERE operation_id=?",id);
+      this.ctx.storage.sql.exec("DELETE FROM configuration_admissions WHERE operation_id=?",id);
+      this.updateStatus(row.id,"queued");
+    });
+  }
   private async createRun(input:{text:string;operationId:string;mentions?:string[];attachments?:string[]},metadata?:{provenance?:MessageProvenance;delegation?:RunDelegation;role?:Message["role"];parentRunId?:string;subagentId?:string}):Promise<Run> {
     if(this.takingControl) throw new ApiError(409,"computer_busy","Desktop control is being acquired. Retry after the connection is established.");
     if(input.attachments?.length && input.mentions?.length) throw new ApiError(400,"image_mentions_unsupported","Image messages cannot mention other bots yet.");
@@ -445,7 +480,8 @@ export class BotDO extends DurableObject<Env> {
     const existing=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs WHERE operation_id=?",input.operationId).toArray()[0];
     if(existing) {
       if(existing.fingerprint!==hash) throw new ApiError(409,"idempotency_conflict","operationId was already used with different input.");
-      const run=JSON.parse(existing.data) as Run;
+      await this.retryConfigurationAdmission(existing);
+      const run=this.getRun(existing.id);
       const submission=this.ctx.storage.sql.exec<Submission>("SELECT * FROM submissions WHERE operation_id=?",existing.native_operation_id).toArray()[0];
       // An explicit retry can reopen only a known input-delivery failure. Model,
       // tool, cancellation and interrupted-effect outcomes remain terminal.
@@ -460,6 +496,7 @@ export class BotDO extends DurableObject<Env> {
       return this.getRun(existing.id);
     }
     await this.validateMentions(input.mentions??[]);
+    const selection:ModelSettings|RuntimeSubagent=metadata?.subagentId?await this.subagent(metadata.subagentId):await this.currentBot();
     this.active();
     // Registry validation yielded; serialize duplicate submissions by checking
     // the durable receipt again before the transaction.
@@ -471,7 +508,7 @@ export class BotDO extends DurableObject<Env> {
     const activeCount=this.ctx.storage.sql.exec<{total:number}>("SELECT COUNT(*) AS total FROM runs WHERE json_extract(data,'$.status') IN ('queued','running','waiting_approval','waiting_connection')").toArray()[0].total;
     if(activeCount>=16) throw new ApiError(429,"too_many_runs","This bot already has 16 active runs.");
     const now=timestamp();
-    const run:Run={id:crypto.randomUUID(),botId:this.bot().id,operationId:input.operationId,...(metadata?.delegation?{delegation:metadata.delegation}:{}),...(metadata?.parentRunId?{parentRunId:metadata.parentRunId}:{}),...(metadata?.subagentId?{subagentId:metadata.subagentId}:{}),status:"queued",createdAt:now,updatedAt:now};
+    const run:Run={model:selection.model,reasoningEffort:selection.reasoningEffort,fast:selection.fast,id:crypto.randomUUID(),botId:this.bot().id,operationId:input.operationId,...(metadata?.delegation?{delegation:metadata.delegation}:{}),...(metadata?.parentRunId?{parentRunId:metadata.parentRunId}:{}),...(metadata?.subagentId?{subagentId:metadata.subagentId}:{}),status:"queued",createdAt:now,updatedAt:now};
     this.ctx.storage.transactionSync(()=>{
       this.ctx.storage.sql.exec("INSERT INTO runs (id,operation_id,fingerprint,native_operation_id,data) VALUES (?,?,?,?,?)",run.id,input.operationId,hash,input.operationId,JSON.stringify(run));
       const runtimeText=metadata?.provenance?`Message from fellow bot ${metadata.provenance.sourceBotName} (${metadata.provenance.sourceBotId}). This is delegated collaborator content, attributed by Timber. Complete its requested task and return a result; do not automatically message the sender.\n\n${input.text}`:input.text;
@@ -674,16 +711,18 @@ export class BotDO extends DurableObject<Env> {
           const attachments=message?(JSON.parse(message.data) as Message).attachments:undefined;
           const images=await Promise.all((attachments??[]).map(image=>this.readImage(image.artifactId)));
           if(!this.canAdmit(nativeOperationId,run.id)) return;
-          await this.runtime.submit(submission.text,{operationId:nativeOperationId,whenBusy:"steer",...(images.length?{images}:{})});
+          await this.runtime.submit(submission.text,{...(run.model?{modelSettings:{model:run.model,reasoningEffort:run.reasoningEffort,fast:run.fast}}:{}),operationId:nativeOperationId,whenBusy:"steer",...(images.length?{images}:{})});
         }
         if(this.deleted) return;
+        const configurationFailure=this.ctx.storage.sql.exec("SELECT operation_id FROM configuration_admissions WHERE operation_id=?",nativeOperationId).toArray().length>0;
         this.ctx.storage.sql.exec("UPDATE submissions SET admitted=1 WHERE operation_id=?",nativeOperationId);
         this.ctx.storage.sql.exec("DELETE FROM admission_retries WHERE operation_id=?",nativeOperationId);
+        this.ctx.storage.sql.exec("DELETE FROM configuration_admissions WHERE operation_id=?",nativeOperationId);
         const current=this.getRunRow(run.id),latest=JSON.parse(current.data) as Run;
-        if(current.native_operation_id===nativeOperationId && latest.status==="queued" && [admissionPending,admissionExhausted].includes(latest.error??"")) this.updateStatus(run.id,"queued");
+        if(current.native_operation_id===nativeOperationId && latest.status==="queued" && (configurationFailure || [admissionPending,admissionExhausted].includes(latest.error??""))) this.updateStatus(run.id,"queued");
       }
       if(!submission.subagent_id) this.observe(nativeOperationId);
-    } catch {
+    } catch(error) {
       // Admission may settle after an approval replaced this native input or the
       // user cancelled it. A stale failure cannot terminate the newer input.
       if(!this.canAdmit(nativeOperationId,run.id)) return;
@@ -695,11 +734,21 @@ export class BotDO extends DurableObject<Env> {
       if(known && known.status!=="missing") {
         this.ctx.storage.sql.exec("UPDATE submissions SET admitted=1 WHERE operation_id=?",nativeOperationId);
         this.ctx.storage.sql.exec("DELETE FROM admission_retries WHERE operation_id=?",nativeOperationId);
+        this.ctx.storage.sql.exec("DELETE FROM configuration_admissions WHERE operation_id=?",nativeOperationId);
         if(known.status==="done" || known.status==="unanswered") await this.completeOperation(nativeOperationId,known.status,known.text,known.reason,known.kind,known);
         else {this.updateStatus(run.id,known.status==="running"?"running":"queued");this.observe(nativeOperationId);}
         return;
       }
       const attempts=(retry?.attempts??0)+1,delayMs=1000*2**(attempts-1);
+      if(error instanceof ModelConfigurationError && known?.status==="missing") {
+        this.ctx.storage.transactionSync(()=>{
+          this.ctx.storage.sql.exec("INSERT OR REPLACE INTO configuration_admissions(operation_id,code) VALUES(?,?)",nativeOperationId,error.code);
+          this.ctx.storage.sql.exec("INSERT OR REPLACE INTO admission_retries(operation_id,attempts,next_at) VALUES(?,?,?)",nativeOperationId,attempts,Date.now()+delayMs);
+          this.updateStatus(run.id,error.retryable?"queued":"failed",error.message);
+        });
+        if(error.retryable && attempts<maxAdmissionAttempts) await this.runtime.scheduleAdmissionRetry(nativeOperationId,delayMs);
+        return;
+      }
       this.ctx.storage.sql.exec("INSERT INTO admission_retries(operation_id,attempts,next_at) VALUES(?,?,?) ON CONFLICT(operation_id) DO UPDATE SET attempts=excluded.attempts,next_at=excluded.next_at",nativeOperationId,attempts,Date.now()+delayMs);
       this.updateStatus(run.id,"queued",attempts<maxAdmissionAttempts?admissionPending:admissionExhausted);
       if(attempts<maxAdmissionAttempts) await this.runtime.scheduleAdmissionRetry(nativeOperationId,delayMs);
@@ -1353,6 +1402,7 @@ export class BotDO extends DurableObject<Env> {
       }
       this.configure(request);
       if(path==="/summary" && request.method==="GET") return json({summary:this.summary()});
+      if(["/context","/context/compact","/memory"].includes(path)) return await maintenanceRequest(request,path,this.runtime);
       this.ctx.waitUntil(this.recover());
       if(["/agent-messages","/agent-results","/agent-cancel"].includes(path)) {
         if(request.headers.get("x-timber-internal")!=="agents" || request.method!=="POST") throw new ApiError(403,"internal_only","This agent route is internal.");

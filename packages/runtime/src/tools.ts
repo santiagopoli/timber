@@ -6,7 +6,7 @@ import type { RuntimeHostToolRequest, RuntimePause, RuntimeToolResult, RuntimeTo
 type Context = Parameters<ToolExecutionApi['agent']>[0];
 export interface ToolBridge {
   tools: RuntimeTools;
-  imageInputSupported?(): Promise<boolean>;
+  imageInputSupported?(api: ToolExecutionApi): Promise<boolean>;
   operationForCall(api: ToolExecutionApi, context: Context): Promise<string>;
   childForCall?(api: ToolExecutionApi, context: Context): Promise<{ subagentId: string; subagentOperationId: string } | undefined>;
   consume(runOperationId: string, kind: 'tool', itemId: string): void;
@@ -70,7 +70,7 @@ export async function executeComputerTool(
   api: ToolExecutionApi,
   context: Context,
 ): Promise<ToolExecutionResult> {
-  if (action.type === 'screenshot' && bridge.imageInputSupported && !(await bridge.imageInputSupported())) {
+  if (action.type === 'screenshot' && bridge.imageInputSupported && !(await bridge.imageInputSupported(api))) {
     return { content: [{ type: 'text', text: 'The configured model does not accept screenshot images. Select a vision-capable model to use visual computer tools.' }], isError: true };
   }
   return executeBridgeTool(bridge, api, context, request => bridge.tools.execute({ ...request, action }), async result => {

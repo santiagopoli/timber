@@ -1,0 +1,37 @@
+name: Read production diagnostics
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: Hours to inspect (1 to 24)
+        required: true
+        default: '6'
+        type: string
+      end_time:
+        description: Optional UTC end time, within the last 7 days (YYYY-MM-DDTHH:mm:ssZ)
+        required: false
+        type: string
+permissions:
+  contents: read
+jobs:
+  diagnostics:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Verify diagnostic output filtering
+        run: node --test scripts/tests/prod-diagnostics.test.mjs
+      - name: Read sampled production telemetry
+        env:
+          CLOUDFLARE_ACCOUNT_ID: '3acfff91febe1ba644c6358ae5612736'
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
+          CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
+          DIAGNOSTIC_HOURS: ${{ inputs.hours }}
+          DIAGNOSTIC_END: ${{ inputs.end_time }}
+        run: node scripts/prod-diagnostics.mjs

@@ -10,7 +10,7 @@ export function textContent(content: unknown): string {
   ).map(part => part.text).join('');
 }
 export function normalizeEntries(entries: readonly EntryRecord[]): RuntimeMessage[] {
-  return entries.flatMap(entry => (entry.model ?? []).flatMap((message, index) => {
+  return entries.filter(entry => entry.kind !== 'pi.compaction').flatMap(entry => (entry.model ?? []).flatMap((message, index) => {
     const role = message.role === 'toolResult' ? 'tool' : message.role;
     if (!['user', 'assistant', 'tool', 'system'].includes(role)) return [];
     if (message.role === 'assistant' && ['error', 'aborted'].includes(message.stopReason)) return [];

@@ -1,13 +1,18 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
-import { previewCloudComputer } from "@botspace/computer";
+import { ComputerProviderError, previewCloudComputer } from "@botspace/computer";
 import type { Bot } from "@botspace/contracts";
 import type { Env } from "./env";
 import { ApiError, errorResponse } from "./errors";
 import { object, string, UUID } from "./validation";
 
+export interface AppReadiness {
+  code:"http_error"|"computer_unavailable"|"timeout"|"connection_failed";
+  httpStatus?:number;
+  message:string;
+}
 export interface WorkspaceApp {
   id:string; botId:string; name:string; port:number; basePath:string; url:string;
-  state:"ready"|"unavailable"|"stopped"; createdAt:string; updatedAt:string;
+  state:"ready"|"unavailable"|"stopped"; readiness?:AppReadiness; createdAt:string; updatedAt:string;
 }
 export interface WorkspaceAppOpen {actionUrl:string; ticket:string; expiresAt:string;}
 interface Access {appId:string; expiresAt:number;}
@@ -27,6 +32,21 @@ function origin(value:string):string {
   throw new ApiError(503,"apps_not_configured","Workspace apps are not configured.");
 }
 function missing():never {throw new ApiError(404,"app_not_found","This app is no longer available.");}
+function httpReadiness(status:number):AppReadiness {
+  const message=status===404
+    ? "The app returned HTTP 404 at its registered base path. Configure the server and client router for the returned basePath, then check again."
+    : status===401 || status===403
+      ? `The app returned HTTP ${status}. Check its own access and allowed-host configuration; this probe already bypasses Timber's browser login.`
+      : status>=500
+        ? `The app preview returned HTTP ${status}. Inspect the existing server process and its log; verify the computer is running before starting another server.`
+        : `The app returned HTTP ${status}. Inspect the route at the registered basePath and its server log.`;
+  return {code:"http_error",httpStatus:status,message};
+}
+function probeFailure(error:unknown,timedOut=false):AppReadiness {
+  if(timedOut || (error instanceof DOMException && error.name==="TimeoutError")) return {code:"timeout",message:"The app did not answer within five seconds. Poll the existing startup process and inspect its log before trying another server."};
+  if(error instanceof ComputerProviderError) return {code:"computer_unavailable",message:"The workspace computer is not available. Check its status before starting or restarting the app."};
+  return {code:"connection_failed",message:"The app preview could not connect. Verify an existing server is listening on the registered port, bound to 0.0.0.0, and inspect its log."};
+}
 function unavailable():Response {
   return new Response("The app is not responding. Return to its bot and ask it to start the app.",{status:503,headers:{"content-type":"text/plain; charset=utf-8","cache-control":"no-store","retry-after":"3","referrer-policy":"no-referrer"}});
 }
@@ -67,21 +87,24 @@ export class WorkspaceApps {
     if(!app || app.botId!==this.botId) missing();
     return app;
   }
-  private async recordState(app:WorkspaceApp,state:WorkspaceApp["state"]):Promise<WorkspaceApp> {
+  private async recordState(app:WorkspaceApp,state:WorkspaceApp["state"],readiness?:AppReadiness):Promise<WorkspaceApp> {
     return this.storage.transaction(async tx=>{
       const current=await tx.get<WorkspaceApp>(APP+app.id);
       if(!current) missing();
-      if(current.state===state) return current;
+      if(current.state===state && JSON.stringify(current.readiness)===JSON.stringify(readiness)) return current;
       const updated={...current,state,updatedAt:new Date().toISOString()};
+      if(readiness) updated.readiness=readiness;else delete updated.readiness;
       await tx.put(APP+app.id,updated);return updated;
     });
   }
   private async probe(app:WorkspaceApp):Promise<WorkspaceApp> {
+    const signal=AbortSignal.timeout(5_000);
     try {
-      const response=await previewCloudComputer(this.computers,this.botId,app.port,new Request(app.url,{signal:AbortSignal.timeout(5_000)}));
+      const response=await previewCloudComputer(this.computers,this.botId,app.port,new Request(app.url,{signal}));
       await response.body?.cancel();
-      return this.recordState(app,response.status>=200 && response.status<400 ? "ready":"unavailable");
-    } catch {return this.recordState(app,"unavailable");}
+      const ready=response.status>=200 && response.status<400;
+      return this.recordState(app,ready ? "ready":"unavailable",ready?undefined:httpReadiness(response.status));
+    } catch(error) {return this.recordState(app,"unavailable",probeFailure(error,signal.aborted));}
   }
 
   async publish(input:unknown):Promise<WorkspaceApp> {
@@ -165,9 +188,14 @@ export class WorkspaceApps {
     const forwarded=new Request(publicUrl,{method:request.method,headers,body:["GET","HEAD"].includes(request.method)?undefined:request.body,redirect:"manual",signal:request.signal});
     let response:Response;
     try {response=await previewCloudComputer(this.computers,this.botId,app.port,forwarded);}
-    catch {await this.recordState(app,"unavailable");return unavailable();}
-    if(response.status===503) {await response.body?.cancel();await this.recordState(app,"unavailable");return unavailable();}
-    await this.recordState(app,response.status<500 ? "ready":"unavailable");
+    catch(error) {await this.recordState(app,"unavailable",probeFailure(error));return unavailable();}
+    if(response.status===503) {await response.body?.cancel();await this.recordState(app,"unavailable",httpReadiness(503));return unavailable();}
+    // A missing asset must not override the root readiness observation.
+    // A root response, however, follows the same 2xx/3xx rule as agent probes.
+    if(publicUrl.pathname===app.basePath) {
+      const ready=response.status>=200 && response.status<400;
+      await this.recordState(app,ready?"ready":"unavailable",ready?undefined:httpReadiness(response.status));
+    }
     return appResponse(response,app);
   }
 

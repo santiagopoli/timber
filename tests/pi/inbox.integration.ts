@@ -85,3 +85,23 @@ it("wakes an unadmitted saved message durably after object eviction with no brow
   expect(messages.filter(message=>message.role==="assistant")).toHaveLength(1);
   expect(messages.find(message=>message.role==="assistant")?.text).toBe("Hello from ChatGPT via the real Pi harness.");
 });
+
+
+it("retains the chosen model configuration when a saved run is admitted after a settings change and eviction",async()=>{
+  const create=await api("/v1/bots",{name:"Model snapshot",model:"gpt-6.1-sol",reasoningEffort:"high",fast:true});
+  const {bot}=await create.json<{bot:Bot}>();
+  await api(`/v1/bots/${bot.id}/messages`);
+  let stub=bindings.BOT.get(bindings.BOT.idFromName(`owner:${bot.id}`));
+  await runInDurableObject(stub,instance=>{const target=instance as unknown as {runtime:AgentRuntime};target.runtime={...target.runtime,submit:async()=>{throw new Error("Transient delivery");}};});
+  const run=await send(bot,"remember the selected inference settings");
+  expect(run).toMatchObject({model:"gpt-6.1-sol",reasoningEffort:"high",fast:true,status:"queued"});
+  const patch=await exports.default.fetch(`https://botspace.test/v1/bots/${bot.id}`,{method:"PATCH",headers:{authorization:"Bearer test-only-botspace-owner-token-000000","content-type":"application/json"},body:JSON.stringify({reasoningEffort:"low",fast:false})});
+  expect(patch.status).toBe(200);
+  await abortAllDurableObjects();
+  stub=bindings.BOT.get(bindings.BOT.idFromName(`owner:${bot.id}`));
+  await new Promise(resolve=>setTimeout(resolve,1100));await runDurableObjectAlarm(stub);
+  expect(await until(()=>getRun(bot,run),value=>["completed","failed","interrupted"].includes(value.status))).toMatchObject({status:"completed",reasoningEffort:"high",fast:true});
+  const provider=bindings.CHATGPT!.get(bindings.CHATGPT!.idFromName("owner"));
+  const payload=await runInDurableObject(provider,(_instance,state)=>state.storage.sql.exec<{input:string}>("SELECT input FROM inference_calls ORDER BY id DESC LIMIT 1").one().input);
+  expect(JSON.parse(payload)).toMatchObject({model:"gpt-6.1-sol",reasoning:{effort:"high"},service_tier:"fast"});
+});
