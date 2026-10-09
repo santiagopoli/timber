@@ -35,29 +35,36 @@ function markdown(index) {
 // assumed. A genuine historical edit below verifies probe sensitivity first.
 function installRenderProbe() {
   const probe = globalThis.__longHistoryProbe = {enabled: false, injected: 0, commits: 0, historyTextRenders: 0, renderedHistoryIds: [], historyMutationRecords: 0, longTasks: [], frameGaps: []};
-  let previousTextFibers = new WeakSet();
+  const textFiberSignatures = new WeakMap();
+  let commitSequence = 0;
   globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__ = {
     supportsFiber: true,
     inject() {probe.injected++; return probe.injected;},
     onCommitFiberRoot(_renderer, root) {
       if (probe.enabled) probe.commits++;
-      const nextTextFibers = new WeakSet(), stack = [root.current];
+      const commit = ++commitSequence;
+      const stack = [root.current];
       while (stack.length) {
         const fiber = stack.pop(), text = fiber.memoizedProps?.text;
         if ([0, 14, 15].includes(fiber.tag) && typeof text === 'string' && text.startsWith('History item ')) {
-          nextTextFibers.add(fiber);
-          // A bailed-out parent can reuse child fibers with old flags. Do not
-          // count those reused objects as new render work.
-          if (probe.enabled && !previousTextFibers.has(fiber) && (fiber.flags & 1)) {
+          // React can reuse either current OR alternate children carrying an
+          // old PerformedWork bit (notably after Copy state updates). Compare
+          // the most recently committed props/hook-state signature across
+          // both fiber identities, including newly cloned bailout children.
+          // Genuine text edits/new props and Copy local state still register.
+          const own = textFiberSignatures.get(fiber), alternate = fiber.alternate && textFiberSignatures.get(fiber.alternate);
+          const previous = !own || alternate?.commit > own.commit ? alternate : own;
+          const changed = !previous || previous.props !== fiber.memoizedProps || previous.state !== fiber.memoizedState;
+          if (probe.enabled && changed && (fiber.flags & 1)) {
             probe.historyTextRenders++;
             const marker = /^History item (\d+):/.exec(text)?.[1];
             if (marker && !probe.renderedHistoryIds.includes(marker)) probe.renderedHistoryIds.push(marker);
           }
+          textFiberSignatures.set(fiber, {props: fiber.memoizedProps, state: fiber.memoizedState, commit});
         }
         if (fiber.child) stack.push(fiber.child);
         if (fiber.sibling) stack.push(fiber.sibling);
       }
-      previousTextFibers = nextTextFibers;
     },
     onCommitFiberUnmount() {}, onPostCommitFiberRoot() {},
   };
