@@ -4,10 +4,12 @@ import type { Env } from "./env";
 import { ApiError, errorResponse, json } from "./errors";
 import { body, parseBotInput, UUID } from "./validation";
 import { AgentCoordinator } from "./agent-coordination";
+import { AvatarCoordinator } from "./avatars";
 
 export class WorkspaceDO extends DurableObject<Env> {
   private deleting=new Map<string,Promise<void>>();
   private agents:AgentCoordinator;
+  private avatars:AvatarCoordinator;
   private configuring:Promise<unknown>=Promise.resolve();
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx,env);
@@ -27,7 +29,8 @@ export class WorkspaceDO extends DurableObject<Env> {
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS bot_task_deletions (task_id TEXT PRIMARY KEY,bot_id TEXT NOT NULL,completed INTEGER NOT NULL DEFAULT 0)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS bot_deletions (id TEXT PRIMARY KEY,completed INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL)");
     this.agents=new AgentCoordinator(ctx,env,()=>this.rearmDeletion(),(botId,operationId)=>this.beginComputerAdmission(botId,null,operationId),token=>this.completeComputerAdmission(token));
-    ctx.waitUntil(this.rearmDeletion());
+    this.avatars=new AvatarCoordinator(ctx,env,()=>this.rearmDeletion());
+    ctx.blockConcurrencyWhile(()=>this.rearmDeletion());
   }
   private serializeConfiguration<T>(change:()=>Promise<T>):Promise<T> {
     const pending=this.configuring.then(change,change);this.configuring=pending.catch(()=>{});return pending;
@@ -50,7 +53,7 @@ export class WorkspaceDO extends DurableObject<Env> {
     const schedulerActive=this.ctx.storage.sql.exec("SELECT 1 FROM task_slots LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM computer_admissions LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM tasks WHERE json_extract(data,'$.status')='queued' AND json_extract(data,'$.startImmediately')=1 LIMIT 1").toArray().length>0;
     const now=Date.now(),existingAlarm=await this.ctx.storage.getAlarm();
     const schedulerTime=schedulerActive?Math.min(existingAlarm&&existingAlarm>now?existingAlarm:Infinity,now+5000):Infinity;
-    const nextAt=Math.min(next?.next_at??Infinity,agentTime??Infinity,schedulerTime);
+    const nextAt=Math.min(next?.next_at??Infinity,agentTime??Infinity,schedulerTime,this.avatars?.nextAlarm()??Infinity);
     if(Number.isFinite(nextAt)) await this.ctx.storage.setAlarm(Math.max(Date.now(),nextAt));
     else await this.ctx.storage.deleteAlarm();
   }
@@ -81,6 +84,7 @@ export class WorkspaceDO extends DurableObject<Env> {
       const bot=this.env.BOT.get(this.env.BOT.idFromName(`owner:${id}`));
       const response=await bot.fetch("https://bot/delete",{method:"POST",headers:{"x-botspace-bot-id":id}});
       if(!response.ok) throw new Error("Bot shutdown pending");
+      await this.avatars.drainBot(id);
       // Computer shutdown has fenced and drained every possible uploader. Delete
       // pages from the beginning so partial failures can resume idempotently.
       while(true) {
@@ -301,7 +305,7 @@ export class WorkspaceDO extends DurableObject<Env> {
   }
   async alarm():Promise<void> {
     const due=this.ctx.storage.sql.exec<{id:string}>("SELECT id FROM bot_deletions WHERE completed=0 AND next_at<=? ORDER BY next_at LIMIT 8",Date.now()).toArray();
-    await Promise.allSettled([...due.map(row=>this.cleanup(row.id)),this.agents.alarm()]);
+    await Promise.allSettled([...due.map(row=>this.cleanup(row.id)),this.agents.alarm(),this.avatars.alarm()]);
     await this.reconcileComputerSlots();
     await this.rearmDeletion();
   }
@@ -316,19 +320,21 @@ export class WorkspaceDO extends DurableObject<Env> {
         for(const entry of tasks) {this.ctx.storage.sql.exec("INSERT OR IGNORE INTO bot_task_deletions(task_id,bot_id) VALUES(?,?)",entry.id,id);const task=JSON.parse(entry.data);task.status="cancelled";task.deleting=true;task.updatedAt=new Date().toISOString();this.ctx.storage.sql.exec("UPDATE tasks SET data=? WHERE id=?",JSON.stringify(task),entry.id);}
         this.ctx.storage.sql.exec("DELETE FROM bots WHERE id=?",id);
         this.agents.forgetBot(id);
+        this.avatars.forgetBot(id);
       });
     }
     // Fence is durable before cleanup and is also the authorization record for
     // retries. Keep only this minimal tombstone after all user data is erased.
-    await this.rearmDeletion();
     const work=this.cleanup(id);
     this.ctx.waitUntil(work.catch(()=>{}));
+    await this.rearmDeletion();
     await work;
     return json({botId:id,deleted:true});
   }
   async fetch(request:Request):Promise<Response> {
     try {
       const path=new URL(request.url).pathname;
+      if(path.startsWith("/avatar")) return await this.avatars.fetch(request);
       if(path.startsWith("/agents/")) return await this.agents.fetch(request);
       if(path==="/tasks" && request.method==="GET") {
         const tasks=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks ORDER BY rowid DESC").toArray().map(row=>JSON.parse(row.data));

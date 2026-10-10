@@ -250,12 +250,22 @@ test('network return resumes Watch, while explicit Stop cancels recovery',async(
  await withDesktop(async({page,login,open,state,context})=>{
   await login();await open('view');await context.setOffline(true);
   await page.locator('.desktop-status').filter({hasText:'Waiting for connection'}).waitFor();
-  await until(()=>state.sockets[0].closed);await context.setOffline(false);await watching(page);
+  assert.equal(await page.locator('.desktop-screen canvas').count(),0,'offline pause removes the local framebuffer');
+  await until(()=>deletes(state).some(call=>call.path===`/v1/bots/${BOT_A}/computer/live-session/session-1`));
+  assert.equal(creates(state).length,1,'Watch does not request a new lease while offline');
+  // Chromium may defer the WebSocket close handshake while offline. Verify
+  // server-side transport cleanup only once the network can carry it again.
+  await context.setOffline(false);await watching(page);await until(()=>state.sockets[0].closed);
   assert.equal(creates(state).length,2);
+  assert.equal(creates(state)[1].body.mode,'view');
+  assert.equal(state.sockets.filter(socket=>!socket.closed).length,1,'recovery leaves only the new Watch socket active');
   await context.setOffline(true);await page.locator('[data-desktop="disconnect"]').click();
+  await until(()=>deletes(state).some(call=>call.path===`/v1/bots/${BOT_A}/computer/live-session/session-2`));
   await context.setOffline(false);await visibility(page,true);await visibility(page,false);
   await page.locator('.desktop-status').filter({hasText:'Disconnected'}).waitFor();
+  await until(()=>state.sockets[1].closed);
   assert.equal(creates(state).length,2);
+  assert.equal(state.sockets.filter(socket=>!socket.closed).length,0,'Stop leaves no active Watch socket');
  });
 });
 

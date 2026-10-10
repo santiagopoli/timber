@@ -114,8 +114,18 @@ for(const width of [320,1440])test(`compaction browser timeline keeps each histo
     await page.clock.fastForward(16000);
     await page.locator('[data-compaction-id="compact:live"][data-compaction-status="completed"]').waitFor();
     assert.equal(await page.locator('#messages [data-compaction-id]').count(),4);
-    await page.reload();await manual.waitFor();assert.equal(await page.locator('#messages [data-compaction-id]').count(),4);
+    // Context and transcript reload independently. Hold messages back so this
+    // regression cannot accidentally rely on their response arriving first.
+    let releaseMessages;
+    const messagesReady=new Promise(resolve=>{releaseMessages=resolve;});
+    await page.route(`**/v1/bots/${BOT_A}/messages*`,async route=>{await messagesReady;await route.continue();});
+    try {
+      await page.reload();await manual.waitFor();assert.equal(await page.locator('#messages [data-compaction-id]').count(),4);
+    } finally {releaseMessages();}
+    await page.locator('#messages [data-message-id="before-compact"]').waitFor({state:'attached'});
+    await page.locator('#messages [data-message-id="after-compact"]').waitFor({state:'attached'});
     const order=await page.locator('#messages [data-message-id], #messages [data-compaction-id]').evaluateAll(nodes=>nodes.map(node=>node.getAttribute('data-message-id')||node.getAttribute('data-compaction-id')));
+    for(const id of ['before-compact','after-compact','compact:manual','compact:auto'])assert.ok(order.includes(id),`timeline contains ${id}`);
     assert.ok(order.indexOf('before-compact')<order.indexOf('compact:manual'));assert.ok(order.indexOf('compact:auto')<order.indexOf('after-compact'));
     assert.match(await page.locator('#messages').innerText(),/Older history before compaction/);assert.match(await page.locator('#messages').innerText(),/New history after compaction/);
     const otherBot=page.locator(`[data-bot-id="${BOT_B}"]`);if(!await otherBot.isVisible())await page.locator('#mobile-back').click();await otherBot.click();

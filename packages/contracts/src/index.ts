@@ -52,3 +52,4 @@ export interface BotContextStatus {automatic:true;estimatedTokens:number;activeE
 export type TaskStatus = "pending" | "queued" | "running" | "waiting_approval" | "waiting_connection" | "cancelling" | "completed" | "failed" | "cancelled";
 export interface Task { id:string; title:string; description:string; botId:string; botName:string; creator:"owner"|"bot"; createdByBotId?:string; sourceRunId?:string; status:TaskStatus; startImmediately:boolean; createdAt:string; updatedAt:string; lastActivity?:string; }
 export interface TaskPage { tasks:Task[]; }
+export * from "./avatars";
