@@ -1,12 +1,13 @@
 import {ApiError} from './errors';
 
-/** Keep base64 plus job snapshots below the SQLite 2 MB row/string limit. */
-export const AVATAR_PNG_MAX_BYTES = 1024 * 1024;
+/** A 1024px RGBA PNG can exceed 4 MiB. Journal payloads in separate small rows;
+ * the transport/artifact bound must not depend on SQLite's per-row limit. */
+export const AVATAR_PNG_MAX_BYTES = 8 * 1024 * 1024;
 export const AVATAR_PNG_MAX_DIMENSION = 1024;
 export const AVATAR_PNG_MAX_BASE64 = 4 * Math.ceil(AVATAR_PNG_MAX_BYTES / 3);
 export const AVATAR_PNG_MAX_JSON_BYTES = AVATAR_PNG_MAX_BASE64 + 65_536;
 const SIGNATURE = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
-const tooLarge = (): never => { throw new ApiError(502, 'avatar_image_limit', 'The PNG avatar exceeded the 1 MiB safe durable-storage limit. No automatic retry was attempted.'); };
+const tooLarge = (): never => { throw new ApiError(502, 'avatar_image_limit', 'The PNG avatar exceeded the 8 MiB image limit. No automatic retry was attempted.'); };
 const invalid = (): never => { throw new ApiError(502, 'avatar_image_invalid', 'The image provider returned an invalid or unsafe PNG avatar. No automatic retry was attempted.'); };
 const crcTable = new Uint32Array(256);
 for (let n = 0; n < 256; n++) {
@@ -28,7 +29,9 @@ function base64Bytes(value: string): Uint8Array {
   try { binary = atob(value); } catch { invalid(); }
   if (binary.length > AVATAR_PNG_MAX_BYTES) tooLarge();
   if (btoa(binary) !== value) invalid();
-  return Uint8Array.from(binary, c => c.charCodeAt(0));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
 }
 function base64(bytes: Uint8Array): string {
   let binary = '';
@@ -42,7 +45,12 @@ function base64(bytes: Uint8Array): string {
  * metadata, leaving only IHDR/IDAT/IEND; animated PNG is explicitly rejected.
  */
 export async function decodeAvatarPng(value: string): Promise<Uint8Array> {
-  const bytes = base64Bytes(value);
+  return validateAvatarPngBytes(base64Bytes(value));
+}
+/** Validate R2 bytes directly, without allocating another base64 copy. */
+export async function validateAvatarPngBytes(bytes: Uint8Array): Promise<Uint8Array> {
+  if (!(bytes instanceof Uint8Array)) invalid();
+  if (bytes.length > AVATAR_PNG_MAX_BYTES) tooLarge();
   if (bytes.length < 57 || !SIGNATURE.every((n, i) => bytes[i] === n)) invalid();
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const keep: Uint8Array[] = [SIGNATURE], compressed: Uint8Array[] = [];
@@ -98,9 +106,3 @@ export async function decodeAvatarPng(value: string): Promise<Uint8Array> {
   return canonical;
 }
 export async function validateAvatarPng(value: string): Promise<string> { return base64(await decodeAvatarPng(value)); }
-/** Validate R2 bytes using the same decoder; no MIME/signature-only shortcut. */
-export async function validateAvatarPngBytes(bytes: Uint8Array): Promise<Uint8Array> {
-  if (!(bytes instanceof Uint8Array)) invalid();
-  if (bytes.length > AVATAR_PNG_MAX_BYTES) tooLarge();
-  return decodeAvatarPng(base64(bytes));
-}

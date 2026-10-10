@@ -907,7 +907,7 @@ regeneration on selection.
   pending. It is fenced by bot membership and current stored pointer after awaits.
   No public R2 URLs are returned. SVG is restricted and revalidated on read; PNG
   validation is also enforced; generated PNGs are bounded to 1024px per dimension
-  and 1 MiB encoded bytes by the current validator. Responses use attachment/nosniff security headers
+  and 8 MiB encoded bytes by the current validator. Responses use attachment/nosniff security headers
   and a private ETag cache validator; authenticated external avatar GET forwards only
   `If-None-Match` internally and returns 304 on a match. The response declares `original` (there is no
   server-generated thumbnail). Clients fetch authenticated bytes into safe `img`
@@ -935,7 +935,14 @@ unless the provider reports a known amount (currently it does not).
 Image API dispatch uses the server-only `OPENAI_API_KEY` Worker secret with one
 `POST /v1/images/generations`, PNG `1024x1024`, `background:"transparent"` for
 structured head themes, and a 30-minute transport deadline.
-The 1 MiB PNG limit keeps base64 output plus snapshots below SQLite row limits.
+The 8 MiB PNG bound accommodates detailed 1024px RGBA images without reducing
+resolution or discarding transparency. JSON transport allows the corresponding
+base64 expansion plus 64 KiB of response metadata. Validated output larger than
+512 KiB is journaled in ordered 512 KiB SQL chunks, atomically with a length
+manifest in the job row; no row contains the whole large image. Recovery checks
+the manifest and chunks, then revalidates PNG bytes before publishing, without
+redispatching inference. Existing inline journals remain readable. Completion,
+failure, obsolescence and bot deletion erase the private output chunks.
 Chunk CRC/order, exact decoded scanlines and filter values are checked; only
 non-interlaced 8-bit RGB/RGBA is accepted, ancillary metadata is removed and APNG
 is rejected. Candidate identities precede PUT; pointer replacement and old-object

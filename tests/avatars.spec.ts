@@ -7,6 +7,7 @@ import type { Env } from '../apps/api/src/env';
 import { AvatarCoordinator } from '../apps/api/src/avatars';
 import { errorResponse } from '../apps/api/src/errors';
 import { sanitizeAvatarSvg } from '../apps/api/src/avatar-svg';
+import { largeAvatarPng } from './fixtures/avatar-png';
 
 const bindings = env as unknown as Env;
 const MODEL = 'gpt-6.1-sol';
@@ -74,6 +75,7 @@ function coordinator(state: DurableObjectState, provider = fakeProvider(), files
 function expectClearedSnapshot(state: DurableObjectState, jobId: string) {
   const row = state.storage.sql.exec<{ bot: string; theme: string; output: string | null }>('SELECT bot,theme,output FROM avatar_jobs WHERE id=?', jobId).one();
   expect(row).toEqual({ bot: '{}', theme: '{}', output: null });
+  expect(state.storage.sql.exec('SELECT job_id FROM avatar_output_chunks WHERE job_id=?',jobId).toArray()).toEqual([]);
 }
 async function theme(c: AvatarCoordinator, name = 'Angular', kind: AvatarTheme['kind'] = 'vector', model = MODEL) {
   const response = await call(c, '/avatar-themes', 'POST', { operationId: crypto.randomUUID(), name, kind, model, prompt: `${name} shared design` });
@@ -875,6 +877,81 @@ describe('explicit Image API coordinator admission and PNG publication',()=>{
         expectClearedSnapshot(state,job.id);expect((await call(recovered,`/avatar/${bot.id}`)).status).toBe(200);
         const pointer=recovered.settings().avatars[0];await bindings.FILES.put(`bots/${bot.id}/avatars/${pointer.artifactId}`,'bad raster',{httpMetadata:{contentType:'image/png'}});
         await expectError(await call(recovered,`/avatar/${bot.id}`),502,'avatar_image_invalid');
+      });
+    }finally{mock.restore();}
+  });
+  it('journals a full-size RGBA image across small SQL rows and recovers publication without another image request',async()=>{
+    const large=await largeAvatarPng();expect(large.bytes.length).toBeGreaterThan(4*1024*1024);
+    const mock=imageFetch(large.base64);try{
+      await runInDurableObject(stub(),async(_instance,state)=>{
+        const provider=fakeProvider({connected:false}),bot=seed(state);let puts=0;
+        const files=new Proxy(bindings.FILES,{get(target,property){
+          if(property==='put')return async(...args:Parameters<R2Bucket['put']>)=>{puts++;if(puts===1)throw new Error('temporary storage failure');return target.put(...args);};
+          const member=Reflect.get(target,property,target);return typeof member==='function'?member.bind(target):member;
+        }});
+        const c=imageCoordinator(state,provider,files);await select(c,(await theme(c,'Large transparent image','image',IMAGE_MODEL)).id);
+        expect((await call(c,'/avatar-generations','POST',imageInput(c,bot.id))).status).toBe(202);await c.alarm();
+        const job=c.settings().jobs[0];expect(job.status).toBe('running');expect(job.error).toBeUndefined();expect(mock.calls).toHaveLength(1);
+        const chunks=state.storage.sql.exec<{size:number}>('SELECT length(content) AS size FROM avatar_output_chunks WHERE job_id=? ORDER BY part',job.id).toArray();
+        expect(chunks.length).toBeGreaterThan(1);expect(chunks.every(chunk=>chunk.size<=512*1024)).toBe(true);
+        expect(chunks.reduce((sum,chunk)=>sum+chunk.size,0)).toBe(large.base64.length);
+        expect(state.storage.sql.exec<{size:number}>('SELECT length(output) AS size FROM avatar_jobs WHERE id=?',job.id).one().size).toBeLessThan(100);
+        state.storage.sql.exec('UPDATE avatar_jobs SET next_at=0 WHERE id=?',job.id);
+        const recovered=imageCoordinator(state,provider,files);await recovered.alarm();
+        expect(recovered.settings().jobs[0].status).toBe('completed');expect(mock.calls).toHaveLength(1);expect(puts).toBe(2);
+        const response=await call(recovered,`/avatar/${bot.id}`);expect(response.status).toBe(200);expect(response.headers.get('content-type')).toBe('image/png');
+        const served=await response.arrayBuffer();expect(served.byteLength).toBe(large.bytes.length);
+        expect(await crypto.subtle.digest('SHA-256',served)).toEqual(await crypto.subtle.digest('SHA-256',large.bytes));
+        expectClearedSnapshot(state,job.id);
+        expect(state.storage.sql.exec('SELECT job_id FROM avatar_output_chunks WHERE job_id=?',job.id).toArray()).toEqual([]);
+      });
+    }finally{mock.restore();}
+  });
+  for(const outcome of ['missing chunk','corrupt chunk','theme switch','bot deletion','storage exhausted'] as const)it(`clears large image journals after ${outcome}, without replaying inference`,async()=>{
+    const large=await largeAvatarPng(),mock=imageFetch(large.base64);try{
+      await runInDurableObject(stub(),async(_instance,state)=>{
+        const bot=seed(state),provider=fakeProvider({connected:false});
+        const files=new Proxy(bindings.FILES,{get(target,property){
+          if(property==='put')return async()=>{throw new Error('storage unavailable');};
+          const member=Reflect.get(target,property,target);return typeof member==='function'?member.bind(target):member;
+        }});
+        const c=imageCoordinator(state,provider,files);await select(c,(await theme(c,'Large journal lifecycle','image',IMAGE_MODEL)).id);
+        expect((await call(c,'/avatar-generations','POST',imageInput(c,bot.id))).status).toBe(202);await c.alarm();
+        const job=c.settings().jobs[0];expect(job.status).toBe('running');
+        expect(state.storage.sql.exec('SELECT part FROM avatar_output_chunks WHERE job_id=?',job.id).toArray().length).toBeGreaterThan(1);
+        if(outcome==='theme switch'){
+          await select(c,(await theme(c,'Replacement theme')).id);expect(c.settings().jobs[0].status).toBe('obsolete');
+        }else if(outcome==='bot deletion'){
+          state.storage.sql.exec('DELETE FROM bots WHERE id=?',bot.id);c.forgetBot(bot.id);await c.drainBot(bot.id);
+          expect(c.settings().jobs).toEqual([]);
+        }else{
+          if(outcome==='missing chunk')state.storage.sql.exec('DELETE FROM avatar_output_chunks WHERE job_id=? AND part=1',job.id);
+          if(outcome==='corrupt chunk')state.storage.sql.exec("UPDATE avatar_output_chunks SET content='A'||substr(content,2) WHERE job_id=? AND part=0",job.id);
+          if(outcome==='storage exhausted')state.storage.sql.exec('UPDATE avatar_jobs SET attempts=4 WHERE id=?',job.id);
+          state.storage.sql.exec('UPDATE avatar_jobs SET next_at=0 WHERE id=?',job.id);
+          const recovered=imageCoordinator(state,provider,files);await recovered.alarm();
+          expect(recovered.settings().jobs[0]).toMatchObject({status:'failed',error:{code:outcome==='corrupt chunk'?'avatar_image_invalid':'avatar_storage_failed'}});
+          expect(recovered.settings().avatars).toEqual([]);
+        }
+        if(outcome!=='bot deletion')expectClearedSnapshot(state,job.id);
+        expect(state.storage.sql.exec('SELECT job_id FROM avatar_output_chunks WHERE job_id=?',job.id).toArray()).toEqual([]);
+        await c.alarm();expect(mock.calls).toHaveLength(1);
+      });
+    }finally{mock.restore();}
+  });
+  it('rolls back partial chunk writes and never reissues an uncertain image generation after restart',async()=>{
+    const large=await largeAvatarPng(),mock=imageFetch(large.base64);try{
+      await runInDurableObject(stub(),async(_instance,state)=>{
+        const c=imageCoordinator(state),bot=seed(state);await select(c,(await theme(c,'Atomic image journal','image',IMAGE_MODEL)).id);
+        expect((await call(c,'/avatar-generations','POST',imageInput(c,bot.id))).status).toBe(202);
+        state.storage.sql.exec("CREATE TRIGGER fail_avatar_chunk BEFORE INSERT ON avatar_output_chunks WHEN NEW.part=1 BEGIN SELECT RAISE(ABORT,'fixture journal failure'); END");
+        await expect(c.alarm()).rejects.toThrow('fixture journal failure');
+        expect(state.storage.sql.exec('SELECT job_id FROM avatar_output_chunks').toArray()).toEqual([]);
+        expect(state.storage.sql.exec<{output:string|null}>('SELECT output FROM avatar_jobs').one().output).toBeNull();
+        state.storage.sql.exec('DROP TRIGGER fail_avatar_chunk');
+        const recovered=imageCoordinator(state);await recovered.alarm();
+        expect(recovered.settings().jobs[0]).toMatchObject({status:'interrupted',error:{code:'avatar_generation_interrupted'}});
+        expect(recovered.settings().avatars).toEqual([]);expectClearedSnapshot(state,recovered.settings().jobs[0].id);expect(mock.calls).toHaveLength(1);
       });
     }finally{mock.restore();}
   });

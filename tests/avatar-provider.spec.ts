@@ -2,6 +2,7 @@ import {afterEach, describe, expect, it, vi} from 'vitest';
 import type {Env} from '../apps/api/src/env';
 import {MODEL_FAILURES} from '@botspace/contracts';
 import {avatarModelCatalog, generateVectorAvatar, generateImageAvatar, imageGenerationError} from '../apps/api/src/avatar-provider';
+import {AVATAR_PNG_MAX_JSON_BYTES} from '../apps/api/src/avatar-png';
 const svg = '<svg viewBox="0 0 128 128"><path d="M5 5L20 5L10 20Z" fill="#abc"/></svg>';
 const input = {model: 'account-text-model', prompt: 'flat forest theme', botName: 'Helper', botInstructions: 'Organizes tasks'};
 const model = {id: input.model, name: 'Account text model', provider: 'openai', reasoningEfforts: ['high'], supportsFast: true, inputModalities: ['text', 'image']};
@@ -460,7 +461,7 @@ describe('explicit server-only OpenAI Image API', () => {
     let fetch = vi.fn(() => new Response(new ReadableStream<Uint8Array>({cancel: cancelled}), {headers: {'content-type': 'text/html'}})); vi.stubGlobal('fetch', fetch);
     await expect(generateImageAvatar(imageEnv, imageInput)).rejects.toMatchObject({code: 'avatar_image_invalid'});
     expect(cancelled).toHaveBeenCalled();
-    fetch = vi.fn(() => new Response(' '.repeat(7_100_000), {headers: {'content-type': 'application/json'}})); vi.stubGlobal('fetch', fetch);
+    fetch = vi.fn(() => new Response(' '.repeat(AVATAR_PNG_MAX_JSON_BYTES + 1), {headers: {'content-type': 'application/json'}})); vi.stubGlobal('fetch', fetch);
     await expect(generateImageAvatar(imageEnv, imageInput)).rejects.toMatchObject({code: 'avatar_response_limit'});
     const controller = new AbortController();
     fetch = vi.fn(() => new Response(new ReadableStream<Uint8Array>({start(stream) {stream.enqueue(new TextEncoder().encode('{')); queueMicrotask(() => controller.abort());}, cancel: cancelled}), {headers: {'content-type': 'application/json'}})); vi.stubGlobal('fetch', fetch);
