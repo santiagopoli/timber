@@ -1,0 +1,24 @@
+.avatar-theme-gallery{display:grid;gap:20px;padding:12px 0 4px}
+.avatar-theme-group{display:grid;gap:10px;min-width:0}
+.avatar-theme-group h4{margin:0 0 2px;color:var(--muted);font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}
+.avatar-theme-card{display:grid;grid-template-columns:minmax(0,1fr);justify-content:stretch;align-items:stretch;width:100%;min-width:0;gap:14px;padding:16px;border:1px solid var(--line);border-radius:16px;background:var(--surface,#fff);color:var(--ink);text-align:left;font-weight:400;box-shadow:none;cursor:pointer}
+.avatar-theme-card:hover{background:var(--soft)}
+.avatar-theme-card[aria-pressed=true]{border-color:var(--ink);box-shadow:0 0 0 1px var(--ink)}
+.avatar-theme-card:focus-visible{outline:3px solid var(--accent,#58816a);outline-offset:3px}
+.avatar-theme-card-heading{display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap;line-height:1.4}
+.avatar-theme-card-heading strong{font-size:15px;font-weight:600}
+.avatar-theme-subject{font-size:12px;color:var(--muted)}
+.avatar-theme-subject::before{content:'·';margin-right:8px}
+.avatar-theme-badge{margin-left:auto;color:var(--muted);font-size:10px;line-height:1;letter-spacing:.02em;padding:5px 7px;border:1px solid var(--line);border-radius:6px}
+.avatar-theme-samples{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}
+.avatar-theme-sample{display:block;position:relative;aspect-ratio:1;border-radius:50%;overflow:hidden}
+.avatar-sample-art{position:absolute;inset:0;display:block}
+.avatar-sample-art img{width:100%;height:100%;object-fit:contain;opacity:0}
+.avatar-sample-art img[data-framed=true]{opacity:1}
+.avatar-theme-description{font-size:12px;color:var(--muted);line-height:1.4}
+.avatar-collection-details{margin:12px 0}
+.avatar-collection-details>summary{cursor:pointer;font-size:13px;font-weight:600;padding:10px 0}
+.avatar-theme-preview{margin:8px 0;color:var(--muted);font-size:12px;line-height:1.5}
+.avatar.avatar-head{background:var(--agent-fill,#e1e9df)!important;border:0!important;border-radius:50%!important;overflow:hidden!important}
+.avatar.avatar-head .timber-avatar-image{inset:0;width:100%;height:100%;object-fit:contain}
+@media(max-width:420px){.avatar-theme-card{padding:12px;gap:12px}.avatar-theme-samples{gap:6px}.avatar-theme-card-heading{gap:6px}.avatar-theme-card-heading strong{font-size:14px}.avatar-theme-description{font-size:11px}}

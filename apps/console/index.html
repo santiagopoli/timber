@@ -101,17 +101,28 @@
   <div class="dialog-heading"><h2 id="settings-title">Settings</h2><button class="quiet icon-button" data-close-dialog="settings-dialog" aria-label="Close settings">×</button></div>
   <section class="connection-section avatar-settings" aria-label="Global bot avatars">
     <div class="section-title"><h3>Bot avatars</h3><button id="avatar-refresh" class="quiet" type="button">Refresh</button></div>
-    <p class="hint">One shared theme applies to every bot. Individual regeneration never changes a bot’s theme. Previous validated avatars remain visible as stale until a replacement is ready.</p>
+    <p class="hint">One style for your whole team. Choose a style and an optional subject; each bot gets its own face.</p>
     <p id="avatar-status" class="hint" role="status" aria-live="polite">Loading avatar settings…</p>
     <label for="avatar-theme-select">Global theme</label><select id="avatar-theme-select" disabled><option value="">No theme selected</option></select>
+    <p id="avatar-theme-preview" class="avatar-theme-preview"></p>
+    <div id="avatar-reasoning-field" hidden>
+      <label for="avatar-reasoning-select">SVG reasoning</label>
+      <div class="row wrap"><select id="avatar-reasoning-select" aria-describedby="avatar-reasoning-help"></select><button id="avatar-save-reasoning" type="button" class="quiet">Save reasoning</button></div>
+      <p id="avatar-reasoning-help" class="hint">Saved per theme, independently of the bot’s reasoning. Applies to future generations.</p>
+      <p id="avatar-reasoning-status" class="hint" role="status" aria-live="polite"></p>
+    </div>
+    <details class="avatar-collection-details"><summary>Browse 10 included themes</summary><p class="hint">Five example heads per style. Transparent artwork on solid circles. Generated avatars will vary.</p><div id="avatar-theme-gallery" class="avatar-theme-gallery"></div></details>
     <div class="row wrap"><button id="avatar-apply-theme" class="quiet" type="button" disabled>Apply theme</button><button id="avatar-generate-all" type="button" disabled>Regenerate all bots</button></div>
     <div id="avatar-jobs" class="avatar-jobs" aria-live="polite"></div>
     <details class="setup-details" id="avatar-create-details"><summary>Create a theme</summary>
       <form id="avatar-create-form" class="avatar-create-form">
         <label for="avatar-theme-name">Name</label><input id="avatar-theme-name" maxlength="80" required placeholder="Studio portrait">
-        <label for="avatar-theme-kind">Style</label><select id="avatar-theme-kind"><option value="vector">Vector · SVG</option><option value="image">Image</option></select>
-        <label for="avatar-theme-prompt">Prompt</label><textarea id="avatar-theme-prompt" rows="4" maxlength="4000" required placeholder="Describe a consistent avatar style shared by all bots…"></textarea>
+        <label for="avatar-theme-kind">Format</label><select id="avatar-theme-kind"><option value="vector">Vector · SVG</option><option value="image">Image</option></select>
+        <label for="avatar-theme-prompt">Style</label><textarea id="avatar-theme-prompt" rows="3" maxlength="4000" required placeholder="Watercolor, soft washes and fine ink details…"></textarea>
+        <label for="avatar-theme-subject">Subject <span class="hint">(optional)</span></label><input id="avatar-theme-subject" maxlength="160" placeholder="Animals, robots, forest spirits…">
+        <p class="hint">Leave subject blank to let each bot choose. Heads are generated on transparent backgrounds; Timber adds the solid circle.</p>
         <label for="avatar-theme-model">Model</label><select id="avatar-theme-model" required></select>
+        <label id="avatar-theme-reasoning-field" for="avatar-theme-reasoning" hidden>SVG reasoning<select id="avatar-theme-reasoning"></select></label>
         <p id="avatar-image-capability" class="hint">Image generation capability is unavailable.</p>
         <button id="avatar-create-submit" type="submit">Create theme</button>
       </form>

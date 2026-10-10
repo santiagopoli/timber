@@ -50,3 +50,4 @@ export interface CompactionReceipt {id:string;reason:"manual"|"threshold"|"overf
 export interface BotContextStatus {automatic:true;estimatedTokens:number;activeEntries:number;contextWindow:number;compactions:CompactionReceipt[];historyRetained:true;}
 
 export * from "./avatars";
+export * from "./avatar-presets";
