@@ -1243,8 +1243,11 @@ test('disconnecting while app access is being prepared closes the tab without di
     try {
       await login(); await openPanel(page, 'apps');
       const opened = context.waitForEvent('page'); await page.getByRole('button', {name: 'Open Slow app', exact: true}).click(); const tab = await opened;
+      // Subscribe before disconnect/release can close the popup; checking
+      // isClosed() and subscribing afterwards races the close event.
+      const closed = tab.waitForEvent('close');
       await signOut(page); release();
-      if (!tab.isClosed()) await tab.waitForEvent('close');
+      await closed;
       assert.equal(state.previewCalls.length, 0); assert.equal(await page.locator('#workspace-app-list').textContent(), '');
     } finally {release();}
   });
@@ -2599,11 +2602,41 @@ test('permanent model failures route to connection or context and do not offer u
   });
 });
 
-test('transient model failure continuation preserves recorded results and starts only after an explicit click',async()=>{
+for (const delayedReplay of [false, true]) test(`transient model failure continuation preserves recorded results and starts only after an explicit click${delayedReplay ? ' with delayed SSE replay' : ''}`,async()=>{
   await withPage(async({page,state,login})=>{
+    if (delayedReplay) await page.addInitScript(() => {
+      // Preserve real SSE response headers, but hold the body until the test
+      // releases it. Live means connected, not that history has been replayed.
+      const fetch = window.fetch.bind(window);
+      window.fetch = async (...args) => {
+        const response = await fetch(...args);
+        if (!new URL(response.url).pathname.endsWith('/events') || !response.body) return response;
+        const reader = response.body.getReader();
+        const gate = new Promise(resolve => {window.__releaseModelFailureReplay = resolve;});
+        return new Response(new ReadableStream({
+          async pull(controller) {
+            await gate;
+            const {done, value} = await reader.read();
+            if (done) controller.close(); else controller.enqueue(value);
+          },
+          cancel: reason => reader.cancel(reason),
+        }), {status: response.status, headers: response.headers});
+      };
+    });
     const stamp=new Date().toISOString(),run={id:'transient-failure',botId:BOT_A,operationId:'transient-operation',status:'failed',error:'A safe older fallback.',errorCode:'model_connection_interrupted',createdAt:stamp,updatedAt:stamp};state.runs.set(BOT_A,[run]);state.messages.set(BOT_A,[{id:'transient-request',botId:BOT_A,runId:run.id,role:'user',text:'Inspect the saved build result.',createdAt:stamp}]);state.emit(BOT_A,'tool.completed',{operationId:'preserved-build',toolName:'exec',result:{status:'completed',output:'Build passed.',exitCode:0}},run.id);await login();
-    const notice=page.locator(`[data-run-outcome="${run.id}"]`);await notice.getByText(MODEL_FAILURES.model_connection_interrupted,{exact:true}).waitFor();assert.equal(sentMessages(state,BOT_A).length,0);assert.equal(await page.locator('[data-tool-operation-id="preserved-build"][data-tool-status="completed"]').count(),1);
+    const notice=page.locator(`[data-run-outcome="${run.id}"]`);await notice.getByText(MODEL_FAILURES.model_connection_interrupted,{exact:true}).waitFor();assert.equal(sentMessages(state,BOT_A).length,0);
+    if (delayedReplay) {
+      assert.equal(await page.locator('[data-tool-operation-id="preserved-build"]').count(), 0, 'the failure notice can render before SSE replay');
+      await page.waitForFunction(() => typeof window.__releaseModelFailureReplay === 'function');
+      await page.evaluate(() => window.__releaseModelFailureReplay());
+    }
+    const preserved = page.locator('[data-tool-operation-id="preserved-build"][data-tool-status="completed"]');
+    await preserved.waitFor();
+    assert.equal(await preserved.count(),1);
+    assert.match(await preserved.textContent(),/Build passed\./);
     const accepted=page.waitForResponse(response=>response.request().method()==='POST'&&response.url().endsWith('/messages'));await notice.getByRole('button',{name:'Continue',exact:true}).click();await accepted;const sent=sentMessages(state,BOT_A);assert.equal(sent.length,1);assert.notEqual(sent[0].body.operationId,run.operationId);assert.match(sent[0].body.text,/Inspect the saved build result/);assert.match(sent[0].body.text,/do not repeat completed work/);assert.equal(state.actions.length,0);
+    assert.equal(await preserved.count(),1);
+    assert.match(await preserved.textContent(),/Build passed\./);
   });
 });
 
