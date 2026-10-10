@@ -317,6 +317,14 @@ const imageInput = {...input, model: 'gpt-image-2.5-sunburst'};
 const imageEnv = {OPENAI_API_KEY: 'test-key-not-a-real-secret'} as Env;
 afterEach(() => {vi.unstubAllGlobals(); vi.useRealTimers();});
 describe('explicit server-only OpenAI Image API', () => {
+  it('requests transparent PNG artwork for head themes, leaving the solid circle to the UI',async()=>{
+    const fetch=vi.fn(async(_url:string,options:RequestInit)=>{
+      expect(JSON.parse(options.body as string)).toMatchObject({background:'transparent',output_format:'png',n:1});
+      return Response.json({data:[{b64_json:png}]});
+    });vi.stubGlobal('fetch',fetch);
+    expect(await generateImageAvatar(imageEnv,{...imageInput,transparentBackground:true})).toBe(png);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
   it('makes image configuration independent of SIWC and never infers verified entitlement or price', async () => {
     const fetch = vi.fn(() => {throw new Error('should not dispatch API');}); vi.stubGlobal('fetch', fetch);
     for (const env of [imageEnv, {...mockEnv(() => Response.json({error: 'private-body'}, {status: 503})).env, ...imageEnv}]) {

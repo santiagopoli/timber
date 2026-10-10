@@ -1,4 +1,5 @@
 import type { AvatarJob, AvatarSelection, AvatarSettings, AvatarTheme, Bot, BotAvatar } from '@botspace/contracts';
+import { avatarThemePrompt, builtinAvatarThemes } from '@botspace/contracts';
 import type { Env } from './env';
 import { ApiError, json } from './errors';
 import { body, operationId, string, UUID } from './validation';
@@ -42,14 +43,14 @@ export class AvatarCoordinator {
     ctx.storage.sql.exec('CREATE INDEX IF NOT EXISTS avatar_gc_pending ON avatar_gc(next_at)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS avatar_candidates (key TEXT PRIMARY KEY,bot_id TEXT NOT NULL,job_id TEXT NOT NULL)');
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS avatar_jobs_pending ON avatar_jobs(json_extract(data,'$.status'),next_at)");
-    // Only initialize once. No inference is implicit in startup or theme selection.
-    if (!ctx.storage.sql.exec('SELECT id FROM avatar_themes LIMIT 1').toArray().length) {
-      const theme: AvatarTheme = { id: crypto.randomUUID(), name: 'Paper sculpture', kind: 'vector', model: env.BOTSPACE_DEFAULT_MODEL?.startsWith('@cf/') ? 'gpt-6.1-sol' : env.BOTSPACE_DEFAULT_MODEL ?? 'gpt-6.1-sol', prompt: 'A minimal, geometric paper-sculpture character. Warm ivory, teal, amber and charcoal palette, clear angular shapes, consistent lighting and visual weight. Distinct silhouette reflecting each bot’s purpose, no text or letters. Transparent background, no circle, circular frame, border, badge or container.', createdAt: now() };
-      ctx.storage.transactionSync(() => {
-        ctx.storage.sql.exec('INSERT INTO avatar_themes(id,data) VALUES(?,?)', theme.id, JSON.stringify(theme));
-        ctx.storage.sql.exec('INSERT INTO avatar_selection(singleton,data) VALUES(1,?)', JSON.stringify({ themeId: theme.id, revision: 1 }));
-      });
-    }
+    // Add the collection to both new and existing workspaces. Stable identities
+    // preserve custom/legacy themes, selection, revision and already-paid jobs.
+    // Neither startup nor selection schedules inference.
+    const presets = builtinAvatarThemes(env.BOTSPACE_DEFAULT_MODEL?.startsWith('@cf/') ? 'gpt-6.1-sol' : env.BOTSPACE_DEFAULT_MODEL ?? 'gpt-6.1-sol');
+    ctx.storage.transactionSync(() => {
+      for (const theme of presets) ctx.storage.sql.exec('INSERT OR IGNORE INTO avatar_themes(id,data) VALUES(?,?)', theme.id, JSON.stringify(theme));
+      ctx.storage.sql.exec('INSERT OR IGNORE INTO avatar_selection(singleton,data) VALUES(1,?)', JSON.stringify({ themeId: presets[0].id, revision: 1 }));
+    });
     // Restart after provider dispatch: never silently run a possibly paid call again.
     for (const row of ctx.storage.sql.exec<{id:string;data:string;output:string|null}>("SELECT id,data,output FROM avatar_jobs WHERE json_extract(data,'$.status')='running'").toArray()) {
       if (!row.output) {
@@ -130,14 +131,18 @@ export class AvatarCoordinator {
     if (path === '/avatar-models' && request.method === 'GET') return json(await avatarModelCatalog(this.env));
     if (path === '/avatar-settings' && request.method === 'GET') return json(this.settings());
     if (path === '/avatar-themes' && request.method === 'POST') {
-      const input=await body(request); keys(input,['name','kind','prompt','model','operationId']);
-      const operation=operationId(input.operationId), name=string(input.name,'name',80).trim(), prompt=string(input.prompt,'prompt',8000).trim(), model=string(input.model,'model',180).trim();
-      if (!name || !prompt || !model || !['vector','image'].includes(input.kind as string)) throw new ApiError(400,'invalid_request','A name, prompt, model and vector/image kind are required.');
+      const input=await body(request); keys(input,['name','kind','prompt','style','subject','model','operationId']);
+      const operation=operationId(input.operationId), name=string(input.name,'name',80).trim(), model=string(input.model,'model',180).trim();
+      if (input.style !== undefined && input.prompt !== undefined || input.subject !== undefined && input.style === undefined) throw new ApiError(400,'invalid_request','Use style with an optional subject, or a legacy prompt.');
+      const style=input.style===undefined?undefined:string(input.style,'style',4000).trim();
+      const subject=input.subject===undefined?undefined:string(input.subject,'subject',160,0).trim()||undefined;
+      const prompt=style===undefined?string(input.prompt,'prompt',8000).trim():avatarThemePrompt(style,subject);
+      if (!name || !prompt || style==='' || !model || !['vector','image'].includes(input.kind as string)) throw new ApiError(400,'invalid_request','A name, style, model and vector/image kind are required.');
       if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(model)) throw new ApiError(400,'invalid_request','Avatar models must be identifiers from the existing OpenAI connection.');
-      const fingerprint=JSON.stringify({type:'theme',name,kind:input.kind,prompt,model});
+      const fingerprint=JSON.stringify({type:'theme',name,kind:input.kind,prompt,model,...(style===undefined?{}:{style,subject})});
       const replay=this.receipt(operation,fingerprint) as {themeId?:string;theme?:AvatarTheme}|undefined;
       if(replay) return json({theme:replay.themeId?this.theme(replay.themeId):replay.theme},201);
-      const theme:AvatarTheme={id:crypto.randomUUID(),name,kind:input.kind as AvatarTheme['kind'],prompt,model,createdAt:now()};
+      const theme:AvatarTheme={id:crypto.randomUUID(),name,kind:input.kind as AvatarTheme['kind'],prompt,model,createdAt:now(),...(style===undefined?{}:{style,subject,framing:'circle' as const})};
       this.ctx.storage.transactionSync(()=>{
         this.ctx.storage.sql.exec('INSERT INTO avatar_themes(id,data) VALUES(?,?)',theme.id,JSON.stringify(theme));
         this.saveReceipt(operation,fingerprint,{themeId:theme.id});
@@ -315,7 +320,7 @@ export class AvatarCoordinator {
         // Durable running marker precedes dispatch. Recovery never reissues it.
         const controller=new AbortController();this.generating={botId:job.botId,controller};
         try {
-          const input={model:theme.model,prompt:theme.prompt,botName:bot.name,botInstructions:bot.instructions};
+          const input={model:theme.model,prompt:theme.prompt,botName:bot.name,botInstructions:bot.instructions,transparentBackground:theme.framing==='circle'};
           output=await validate(await (theme.kind==='image'?generateImageAvatar(this.env,input,controller.signal):generateVectorAvatar(this.env,input,controller.signal)));
         }
         finally {this.generating=undefined;}

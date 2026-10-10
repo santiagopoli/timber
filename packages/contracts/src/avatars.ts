@@ -6,6 +6,13 @@ export interface AvatarTheme {
   name: string;
   kind: 'vector' | 'image';
   prompt: string;
+  /** Structured design data. Older custom themes may only have a prompt. */
+  style?: string;
+  subject?: string;
+  /** Transparent head artwork, displayed on a solid circle by the client. */
+  framing?: 'circle';
+  /** Stable built-in collection key; never accepted from theme creation input. */
+  preset?: string;
   model: string;
   createdAt: string;
 }

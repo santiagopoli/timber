@@ -1,5 +1,43 @@
 # Bot avatar themes
 
+## Included collection
+
+Ten themes ship with Timber. Each separates **style** from an optional
+**subject**: Paperfold · Animals, Bauhaus · Robots, Monoline · Animals,
+Pixel · Adventurers, Botanical · Forest spirits (SVG); Clay · Animals,
+Plush · Monsters, Porcelain · Animals, Watercolor · Animals and Space Toys ·
+Robots (PNG). Settings → Bot avatars → Browse 10 included themes shows five
+curated examples per theme. These are packaged design examples, not live bot
+avatars or evidence that a provider is configured. Opening the gallery never
+calls a generation provider.
+
+New structured themes generate **heads only** on transparent backgrounds.
+Image requests explicitly set `background: "transparent"`. The console places
+the artwork inside a solid circular background using the bot's stable color;
+the provider must not bake that circle into the file. SVG markup remains within
+the existing passive grammar. The client measures visible alpha coverage to
+normalize apparent head size and remove padding differences, then centers each
+silhouette with a bound for long ears/antennae. PNG normalization precedes its
+96px thumbnail; SVG keeps its original vector bytes and receives viewport placement.
+The same optical normalization is used for all 50 gallery examples. Legacy prompt-only themes retain their original
+framing. Existing avatars remain visible until a replacement is ready.
+
+Creation accepts `{name,kind,style,subject?,model,operationId}`. An omitted or
+blank subject lets the bot's purpose guide its character. Legacy `{prompt}`
+requests remain supported, but cannot be mixed with style/subject. The server
+composes the rendering prompt and records `framing: "circle"`; clients cannot
+claim a built-in preset ID. Built-ins use stable UUIDs and insert-if-absent
+seeding on startup, including existing owners, without changing selection,
+revision, legacy/custom themes, avatar pointers or job snapshots. A new owner
+starts with Paperfold. Previously selected themes remain selected on upgrade.
+
+The five raster contact strips were generated specifically for the collection;
+the 25 SVG heads are authored in `scripts/generate-avatar-vector-previews.mjs`.
+All preview artwork is served as local static assets under
+`/console/avatar-themes/`; no third-party image hosts or credentials are involved.
+Regeneration still follows the existing explicit selection, count and API
+billing confirmation flow.
+
 ## Product behavior
 
 Avatars use **one global theme per owner**. Settings lets the owner choose a shared
@@ -7,8 +45,9 @@ theme and explicitly regenerate all bots or one bot. No bot can override the glo
 theme. Changing the global theme marks the previous validated avatars stale but
 keeps them visible while replacements are generated; a newly generated avatar
 replaces the old image only after validation and publication succeed. If generation
-fails, the old image remains visible and is identified as stale. SVGs have a
-transparent background and are not displayed in circular frames.
+fails, the old image remains visible and is identified as stale. SVG artwork has a
+transparent background. Structured head themes use a solid circle supplied by the
+UI; legacy prompt-only themes retain their original unframed display.
 
 SVG output is generated with the connected OpenAI **text** model through SIWC's
 streaming Responses transport using `store:false`. SIWC text model/account discovery

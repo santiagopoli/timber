@@ -2,6 +2,7 @@ import { env, exports } from 'cloudflare:workers';
 import { runInDurableObject } from 'cloudflare:test';
 import { describe, expect, it, vi } from 'vitest';
 import type { AvatarJob, AvatarSettings, AvatarTheme, Bot, ModelOption } from '@botspace/contracts';
+import { AVATAR_THEME_PRESETS, builtinAvatarThemes } from '@botspace/contracts';
 import type { Env } from '../apps/api/src/env';
 import { AvatarCoordinator } from '../apps/api/src/avatars';
 import { errorResponse } from '../apps/api/src/errors';
@@ -141,6 +142,49 @@ describe('avatar HTTP boundary', () => {
 });
 
 describe('owner-local AvatarCoordinator journals', () => {
+  it('ships five SVG and five image themes without inference and preserves legacy state on upgrade',async()=>{
+    await runInDurableObject(stub(),async(_instance,state)=>{
+      const provider=fakeProvider(),c=coordinator(state,provider);
+      expect(c.settings().themes).toEqual(builtinAvatarThemes());
+      expect(c.settings().themes.filter(theme=>theme.kind==='vector')).toHaveLength(5);
+      expect(c.settings().themes.filter(theme=>theme.kind==='image')).toHaveLength(5);
+      expect(c.settings().jobs).toEqual([]);
+      expect(provider.catalogueCalls()).toBe(0);expect(provider.calls).toHaveLength(0);
+      const legacy=await theme(c,'Existing owner theme'),bot=seed(state);
+      await select(c,legacy.id);await generate(c,bot.id);
+      // Simulate an owner predating the collection, with an existing selection
+      // and queued snapshot. Startup must neither switch it nor replay work.
+      for(const preset of AVATAR_THEME_PRESETS)state.storage.sql.exec('DELETE FROM avatar_themes WHERE id=?',preset.id);
+      const before=c.settings();
+      const snapshot=state.storage.sql.exec('SELECT theme,bot FROM avatar_jobs').toArray();
+      const restored=coordinator(state,provider).settings();
+      expect(restored.themes).toHaveLength(11);
+      expect(restored.themes.find(theme=>theme.id===legacy.id)).toEqual(legacy);
+      expect({...restored,themes:before.themes}).toEqual(before);
+      expect(state.storage.sql.exec('SELECT theme,bot FROM avatar_jobs').toArray()).toEqual(snapshot);
+      expect(coordinator(state,provider).settings()).toEqual(restored);
+      expect(provider.calls).toHaveLength(0);
+    });
+  });
+  it('persists style and optional subject as head artwork while keeping legacy receipt compatibility',async()=>{
+    await runInDurableObject(stub(),async(_instance,state)=>{
+      const provider=fakeProvider(),c=coordinator(state,provider);
+      const input={operationId:crypto.randomUUID(),name:'Watercolor Animals',kind:'image',model:'gpt-image-2.5-sunburst',style:'Soft watercolor washes',subject:'Animals'};
+      const response=await call(c,'/avatar-themes','POST',input);expect(response.status).toBe(201);
+      const saved=await response.json<{theme:AvatarTheme}>();
+      expect(saved.theme).toMatchObject({style:input.style,subject:'Animals',framing:'circle'});
+      expect(saved.theme.preset).toBeUndefined();
+      expect(saved.theme.prompt).toContain('Head only');expect(saved.theme.prompt).toContain('Subject family: Animals');
+      expect(saved.theme.prompt).toContain('truly transparent background');
+      expect(await (await call(c,'/avatar-themes','POST',input)).json()).toEqual(saved);
+      await expectError(await call(c,'/avatar-themes','POST',{...input,subject:'Robots'}),409,'operation_conflict');
+      const free=await (await call(c,'/avatar-themes','POST',{...input,operationId:crypto.randomUUID(),subject:''})).json<{theme:AvatarTheme}>();
+      expect(free.theme.subject).toBeUndefined();expect(free.theme.prompt).toContain('choose a distinctive character');
+      for(const extra of [{style:' '},{subject:'x'.repeat(161)},{prompt:'Conflicting legacy prompt'},{preset:'clay'}])await expectError(await call(c,'/avatar-themes','POST',{...input,operationId:crypto.randomUUID(),...extra}),400,'invalid_request');
+      const legacy=await theme(c);expect(legacy.style).toBeUndefined();expect(legacy.framing).toBeUndefined();
+      expect(provider.catalogueCalls()).toBe(0);expect(provider.calls).toHaveLength(0);
+    });
+  });
   it('honors supplied vector global preconditions without permitting a per-bot model override',async()=>{
     await runInDurableObject(stub(),async(_instance,state)=>{
       const provider=fakeProvider(),c=coordinator(state,provider),bot=seed(state),confirmed=c.selection()!;

@@ -316,10 +316,10 @@ dialog{max-width:calc(100vw - 24px);padding:20px;max-height:calc(var(--app-heigh
 .avatar-small{width:30px;height:30px;font-size:12px}
 .avatar{position:relative;overflow:hidden}
 .timber-avatar-image{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:1}
-.avatar-vector{border:0!important;border-radius:0!important;background:transparent!important}
+.avatar-vector:not(.avatar-head){border:0!important;border-radius:0!important;background:transparent!important}
 .avatar-vector .timber-avatar-image{object-fit:contain}
-.avatar-image{border-radius:10px!important}
-.avatar-vector{overflow:visible!important}
+.avatar-image:not(.avatar-head){border-radius:10px!important}
+.avatar-vector:not(.avatar-head){overflow:visible!important}
 .avatar-stale{outline:1px dashed color-mix(in srgb,var(--muted) 55%,transparent);outline-offset:2px}
 .avatar-bot-row .avatar-stale{opacity:.82}
 .avatar-vector .timber-model-badge{display:none!important}

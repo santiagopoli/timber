@@ -826,9 +826,16 @@ boundaries and the Hermes, OpenClaw and Meta Muse sources informing this design.
 ## Owner-global bot avatars
 
 The authenticated owner's WorkspaceDO owns one global theme selection and a
-monotonic revision; bots have no theme override. A starter vector theme is selected
-without scheduling inference. Themes are immutable shared design prompts with
-`kind:vector|image`, model and name. Editing a prompt means creating a new theme
+monotonic revision; bots have no theme override. Ten built-in themes (five SVG,
+five image) are seeded with stable IDs for both new and existing owners, without
+changing existing selection, revisions, custom themes, avatars or jobs. New owners
+start with Paperfold without scheduling inference. Themes are immutable shared
+design prompts with `kind:vector|image`, model and name. New themes separate
+`style` and optional `subject`, with `framing:"circle"`: transparent head artwork
+displayed on a solid circle supplied by the console. Built-ins also carry a
+server-assigned `preset` key for the static five-example gallery. These curated
+examples do not invoke inference or represent generated owner avatars.
+Editing a prompt means creating a new theme
 and selecting it globally. Changing selection does **not** remove a bot's previous
 validated avatar: it remains visible and is marked stale until a replacement for
 the current theme/revision has been fully generated, validated and published. The
@@ -853,7 +860,11 @@ regeneration on selection.
   or image generation has been tested. No credentials are returned to the client.
 - `GET /v1/avatar-settings` -> `AvatarSettings` with themes, global selection,
   avatar metadata and newest 100 jobs. It performs no inference or VM wakeup.
-- `POST /v1/avatar-themes` `{name,kind,prompt,model,operationId}` -> 201 `{theme}`.
+- `POST /v1/avatar-themes` `{name,kind,style,subject?,model,operationId}` -> 201 `{theme}`.
+  Style is required (up to 4,000 characters), subject is optional (up to 160);
+  a blank subject is omitted. The server composes the head-only transparent prompt.
+  Legacy `{name,kind,prompt,model,operationId}` remains supported with its original
+  receipt fingerprint and framing; prompt cannot be combined with style/subject.
   Themes can be saved before provider configuration; a saved ID is not a capability
   claim. SVG themes use an available connected-account **text** model.
 - `PUT /v1/avatar-settings` `{themeId,operationId}` -> `AvatarSettings`. Switching
@@ -887,7 +898,11 @@ regeneration on selection.
   and a private ETag cache validator; authenticated external avatar GET forwards only
   `If-None-Match` internally and returns 304 on a match. The response declares `original` (there is no
   server-generated thumbnail). Clients fetch authenticated bytes into safe `img`
-  Blob URLs, never inline SVG/HTML or a circular clipping frame. PNG display blobs
+  Blob URLs, never inline SVG/HTML. Structured head themes receive a solid
+  circular UI background with contained artwork; visible alpha coverage controls
+  apparent size and silhouette centering, with bounds for tall/wide heads. SVG
+  stays vector using CSS placement; PNG is normalized before thumbnailing.
+  Legacy themes retain their framing. PNG display blobs
   are reduced client-side to 96×96 with browser bitmap/canvas decoding, with bounded
   original/CSS fallback on older browsers. A previous decoded avatar is retained
   while replacement loads or fails; superseded cache URLs are evicted afterwards.
@@ -905,7 +920,8 @@ billing is separate from ChatGPT SIWC allowance and no amount is inferred or sho
 unless the provider reports a known amount (currently it does not).
 
 Image API dispatch uses the server-only `OPENAI_API_KEY` Worker secret with one
-`POST /v1/images/generations`, PNG `1024x1024`, and a 30-minute transport deadline.
+`POST /v1/images/generations`, PNG `1024x1024`, `background:"transparent"` for
+structured head themes, and a 30-minute transport deadline.
 The 1 MiB PNG limit keeps base64 output plus snapshots below SQLite row limits.
 Chunk CRC/order, exact decoded scanlines and filter values are checked; only
 non-interlaced 8-bit RGB/RGBA is accepted, ancillary metadata is removed and APNG
