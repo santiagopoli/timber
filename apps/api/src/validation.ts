@@ -40,6 +40,7 @@ export function operationId(value:unknown):string {
 export function parseMessage(value:unknown):{text:string;operationId:string;mentions?:string[];attachments?:string[]} {
   const data=object(value);
     const text=string(data.text,"text",32_000,0);
+  if(/\[private-draft:[a-f0-9-]{36}\]/i.test(text))invalid("Complete the private input before sending.");
   const attachments=data.attachments;
   if(attachments!==undefined && (!Array.isArray(attachments) || attachments.length>4 || attachments.some(id=>typeof id!=="string" || !UUID.test(id)) || new Set(attachments).size!==attachments.length)) invalid("attachments must contain up to four distinct image IDs.");
   const ids=attachments as string[]|undefined;

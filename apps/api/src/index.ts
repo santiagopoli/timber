@@ -95,6 +95,7 @@ export default {
         return env.GITHUB.get(env.GITHUB.idFromName(owner)).fetch(internalRequest(request,"https://github/status"));
       }
       const registry=env.WORKSPACE.get(env.WORKSPACE.idFromName(owner));
+      if(url.pathname==='/v1/keychain'||url.pathname.startsWith('/v1/keychain/'))return registry.fetch(internalRequest(request,`https://workspace${url.pathname.slice(3)}`));
       if(["/v1/avatar-settings","/v1/avatar-themes","/v1/avatar-generations","/v1/avatar-models"].includes(url.pathname)) {
         return registry.fetch(internalRequest(request,`https://workspace${url.pathname.slice(3)}`));
       }
@@ -106,12 +107,14 @@ export default {
       if(!match || !UUID.test(match[1])) throw new ApiError(404,"not_found","Bot not found.");
       const botId=match[1];
       const tail=match[2]??"";
+      if(tail.startsWith('/_keychain'))throw new ApiError(404,'not_found','Endpoint not found.');
       if(["/agent-messages","/agent-results","/agent-cancel"].includes(tail)) throw new ApiError(404,"not_found","Endpoint not found.");
       if(tail==="" && ["PATCH","DELETE"].includes(request.method)) return registry.fetch(internalRequest(request,`https://workspace/${botId}`));
       const record=await registry.fetch(`https://workspace/${botId}`);
       if(!record.ok) return record;
       const {bot}=await record.json<{bot:Bot}>();
       if(!tail && request.method==="GET") return json({bot});
+      if(tail==='/keychain'||tail.startsWith('/keychain/')){const forwarded=internalRequest(request,`https://workspace${tail}`);forwarded.headers.set('x-keychain-bot',botId);return registry.fetch(forwarded);}
       if(tail==="/avatar") return registry.fetch(internalRequest(request,`https://workspace/avatar/${botId}`,true));
       const artifact=/^\/artifacts\/([^/]+)$/.exec(tail);
       if(artifact && request.method==="GET") {

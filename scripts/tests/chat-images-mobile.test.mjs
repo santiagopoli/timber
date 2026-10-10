@@ -14,7 +14,7 @@ for(const width of [390,320]) test(`mobile image composer geometry and accessibl
  const capture=name=>page.screenshot({path:`${output}/${width}-${name}.png`});
  const geometry=async count=>{
   const form=page.locator('#message-form'),textarea=await page.locator('#message').boundingBox();
-  const attach=await form.getByRole('button',{name:'Attach images',exact:true}).boundingBox(),send=await form.getByRole('button',{name:'Send message',exact:true}).boundingBox();
+  const attach=await form.getByRole('button',{name:'Add',exact:true}).boundingBox(),send=await form.getByRole('button',{name:'Send message',exact:true}).boundingBox();
   assert.ok(textarea.width>=width-160,'attachments do not squeeze text field');
   for(const [name,box] of [['attach',attach],['send',send]]){
    assert.ok(box&&box.width>=44&&box.height>=44,`${name} mobile touch target`);
@@ -36,7 +36,7 @@ for(const width of [390,320]) test(`mobile image composer geometry and accessibl
   assert.equal(fixture.state.calls.filter(call=>call.method==='POST'&&call.path.endsWith('/messages')).length,0,'mobile newline does not submit the message');
   await page.locator('#message').fill('');
   await capture('empty');await geometry(0);assert.equal(await page.getByRole('button',{name:'Send message',exact:true}).isDisabled(),true);
-  const chooser=page.waitForEvent('filechooser');await page.getByRole('button',{name:'Attach images',exact:true}).click();await(await chooser).setFiles(image(1));await page.locator('.timber-image-attachments img').waitFor();
+  const chooser=page.waitForEvent('filechooser');await page.getByRole('button',{name:'Add',exact:true}).click();await page.getByRole('menuitem',{name:'Attach images',exact:true}).click();await(await chooser).setFiles(image(1));await page.locator('.timber-image-attachments img').waitFor();
   await capture('one');await geometry(1);assert.equal(await page.getByRole('button',{name:'Send message',exact:true}).isEnabled(),true,'image-only input can send');
   await page.locator('input[type=file]').setInputFiles([image(2),image(3),image(4)]);await page.waitForFunction(()=>document.querySelectorAll('.timber-image-attachments img').length===4);
   await capture('four');await geometry(4);

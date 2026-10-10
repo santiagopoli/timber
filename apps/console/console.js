@@ -585,7 +585,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
       const latest=isSelected?latestConversationMessage:undefined;
       const activeAgents=isSelected&&!chatLoading?subagents.filter(agent=>!terminal.has(agent.status)).length:saved?.activeAgents||0;
       const latestText=latest?.text?.trim()||(latest?.attachments?.length?(latest.attachments.length===1?'Image':`${latest.attachments.length} images`):'');
-      return {bot,activity,activeAgents,modelName:modelCatalog.models.find(model=>model.id===bot.model)?.name||bot.model,preview:(latestText||saved?.lastMessage?.text||bot.instructions||'Start a conversation').trim().replace(/\s+/g,' ').slice(0,180)};
+      return {bot,activity,activeAgents,modelName:modelCatalog.models.find(model=>model.id===bot.model)?.name||bot.model,preview:(latestText||saved?.lastMessage?.text||bot.instructions||'Start a conversation').trim().replace(/\[private:[a-f0-9-]{36}\]/gi,'🔒 ••••••').replace(/\s+/g,' ').slice(0,180)};
     });
     const renderKey=JSON.stringify([bots.length,selected?.id,rows,[...deletionPending.values()]]);if(renderKey===botRenderKey)return;botRenderKey=renderKey;
     $('bot-count').textContent = String(bots.length); $('bot-list').replaceChildren();

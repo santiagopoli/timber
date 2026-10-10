@@ -52,3 +52,4 @@ export interface BotContextStatus {automatic:true;estimatedTokens:number;activeE
 
 export * from "./avatars";
 export * from "./avatar-presets";
+export type {SecretMetadata,SecureInputRequest} from './keychain';

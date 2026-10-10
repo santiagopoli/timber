@@ -67,11 +67,11 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
         return paused;
       }
     }
-    if (["fixture:github", "fixture:github-account"].includes(operation.text)) {
+    if (["fixture:github", "fixture:github-account", "fixture:secret"].includes(operation.text) || operation.text.startsWith("fixture:configure:")) {
       if (!options.tools.call) throw new Error("Host tools fixture requires a host bridge");
       const result = await options.tools.call({
         operationId: `fixture-host:${operationId}`, runOperationId: operationId,
-        name: operation.text === "fixture:github-account" ? "github_connect" : "github_clone", arguments: operation.text === "fixture:github-account" ? {} : {repository: "Owner/Private", path: "project"},
+        name: operation.text.startsWith('fixture:configure:') ? 'configure_secret' : operation.text === 'fixture:secret' ? 'request_secret' : operation.text === "fixture:github-account" ? "github_connect" : "github_clone", arguments: operation.text.startsWith('fixture:configure:') ? {secretId:operation.text.slice('fixture:configure:'.length),name:'Example API key',origin:'https://api.example.com',header:'X-API-Key',prefix:'',purpose:'Read the account profile'} : operation.text === 'fixture:secret' ? {name:'Test API key',origin:'https://api.example.com',purpose:'Read the account profile'} : operation.text === "fixture:github-account" ? {} : {repository: "Owner/Private", path: "project"},
         signal: new AbortController().signal,
       });
       await options.storage.put(`fixture-host-result:${operationId}`, result);

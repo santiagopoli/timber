@@ -9,13 +9,14 @@ import { WorkspaceApps } from "./workspace-apps";
 import { computerActivityInput, hostActivityInput } from "./tool-activity";
 import type { Env } from "./env";
 import { ApiError, errorResponse, json } from "./errors";
-import { body, fingerprint, operationId, parseAction, parseMessage, UUID } from "./validation";
+import { body, object, fingerprint, operationId, parseAction, parseMessage, UUID } from "./validation";
 import {modelCatalog,openRouterRequest} from './model-catalog';
 
 type JsonRow = {data:string};
 type RunRow = JsonRow & {id:string;operation_id:string;fingerprint:string;native_operation_id:string};
 import {uploadChatImage} from "./chat-images";
 import {maintenanceRequest} from "./bot-maintenance";
+import {SecureInputRequests, type SecureInputRequest, type SecretMetadata} from './keychain';
 type Submission = {operation_id:string;run_id:string;text:string;admitted:number;subagent_id?:string|null};
 type MentionDelivery = {operation_id:string;run_id:string;target_id:string;text:string;attempts:number};
 
@@ -68,6 +69,8 @@ export class BotDO extends DurableObject<Env> {
   private deleted=false;
   private deleting?:Promise<void>;
   private closeStreams=new Set<()=>void>();
+  private keychainStore?:SecureInputRequests;
+  private keychain():SecureInputRequests {return this.keychainStore??=new SecureInputRequests(this.ctx.storage);}
 
   constructor(ctx:DurableObjectState,env:Env) {
     super(ctx,env);
@@ -531,7 +534,7 @@ export class BotDO extends DurableObject<Env> {
 
     if(this.takingControl) throw new ApiError(409,"computer_busy","Desktop control is being acquired. Retry after the connection is established.");
     this.active();
-    if(!metadata && /^(approval|delegate|connection|subagent|agent-result|subagent-report|mention|process-cancel|process-poll|run-cancel):/.test(input.operationId)) throw new ApiError(400,"reserved_operation_id","This operationId prefix is reserved.");
+    if(!metadata && /^(approval|delegate|connection|secure|subagent|agent-result|subagent-report|mention|process-cancel|process-poll|run-cancel):/.test(input.operationId)) throw new ApiError(400,"reserved_operation_id","This operationId prefix is reserved.");
     if(this.ctx.storage.sql.exec("SELECT operation_id FROM cancelled_agent_inputs WHERE operation_id=?",input.operationId).toArray().length) throw new ApiError(409,"run_cancelled","This delegated input has been cancelled.");
     if(metadata?.parentRunId && this.stopped(metadata.parentRunId)) throw new ApiError(409,"run_cancelled","The parent task has been cancelled.");
     if(metadata?.subagentId && this.subagentStopped(metadata.subagentId)) throw new ApiError(409,"agent_inactive","This subagent has been stopped.");
@@ -766,6 +769,7 @@ export class BotDO extends DurableObject<Env> {
       const connection=JSON.parse(row.data) as ConnectionRequest;
       connection.status="cancelled";this.saveConnection(connection);this.emit("connection.updated",{connection},id);
     }
+    for(const request of this.keychain().requests())if(request.runId===id&&request.status==='pending'){request.status='cancelled';this.keychain().setRequest(request);this.emit('keychain.updated',{request},id);this.ctx.waitUntil(this.keychainTool('cancel',{},request.runId,request.nativeOperationId,`cancel:${request.id}`).catch(()=>{}));}
   }
 
   private async waitForCapacity(operationId:string,runId:string):Promise<void> {
@@ -1226,7 +1230,7 @@ export class BotDO extends DurableObject<Env> {
     this.ctx.storage.sql.exec("UPDATE connections SET data=? WHERE id=?",JSON.stringify(connection),connection.id);
   }
   private hasPendingConnection(runId:string):boolean {
-    return this.ctx.storage.sql.exec("SELECT id FROM connections WHERE json_extract(data,'$.runId')=? AND json_extract(data,'$.status')='pending' LIMIT 1",runId).toArray().length>0;
+    return this.keychain().hasPending(runId) || this.ctx.storage.sql.exec("SELECT id FROM connections WHERE json_extract(data,'$.runId')=? AND json_extract(data,'$.status')='pending' LIMIT 1",runId).toArray().length>0;
   }
   private async github(path:string,method='POST',input?:unknown):Promise<Record<string,unknown>> {
     if(!this.env.GITHUB) throw new ApiError(503,'github_not_configured','GitHub connections are not configured.');
@@ -1291,6 +1295,25 @@ export class BotDO extends DurableObject<Env> {
     if(continuation) await this.admit(continuation);
     return connection;
   }
+  private async keychainTool(name:string,args:Record<string,unknown>,runId:string,nativeOperationId:string,operationId:string,signal?:AbortSignal):Promise<Record<string,unknown>>{
+    const response=await this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName('owner')).fetch('https://workspace/keychain-tools',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name,arguments:args,botId:this.bot().id,runId,nativeOperationId,operationId}),signal});
+    const value=await response.json<Record<string,unknown>>();
+    if(!response.ok){const error=value.error as {code?:string;message?:string}|undefined;throw new ApiError(response.status,error?.code??'keychain_unavailable',error?.message??'Keychain is unavailable.');}return value;
+  }
+  private async resumeSecureInput(request:SecureInputRequest,entries:SecretMetadata[]):Promise<void>{
+    let continuation:string|undefined;
+    this.ctx.storage.transactionSync(()=>{
+      this.active();const run=this.getRun(request.runId),native=this.getRunRow(run.id).native_operation_id,id=`secure:${request.id}`;
+      if(request.botId!==this.bot().id||request.status!=='saved')throw new ApiError(409,'secure_input_inactive','Invalid secure continuation.');
+      if(terminal.has(run.status)||this.stopped(run.id))return;
+      if(native===id){continuation=id;return;}
+      if(native!==request.nativeOperationId)return;
+      this.keychain().setRequest(request);this.emit('keychain.updated',{request,entries},run.id);
+      const text=`The user supplied or authorized a private input from their keychain. Saved references: ${JSON.stringify(entries.map(({id,name,origin,header,prefix})=>({id,name,origin,header,prefix})))}. Use secret_request with the saved reference if configured, otherwise prepare its use with configure_secret. Never request or reveal the value. Continue the original task using its recorded results. No authenticated action has been performed by saving or authorizing this input.`;
+      this.ctx.storage.sql.exec('INSERT INTO submissions(operation_id,run_id,text,subagent_id) VALUES(?,?,?,?)',id,run.id,text,run.subagentId??null);this.ctx.storage.sql.exec('UPDATE runs SET native_operation_id=? WHERE id=?',id,run.id);this.updateStatus(run.id,'queued');continuation=id;
+    });
+    if(continuation)await this.admit(continuation);
+  }
   private async executeHostTool(input:RuntimeHostToolRequest):Promise<RuntimeToolResult> {
     this.active();
     input=await this.childToolInput(input);
@@ -1303,6 +1326,7 @@ export class BotDO extends DurableObject<Env> {
     this.active();
     if(this.getRunRow(run.id).native_operation_id!==input.runOperationId || terminal.has(this.getRun(run.id).status) || input.signal.aborted) return {operationId:input.operationId,status:'interrupted',error:'Run is no longer active.'};
     const args=input.arguments;
+    if(['request_secret','configure_secret','list_secrets','secret_request'].includes(input.name) && (input.subagentId || run.subagentId)) return {operationId:input.operationId,status:'failed',error:'Only the named bot can use the owner’s permitted private inputs. Ask your parent to perform this authenticated operation.'};
     if(typeof args.repository==='string') {
       const repository=args.repository.toLowerCase();
       if(!/^[a-z0-9][a-z0-9-]{0,38}\/[a-z0-9._-]{1,100}$/.test(repository) || repository.endsWith('/.') || repository.endsWith('/..')) throw new ApiError(400,'invalid_repository','Use a GitHub repository in owner/name format.');
@@ -1311,7 +1335,17 @@ export class BotDO extends DurableObject<Env> {
     this.startTool(input.operationId,activity,run.id);
     const completed=(value:unknown):ComputerResult=>({operationId:input.operationId,status:'completed',output:typeof value==='string'?value:JSON.stringify(value)});
     let result:ComputerResult;
-    if(input.name==='list_bots') {
+    if(input.name==='request_secret'||input.name==='configure_secret') {
+      const {request}=await this.keychainTool(input.name,args,run.id,input.runOperationId,input.operationId,input.signal) as unknown as {request:SecureInputRequest};
+      if(this.stopped(run.id)||terminal.has(this.getRun(run.id).status)){await this.keychainTool('cancel',{},run.id,input.runOperationId,`cancel:${request.id}`);return {operationId:input.operationId,status:'interrupted',error:'Task stopped.'};}
+      this.keychain().setRequest(request);
+      if(request.status!=='pending')return completed({requestId:request.id,status:request.status});
+      this.updateStatus(run.id,'waiting_connection');this.emit('keychain.updated',{request},run.id,`secure-input:${request.id}`);
+      this.emit('tool.completed',{operationId:input.operationId,...activity,result:completed({requestId:request.id,status:'pending',message:'Secure input requested. Waiting for the user.'})},run.id,`tool:${input.operationId}`);
+      return {status:'pending_connection',provider:'keychain',permission:'write',requestId:request.id,message:'A secure input is displayed in the chat. Wait for the user; the host will resume this task after submission. The credential value will never enter the conversation.'};
+    } else if(input.name==='list_secrets') result=completed(await this.keychainTool(input.name,args,run.id,input.runOperationId,input.operationId,input.signal));
+    else if(input.name==='secret_request') result=await this.keychainTool(input.name,args,run.id,input.runOperationId,input.operationId,input.signal) as unknown as ComputerResult;
+    else if(input.name==='list_bots') {
       const registry=this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName("owner"));
       const response=await registry.fetch("https://workspace/");
       if(!response.ok) throw new ApiError(503,"bots_unavailable","Bots could not be listed.");
@@ -1575,6 +1609,14 @@ export class BotDO extends DurableObject<Env> {
       }
       this.configure(request);
       if(path==="/summary" && request.method==="GET") return json({summary:this.summary()});
+      if(path==='/_keychain/check'&&request.method==='POST'){
+        const input=await body(request),run=this.getRun(String(input.runId));
+        if(terminal.has(run.status)||this.stopped(run.id)||this.getRunRow(run.id).native_operation_id!==input.nativeOperationId)throw new ApiError(409,'secure_input_inactive','The task is no longer active.');
+        return json({active:true});
+      }
+      if(path==='/_keychain/resume'&&request.method==='POST'){
+        const input=await body(request);await this.resumeSecureInput(input.request as SecureInputRequest,input.entries as SecretMetadata[]);return json({received:true});
+      }
       if(["/context","/context/compact","/memory"].includes(path)||path.startsWith('/memory/')) return await maintenanceRequest(request,path,this.runtime);
       this.ctx.waitUntil(this.recover());
       if(["/agent-messages","/agent-results","/agent-cancel"].includes(path)) {
@@ -1595,7 +1637,7 @@ export class BotDO extends DurableObject<Env> {
         if(agentRoute[2]==="messages" && request.method==="GET") return json({messages:await this.runtime.subagentMessages(id)});
         if(agentRoute[2]==="messages" && request.method==="POST") {
           const input=parseMessage(await body(request));
-          if(input.mentions?.length || /^(approval|delegate|connection|subagent|agent-result|subagent-report|mention|process-cancel|process-poll|run-cancel):/.test(input.operationId)) throw new ApiError(400,"invalid_request","Use an independent operation ID for the subagent message.");
+          if(input.mentions?.length || /^(approval|delegate|connection|secure|subagent|agent-result|subagent-report|mention|process-cancel|process-poll|run-cancel):/.test(input.operationId)) throw new ApiError(400,"invalid_request","Use an independent operation ID for the subagent message.");
           const agent=await this.subagent(id),parent=this.findRun(agent.parentOperationId);
           if(agent.status==="cancelled" || this.subagentStopped(id) || !parent) throw new ApiError(409,"agent_inactive","This subagent is no longer active.");
           const run=await this.createRun(input,{subagentId:id,parentRunId:parent.id});

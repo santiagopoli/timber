@@ -32,6 +32,96 @@ that conversation. v1 is cloud-only; no iOS implementation in this milestone.
 
 ## HTTP surface
 JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
+- GET /v1/keychain -> {entries:SecretMetadata[],requests:SecureInputRequest[]}.
+  The keychain belongs to the authenticated owner, independently of bots. Metadata
+  includes names, approved destinations, revisions, timestamps and permitted
+  botIds. There is no endpoint for reading a private value. The bot-context alias
+  /v1/bots/:id/keychain returns the same owner entries and that bot's requests.
+- POST /v1/keychain {operationId,entries:[{value,name?,origin?,header?,prefix?,id?,expectedRevision?}],requestId?}
+  -> {entries:SecretMetadata[]}. Accepts one to four opaque private text values,
+  each up to 16,000 characters, in a separate authenticated request. Normal UI
+  submissions supply only text. No service, URL or credential format is required.
+  Unconfigured values have blank origin/header/prefix and cannot be used for
+  network access. Names default to "Private input". Existing IDs require
+  expectedRevision; replacements preserve approved format when omitted. Revoked
+  or stale revisions cannot be overwritten. At most 100 active inputs per owner.
+  Batches commit atomically with keyed fingerprints and durable receipts.
+  The bot-context alias grants that bot access when a new entry is inserted.
+  Root writes without a requestId grant no bot access automatically.
+  A requestId fulfills a bot-requested input using its server-stored metadata;
+  client destination overrides are ignored. An encrypted save and an outbox
+  continuation receipt commit together in WorkspaceDO. Alarms retry only delivery
+  of the continuation, never the prior authenticated action. BotDO deduplicates
+  admission and checks the original run/native-operation fence. A stopped request
+  cannot resume. If Stop races an already committed save, the owner's saved input
+  remains but the bot stays stopped. Continuations contain references only.
+- POST /v1/keychain/:secretId/permissions {botId,allowed:boolean}
+  -> {entries:SecretMetadata[]}. Only the authenticated owner can grant or revoke
+  bot access. The target must be a live registered bot. Grants are signed and
+  bound to the owner, entry ID, bot ID, approved HTTP format and permission epoch.
+  Revocation followed by a new grant cannot revive an old pending authorization.
+  Bots cannot grant themselves access. Bot-context aliases require membership.
+- POST /v1/keychain/requests/:requestId/authorize -> {entries:SecretMetadata[]}.
+  configure_secret prepares a permitted reference with a descriptive name, exact
+  public HTTPS origin and authentication header/prefix. The owner sees only an
+  Allow use confirmation naming the destination. Approval re-encrypts the unchanged
+  private value with authenticated metadata and queues the waiting task. Revision,
+  permission and Stop checks reject stale approval. Duplicate approval cannot
+  create another continuation or revive stopped work. Changing the approved
+  destination/format invalidates grants for the previous format; other bots must
+  be explicitly allowed again. Saving or authorizing does not perform an external
+  action. Default format is Authorization with prefix `Bearer `; a raw API key
+  uses an empty prefix. Origins exclude ports, paths, URL credentials, IP literals
+  and local/internal names. These options belong to the agent API, not setup UI.
+- DELETE /v1/keychain/:secretId -> {revoked:true}. Removes ciphertext and all
+  grants; future use and stale replacements fail. Repeated removal is idempotent.
+  Already dispatched requests cannot be recalled. Deleting a bot removes only its
+  grants and pending continuations, never the owner's saved credentials.
+  The authorize and delete routes also have /v1/bots/:id/keychain aliases.
+
+  Private values are stored only in WorkspaceDO, encrypted with AES-256-GCM and
+  a fresh random 96-bit IV per write. HKDF-SHA-256 derives an owner key from the
+  server-only CHATGPT_CREDENTIAL_KEY with purpose timber.owner-keychain.v1 and
+  owner identity. Authenticated data binds owner, entry ID, revision, name,
+  origin, header and prefix. Copying ciphertext or changing its destination fails
+  authentication. This is server-side encryption, not end-to-end encryption:
+  the host decrypts briefly to authenticate a request. Master key rotation requires
+  migration before replacing the key, as with existing connection stores.
+  No plaintext is written to messages, events, Pi history, memory, computer files,
+  R2 checkpoints, API responses or operation journals. BotDO stores only request
+  metadata; the host's internal check/resume routes are blocked at the gateway.
+
+  Host tools request_secret, configure_secret, list_secrets and secret_request
+  work with public references only. request_secret is a durable pending_connection
+  wait with provider keychain. list_secrets returns only permitted entries;
+  temporary subagents must ask their parent to perform authenticated work.
+  secret_request accepts single-line ASCII header values up to 8192 characters,
+  injects one header at the approved origin, accepts bounded public API headers
+  that cannot override authentication, disallows redirects and journals dispatch
+  before network I/O. A recovered or uncertain call is never sent again
+  automatically. The host checks task liveness, permission and revocation before
+  dispatch. Only bounded response text is returned; exact, URL/base64/JSON-encoded
+  echoes and common JSON credential fields are redacted. Provider exceptions and
+  redirect bodies are hidden. This filter is defense in depth, not a guarantee
+  against a malicious authorized service encoding data in an arbitrary form.
+  This API supports header credentials, not browser-password filling, generated
+  .env files, shell injection or app-wide provider billing configuration.
+
+  The console offers Add → Secure input and Secure input in the @ dropdown.
+  The masked field appears as the same compact locked pill inside the composer.
+  Enter, leaving the field or sending saves it; six centered dots remain, there is no reveal control. Selected existing text
+  can be converted directly with Make selection secure (or Add → Secure input).
+  Owners write around pills, insert multiple inputs and reuse entries from their
+  shared Keychain. The keychain lets them grant/revoke bots, replace a value or
+  explicitly remove it for all bots. Internal [private:UUID] references are rendered
+  as locked dots in composer and transcript. Unsaved placeholders cannot be sent
+  to the backend. The agent prepares credential format from surrounding text.
+  Removing a pill or discarding a draft does not revoke an already saved entry.
+  Private fields clear on save, removal, bot switch and logout. Their values stay
+  in masked DOM fields and the dedicated encrypted-write request, not React state,
+  browser storage or message-delivery retries. Converting ordinary selected text
+  immediately replaces it in the chat draft. An uncertain save reloads metadata
+  and asks the owner to inspect the keychain before submitting another value.
 - GET /health -> {ok:true,service:"botspace"}
 - POST /v1/session with Authorization: Bearer token -> {authenticated:true,expiresAt}.
 - GET /v1/session with session cookie -> {authenticated:true,expiresAt}; invalid or

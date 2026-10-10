@@ -10,7 +10,7 @@ export type PendingApproval = {
 export type PendingConnection = {
   status: 'pending_connection';
   requestId: string;
-  provider: 'github';
+  provider: 'github' | 'keychain';
   repository?: string;
   permission: 'read' | 'write';
   message?: string;
