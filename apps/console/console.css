@@ -295,3 +295,33 @@ dialog{max-width:calc(100vw - 24px);padding:20px;max-height:calc(var(--app-heigh
 }
 @media(max-width:374px){.bot-header{gap:3px}.bot-header h1{font-size:16px}.bot-header .status{display:none}.sidebar{padding-inline:14px}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important}.spinner{animation:none}}
+
+/* Global avatar themes and safe image previews. */
+.avatar-settings{border-bottom:1px solid var(--line);margin-bottom:18px}
+.avatar-create-form{display:grid;gap:8px;padding:12px 0}
+.avatar-create-form label,.avatar-settings>label{font-size:12px;font-weight:600;color:var(--muted)}
+.avatar-create-form input,.avatar-create-form select,.avatar-create-form textarea,.avatar-settings>select{width:100%;min-width:0}
+.avatar-create-form textarea{resize:vertical}
+.avatar-settings .row{margin:8px 0}
+.avatar-settings .row button{flex:1}
+.avatar-settings .hint{line-height:1.5}
+.avatar-jobs,.avatar-bot-list{display:grid;gap:8px;margin:12px 0}
+.avatar-job{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:4px 10px;padding:10px;border:1px solid var(--line);border-radius:10px;font-size:12px}
+.avatar-job p{grid-column:1/-1;margin:0}
+.avatar-job button{grid-column:2;grid-row:1}
+.avatar-job[data-job-status=failed]{border-color:color-mix(in srgb,var(--danger) 50%,var(--line))}
+.avatar-bot-row{display:grid;grid-template-columns:34px minmax(0,1fr) auto;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line);font-size:13px}
+.avatar-bot-row>.hint{grid-column:2;grid-row:2;margin:0;font-size:11px}
+.avatar-bot-row>button{grid-column:3;grid-row:1/3}
+.avatar-small{width:30px;height:30px;font-size:12px}
+.avatar{position:relative;overflow:hidden}
+.timber-avatar-image{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:1}
+.avatar-vector{border:0!important;border-radius:0!important;background:transparent!important}
+.avatar-vector .timber-avatar-image{object-fit:contain}
+.avatar-image{border-radius:10px!important}
+.avatar-vector{overflow:visible!important}
+.avatar-stale{outline:1px dashed color-mix(in srgb,var(--muted) 55%,transparent);outline-offset:2px}
+.avatar-bot-row .avatar-stale{opacity:.82}
+.avatar-vector .timber-model-badge{display:none!important}
+.avatar-interrupted-warning{grid-column:1/-1;margin:0;color:var(--danger);font-size:12px;line-height:1.45}
+.avatar-admission{border-style:dashed}

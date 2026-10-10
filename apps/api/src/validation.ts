@@ -50,6 +50,7 @@ export function parseMessage(value:unknown):{text:string;operationId:string;ment
 }
 export function parseBotInput(value:unknown,patch=false):{name?:string;instructions?:string;model?:string;reasoningEffort?:string;fast?:boolean;computerApprovalMode?:ComputerApprovalMode;allowNamedAgents?:boolean} {
   const data=object(value);
+  if(["themeId","avatarThemeId","avatarTheme","avatar"].some(key=>data[key]!==undefined)) invalid("Avatar themes belong to the owner and cannot be overridden by a bot.");
   if(data.runtime!==undefined && data.runtime!=="pi") invalid("runtime must be pi.");
   const output:{name?:string;instructions?:string;model?:string;reasoningEffort?:string;fast?:boolean;computerApprovalMode?:ComputerApprovalMode;allowNamedAgents?:boolean}={};
   if(data.name!==undefined || !patch) {

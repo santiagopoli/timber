@@ -99,6 +99,26 @@
 <dialog id="delete-dialog" aria-labelledby="delete-title" aria-describedby="delete-description"><div class="dialog-heading"><h2 id="delete-title">Delete bot?</h2></div><form id="delete-form"><p id="delete-description">This permanently deletes <strong id="delete-bot-name"></strong>, its conversation, run history, approvals, computer, saved files and artifacts. Any active work will stop.</p><p class="hint">This cannot be undone. Your other bots and ChatGPT connection are kept.</p><p id="delete-error" class="error" role="alert"></p><div class="dialog-actions"><button id="cancel-delete-bot" type="button" class="quiet">Cancel</button><button id="confirm-delete-bot" type="submit" class="danger">Delete permanently</button></div></form></dialog>
 <dialog id="settings-dialog" aria-labelledby="settings-title">
   <div class="dialog-heading"><h2 id="settings-title">Settings</h2><button class="quiet icon-button" data-close-dialog="settings-dialog" aria-label="Close settings">×</button></div>
+  <section class="connection-section avatar-settings" aria-label="Global bot avatars">
+    <div class="section-title"><h3>Bot avatars</h3><button id="avatar-refresh" class="quiet" type="button">Refresh</button></div>
+    <p class="hint">One shared theme applies to every bot. Individual regeneration never changes a bot’s theme. Previous validated avatars remain visible as stale until a replacement is ready.</p>
+    <p id="avatar-status" class="hint" role="status" aria-live="polite">Loading avatar settings…</p>
+    <label for="avatar-theme-select">Global theme</label><select id="avatar-theme-select" disabled><option value="">No theme selected</option></select>
+    <div class="row wrap"><button id="avatar-apply-theme" class="quiet" type="button" disabled>Apply theme</button><button id="avatar-generate-all" type="button" disabled>Regenerate all bots</button></div>
+    <div id="avatar-jobs" class="avatar-jobs" aria-live="polite"></div>
+    <details class="setup-details" id="avatar-create-details"><summary>Create a theme</summary>
+      <form id="avatar-create-form" class="avatar-create-form">
+        <label for="avatar-theme-name">Name</label><input id="avatar-theme-name" maxlength="80" required placeholder="Studio portrait">
+        <label for="avatar-theme-kind">Style</label><select id="avatar-theme-kind"><option value="vector">Vector · SVG</option><option value="image">Image</option></select>
+        <label for="avatar-theme-prompt">Prompt</label><textarea id="avatar-theme-prompt" rows="4" maxlength="4000" required placeholder="Describe a consistent avatar style shared by all bots…"></textarea>
+        <label for="avatar-theme-model">Model</label><select id="avatar-theme-model" required></select>
+        <p id="avatar-image-capability" class="hint">Image generation capability is unavailable.</p>
+        <button id="avatar-create-submit" type="submit">Create theme</button>
+      </form>
+    </details>
+    <div id="avatar-bot-list" class="avatar-bot-list"></div>
+    <p id="avatar-error" class="error" role="alert"></p>
+  </section>
   <section class="connection-section" aria-label="ChatGPT connection">
     <div class="section-title"><h3>ChatGPT</h3><button id="refresh-chatgpt" class="quiet">Refresh</button></div>
     <p id="chatgpt-status" class="hint">Checking…</p><p id="chatgpt-account" class="hint" hidden></p>

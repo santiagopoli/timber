@@ -19,6 +19,8 @@ import './src/layout.css';
   const removedBots = new Set(), deletionPending = new Map();
   const botSummaries = new Map();
   const modelSettingsWork = new Set();
+  let avatarSettings = {themes:[],selection:null,avatars:[],jobs:[]}, avatarModels={connected:false,vectorModels:[],imageModels:[],imageAvailable:false}, avatarLoading=false, avatarPollTimer, avatarRequest=0;
+  const avatarUrls = new Map(), avatarCacheDetails = new Map(), avatarLoads = new Map(), avatarLoadErrors = new Map(), avatarAdmissions = new Map();
   let modelCatalog={models:[],connected:false,defaultModel:''},modelCatalogLoading=false,modelCatalogError='',modelCatalogRequest=0;
   let botSummaryTimer,botSummaryLoading=false,botSummaryPending=false,botRenderKey='';
   const drafts = new Map(), draftMentions = new Map(), pendingMessages = new Map(), pendingActions = new Map(), computerPending = new Map(), stopping = new Set(), approvalWork = new Map(), approvalFeedback = new Map(), connectionWork = new Map(), appWork = new Map();
@@ -324,6 +326,126 @@ import './src/layout.css';
     if (session !== authSession) throw new DOMException('The session ended.', 'AbortError');
     return result;
   }
+  const avatarPending = job => ['queued','running'].includes(job.status);
+  const avatarOperationId = () => `avatar:${crypto.randomUUID()}`;
+  const avatarKey = avatar => `${avatar.botId}:${avatar.themeId}:${avatar.revision}:${avatar.artifactId}`;
+  function revokeAvatarUrls(){for(const url of avatarUrls.values())URL.revokeObjectURL(url);avatarUrls.clear();avatarCacheDetails.clear();avatarLoads.clear();avatarLoadErrors.clear();document.querySelectorAll('.timber-avatar-image').forEach(node=>node.remove());}
+  function cachedAvatar(botId){const entries=[...avatarUrls].filter(([key])=>key.split(':',1)[0]===botId);const desired=selectedAvatar(botId);const key=desired&&avatarKey(desired);return entries.find(([entry])=>entry===key)||entries.at(-1);}
+  function pruneAvatarUrls(){
+    const liveBots=new Set(bots.map(bot=>bot.id)),used=new Set([...document.querySelectorAll('.timber-avatar-image')].map(node=>node.getAttribute('src')));
+    for(const [key,url] of avatarUrls){const botId=key.split(':',1)[0],cached=cachedAvatar(botId);if(!liveBots.has(botId)||(key!==cached?.[0]&&!used.has(url))){URL.revokeObjectURL(url);avatarUrls.delete(key);avatarCacheDetails.delete(key);}}
+    for(const key of avatarLoadErrors.keys()){const botId=key.split(':',1)[0],desired=selectedAvatar(botId);if(!liveBots.has(botId)||!desired||key!==avatarKey(desired))avatarLoadErrors.delete(key);}
+  }
+  function selectedAvatar(botId){const ready=avatarSettings.avatars.filter(item=>item.botId===botId&&['ready','obsolete'].includes(item.status)).sort((a,b)=>Date.parse(b.updatedAt||'')-Date.parse(a.updatedAt||''));const selection=avatarSettings.selection;return ready.find(item=>item.status==='ready'&&item.themeId===selection?.themeId&&item.revision===selection?.revision)||ready[0]||null;}
+  function avatarIsStale(avatar){const selection=avatarSettings.selection;return !selection||avatar.themeId!==selection.themeId||avatar.revision!==selection.revision;}
+  async function makeAvatarThumbnail(blob,mime){
+    // Safe authenticated PNGs are decoded once into a small cached rendition.
+    // SVG stays vector. Older browsers may retain the bounded original PNG.
+    if(mime!=='image/png'||typeof createImageBitmap!=='function')return blob;
+    const bitmap=await createImageBitmap(blob);
+    try{const canvas=document.createElement('canvas');canvas.width=96;canvas.height=96;const context=canvas.getContext('2d',{alpha:true});if(!context)return blob;context.drawImage(bitmap,0,0,96,96);return await new Promise((resolve,reject)=>canvas.toBlob(value=>value?resolve(value):reject(new Error('Avatar thumbnail could not be encoded.')),'image/png'));}
+    finally{bitmap.close();}
+  }
+  async function loadAvatarImage(botId, avatar){
+    const key=avatarKey(avatar),session=authSession;
+    if(avatarUrls.has(key))return avatarUrls.get(key);
+    if(avatarLoads.has(key))return avatarLoads.get(key);
+    if(avatarLoadErrors.has(key))return null;
+    const promise=(async()=>{
+      const response=await request(`${botPath(botId)}/avatar`,{raw:true}),blob=await response.blob();
+      if(session!==authSession||selectedAvatar(botId)?.artifactId!==avatar.artifactId)return null;
+      const mime=(blob.type||response.headers.get('content-type')||'').split(';')[0].trim().toLowerCase();
+      if(!['image/svg+xml','image/png'].includes(mime)||mime!==avatar.mimeType.toLowerCase())throw new Error('Unsupported avatar image.');
+      const thumbnail=await makeAvatarThumbnail(blob,mime);
+      if(session!==authSession||selectedAvatar(botId)?.artifactId!==avatar.artifactId)return null;
+      const url=URL.createObjectURL(new Blob([thumbnail],{type:mime}));
+      try{const image=new Image();image.src=url;await image.decode();if(session!==authSession||selectedAvatar(botId)?.artifactId!==avatar.artifactId){URL.revokeObjectURL(url);return null;}}
+      catch(error){URL.revokeObjectURL(url);throw error;}
+      avatarUrls.set(key,url);avatarCacheDetails.set(key,avatar);return url;
+    })().finally(()=>avatarLoads.delete(key));
+    avatarLoads.set(key,promise);return promise;
+  }
+  function putAvatarImage(node,avatar,url){const image=document.createElement('img');image.className='timber-avatar-image';image.alt='';image.setAttribute('aria-hidden','true');image.src=url;node.querySelector('.timber-avatar-image')?.remove();node.prepend(image);node.dataset.avatarArtifact=avatar.artifactId;node.classList.toggle('avatar-vector',avatar.mimeType==='image/svg+xml');node.classList.toggle('avatar-image',avatar.mimeType!=='image/svg+xml');}
+  function decorateGlobalAvatar(node,botId){
+    if(node.dataset.avatarBotId!==botId){node.querySelector('.timber-avatar-image')?.remove();node.dataset.avatarArtifact='';node.dataset.avatarBotId=botId;}
+    const avatar=selectedAvatar(botId);node.classList.remove('avatar-vector','avatar-image','avatar-stale');if(!avatar){node.querySelector('.timber-avatar-image')?.remove();node.dataset.avatarArtifact='';node.dataset.avatarRevision='';return;}
+    node.dataset.avatarRevision=String(avatar.revision);node.classList.add(avatar.mimeType==='image/svg+xml'?'avatar-vector':'avatar-image');if(avatarIsStale(avatar))node.classList.add('avatar-stale');
+    if(node.dataset.avatarArtifact===avatar.artifactId&&node.querySelector('.timber-avatar-image'))return;
+    // Recreated Settings/sidebar nodes also retain the last decoded image while
+    // fetching a replacement, including when the new request/decode fails.
+    const cached=cachedAvatar(botId);if(!node.querySelector('.timber-avatar-image')&&cached){const old=avatarCacheDetails.get(cached[0]);if(old)putAvatarImage(node,old,cached[1]);}
+    if(node.dataset.avatarArtifact!==avatar.artifactId)node.classList.add('avatar-stale');
+    void loadAvatarImage(botId,avatar).then(url=>{if(!url||!node.isConnected||selectedAvatar(botId)?.artifactId!==avatar.artifactId)return;putAvatarImage(node,avatar,url);node.classList.toggle('avatar-stale',avatarIsStale(avatar));queueMicrotask(pruneAvatarUrls);}).catch(()=>{if(selectedAvatar(botId)?.artifactId!==avatar.artifactId)return;const key=avatarKey(avatar);if(avatarLoadErrors.has(key))return;avatarLoadErrors.set(key,true);renderAvatarSettings();});
+  }
+  function renderGlobalAvatars(){document.querySelectorAll('.bot-item[data-bot-id]').forEach(button=>decorateGlobalAvatar(button.querySelector('.avatar'),button.dataset.botId));if(selected)decorateGlobalAvatar($('selected-avatar'),selected.id);}
+  function avatarModelOption(option){return {id:option.id,label:option.name||option.label||option.id};}
+  function renderAvatarForm(){
+    const kind=$('avatar-theme-kind').value,availableOptions=kind==='vector'?avatarModels.vectorModels:avatarModels.imageModels,documentedImages=kind==='image'?(avatarModels.unavailableImageModels||[]):[],options=[...(availableOptions||[]),...documentedImages],select=$('avatar-theme-model'),prior=select.value;
+    select.replaceChildren();for(const option of options){const value=avatarModelOption(option),entry=document.createElement('option');entry.value=value.id;entry.textContent=option.available===false?`${value.label} · unavailable · ${option.reason||'server image API is not configured'}`:value.label;entry.dataset.available=String(option.available!==false);select.append(entry);}
+    // A theme is saved metadata, not an inference request. If no documented
+    // model exists for this kind, retain a real saved ID instead of guessing.
+    if(!select.options.length){const saved=avatarSettings.themes.find(theme=>theme.kind===kind)||avatarSettings.themes[0];if(saved?.model){const entry=document.createElement('option');entry.value=saved.model;entry.textContent=`${saved.model} · saved model (not currently available)`;entry.dataset.available='false';select.append(entry);}}
+    if([...select.options].some(option=>option.value===prior))select.value=prior;
+    const unavailable=kind==='image'&&avatarModels.imageAvailable!==true;const disconnected=kind==='vector'&&!avatarModels.connected;
+    const imageNames=documentedImages.map(option=>option.id).join(', ');
+    const billing=avatarModels.imageBilling,billingText=`${billing?.message||'Image generation uses separately billed OpenAI API access, not ChatGPT/SIWC.'} ${billing?.costKnown===false?'Cost is unknown; Timber will not estimate it.':''}`;const imageInfo=avatarModels.imageAvailable?billingText:`Image generation is unavailable: ${(documentedImages.map(option=>option.reason).filter(Boolean).filter((reason,index,all)=>all.indexOf(reason)===index).join(' ')||`the server image API is not configured (${imageNames||'no image models available'}).`)} These models may be saved as theme configuration only; no image will be generated and SIWC does not support image generation. ${billingText}`;
+    $('avatar-image-capability').textContent=kind==='image'?imageInfo:disconnected?'No connected text-model catalogue. Connect the text-model account before generating SVG avatars.':avatarModels.error||'';
+    $('avatar-image-capability').hidden=kind!=='image'&&!disconnected&&!avatarModels.error;
+    $('avatar-create-submit').disabled=avatarLoading||!select.options.length;
+  }
+  function renderAvatarSettings(){
+    const status=$('avatar-status'),select=$('avatar-theme-select'),current=avatarSettings.selection;
+    const currentTheme=avatarSettings.themes.find(theme=>theme.id===current?.themeId),generationUnavailable=currentTheme?.kind==='image'?avatarModels.imageAvailable!==true:!avatarModels.connected;
+    status.textContent=avatarLoading?'Loading global avatar settings…':current?`Global selection · revision ${current.revision}${currentTheme?.kind==='image'&&avatarModels.imageAvailable!==true?' · Image generation unavailable.':''}`:'Choose a global avatar theme to get started.';
+    select.replaceChildren();const none=document.createElement('option');none.value='';none.textContent='Choose a theme';select.append(none);
+    for(const theme of avatarSettings.themes){const option=document.createElement('option');option.value=theme.id;option.textContent=`${theme.name} · ${theme.kind}`;select.append(option);}select.value=current?.themeId||'';select.disabled=avatarLoading||!avatarSettings.themes.length;
+    $('avatar-apply-theme').disabled=avatarLoading||!select.value||select.value===current?.themeId;
+    $('avatar-generate-all').disabled=avatarLoading||!current||generationUnavailable||!bots.length||avatarAdmissions.has('all')||avatarSettings.jobs.some(avatarPending);
+    const jobs=$('avatar-jobs');jobs.replaceChildren();
+    for(const [key,admission] of avatarAdmissions){const row=el('div','avatar-job avatar-admission');row.append(el('strong','','Generation request receipt is unknown'));row.append(el('p','hint','Refresh checks whether it was accepted; if not, resend uses the same operation ID and arguments.'));const retry=el('button','quiet','Check / resend safely');retry.type='button';retry.disabled=avatarLoading;retry.addEventListener('click',()=>void guarded(()=>startAvatarGeneration(admission.botId,true,admission)));row.append(retry);jobs.append(row);}
+    for(const job of [...avatarSettings.jobs].sort((a,b)=>Date.parse(b.updatedAt)-Date.parse(a.updatedAt)).slice(0,30)){const row=el('div','avatar-job');row.dataset.jobStatus=job.status;row.append(el('strong','',`${bots.find(bot=>bot.id===job.botId)?.name||'Bot'} · ${job.status}`));if(job.error?.message)row.append(el('p','hint',job.error.message));if(job.status==='interrupted')row.append(el('p','avatar-interrupted-warning','Previous inference outcome is unconfirmed. Regenerate starts a fresh operation; the earlier request will not be replayed.'));if(['failed','interrupted'].includes(job.status)){const retry=el('button','quiet',job.status==='interrupted'?'Regenerate':'Retry');retry.type='button';retry.disabled=avatarLoading||avatarAdmissions.has(job.botId);retry.addEventListener('click',()=>void guarded(()=>startAvatarGeneration(job.botId)));row.append(retry);}jobs.append(row);}
+    const botList=$('avatar-bot-list');botList.replaceChildren();for(const bot of bots){const avatar=el('span','avatar avatar-small',bot.name.slice(0,1).toUpperCase());avatar.dataset.agentColor=agentColor(bot.id);decorateGlobalAvatar(avatar,bot.id);const row=el('div','avatar-bot-row');row.append(avatar,el('span','',bot.name));const state=selectedAvatar(bot.id);const imageError=state&&avatarLoadErrors.has(`${bot.id}:${state.themeId}:${state.revision}:${state.artifactId}`);row.append(el('small',imageError?'error':'hint',imageError?'Could not load avatar image. Refresh to try again.':state?(avatarIsStale(state)?'Stale · previous theme':'Ready'):'No avatar yet'));if(imageError)row.lastChild.setAttribute('role','alert');if(current){const button=el('button','quiet','Regenerate');button.type='button';button.disabled=avatarLoading||generationUnavailable||avatarAdmissions.has(bot.id)||avatarSettings.jobs.some(job=>job.botId===bot.id&&avatarPending(job));button.addEventListener('click',()=>void guarded(()=>startAvatarGeneration(bot.id)));row.append(button);}botList.append(row);}
+    renderAvatarForm();renderGlobalAvatars();
+  }
+  async function loadAvatarSettings(){if(!authenticated)return;const session=authSession,sequence=++avatarRequest;avatarLoading=true;$('avatar-error').textContent='';renderAvatarSettings();try{const [settings,models]=await Promise.all([request('/v1/avatar-settings'),request('/v1/avatar-models')]);if(session!==authSession||sequence!==avatarRequest)return;if(!Array.isArray(settings.themes)||!Array.isArray(settings.avatars)||!Array.isArray(settings.jobs))throw new Error('The avatar settings response was invalid.');avatarSettings=settings;avatarModels=models;for(const [key,admission] of avatarAdmissions){if(settings.jobs.some(job=>job.operationId===admission.operationId))avatarAdmissions.delete(key);}pruneAvatarUrls();}
+    catch(error){if(session!==authSession||sequence!==avatarRequest)return;$('avatar-error').textContent=errorText(error);}finally{if(session===authSession&&sequence===avatarRequest){avatarLoading=false;renderAvatarSettings();scheduleAvatarPoll();}}
+  }
+  function scheduleAvatarPoll(){clearTimeout(avatarPollTimer);if(authenticated&&(avatarSettings.jobs.some(avatarPending)||avatarAdmissions.size)&&!document.hidden)avatarPollTimer=setTimeout(()=>void loadAvatarSettings(),2500);}
+  async function applyAvatarTheme(){
+    if(!authenticated)return;const session=authSession,themeId=$('avatar-theme-select').value;if(!themeId)return;avatarLoading=true;renderAvatarSettings();
+    try{const result=await request('/v1/avatar-settings',{method:'PUT',body:{themeId,operationId:avatarOperationId()}});if(session!==authSession||!authenticated)return;avatarSettings=result;pruneAvatarUrls();}
+    finally{if(session===authSession&&authenticated){avatarLoading=false;renderAvatarSettings();scheduleAvatarPoll();}}
+  }
+  async function createAvatarTheme(event){
+    event.preventDefault();if(!authenticated||avatarLoading)return;const session=authSession,name=$('avatar-theme-name').value.trim(),kind=$('avatar-theme-kind').value,prompt=$('avatar-theme-prompt').value.trim(),model=$('avatar-theme-model').value;if(!name||!prompt||!model)return;
+    avatarLoading=true;$('avatar-error').textContent='';renderAvatarSettings();
+    try{const result=await request('/v1/avatar-themes',{method:'POST',body:{name,kind,prompt,model,operationId:avatarOperationId()}});if(session!==authSession||!authenticated)return;if(!result.theme)throw new Error('The server did not confirm the new theme.');avatarSettings.themes=[...avatarSettings.themes,result.theme];$('avatar-theme-name').value='';$('avatar-theme-prompt').value='';}
+    catch(error){if(session===authSession&&authenticated)$('avatar-error').textContent=errorText(error);}
+    finally{if(session===authSession&&authenticated){avatarLoading=false;renderAvatarSettings();}}
+  }
+  async function startAvatarGeneration(botId,checkBeforeResend=false,retryAdmission=null){
+    if(!authenticated)return;const session=authSession,key=botId||'all',selection=avatarSettings.selection?{...avatarSettings.selection}:null,theme=avatarSettings.themes.find(item=>item.id===selection?.themeId);let admission=retryAdmission||avatarAdmissions.get(key);
+    if(!admission){if(!selection||!theme)return;admission={operationId:avatarOperationId(),expectedThemeId:selection.themeId,expectedRevision:selection.revision,...(botId?{botId}:{})};if(theme?.kind==='image'){const count=botId?1:bots.length;const billing=avatarModels.imageBilling;const price=billing?.costKnown===true?`Known cost information: ${billing.message}`:`COST UNKNOWN: Timber cannot estimate or disclose an amount.`;const wording=`Generate image avatars for exactly ${count} image${count===1?'':'s'} for ${count} ${count===1?'bot':'bots'} using ${theme.model} (global theme “${theme.name}”, revision ${selection.revision})?\n\n${billing?.message||'This uses separately billed OpenAI API access, not the ChatGPT plan.'}\n${price}\n\nI understand the separate API billing and confirm exactly ${count} image${count===1?'':'s'}.`;if(!window.confirm(wording))return;admission.confirmedCount=count;admission.acknowledgeApiBilling=true;}avatarAdmissions.set(key,Object.freeze(admission));}
+    avatarLoading=true;$('avatar-error').textContent='';renderAvatarSettings();
+    try{
+      if(checkBeforeResend){const snapshot=await request('/v1/avatar-settings');if(session!==authSession||!authenticated)return;avatarSettings=snapshot;const known=snapshot.jobs?.some(job=>job.operationId===admission.operationId);if(known){avatarAdmissions.delete(key);return;}}
+      const result=await request('/v1/avatar-generations',{method:'POST',body:admission});if(session!==authSession||!authenticated)return;
+      if(Array.isArray(result.jobs)){const byId=new Map(avatarSettings.jobs.map(job=>[job.id,job]));for(const job of result.jobs)byId.set(job.id,job);avatarSettings.jobs=[...byId.values()];}
+      avatarAdmissions.delete(key);
+    }catch(error){
+      if(session!==authSession||!authenticated)return;
+      // A received HTTP error confirms rejection; transport loss is uncertain,
+      // so preserve this exact operation and argument object for a safe resend.
+      if(Number.isInteger(error.status)&&error.status<500)avatarAdmissions.delete(key);
+      // Definitive stale-consent rejection needs a fresh selection + a new
+      // confirmation, not a retry with silently substituted model arguments.
+      if(error.code==='avatar_theme_changed'||error.code==='avatar_theme_confirmation_required'){
+        await loadAvatarSettings();if(session!==authSession||!authenticated)return;
+      }
+      $('avatar-error').textContent=errorText(error);
+    }finally{if(session===authSession&&authenticated){avatarLoading=false;renderAvatarSettings();scheduleAvatarPoll();}}
+  }
+
   function closeDialogs() { document.querySelectorAll('dialog[open]').forEach((dialog) => dialog.close()); }
   function clearScreen() {
     if (screenUrl) URL.revokeObjectURL(screenUrl); screenUrl = null; artifact = null;
@@ -333,6 +455,7 @@ import './src/layout.css';
   }
   function disconnect(message = '') {
     desktop.disconnect(); workspace.clear();
+    clearTimeout(avatarPollTimer);avatarRequest++;avatarSettings={themes:[],selection:null,avatars:[],jobs:[]};avatarModels={connected:false,vectorModels:[],imageModels:[],imageAvailable:false};avatarLoading=false;avatarAdmissions.clear();revokeAvatarUrls();$('avatar-error').textContent='';$('avatar-status').textContent='Sign in to load avatar settings.';
     stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId=null; cancelStreamRender(); resetConversationHistory(); generation++; authSession++; authenticated = false; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
     selected = null; currentRun = null; stoppableRun = null; bots = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
     clearTimeout(botSummaryTimer);botSummaries.clear();botSummaryLoading=false;botSummaryPending=false;botRenderKey='';
@@ -353,6 +476,7 @@ import './src/layout.css';
   }
   function emptyState(title, detail) { const node = el('div', 'empty-state'); node.append(el('strong', '', title), el('p', '', detail)); return node; }
   function renderBots() {
+    pruneAvatarUrls();
     const query = $('bot-search').value.trim().toLowerCase(), matching = bots.filter((bot) => `${bot.name} ${bot.instructions}`.toLowerCase().includes(query));
     const rows=matching.map(bot=>{
       const saved=botSummaries.get(bot.id),isSelected=bot.id===selected?.id;
@@ -378,6 +502,7 @@ import './src/layout.css';
       const snippet=el('small','bot-preview',preview);snippet.title=preview;info.append(name,snippet);
       button.append(info); button.addEventListener('click', () => guarded(() => selectBot(bot))); $('bot-list').append(button);
     }
+    renderGlobalAvatars();
     for (const pending of deletionPending.values()) {
       const button = el('button', 'bot-deletion-pending', `Finish deleting ${pending.name}`); button.type = 'button'; button.dataset.pendingDeletion = pending.id;
       button.addEventListener('click', () => openDelete(pending)); $('bot-list').append(button);
@@ -410,7 +535,7 @@ import './src/layout.css';
     avatar.querySelector('.timber-model-badge')?.remove();
     if(bot.model){const badge=el('span','timber-model-badge',modelBadgeLabel(bot.model));badge.dataset.model=bot.model;badge.setAttribute('aria-hidden','true');avatar.append(badge);}
   }
-  function updateBotHeader() { $('selected-name').textContent = selected.name; $('selected-avatar').textContent = selected.name.slice(0, 1).toUpperCase();$('selected-avatar').dataset.agentColor=agentColor(selected.id);decorateModelAvatar($('selected-avatar'),selected); $('selected-model').textContent = `${selected.runtime} · ${modelDescription(selected)}`; $('selected-computer-mode').textContent = selected.computerApprovalMode === 'automatic' ? 'Computer · Use authorized' : 'Computer · Ask for each action'; }
+  function updateBotHeader() { $('selected-name').textContent = selected.name; $('selected-avatar').textContent = selected.name.slice(0, 1).toUpperCase();$('selected-avatar').dataset.agentColor=agentColor(selected.id);decorateModelAvatar($('selected-avatar'),selected);decorateGlobalAvatar($('selected-avatar'),selected.id); $('selected-model').textContent = `${selected.runtime} · ${modelDescription(selected)}`; $('selected-computer-mode').textContent = selected.computerApprovalMode === 'automatic' ? 'Computer · Use authorized' : 'Computer · Ask for each action'; }
   function modelSettingsState(){const error=modelCatalogError||modelCatalog.error;return {choices:(error?[]:modelCatalog.models).map(item=>({id:item.id,label:item.name,available:modelCatalog.connected,reasoningEfforts:item.reasoningEfforts||[],defaultReasoningEffort:item.defaultReasoningEffort,supportsFast:item.supportsFast===true})),loading:modelCatalogLoading,error,message:!modelCatalogLoading&&!modelCatalog.connected&&!error?'Connect ChatGPT in Settings to choose a model.':undefined};}
   async function loadModelCatalog(){
     if(!authenticated)return;
@@ -1178,6 +1303,7 @@ import './src/layout.css';
     document.body.dataset.authenticated = 'true';
     $('connection').textContent = 'Connected'; $('empty').hidden = false; $('bot-workspace').hidden = true;
     void loadModelCatalog();
+    void loadAvatarSettings();
     void chatGPTTask(loadChatGPT);
     const bot = bots.find(item => item.id === chosenHash()) || (!matchMedia('(max-width: 760px)').matches ? bots[0] : null);
     // Restore layout before the workspace becomes interactive. Late initial reads
@@ -1272,7 +1398,13 @@ import './src/layout.css';
   $('file-up').addEventListener('click', () => guarded(() => { const parent = directoryPath.split('/').slice(0, -1).join('/') || '.'; $('file-path').value = parent; return computerAction({ type: 'listFiles', path: parent }); }));
   $('clear-result').addEventListener('click', () => { $('computer-result').textContent = 'No actions yet.'; $('result-raw').textContent = ''; $('result-details').hidden = true; $('computer-warning').hidden = true; $('download-artifact').hidden = true; artifact = null; });
   $('download-artifact').addEventListener('click', () => guarded(async () => { if (!artifact) return; const { id, botId } = artifact, response = await request(`${botPath(botId)}/artifacts/${encodeURIComponent(id)}`, { raw: true }); const url = URL.createObjectURL(await response.blob()), anchor = el('a'); anchor.href = url; anchor.download = `artifact-${id.replaceAll(/[^a-zA-Z0-9._-]/g, '_')}`; anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 30000); }));
-  $('settings-button').addEventListener('click', () => { if ($('panel-menu')) $('panel-menu').open = false; $('settings-dialog').showModal(); void chatGPTTask(loadChatGPT); void loadGitHubStatus(); }); $('refresh-chatgpt').addEventListener('click', () => chatGPTTask(loadChatGPT));
+  $('settings-button').addEventListener('click', () => { if ($('panel-menu')) $('panel-menu').open = false; $('settings-dialog').showModal(); avatarLoadErrors.clear(); void loadAvatarSettings(); void chatGPTTask(loadChatGPT); void loadGitHubStatus(); }); $('refresh-chatgpt').addEventListener('click', () => chatGPTTask(loadChatGPT));
+  $('avatar-refresh').addEventListener('click', () => {avatarLoadErrors.clear();void loadAvatarSettings();});
+  $('avatar-theme-kind').addEventListener('change', renderAvatarForm);
+  $('avatar-theme-select').addEventListener('change', () => { $('avatar-apply-theme').disabled = !$('avatar-theme-select').value || $('avatar-theme-select').value===avatarSettings.selection?.themeId; });
+  $('avatar-apply-theme').addEventListener('click', () => void guarded(applyAvatarTheme));
+  $('avatar-generate-all').addEventListener('click', () => void guarded(() => startAvatarGeneration()));
+  $('avatar-create-form').addEventListener('submit', event => void createAvatarTheme(event));
   $('copy-chatgpt-login').addEventListener('click', async () => { try { await navigator.clipboard.writeText('npm run chatgpt:login'); $('chatgpt-verification').textContent = 'Login command copied. Run it in your local Timber checkout.'; } catch { $('chatgpt-error').textContent = 'Copy the command above and run it in your local Timber checkout.'; } });
   $('verify-chatgpt').addEventListener('click', () => chatGPTTask(async (session) => { $('chatgpt-verification').textContent = 'Testing model access with one small real request…'; try { const result = await request('/v1/connections/chatgpt/verify', { method: 'POST', body: {} }); if (session !== authSession) return; if (result.ok !== true || typeof result.model !== 'string' || !result.model.trim() || result.model.length > 200) throw new Error('The backend did not confirm model access.'); $('chatgpt-verification').textContent = `Verified: ${result.model} completed a real request.`; } catch (error) { if (session === authSession) $('chatgpt-verification').textContent = 'Model access was not verified.'; throw error; } }));
   $('disconnect-chatgpt').addEventListener('click', () => chatGPTTask(async (session) => { const status = await request('/v1/connections/chatgpt', { method: 'DELETE' }); if (session !== authSession) return; renderChatGPT(status); $('chatgpt-verification').textContent = status.revoked === true ? 'ChatGPT disconnected and its renewable session revoked.' : 'Cloud credentials removed. Remote revocation was not confirmed; disconnect Timber in ChatGPT Settings.'; }));
@@ -1287,7 +1419,7 @@ import './src/layout.css';
   window.addEventListener('pageshow', event => {if (event.persisted && authenticated) {startStream(); void guarded(loadBots);void loadOlderMessages();void loadCompactions();}});
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {clearTimeout(compactionsTimer);clearTimeout(historyRetryTimer);}
-    else if (authenticated && selected) {void loadOlderMessages();void loadCompactions();}
+    else if (authenticated && selected) {void loadOlderMessages();void loadCompactions();} if(!document.hidden&&authenticated&&$('settings-dialog').open)void loadAvatarSettings();
   });
   let viewportFrame = 0;
   const updateViewport = () => {

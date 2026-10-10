@@ -816,3 +816,94 @@ the pre-compaction hook schedules review but does not wait for extraction.
 `recall_history` still reads the caller's archive.
 See [context and memory](context-memory.md) for API details, recovery, verification
 boundaries and the Hermes, OpenClaw and Meta Muse sources informing this design.
+
+## Owner-global bot avatars
+
+The authenticated owner's WorkspaceDO owns one global theme selection and a
+monotonic revision; bots have no theme override. A starter vector theme is selected
+without scheduling inference. Themes are immutable shared design prompts with
+`kind:vector|image`, model and name. Editing a prompt means creating a new theme
+and selecting it globally. Changing selection does **not** remove a bot's previous
+validated avatar: it remains visible and is marked stale until a replacement for
+the current theme/revision has been fully generated, validated and published. The
+console prefers a validated current-revision avatar, otherwise keeps the most
+recent validated previous image. There is no per-bot theme override or automatic
+regeneration on selection.
+
+- `GET /v1/avatar-models` -> `AvatarModelCatalog`: actual SIWC text models for SVG,
+  plus independently configured OpenAI Image API model catalogue. `imageAvailable`
+  is based only on the presence of a valid server-side `OPENAI_API_KEY` secret, not
+  SIWC connection state. This is configuration only: it does not verify API account
+  entitlement, successful provider access, or price. `imageModels` contains only configured official IDs
+  `gpt-image-2.5-sunburst` and `gpt-image-2.5-flare`. The catalog explicitly reports
+  `imageBilling.provider:"openai-api"`, `separateFromChatGPT:true`,
+  `costKnown:false` and a message; no price is fabricated. This branch deliberately
+  leaves CI workflows unchanged. GitHub Actions secret wiring is pending a separate
+  workflow-authorized change. The reusable `scripts/configure-avatar-secret.mjs`
+  helper sends `OPENAI_API_KEY` to Wrangler `secret put` on stdin only, removes it
+  from the child environment, and never forwards subprocess diagnostics. It is not
+  invoked by CI here. Standalone mocked tests check the helper, not workflow
+  placement/order or live secret wiring. No real deployment, account entitlement
+  or image generation has been tested. No credentials are returned to the client.
+- `GET /v1/avatar-settings` -> `AvatarSettings` with themes, global selection,
+  avatar metadata and newest 100 jobs. It performs no inference or VM wakeup.
+- `POST /v1/avatar-themes` `{name,kind,prompt,model,operationId}` -> 201 `{theme}`.
+  Themes can be saved before provider configuration; a saved ID is not a capability
+  claim. SVG themes use an available connected-account **text** model.
+- `PUT /v1/avatar-settings` `{themeId,operationId}` -> `AvatarSettings`. Switching
+  increments revision and makes prior output stale; it neither hides the prior
+  validated image nor automatically regenerates.
+- `POST /v1/avatar-generations` `{operationId,botId?,expectedThemeId?,expectedRevision?,confirmedCount?,acknowledgeApiBilling?}`
+  -> 202 `{jobs}`. Omit botId for all current bots. `expectedThemeId` and
+  `expectedRevision` bind the confirmed owner-global selection (not bot/model
+  overrides); both are mandatory for image requests and checked for vector requests
+  whenever either is supplied. The console sends both from the selection snapshot
+  used for confirmation. An identical receipt is replayed FIRST, even after a theme
+  switch. Without a receipt, a stale selection returns 409 `avatar_theme_changed`
+  before catalogue discovery, jobs or inference; missing image binding returns 409
+  `avatar_theme_confirmation_required`. Refresh and explicitly re-confirm after
+  rejection. Uncertain resends keep the same operation ID and exact original payload,
+  never substitute the newly selected theme/model. Image generation is available
+  only when server-configured; for image jobs the client must explicitly confirm
+  the exact target count (`1` for a bot or current batch count) in `confirmedCount`
+  and set `acknowledgeApiBilling:true`. The console confirms this exact count before
+  sending and states that OpenAI API billing is separate from ChatGPT/SIWC; price is
+  clearly presented as unknown. The server checks the count against current bot
+  membership after catalogue discovery. An unconfigured image provider rejects
+  without inference. SVG generation uses SIWC's streaming `store:false` Responses
+  text transport; it never silently falls back to image or API-key billing.
+- `GET /v1/bots/:id/avatar` -> authenticated passive image bytes for the latest
+  validated avatar, including prior-theme output while the current replacement is
+  pending. It is fenced by bot membership and current stored pointer after awaits.
+  No public R2 URLs are returned. SVG is restricted and revalidated on read; PNG
+  validation is also enforced; generated PNGs are bounded to 1024px per dimension
+  and 1 MiB encoded bytes by the current validator. Responses use attachment/nosniff security headers
+  and a private ETag cache validator; authenticated external avatar GET forwards only
+  `If-None-Match` internally and returns 304 on a match. The response declares `original` (there is no
+  server-generated thumbnail). Clients fetch authenticated bytes into safe `img`
+  Blob URLs, never inline SVG/HTML or a circular clipping frame. PNG display blobs
+  are reduced client-side to 96×96 with browser bitmap/canvas decoding, with bounded
+  original/CSS fallback on older browsers. A previous decoded avatar is retained
+  while replacement loads or fails; superseded cache URLs are evicted afterwards.
+  Validated SVG blobs remain vector and are not rasterized.
+
+Generation receipt fingerprints include expected theme/revision, target bot, count and
+billing acknowledgement; receipts bind the exact admitted bot/job set;
+conflicting replays return 409. Jobs durably snapshot the selected immutable theme,
+owner revision and bot identity before dispatch. Uncertain in-flight generation is
+interrupted, never automatically replayed. A replacement only becomes visible after
+provider output validation and successful publication; prior validated bytes are
+retained meanwhile. Terminal jobs retain public metadata, not private prompts.
+Bot deletion fences publication and erases its avatar objects/snapshots. API image
+billing is separate from ChatGPT SIWC allowance and no amount is inferred or shown
+unless the provider reports a known amount (currently it does not).
+
+Image API dispatch uses the server-only `OPENAI_API_KEY` Worker secret with one
+`POST /v1/images/generations`, PNG `1024x1024`, and a 30-minute transport deadline.
+The 1 MiB PNG limit keeps base64 output plus snapshots below SQLite row limits.
+Chunk CRC/order, exact decoded scanlines and filter values are checked; only
+non-interlaced 8-bit RGB/RGBA is accepted, ancillary metadata is removed and APNG
+is rejected. Candidate identities precede PUT; pointer replacement and old-object
+GC admission commit atomically. Deletion stops the target runtime before avatar
+drain, never awaiting another bot’s avatar. Receipts are compact and terminal
+private snapshots are cleared; status/next-time and GC scheduling are indexed.

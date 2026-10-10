@@ -4,16 +4,20 @@ import type { Env } from "./env";
 import { ApiError, errorResponse, json } from "./errors";
 import { body, parseBotInput, UUID } from "./validation";
 import { AgentCoordinator } from "./agent-coordination";
+import { AvatarCoordinator } from "./avatars";
 
 export class WorkspaceDO extends DurableObject<Env> {
   private deleting=new Map<string,Promise<void>>();
   private agents:AgentCoordinator;
+  private avatars:AvatarCoordinator;
   private configuring:Promise<unknown>=Promise.resolve();
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx,env);
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS bots (id TEXT PRIMARY KEY, data TEXT NOT NULL)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS bot_deletions (id TEXT PRIMARY KEY,completed INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL)");
     this.agents=new AgentCoordinator(ctx,env,()=>this.rearmDeletion());
+    this.avatars=new AvatarCoordinator(ctx,env,()=>this.rearmDeletion());
+    ctx.blockConcurrencyWhile(()=>this.rearmDeletion());
   }
   private serializeConfiguration<T>(change:()=>Promise<T>):Promise<T> {
     const pending=this.configuring.then(change,change);this.configuring=pending.catch(()=>{});return pending;
@@ -33,7 +37,7 @@ export class WorkspaceDO extends DurableObject<Env> {
   private async rearmDeletion():Promise<void> {
     const next=this.ctx.storage.sql.exec<{next_at:number}>("SELECT next_at FROM bot_deletions WHERE completed=0 ORDER BY next_at LIMIT 1").toArray()[0];
     const agentTime=this.agents.nextAlarm();
-    const nextAt=Math.min(next?.next_at??Infinity,agentTime??Infinity);
+    const nextAt=Math.min(next?.next_at??Infinity,agentTime??Infinity,this.avatars?.nextAlarm()??Infinity);
     if(Number.isFinite(nextAt)) await this.ctx.storage.setAlarm(Math.max(Date.now(),nextAt));
     else await this.ctx.storage.deleteAlarm();
   }
@@ -49,6 +53,7 @@ export class WorkspaceDO extends DurableObject<Env> {
       const bot=this.env.BOT.get(this.env.BOT.idFromName(`owner:${id}`));
       const response=await bot.fetch("https://bot/delete",{method:"POST",headers:{"x-botspace-bot-id":id}});
       if(!response.ok) throw new Error("Bot shutdown pending");
+      await this.avatars.drainBot(id);
       // Computer shutdown has fenced and drained every possible uploader. Delete
       // pages from the beginning so partial failures can resume idempotently.
       while(true) {
@@ -66,7 +71,7 @@ export class WorkspaceDO extends DurableObject<Env> {
   }
   async alarm():Promise<void> {
     const due=this.ctx.storage.sql.exec<{id:string}>("SELECT id FROM bot_deletions WHERE completed=0 AND next_at<=? ORDER BY next_at LIMIT 8",Date.now()).toArray();
-    await Promise.allSettled([...due.map(row=>this.cleanup(row.id)),this.agents.alarm()]);
+    await Promise.allSettled([...due.map(row=>this.cleanup(row.id)),this.agents.alarm(),this.avatars.alarm()]);
     await this.rearmDeletion();
   }
   private async deleteBot(id:string):Promise<Response> {
@@ -78,19 +83,21 @@ export class WorkspaceDO extends DurableObject<Env> {
         this.ctx.storage.sql.exec("INSERT INTO bot_deletions(id,next_at) VALUES(?,?)",id,Date.now());
         this.ctx.storage.sql.exec("DELETE FROM bots WHERE id=?",id);
         this.agents.forgetBot(id);
+        this.avatars.forgetBot(id);
       });
     }
     // Fence is durable before cleanup and is also the authorization record for
     // retries. Keep only this minimal tombstone after all user data is erased.
-    await this.rearmDeletion();
     const work=this.cleanup(id);
     this.ctx.waitUntil(work.catch(()=>{}));
+    await this.rearmDeletion();
     await work;
     return json({botId:id,deleted:true});
   }
   async fetch(request:Request):Promise<Response> {
     try {
       const path=new URL(request.url).pathname;
+      if(path.startsWith("/avatar")) return await this.avatars.fetch(request);
       if(path.startsWith("/agents/")) return await this.agents.fetch(request);
       const id=path.slice(1);
       if(path==="/" && request.method==="GET") {

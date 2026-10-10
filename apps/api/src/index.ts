@@ -10,10 +10,16 @@ export { WorkspacePreviewGateway } from "./workspace-apps";
 export { ChatGPTAuthDO } from "./chatgpt";
 export { ComputerDO } from "@botspace/computer";
 
-function internalRequest(request:Request,url:string):Request {
+function internalRequest(request:Request,url:string,forwardAvatarValidator=false):Request {
   const headers=new Headers();
   const contentType=request.headers.get("content-type");
   if(contentType) headers.set("content-type",contentType);
+  // Only the authenticated avatar GET route opts into this narrow allowlist.
+  // Never forward owner credentials or arbitrary client headers internally.
+  if(forwardAvatarValidator && request.method==="GET") {
+    const validator=request.headers.get("if-none-match");
+    if(validator) headers.set("if-none-match",validator);
+  }
   return new Request(url,{method:request.method,headers,body:["GET","HEAD"].includes(request.method)?undefined:request.body,redirect:"manual"});
 }
 export default {
@@ -89,6 +95,9 @@ export default {
         return env.GITHUB.get(env.GITHUB.idFromName(owner)).fetch(internalRequest(request,"https://github/status"));
       }
       const registry=env.WORKSPACE.get(env.WORKSPACE.idFromName(owner));
+      if(["/v1/avatar-settings","/v1/avatar-themes","/v1/avatar-generations","/v1/avatar-models"].includes(url.pathname)) {
+        return registry.fetch(internalRequest(request,`https://workspace${url.pathname.slice(3)}`));
+      }
       if(url.pathname==="/v1/bots") {
         if(!["GET","POST"].includes(request.method)) throw new ApiError(405,"method_not_allowed","Method not allowed.");
         return registry.fetch(internalRequest(request,"https://workspace/"));
@@ -103,6 +112,7 @@ export default {
       if(!record.ok) return record;
       const {bot}=await record.json<{bot:Bot}>();
       if(!tail && request.method==="GET") return json({bot});
+      if(tail==="/avatar") return registry.fetch(internalRequest(request,`https://workspace/avatar/${botId}`,true));
       const artifact=/^\/artifacts\/([^/]+)$/.exec(tail);
       if(artifact && request.method==="GET") {
         if(!UUID.test(artifact[1])) throw new ApiError(404,"not_found","Artifact not found.");

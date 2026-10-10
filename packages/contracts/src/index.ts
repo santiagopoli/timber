@@ -48,3 +48,5 @@ export interface ConnectionRequest {id:string;botId:string;runId:string;nativeOp
 export type {MemoryCategory,MemoryActor,MemoryState,MemorySource,MemoryEntry,MemorySaveInput,MemorySuggestionInput,MemoryForgetInput,MemoryAcceptInput,MemoryMutationResult,MemoryRevision,MemorySearchHit,MemorySearchResult,MemoryReviewStatus,MemoryLegacy,MemoryLimits,BotMemory} from './memory';
 export interface CompactionReceipt {id:string;reason:"manual"|"threshold"|"overflow";status:"running"|"completed"|"unchanged"|"failed"|"cancelled";summaryApplied:boolean;error?:string;createdAt?:string;startedAt?:string;summaryCreatedAt?:string;firstKeptEntryId?:number;summarizedEntries?:number;estimatedTokensBefore?:number;historyRetained?:true;}
 export interface BotContextStatus {automatic:true;estimatedTokens:number;activeEntries:number;contextWindow:number;compactions:CompactionReceipt[];historyRetained:true;}
+
+export * from "./avatars";

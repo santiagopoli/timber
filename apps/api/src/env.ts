@@ -7,6 +7,8 @@ export interface Env {
   PREVIEW_ORIGIN?: string;
   CHATGPT?: DurableObjectNamespace;
   CHATGPT_CREDENTIAL_KEY?: string;
+  /** Server-only Worker secret. Explicitly billed Image API; never exposed to clients. */
+  OPENAI_API_KEY?: string;
   FILES: R2Bucket;
   AI: Ai;
   ASSETS?: Fetcher;
