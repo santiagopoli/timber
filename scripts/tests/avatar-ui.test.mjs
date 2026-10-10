@@ -3,15 +3,27 @@ import assert from 'node:assert/strict';
 import {chromium} from 'playwright';
 import {createConsoleFixture,TEST_TOKEN,BOT_A} from './console-fixture.mjs';
 
+// Keep the mutation response pending so these regressions exercise the loading
+// render deterministically, rather than depending on CI/network timing.
+function responseGate(){
+ const entered=Promise.withResolvers(),response=Promise.withResolvers();
+ return {entered:entered.promise,release:response.resolve,async hold(){entered.resolve();await response.promise;}};
+}
+async function waitForGlobalSelection(page,themeId,revision){
+ // An existing avatar can be visible during loading. The committed revision is
+ // the observable completion signal; do not mistake that old image for a PUT ack.
+ await page.waitForFunction(({themeId,revision})=>document.querySelector('#avatar-status').textContent===`Global selection · revision ${revision}`&&document.querySelector('#avatar-theme-select').value===themeId,{themeId,revision});
+}
+
 test('image API catalogue is independent of SIWC and batch generation requires exact billing confirmation',async()=>{
  const fixture=await createConsoleFixture();
  const browser=await chromium.launch({executablePath:process.env.CONSOLE_CHROMIUM_PATH||'/usr/bin/chromium',args:['--no-sandbox']});
  const themes=[{id:'theme-vector',name:'Paper sculpture',kind:'vector',prompt:'Paper character',model:'gpt-6.1-sol',createdAt:'2026-10-01T00:00:00.000Z'}];
- let selection={themeId:'theme-vector',revision:1};const calls=[];
+ let selection={themeId:'theme-vector',revision:1};const calls=[],applyResponse=responseGate();
  const settings=()=>({themes:structuredClone(themes),selection:{...selection},avatars:[],jobs:[]});
  try{
   const page=await browser.newPage({viewport:{width:1280,height:900}});await page.addInitScript(()=>{window.confirm=message=>{window.__avatarConfirmation=message;return true;};});
-  await page.route('**/v1/avatar-settings',async route=>{if(route.request().method()==='PUT'){selection={themeId:route.request().postDataJSON().themeId,revision:selection.revision+1};}await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(settings())});});
+  await page.route('**/v1/avatar-settings',async route=>{if(route.request().method()==='PUT'){selection={themeId:route.request().postDataJSON().themeId,revision:selection.revision+1};await applyResponse.hold();}await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(settings())});});
   await page.route('**/v1/avatar-models',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:false,vectorModels:[],imageModels:[
    {id:'gpt-image-2.5-sunburst',name:'GPT Image 2.5 Sunburst',provider:'openai',billing:'openai-api'},
    {id:'gpt-image-2.5-flare',name:'GPT Image 2.5 Flare',provider:'openai',billing:'openai-api'},
@@ -24,12 +36,17 @@ test('image API catalogue is independent of SIWC and batch generation requires e
   assert.match(await page.locator('#avatar-image-capability').textContent(),/cost is unknown/i);
   await page.locator('#avatar-theme-name').fill('Sunburst setup');await page.locator('#avatar-theme-prompt').fill('Consistent image avatar style.');await model.selectOption('gpt-image-2.5-sunburst');await page.locator('#avatar-create-submit').click();
   await page.locator('#avatar-theme-select option[value="theme-image"]').waitFor({state:'attached'});await page.locator('#avatar-theme-select').selectOption('theme-image');await page.locator('#avatar-apply-theme').click();
+  await applyResponse.entered;
+  assert.equal(await page.locator('#avatar-status').textContent(),'Loading global avatar settings…');
+  assert.equal(await page.locator('#avatar-generate-all').isDisabled(),true,'pending apply must not generate with the old vector selection');
+  applyResponse.release();await waitForGlobalSelection(page,'theme-image',2);
   assert.equal(await page.locator('#avatar-generate-all').isDisabled(),false,'image generation is enabled despite disconnected SIWC');
-  await page.locator('#avatar-generate-all').click();await page.waitForFunction(()=>!!window.__avatarConfirmation);
+  const batchResponse=page.waitForResponse(response=>response.url().endsWith('/v1/avatar-generations')&&response.status()===202);
+  await page.locator('#avatar-generate-all').click();await batchResponse;await page.waitForFunction(()=>!!window.__avatarConfirmation);
   assert.match(await page.evaluate(()=>window.__avatarConfirmation),/exactly 2 images for 2 bots/i);assert.match(await page.evaluate(()=>window.__avatarConfirmation),/COST UNKNOWN/i);
   const batch=calls.find(call=>call.path==='/v1/avatar-generations').body;assert.equal(batch.expectedThemeId,'theme-image');assert.equal(batch.expectedRevision,2);assert.equal(batch.confirmedCount,2);assert.equal(batch.acknowledgeApiBilling,true);assert.equal(typeof batch.operationId,'string');
   await page.close();
- }finally{await browser.close();await fixture.close();}
+ }finally{applyResponse.release();await browser.close();await fixture.close();}
 });
 
 test('vector avatars use authenticated Blob images, preserve stale revisions and keep uncertain admission IDs', async () => {
@@ -38,12 +55,12 @@ test('vector avatars use authenticated Blob images, preserve stale revisions and
  const themes=['paper','angular'].map(id=>({id,name:id,kind:'vector',prompt:'Transparent geometric character, no circular frame',model:'gpt-6.1-sol',createdAt:'2026-10-01T00:00:00.000Z'}));
  let selection={themeId:'paper',revision:1},jobs=[];
  const avatars=[{botId:BOT_A,themeId:'paper',revision:1,status:'ready',artifactId:'one',mimeType:'image/svg+xml',updatedAt:'2026-10-01T00:00:00.000Z'}];
- const calls=[],images=[];
+ const calls=[],images=[],applyResponse=responseGate();
  const settings=()=>({themes,selection,avatars,jobs});
  try {
   const page=await browser.newPage({viewport:{width:1280,height:900}});page.setDefaultTimeout(10000);
   await page.route('**/v1/avatar-settings',async route=>{
-   const req=route.request();if(req.method()==='PUT'){selection={themeId:req.postDataJSON().themeId,revision:2};avatars[0].status='obsolete';}
+   const req=route.request();if(req.method()==='PUT'){selection={themeId:req.postDataJSON().themeId,revision:2};avatars[0].status='obsolete';await applyResponse.hold();}
    await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(settings())});
   });
   await page.route('**/v1/avatar-models',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:true,vectorModels:[{id:'gpt-6.1-sol',name:'Text model'}],imageModels:[],imageAvailable:false})}));
@@ -66,12 +83,22 @@ test('vector avatars use authenticated Blob images, preserve stale revisions and
   await page.locator('.avatar-interrupted-warning').waitFor({state:'visible'});
   assert.equal(calls.length,2);assert.equal(calls[0].operationId,calls[1].operationId);
   assert.deepEqual(calls[0],calls[1]);assert.equal(calls[0].expectedThemeId,'paper');assert.equal(calls[0].expectedRevision,1);assert.deepEqual(Object.keys(calls[0]),['operationId','expectedThemeId','expectedRevision']);
+  const prior=await page.locator('#avatar-bot-list .timber-avatar-image').getAttribute('src');
   await page.locator('#avatar-theme-select').selectOption('angular');await page.locator('#avatar-apply-theme').click();
+  await applyResponse.entered;
+  assert.equal(await page.locator('#avatar-status').textContent(),'Loading global avatar settings…');
+  await page.locator('#avatar-bot-list .timber-avatar-image').waitFor({state:'visible'});
+  assert.equal(await page.locator('#avatar-bot-list .avatar-stale').count(),0,'visible old image alone does not acknowledge the theme switch');
+  assert.equal(await page.locator('#avatar-bot-list .timber-avatar-image').getAttribute('src'),prior,'loading retains the validated Blob');
+  applyResponse.release();await waitForGlobalSelection(page,'angular',2);
   await page.locator('#avatar-bot-list .timber-avatar-image').waitFor({state:'visible'});
   assert.equal(await page.locator('#avatar-bot-list .avatar-stale').count(),1,'previous validated avatar remains visible and stale');
   assert.equal(await page.locator('#avatar-bot-list .timber-avatar-image').count(),1);
+  assert.equal(await page.locator('#avatar-bot-list .timber-avatar-image').getAttribute('src'),prior,'theme switch retains the same validated Blob');
+  assert.equal(await page.locator(`.bot-item[data-bot-id="${BOT_A}"] .timber-avatar-image`).getAttribute('src'),prior,'sidebar retains the same validated Blob');
+  assert.equal(await page.locator(`.bot-item[data-bot-id="${BOT_A}"] .avatar-stale`).count(),1);
   await page.close();
- } finally {await browser.close();await fixture.close();}
+ } finally {applyResponse.release();await browser.close();await fixture.close();}
 });
 
 test('PNG avatar display caches a 96px client thumbnail from authenticated image bytes',async()=>{
