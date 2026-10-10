@@ -96,6 +96,36 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   round, or start a new run after the current final answer. An in-flight model
   generation or unsafe action is not aborted or replayed to admit a message.
   New requests can create independent subagents while earlier children continue.
+  Projected active runs are input receipts, not an execution-capacity counter:
+  several running inputs can share one native root turn, and host decision waits
+  do not consume an inference slot. New host submissions use separate queued-input
+  admission budgets of 32 user inputs and 16 internal/collaborator inputs per bot.
+  Queued user inputs include explicit owner follow-ups to temporary agents. Origin
+  is persisted by the host, not supplied through operation-ID prefixes. Running
+  and waiting inputs do not consume these backlog budgets.
+
+  Native root admission separately permits at most 16 queued inbox inputs. The
+  host serializes the capacity check and submission; a full native inbox leaves
+  the already accepted input durably queued in the host outbox with the diagnostic
+  "Message saved. Waiting for space in the agent inbox." A replaceable one-second
+  Lifecycle wake retries capacity after recovery, without browser polling and
+  without consuming delivery-failure attempts. Previously admitted native inputs
+  are deduplicated/reconciled under their original operation IDs, even at capacity.
+  Pi still owns execution concurrency: one root conversation and the independent
+  eight-active-agent cap. New messages never abort an existing generation or tool
+  just to free capacity.
+
+  A full queued-input budget rejects a new submission with 429 `inbox_full`, before
+  creating its message/run. A circuit breaker rejects new host admissions at 128
+  unresolved queued/running/waiting host projections with 503
+  `run_lifecycle_overloaded` and a fixed operator diagnostic. This is not an age-based
+  cleanup rule or an absolute cap on native child projections: already accepted
+  native work remains inspectable and is never silently terminated. Existing
+  identical receipts remain available at these limits. Explicitly reopening a
+  terminal unadmitted configuration/legacy delivery failure must reacquire a
+  backlog slot; retrying an already queued receipt does not allocate another slot.
+  See [run-backlog.md](run-backlog.md) for operational interpretation and recovery.
+
   Transient engine admission failures stay queued
   with a fixed diagnostic and retry through the shared Lifecycle alarm using the
   same operation ID (five total attempts, with 1/2/4/8-second backoff). A lost
@@ -120,13 +150,14 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   digit string representing a positive safe integer. Invalid values return 400.
   Pass `nextCursor` unchanged as `before` for the next older page; null means no
   older page remains. New runs inserted between requests do not shift older pages.
-  `activeRuns` independently contains all admitted queued/running/waiting_approval/waiting_connection
+  `activeRuns` independently contains all accepted queued/running/waiting_approval/waiting_connection
   runs, newest-created first, even if absent from the requested page;
   it can overlap `runs`. Listing makes no new inference calls beyond the existing
   recovery of already accepted runs. Authentication and bot membership checks apply.
-  HTTP task admission permits at most 16 active host runs. Native child inputs are
+  HTTP task admission uses the separate backlog budgets and native root inbox
+  limit described above, not a 16-active-projection gate. Native child inputs are
   projected separately and may increase that total; `activeRuns` is never truncated
-  to the admission limit. Temporary agents retain their independent eight-agent cap.
+  to an admission limit. Temporary agents retain their independent eight-agent cap.
 - GET /v1/bots/:id/runs/:runId -> {run:Run}
 - POST /v1/bots/:id/runs/:runId/cancel -> {run:Run}
 - GET /v1/bots/:id/events?after=cursor -> SSE id, event=event, JSON BotEvent.

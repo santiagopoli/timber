@@ -33,11 +33,22 @@ const legacyAdmissionFailure="The agent runtime could not accept this run.";
 const admissionPending="Message saved. Delivery to the agent is being retried.";
 const admissionExhausted="Message saved, but delivery to the agent could not be confirmed. Retry this message to resume delivery.";
 const maxAdmissionAttempts=5;
+// Host runs are input receipts, not workers: several running inputs can share
+// one Pi turn. Pi owns execution concurrency (one root, eight child sessions).
+// Bound queued input separately, and retain a final circuit breaker for stuck
+// projections without aborting or rewriting genuine outstanding work.
+const maxNativeQueuedInputs=16;
+const maxUserQueuedInputs=32;
+const maxInternalQueuedInputs=16;
+const maxOutstandingInputs=128;
+const capacityPending="Message saved. Waiting for space in the agent inbox.";
 
 export class BotDO extends DurableObject<Env> {
   private runtime!:AgentRuntime;
   private computer:ReturnType<typeof createCloudComputerProvider>;
   private admitting=new Map<string,Promise<void>>();
+  private admissionQueue:Promise<void>=Promise.resolve();
+  private capacityWakes=new Map<string,Promise<void>>();
   private mentioning=new Map<string,Promise<void>>();
   private observing=new Set<string>();
   private recovering?:Promise<void>;
@@ -69,6 +80,9 @@ export class BotDO extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, fingerprint TEXT NOT NULL, native_operation_id TEXT NOT NULL, data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS runs_status_idx ON runs (json_extract(data,'$.status'));
       CREATE TABLE IF NOT EXISTS submissions (operation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, text TEXT NOT NULL, admitted INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS admission_sources (run_id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('user','internal')));
+      CREATE TABLE IF NOT EXISTS capacity_waits (operation_id TEXT PRIMARY KEY,run_id TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS capacity_waits_run_idx ON capacity_waits(run_id);
       CREATE TABLE IF NOT EXISTS admission_retries (operation_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL, next_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS configuration_admissions (operation_id TEXT PRIMARY KEY, code TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, source_key TEXT UNIQUE, data TEXT NOT NULL);
@@ -296,6 +310,8 @@ export class BotDO extends DurableObject<Env> {
     if(safeCode) updated.errorCode=safeCode;else delete updated.errorCode;
     this.saveRun(updated);
     this.emit("run.updated",{run:updated},runId);
+    if(status==="running" || terminal.has(status)) this.ctx.storage.sql.exec("DELETE FROM capacity_waits WHERE run_id=?",runId);
+    if((run.status==="queued" && status==="running") || terminal.has(status)) this.wakeCapacityAdmissions(run.subagentId);
     return true;
   }
   private approvalContext():RuntimeApprovalContext {
@@ -488,6 +504,9 @@ export class BotDO extends DurableObject<Env> {
       const submission=this.ctx.storage.sql.exec<Submission>("SELECT * FROM submissions WHERE operation_id=?",id).toArray()[0];
       if(this.stopped(row.id) || latest.native_operation_id!==id || !submission || submission.admitted || !["failed","queued"].includes(current.status)
         || !this.ctx.storage.sql.exec("SELECT operation_id FROM configuration_admissions WHERE operation_id=?",id).toArray().length) return;
+      // A terminal delivery failure is not already using a queue slot. An
+      // explicit resend must not reopen unlimited historical failures at once.
+      if(current.status==="failed") this.checkInboxCapacity(this.admissionSource(current));
       this.saveRun({...current,model:selection.model,reasoningEffort:selection.reasoningEffort,fast:selection.fast});
       this.ctx.storage.sql.exec("DELETE FROM admission_retries WHERE operation_id=?",id);
       this.ctx.storage.sql.exec("DELETE FROM configuration_admissions WHERE operation_id=?",id);
@@ -521,12 +540,13 @@ export class BotDO extends DurableObject<Env> {
       // An explicit retry can reopen only a known input-delivery failure. Model,
       // tool, cancellation and interrupted-effect outcomes remain terminal.
       if(!this.stopped(run.id) && submission && !submission.admitted && ((run.status==="failed" && run.error===legacyAdmissionFailure) || (run.status==="queued" && run.error===admissionExhausted))) {
+        if(run.status==="failed") this.checkInboxCapacity(this.admissionSource(run));
         this.ctx.storage.transactionSync(()=>{
           this.ctx.storage.sql.exec("DELETE FROM admission_retries WHERE operation_id=?",existing.native_operation_id);
           this.updateStatus(run.id,"queued");
         });
       }
-      await this.admit(existing.native_operation_id);
+      await this.deliverReceipt(existing.native_operation_id,run.id);
       for(const delivery of this.ctx.storage.sql.exec<MentionDelivery>("SELECT * FROM mention_deliveries WHERE run_id=?",existing.id).toArray()) await this.dispatchMention(delivery.operation_id);
       return this.getRun(existing.id);
     }
@@ -540,12 +560,13 @@ export class BotDO extends DurableObject<Env> {
     if(metadata?.parentRunId && this.stopped(metadata.parentRunId)) throw new ApiError(409,"run_cancelled","The parent task has been cancelled.");
     if(metadata?.subagentId && this.subagentStopped(metadata.subagentId)) throw new ApiError(409,"agent_inactive","This subagent has been stopped.");
     if(this.suspending) throw new ApiError(409,"computer_busy","The computer is being suspended. Retry after it stops.");
-    const activeCount=this.ctx.storage.sql.exec<{total:number}>("SELECT COUNT(*) AS total FROM runs WHERE json_extract(data,'$.status') IN ('queued','running','waiting_approval','waiting_connection')").toArray()[0].total;
-    if(activeCount>=16) throw new ApiError(429,"too_many_runs","This bot already has 16 active runs.");
+    const source=!metadata?.provenance && metadata?.role!=="system"?"user":"internal";
+    this.checkInboxCapacity(source);
     const now=timestamp();
     const run:Run={model:selection.model,reasoningEffort:selection.reasoningEffort,fast:selection.fast,id:crypto.randomUUID(),botId:this.bot().id,operationId:input.operationId,...(metadata?.delegation?{delegation:metadata.delegation}:{}),...(metadata?.parentRunId?{parentRunId:metadata.parentRunId}:{}),...(metadata?.subagentId?{subagentId:metadata.subagentId}:{}),status:"queued",createdAt:now,updatedAt:now};
     this.ctx.storage.transactionSync(()=>{
       this.ctx.storage.sql.exec("INSERT INTO runs (id,operation_id,fingerprint,native_operation_id,data) VALUES (?,?,?,?,?)",run.id,input.operationId,hash,input.operationId,JSON.stringify(run));
+      this.ctx.storage.sql.exec("INSERT INTO admission_sources(run_id,kind) VALUES(?,?)",run.id,source);
       const runtimeText=metadata?.provenance?`Message from fellow bot ${metadata.provenance.sourceBotName} (${metadata.provenance.sourceBotId}). This is delegated collaborator content, attributed by Timber. Complete its requested task and return a result; do not automatically message the sender.\n\n${input.text}`:input.text;
       this.ctx.storage.sql.exec("INSERT INTO submissions (operation_id,run_id,text,subagent_id) VALUES (?,?,?,?)",input.operationId,run.id,runtimeText,run.subagentId??null);
       if(!run.subagentId && metadata?.role!=="system") this.addMessage({id:crypto.randomUUID(),botId:run.botId,runId:run.id,role:metadata?.role??"user",text:input.text,...(attachments.length?{attachments}:{}),...(metadata?.provenance?{provenance:metadata.provenance}:{}),...(input.mentions?.length?{mentions:input.mentions}:{}),createdAt:now},`input:${input.operationId}`);
@@ -554,8 +575,40 @@ export class BotDO extends DurableObject<Env> {
       this.emit("run.updated",{run},run.id,`created:${run.id}`);
     });
     for(const target of input.mentions??[]) await this.dispatchMention(`mention:${run.id}:${target}`);
-    await this.admit(input.operationId);
+    await this.deliverReceipt(input.operationId,run.id);
     return this.getRun(run.id);
+  }
+
+  private admissionSource(run:Run):"user"|"internal" {
+    const saved=this.ctx.storage.sql.exec<{kind:"user"|"internal"}>("SELECT kind FROM admission_sources WHERE run_id=?",run.id).toArray()[0];
+    if(saved) return saved.kind;
+    const row=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM messages WHERE source_key=?",`input:${run.operationId}`).toArray()[0];
+    const message=row?JSON.parse(row.data) as Message:undefined;
+    return message?.role==="user" && !message.provenance?"user":"internal";
+  }
+
+  private checkInboxCapacity(source:"user"|"internal"):void {
+    const outstanding=this.ctx.storage.sql.exec<{total:number}>("SELECT COUNT(*) AS total FROM runs WHERE json_extract(data,'$.status') IN ('queued','running','waiting_approval','waiting_connection')").toArray()[0].total;
+    if(outstanding>=maxOutstandingInputs) {
+      // Deliberately not a cleanup policy: age/status alone cannot prove that a
+      // task is stale. Keep exact inputs available for inspection and Stop.
+      this.emit("runtime.error",{code:"run_lifecycle_overloaded",message:"Too many unresolved inputs. Inspect pending decisions and runtime recovery before accepting more work."},undefined,"run-lifecycle-overloaded");
+      console.warn(JSON.stringify({event:"run.lifecycle.overloaded",outstanding}));
+      throw new ApiError(503,"run_lifecycle_overloaded","This bot has too many unresolved inputs. Resolve pending decisions or stop unwanted tasks; persistent overload requires operator recovery.");
+    }
+    // Compatibility: classify pre-migration root receipts from their public
+    // user message, never from client-supplied operation-ID prefixes.
+    const queued=this.ctx.storage.sql.exec<{kind:string;total:number}>(`
+      SELECT COALESCE(a.kind,CASE WHEN json_extract(m.data,'$.role')='user'
+        AND json_extract(m.data,'$.provenance') IS NULL THEN 'user' ELSE 'internal' END) AS kind,COUNT(*) AS total
+      FROM runs r LEFT JOIN admission_sources a ON a.run_id=r.id
+      LEFT JOIN messages m ON m.source_key='input:'||r.operation_id
+      WHERE json_extract(r.data,'$.status')='queued' GROUP BY kind
+    `).toArray().find(row=>row.kind===source)?.total??0;
+    const maximum=source==="user"?maxUserQueuedInputs:maxInternalQueuedInputs;
+    if(queued>=maximum) throw new ApiError(429,"inbox_full",source==="user"
+      ?"This bot's message backlog is full. Wait for queued messages to be delivered or cancel an unwanted queued message."
+      :"This bot's collaborator backlog is full. Delivery can be retried after queued inputs settle.");
   }
 
   private async receiveAgentResult(input:{delegation:AgentDelegation;status:RunStatus;text:string;provenance:MessageProvenance}):Promise<void> {
@@ -711,6 +764,43 @@ export class BotDO extends DurableObject<Env> {
     }
   }
 
+  private async waitForCapacity(operationId:string,runId:string):Promise<void> {
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO capacity_waits(operation_id,run_id) VALUES(?,?)",operationId,runId);
+    this.updateStatus(runId,"queued",capacityPending);
+    await this.runtime.scheduleAdmissionRetry(operationId,1000);
+  }
+  private async deliverReceipt(operationId:string,runId:string):Promise<void> {
+    const submission=this.ctx.storage.sql.exec<Submission>("SELECT * FROM submissions WHERE operation_id=?",operationId).toArray()[0];
+    // The durable receipt must not wait behind an older admission RPC. Persist
+    // a wake before acknowledging, then let the same serialized lane deliver it.
+    // Never turn an already-admitted native queued input into a fresh delivery.
+    if(this.admitting.size && submission && !submission.admitted && this.getRun(runId).status==="queued" && this.canAdmit(operationId,runId)) {
+      await this.waitForCapacity(operationId,runId);
+      this.ctx.waitUntil(this.admit(operationId));
+      return;
+    }
+    await this.admit(operationId);
+  }
+  private wakeCapacityAdmissions(subagentId?:string):void {
+    const scope=subagentId??"root";
+    if(this.capacityWakes.has(scope)) return;
+    const rows=this.ctx.storage.sql.exec<{operation_id:string}>(`
+      SELECT c.operation_id FROM runs r
+      JOIN capacity_waits c ON c.run_id=r.id AND c.operation_id=r.native_operation_id
+      JOIN submissions s ON s.operation_id=c.operation_id
+      WHERE json_extract(r.data,'$.status')='queued' AND s.admitted=0
+        AND s.subagent_id IS ? AND NOT EXISTS(SELECT 1 FROM run_stops stop WHERE stop.run_id=r.id)
+      ORDER BY r.rowid
+    `,subagentId??null).toArray();
+    if(!rows.length) return;
+    // Scheduling is durable and effect-free. Do not await admission from a
+    // native status callback; that callback can itself be inside submit().
+    const work=(async()=>{for(const row of rows) await this.runtime.scheduleAdmissionRetry(row.operation_id,0);})()
+      .catch(()=>{}).finally(()=>this.capacityWakes.delete(scope));
+    this.capacityWakes.set(scope,work);
+    this.ctx.waitUntil(work);
+  }
+
   /** This outbox only admits durable inputs. Pi owns all execution and tool recovery. */
   private admit(nativeOperationId:string):Promise<void> {
     if(nativeOperationId.startsWith("run-cancel:")) return this.flushRunCancellations();
@@ -719,7 +809,10 @@ export class BotDO extends DurableObject<Env> {
     if(nativeOperationId.startsWith("mention:")) return this.dispatchMention(nativeOperationId);
     const existing=this.admitting.get(nativeOperationId);
     if(existing) return existing;
-    const operation=this.admitOnce(nativeOperationId).finally(()=>this.admitting.delete(nativeOperationId));
+    // Check and submit under one host admission lane. Different HTTP requests
+    // and Lifecycle wakes must not all observe the same last inbox slot.
+    const operation=this.admissionQueue.then(()=>this.admitOnce(nativeOperationId)).finally(()=>this.admitting.delete(nativeOperationId));
+    this.admissionQueue=operation.catch(()=>{});
     this.admitting.set(nativeOperationId,operation);
     return operation;
   }
@@ -740,6 +833,23 @@ export class BotDO extends DurableObject<Env> {
     if(!submission.admitted && retry && (retry.attempts>=maxAdmissionAttempts || retry.next_at>Date.now())) return;
     try {
       if(!submission.admitted) {
+        if(!submission.subagent_id) {
+          const pending=await this.runtime.pending();
+          // Running receipts are placed inputs, NOT concurrent generations.
+          // A lost receipt already present in Pi must bypass the capacity gate
+          // and be deduplicated/reconciled under its original operation ID.
+          if(pending.filter(input=>input.status==="queued").length>=maxNativeQueuedInputs
+            && !pending.some(input=>input.operationId===nativeOperationId)) {
+            const known=await this.runtime.operation(nativeOperationId);
+            if(known.status==="missing") {
+              if(!this.canAdmit(nativeOperationId,run.id)) return;
+              // Capacity waits are durable, but do not exhaust delivery retries.
+              await this.waitForCapacity(nativeOperationId,run.id);
+              return;
+            }
+          }
+        }
+        if(!this.canAdmit(nativeOperationId,run.id)) return;
         if(submission.subagent_id) await this.runtime.sendSubagent(submission.subagent_id,submission.text,{operationId:nativeOperationId});
         else {
           const message=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM messages WHERE source_key=?",`input:${nativeOperationId}`).toArray()[0];
@@ -751,10 +861,11 @@ export class BotDO extends DurableObject<Env> {
         if(this.deleted) return;
         const configurationFailure=this.ctx.storage.sql.exec("SELECT operation_id FROM configuration_admissions WHERE operation_id=?",nativeOperationId).toArray().length>0;
         this.ctx.storage.sql.exec("UPDATE submissions SET admitted=1 WHERE operation_id=?",nativeOperationId);
+        this.ctx.storage.sql.exec("DELETE FROM capacity_waits WHERE operation_id=?",nativeOperationId);
         this.ctx.storage.sql.exec("DELETE FROM admission_retries WHERE operation_id=?",nativeOperationId);
         this.ctx.storage.sql.exec("DELETE FROM configuration_admissions WHERE operation_id=?",nativeOperationId);
         const current=this.getRunRow(run.id),latest=JSON.parse(current.data) as Run;
-        if(current.native_operation_id===nativeOperationId && latest.status==="queued" && (configurationFailure || [admissionPending,admissionExhausted].includes(latest.error??""))) this.updateStatus(run.id,"queued");
+        if(current.native_operation_id===nativeOperationId && latest.status==="queued" && (configurationFailure || [admissionPending,admissionExhausted,capacityPending].includes(latest.error??""))) this.updateStatus(run.id,"queued");
       }
       if(!submission.subagent_id) this.observe(nativeOperationId);
     } catch(error) {
@@ -768,6 +879,7 @@ export class BotDO extends DurableObject<Env> {
       if(!this.canAdmit(nativeOperationId,run.id)) return;
       if(known && known.status!=="missing") {
         this.ctx.storage.sql.exec("UPDATE submissions SET admitted=1 WHERE operation_id=?",nativeOperationId);
+        this.ctx.storage.sql.exec("DELETE FROM capacity_waits WHERE operation_id=?",nativeOperationId);
         this.ctx.storage.sql.exec("DELETE FROM admission_retries WHERE operation_id=?",nativeOperationId);
         this.ctx.storage.sql.exec("DELETE FROM configuration_admissions WHERE operation_id=?",nativeOperationId);
         if(known.status==="done" || known.status==="unanswered") await this.completeOperation(nativeOperationId,known.status,known.text,known.reason,known.kind,known);
@@ -828,11 +940,10 @@ export class BotDO extends DurableObject<Env> {
       }
       await this.reconcileConnections();
       for(const delivery of this.ctx.storage.sql.exec<MentionDelivery>("SELECT * FROM mention_deliveries WHERE attempts<?",maxAdmissionAttempts).toArray()) await this.dispatchMention(delivery.operation_id);
-      const rows=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs").toArray();
-      for(const row of rows) {
-        const run=JSON.parse(row.data) as Run;
-        if(!terminal.has(run.status) && !["waiting_approval","waiting_connection"].includes(run.status)) await this.admit(row.native_operation_id);
-      }
+      // Status-indexed accepted work only, not the full retained history.
+      // admit() observes s.admitted=1 inputs without submitting them again.
+      const rows=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs WHERE json_extract(data,'$.status') IN ('queued','running') ORDER BY rowid").toArray();
+      for(const row of rows) await this.admit(row.native_operation_id);
       // The computer provider deduplicates these operation IDs, including interrupted operations.
       const approvals=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM approvals").toArray().map(row=>JSON.parse(row.data) as Approval);
       for(const approval of approvals) if(approval.status==="executing") await this.finishApproval(approval);
