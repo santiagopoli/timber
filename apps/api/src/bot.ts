@@ -1238,28 +1238,31 @@ export class BotDO extends DurableObject<Env> {
       return existing.response.then(response=>response.clone());
     }
     const response=(async()=>{
-      let pin:string|undefined;
+      let pin:string|undefined,acknowledged=false;
       if(!["readFile","listFiles","screenshot"].includes(action.type)) {
         const fence=await this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName("owner")).fetch(`https://workspace/tasks/bot-slot/${this.bot().id}/direct-dispatch`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({lease,operationId:op,action})});
-        if(!fence.ok)return fence;
+        // An unavailable/stale fence proves no new dispatch, not the outcome
+        // of an older uncertain effect under this operation ID. Retain its pin.
+        if(!fence.ok){const data=await fence.arrayBuffer();return new Response(data,{status:fence.status,headers:fence.headers});}
         pin=(await fence.json<{token:string}>()).token;
       }
       try {
         this.active();
         if(!["readFile","listFiles","screenshot","execPoll","execCancel"].includes(action.type))this.invalidatePendingGui();
         const result=await this.dispatchComputer(op,action);
+        acknowledged=true;
         this.emit("computer.action",{operationId:op,actionType:action.type,input:computerActivityInput(action),result},undefined,`direct:${op}`);
         return json({result});
       } catch(error) {
         if(error instanceof ApiError&&["idempotency_conflict","process_not_found","process_forbidden"].includes(error.code)||error instanceof ComputerProviderError&&error.code==="computer_upgrade_required") {
           const response=errorResponse(error),data=await response.json<{error:unknown}>();
-          return json({...data,preEffectRejected:true},response.status);
+          acknowledged=true;return json({...data,preEffectRejected:true},response.status);
         }
         return errorResponse(error);
       } finally {
         // The current lease remains pinned across every await before journaling.
         // Recovery reuses the same journal identity, never an alternate effect.
-        if(pin)await this.acknowledgeExecution(pin);
+        if(pin&&acknowledged)await this.acknowledgeExecution(pin);
       }
     })().finally(()=>this.directDispatching.delete(op));
     this.directDispatching.set(op,{action:fingerprint,response});
@@ -1901,7 +1904,7 @@ export class BotDO extends DurableObject<Env> {
       const desktopSession=/^\/computer\/live-session\/([a-f0-9-]{36})(\/renew)?$/.exec(path);
       if(desktopSession && ((request.method==="POST" && desktopSession[2]) || (request.method==="DELETE" && !desktopSession[2]))) {requestBodyForwarded=true;return this.computerView(request,`/desktop/${desktopSession[1]}${desktopSession[2]??""}`);}
       if(path==="/computer" && request.method==="GET") return json({computer:await this.computer.status(this.bot().id)});
-      if(path==="/computer/suspend" && request.method==="POST") return json({computer:await this.suspendComputer()});
+      if(path==="/computer/suspend" && request.method==="POST") {await consumeUnusedBody(request);return json({computer:await this.suspendComputer()});}
       if(path==="/computer/actions" && request.method==="POST") {
         if(this.suspending) throw new ApiError(409,"computer_busy","The computer is being suspended. Retry after it stops.");
         const input=await body(request),action=parseAction(input.action),op=operationId(input.operationId);

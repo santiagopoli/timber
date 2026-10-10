@@ -67,9 +67,9 @@ export class AgentCoordinator {
   private async botRequest<T>(botId:string,path:string,input?:unknown,method="GET",taskId?:string):Promise<T> {
     const bot=this.bot(botId);
     this.sourceTask(botId,taskId);
-    // Agent delivery and result inputs are internal run admissions. Reserve in
-    // this WorkspaceDO directly (rather than recursively calling its own
-    // fetch handler) so an alarm-driven outbox retry cannot deadlock itself.
+    // Ordinary delivery is receipted before execution-lease acquisition. Task
+    // result admissions must retain their active isolated conversation scope;
+    // reserve locally so an outbox alarm cannot recursively deadlock itself.
     let admission:string|undefined;
     if(taskId&&method==="POST"&&(path==="/agent-messages"||path==="/agent-results")) {
       const op=input&&typeof input==="object"?(input as {operationId?:unknown}).operationId:undefined;

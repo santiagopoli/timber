@@ -23,6 +23,7 @@ export class WorkspaceDO extends DurableObject<Env> {
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS computer_slot_generations (bot_id TEXT PRIMARY KEY,generation INTEGER NOT NULL)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS computer_admissions (token TEXT PRIMARY KEY,bot_id TEXT NOT NULL,task_id TEXT NOT NULL,operation_id TEXT NOT NULL,slot_token TEXT NOT NULL,created_at INTEGER NOT NULL)");
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS computer_admissions_scope ON computer_admissions(bot_id,task_id)");
+    if(!ctx.storage.sql.exec<{name:string}>("PRAGMA table_info(computer_admissions)").toArray().some(c=>c.name==="payload"))ctx.storage.sql.exec("ALTER TABLE computer_admissions ADD COLUMN payload TEXT");
     const columns=ctx.storage.sql.exec<{name:string}>("PRAGMA table_info(task_slots)").toArray().map(row=>row.name);
     if(!columns.includes("token")) ctx.storage.sql.exec("ALTER TABLE task_slots ADD COLUMN token TEXT");
     if(!columns.includes("generation")) ctx.storage.sql.exec("ALTER TABLE task_slots ADD COLUMN generation INTEGER NOT NULL DEFAULT 0");
@@ -108,6 +109,7 @@ export class WorkspaceDO extends DurableObject<Env> {
   private reserveBotSlot(botId:string):{token:string;generation:number} {
     const current=this.ctx.storage.sql.exec<{task_id:string}>("SELECT task_id FROM task_slots WHERE bot_id=?",botId).toArray()[0];
     if(current&&current.task_id!=="@bot") throw new ApiError(409,"computer_busy","A task or direct action is using this bot's computer.");
+    if(this.ctx.storage.sql.exec("SELECT 1 FROM computer_admissions WHERE bot_id=? AND payload IS NOT NULL LIMIT 1",botId).toArray().length)throw new ApiError(409,"computer_busy","An owner computer effect is awaiting its authoritative receipt.");
     const token=crypto.randomUUID(),generation=this.nextSlotGeneration(botId);
     this.ctx.storage.sql.exec("INSERT INTO task_slots(bot_id,task_id,token,generation,updated_at) VALUES(?,'@bot',?,?,?) ON CONFLICT(bot_id) DO UPDATE SET token=excluded.token,generation=excluded.generation,updated_at=excluded.updated_at",botId,token,generation,Date.now());
     return {token,generation};
@@ -205,10 +207,10 @@ export class WorkspaceDO extends DurableObject<Env> {
   }
   private taskStartOperation(task:{id:string;startOperationId?:string}):string {return task.startOperationId??`task-start:${task.id}`;}
   private async reconcileAdmissions():Promise<void> {
-    const rows=this.ctx.storage.sql.exec<{token:string;bot_id:string;task_id:string;operation_id:string;created_at:number}>("SELECT token,bot_id,task_id,operation_id,created_at FROM computer_admissions WHERE created_at<=? ORDER BY created_at LIMIT 32",Date.now()-60_000).toArray();
+    const rows=this.ctx.storage.sql.exec<{token:string;bot_id:string;task_id:string;operation_id:string;created_at:number;payload:string|null}>("SELECT token,bot_id,task_id,operation_id,created_at,payload FROM computer_admissions WHERE created_at<=? AND payload IS NULL AND task_id NOT LIKE '@direct:%' ORDER BY created_at LIMIT 32",Date.now()-60_000).toArray();
     for(const row of rows) {
       // Direct pins recover through the original computer journal, not native input admission.
-      if(row.task_id.startsWith("@direct:"))continue;
+      if(row.task_id.startsWith("@direct:")||row.payload)continue;
       try {
         const botRow=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",row.bot_id).toArray()[0];
         if(!botRow) {this.ctx.storage.sql.exec("DELETE FROM computer_admissions WHERE bot_id=?",row.bot_id);continue;}
@@ -255,9 +257,13 @@ export class WorkspaceDO extends DurableObject<Env> {
           if(await this.computerControlled(slot.bot_id,bot))continue;
           const freshSlot=this.slotFor(slot.bot_id);
           if(!freshSlot||freshSlot.task_id!==slot.task_id||freshSlot.token!==slot.token||freshSlot.generation!==slot.generation)continue;
-          const direct=JSON.parse(slot.payload) as {operationId:string;action:{type:string;processId?:string}};
+          // Recover the exact pinned effect (including an owner poll) before
+          // generating a fresh scheduler observation; otherwise crash-left pins
+          // could permanently prevent this holder from releasing its lease.
+          const pinned=this.ctx.storage.sql.exec<{payload:string}>("SELECT payload FROM computer_admissions WHERE bot_id=? AND task_id=? AND slot_token=? AND payload IS NOT NULL ORDER BY created_at LIMIT 1",slot.bot_id,slot.task_id,slot.token).toArray()[0];
+          const direct=JSON.parse(pinned?.payload??slot.payload) as {operationId:string;action:{type:string;processId?:string}};
           const stub=this.env.BOT.get(this.env.BOT.idFromName(`owner:${slot.bot_id}`));
-          const operation=slot.direct_process_id&&direct.action.type!=="execCancel"
+          const operation=!pinned&&slot.direct_process_id&&direct.action.type!=="execCancel"
             ? {operationId:`scheduler-poll:${slot.token}:${Math.floor(Date.now()/5000)}`,action:{type:"execPoll",processId:slot.direct_process_id}}
             : direct;
           const receipt=await stub.fetch(new Request("https://bot/computer/actions",{method:"POST",headers:{"content-type":"application/json","x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-direct-lease":JSON.stringify({key:slot.task_id.slice("@direct:".length),token:slot.token,generation:slot.generation})},body:JSON.stringify(operation)}));
@@ -276,6 +282,16 @@ export class WorkspaceDO extends DurableObject<Env> {
           continue;
         }
         if(slot.task_id==="@bot") {
+          const pinned=this.ctx.storage.sql.exec<{token:string;payload:string}>("SELECT token,payload FROM computer_admissions WHERE bot_id=? AND task_id='@bot' AND slot_token=? AND payload IS NOT NULL ORDER BY created_at LIMIT 1",slot.bot_id,slot.token).toArray()[0];
+          if(pinned) {
+            if(await this.computerControlled(slot.bot_id,bot))continue;
+            const observed=this.slotFor(slot.bot_id);
+            if(!observed||observed.task_id!==slot.task_id||observed.token!==slot.token||observed.generation!==slot.generation)continue;
+            const stub=this.env.BOT.get(this.env.BOT.idFromName(`owner:${slot.bot_id}`));
+            const response=await stub.fetch(new Request("https://bot/computer/actions",{method:"POST",headers:{"content-type":"application/json","x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-direct-lease":JSON.stringify({token:slot.token,generation:slot.generation,admissionToken:pinned.token})},body:pinned.payload}));
+            await response.arrayBuffer();
+            continue;
+          }
           const state=await this.schedulerSnapshot(slot.bot_id,bot);
           if(state.activeRuns===0&&state.activeProcesses===0&&state.pendingCancellations===0&&!state.computerControlled&&!this.hasPendingAdmission(slot.bot_id,"@bot")&&Date.now()-slot.updated_at>5000)this.releaseSlot(slot.bot_id,slot.task_id,slot.token,slot.updated_at);
           continue;
@@ -481,11 +497,14 @@ export class WorkspaceDO extends DurableObject<Env> {
         if(lease?.admissionToken) {
           const admission=this.ctx.storage.sql.exec("SELECT 1 FROM computer_admissions WHERE token=? AND bot_id=? AND task_id='@bot' AND operation_id=? AND slot_token=?",lease.admissionToken,botId,op,slot.token).toArray()[0];
           if(!admission)throw new ApiError(409,"computer_lease_stale","The direct admission is no longer valid.");
+          this.ctx.storage.sql.exec("UPDATE computer_admissions SET payload=? WHERE token=?",JSON.stringify({operationId:op,action}),lease.admissionToken);
           return json({token:lease.admissionToken});
         }
-        const existing=this.ctx.storage.sql.exec<{token:string}>("SELECT token FROM computer_admissions WHERE bot_id=? AND task_id=? AND operation_id=? AND slot_token=?",botId,holder,op,slot.token).toArray()[0];
+        const existing=this.ctx.storage.sql.exec<{token:string;payload:string|null}>("SELECT token,payload FROM computer_admissions WHERE bot_id=? AND task_id=? AND operation_id=? AND slot_token=?",botId,holder,op,slot.token).toArray()[0];
+        const payload=JSON.stringify({operationId:op,action});
+        if(existing?.payload&&existing.payload!==payload)throw new ApiError(409,"operation_id_conflict","The pinned computer action arguments changed.");
         const token=existing?.token??crypto.randomUUID();
-        if(!existing)this.ctx.storage.sql.exec("INSERT INTO computer_admissions(token,bot_id,task_id,operation_id,slot_token,created_at) VALUES(?,?,?,?,?,?)",token,botId,holder,op,slot.token,Date.now());
+        if(!existing)this.ctx.storage.sql.exec("INSERT INTO computer_admissions(token,bot_id,task_id,operation_id,slot_token,created_at,payload) VALUES(?,?,?,?,?,?,?)",token,botId,holder,op,slot.token,Date.now(),payload);
         this.ctx.waitUntil(this.rearmDeletion());return json({token});
       }
       const directQueueRoute=/^\/tasks\/bot-slot\/([0-9a-f-]{36})\/queued-actions(?:\/([^/]+)\/cancel)?$/.exec(path);
@@ -532,6 +551,13 @@ export class WorkspaceDO extends DurableObject<Env> {
             const supplied=input.payload as {operationId?:unknown;action?:unknown};
             const directOperation=operationId(supplied?.operationId),validatedAction=parseAction(supplied?.action),payload=JSON.stringify({operationId:directOperation,action:validatedAction});
             const savedIntent=():Response|undefined=>{
+              const pin=this.ctx.storage.sql.exec<{payload:string;task_id:string;slot_token:string;token:string}>("SELECT payload,task_id,slot_token,token FROM computer_admissions WHERE bot_id=? AND operation_id=? AND payload IS NOT NULL LIMIT 1",botId,directOperation).toArray()[0];
+              if(pin&&pin.payload!==payload)throw new ApiError(409,"operation_id_conflict","The pinned computer action arguments changed.");
+              if(pin) {
+                const slot=this.slotFor(botId);
+                if(slot?.task_id===pin.task_id&&slot.token===pin.slot_token)return json({claimed:true,token:slot.token,generation:slot.generation,key:pin.task_id.startsWith("@direct:")?pin.task_id.slice("@direct:".length):key,...(pin.task_id==="@bot"?{shared:true,admissionToken:pin.token}:{})});
+                throw new ApiError(409,"computer_lease_stale","The pinned action no longer holds its computer lease.");
+              }
               const intent=this.ctx.storage.sql.exec<{payload:string;state:string;receipt:string|null;receipt_status:number}>("SELECT payload,state,receipt,receipt_status FROM direct_intents WHERE bot_id=? AND operation_id=?",botId,directOperation).toArray()[0];
               if(intent&&intent.payload!==payload)throw new ApiError(409,"operation_id_conflict","Queued action operationId was already used for different input.");
               if(intent?.state==="cancelled")throw new ApiError(409,"action_cancelled","This queued action was cancelled and will not execute.");
@@ -548,12 +574,12 @@ export class WorkspaceDO extends DurableObject<Env> {
             }
             current=this.ctx.storage.sql.exec<NonNullable<typeof current>>("SELECT task_id,token,generation,direct_process_id FROM task_slots WHERE bot_id=?",botId).toArray()[0];
             if(current?.task_id.startsWith("@direct:")&&["execPoll","execCancel"].includes(action?.type??"")&&current.direct_process_id===action?.processId) {holder=current.task_id;leaseKey=holder.slice("@direct:".length);}
-            if(current?.task_id==="@bot"&&["key","click","type","scroll"].includes(action?.type??"")) {
+            if(current?.task_id==="@bot"&&["key","click","type","scroll"].includes(action?.type??"")&&!this.ctx.storage.sql.exec("SELECT 1 FROM computer_admissions WHERE bot_id=? AND payload IS NOT NULL LIMIT 1",botId).toArray().length) {
               const botRow=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",botId).toArray()[0];
               if(botRow) {
                 const bot=JSON.parse(botRow.data) as Bot,stub=this.env.BOT.get(this.env.BOT.idFromName(`owner:${botId}`));
                 const runs=await stub.fetch(new Request("https://bot/runs",{headers:{"x-botspace-config":encodeURIComponent(JSON.stringify(bot))}}));
-                if(runs.ok) {const page=await runs.json<{activeRuns:Array<{status:string}>}>();if(page.activeRuns.length&&page.activeRuns.every(run=>run.status==="waiting_approval")) {const saved=savedIntent();if(saved)return saved;const latest=this.slotFor(botId);if(!latest||latest.task_id!=="@bot")throw new ApiError(409,"computer_busy","The computer lease changed; retry the same operation ID.");const op=(input.payload as {operationId?:unknown}).operationId;if(typeof op!=="string")throw new ApiError(400,"invalid_request","A stable action operationId is required.");const admissionToken=this.beginComputerAdmission(botId,null,op);return json({claimed:true,token:this.slotFor(botId)?.token??"",generation:this.slotFor(botId)?.generation,key,shared:true,admissionToken});}}else this.ctx.waitUntil(runs.arrayBuffer().catch(()=>{}));
+                if(runs.ok) {const page=await runs.json<{activeRuns:Array<{status:string}>}>();if(page.activeRuns.length&&page.activeRuns.every(run=>run.status==="waiting_approval")) {const saved=savedIntent();if(saved)return saved;const latest=this.slotFor(botId);if(!latest||latest.task_id!=="@bot")throw new ApiError(409,"computer_busy","The computer lease changed; retry the same operation ID.");const op=(input.payload as {operationId?:unknown}).operationId;if(typeof op!=="string")throw new ApiError(400,"invalid_request","A stable action operationId is required.");const admissionToken=this.beginComputerAdmission(botId,null,op);this.ctx.storage.sql.exec("UPDATE computer_admissions SET payload=? WHERE token=?",payload,admissionToken);return json({claimed:true,token:this.slotFor(botId)?.token??"",generation:this.slotFor(botId)?.generation,key,shared:true,admissionToken});}}else this.ctx.waitUntil(runs.arrayBuffer().catch(()=>{}));
               }
             }
             // Reread immutable arguments and cancellation state after every await.
@@ -588,7 +614,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         if(request.method==="DELETE") {
           const key=new URL(request.url).searchParams.get("key"),token=new URL(request.url).searchParams.get("token");
           if(key&&token)this.releaseSlot(botId,`@direct:${key}`,token);
-          else this.ctx.storage.sql.exec("DELETE FROM task_slots WHERE bot_id=? AND task_id='@bot'",botId);
+          else {const slot=this.slotFor(botId);if(slot?.task_id==="@bot")this.releaseSlot(botId,"@bot",slot.token);}
           await this.rearmDeletion();return json({released:true});
         }
         if(request.method==="GET") {const slot=this.slotFor(botId);return json({taskLocked:!!slot&&slot.task_id!=="@bot",holder:slot?.task_id??null});}

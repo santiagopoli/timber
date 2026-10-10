@@ -233,23 +233,22 @@ export default {
         headers.set("x-timber-direct-lease",JSON.stringify({key:leaseKey??key,token,generation:reserved.generation,...(shared?{admissionToken}:{})}));
         const direct=new Request(`https://bot${tail}${url.search}`,{method:"POST",headers,body:JSON.stringify(directInput),redirect:"manual",signal:request.signal});
         const response=await stub.fetch(direct);
-        if(shared&&admissionToken)await completeAdmission(env,botId,admissionToken);
         if(!shared) {
           try {
             const receipt=await response.clone().json<{result?:{status:string;checkpointStatus?:string};preEffectRejected?:boolean}>();
             const terminal=receipt.preEffectRejected===true||!!receipt.result&&["completed","failed","cancelled","interrupted"].includes(receipt.result.status)&&receipt.result.checkpointStatus!=="pending";
-            await registry.fetch(`https://workspace/tasks/bot-slot/${botId}/receipt?key=${encodeURIComponent(leaseKey??key)}&token=${encodeURIComponent(token)}`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId:op,receipt,terminal,status:response.status})});
+            await registry.fetch(`https://workspace/tasks/bot-slot/${botId}/receipt?key=${encodeURIComponent(leaseKey??key)}&token=${encodeURIComponent(token)}`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId:op,receipt,terminal,status:response.status})}).then(response=>response.arrayBuffer());
           } catch { /* Unknown receipts do not settle or release a queued intent. */ }
         }
         if(!shared&&!response.ok) {
           const rejected=await response.clone().json<{preEffectRejected?:boolean}>().catch(()=>({preEffectRejected:false}));
-          if(rejected.preEffectRejected)await registry.fetch(`https://workspace/tasks/bot-slot/${botId}/reject?key=${encodeURIComponent(leaseKey??key)}&token=${encodeURIComponent(token)}`,{method:"POST"});
+          if(rejected.preEffectRejected)await registry.fetch(`https://workspace/tasks/bot-slot/${botId}/reject?key=${encodeURIComponent(leaseKey??key)}&token=${encodeURIComponent(token)}`,{method:"POST"}).then(response=>response.arrayBuffer());
         }
         if(!shared&&response.ok) {
           try {
             const result=(await response.clone().json<{result:{status:string;processId?:string;checkpointStatus?:string}}>()).result;
-            if(result.status==="running"&&result.processId) await registry.fetch(`https://workspace/tasks/bot-slot/${botId}/direct-process?key=${encodeURIComponent(key)}&token=${encodeURIComponent(token)}`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({processId:result.processId})});
-            if(["completed","failed","cancelled"].includes(result.status)&&result.checkpointStatus!=="pending") await registry.fetch(`https://workspace/tasks/bot-slot/${botId}?key=${encodeURIComponent(leaseKey??key)}&token=${encodeURIComponent(token)}`,{method:"DELETE"});
+            if(result.status==="running"&&result.processId) await registry.fetch(`https://workspace/tasks/bot-slot/${botId}/direct-process?key=${encodeURIComponent(key)}&token=${encodeURIComponent(token)}`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({processId:result.processId})}).then(response=>response.arrayBuffer());
+            if(["completed","failed","cancelled"].includes(result.status)&&result.checkpointStatus!=="pending") await registry.fetch(`https://workspace/tasks/bot-slot/${botId}?key=${encodeURIComponent(leaseKey??key)}&token=${encodeURIComponent(token)}`,{method:"DELETE"}).then(response=>response.arrayBuffer());
           } catch { /* An unreadable/uncertain receipt keeps the lease held. */ }
         }
         return response;

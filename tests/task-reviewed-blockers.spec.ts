@@ -41,8 +41,8 @@ describe("reviewed task blockers",()=>{
   try {const r=await api(`/v1/bots/${owner.id}/computer/actions`,{operationId:crypto.randomUUID(),action:{type:"exec",command:"never dispatched"}});expect(r.status).toBe(409);expect(r.data.preEffectRejected).toBe(true);expect(await slot(owner)).toBeUndefined();await runInDurableObject(root(owner),(_,state)=>{expect(state.storage.sql.exec("SELECT 1 FROM run_processes WHERE status='running'").toArray()).toHaveLength(0);});}
   finally {delete computerFixtureControl.failure;}
   expect((await api(`/v1/bots/${owner.id}/computer/suspend`,{})).status).toBe(200);
-  computerFixtureControl.failure={status:503,body:{error:{code:"computer_unavailable"}}};
-  try {expect((await api(`/v1/bots/${owner.id}/computer/actions`,{operationId:crypto.randomUUID(),action:{type:"key",key:"Escape"}})).status).toBe(503);const held=await slot(owner);expect(held?.task_id.startsWith("@direct:")).toBe(true);await reconcile();expect((await slot(owner))?.token).toBe(held?.token);}
+  const uncertain=await bot();computerFixtureControl.failure={status:503,body:{error:{code:"computer_unavailable"}}};
+  try {expect((await api(`/v1/bots/${uncertain.id}/computer/actions`,{operationId:crypto.randomUUID(),action:{type:"key",key:"Escape"}})).status).toBe(503);const held=await slot(uncertain);expect(held?.task_id.startsWith("@direct:")).toBe(true);await reconcile();expect((await slot(uncertain))?.token).toBe(held?.token);}
   finally {delete computerFixtureControl.failure;}
  });
  it("rereads direct lease after a delayed body and preserves the competing cancellation intent",async()=>{
@@ -73,7 +73,7 @@ describe("reviewed task blockers",()=>{
  it("fences a stale reconciler after control awaits while preserving a replacement task holder",async()=>{
   const owner=await bot(),op=crypto.randomUUID(),input={operationId:op,action:{type:"exec",command:"stale reconciler must not run"}};
   const url=`https://workspace/tasks/bot-slot/${owner.id}?kind=direct&key=${op}`;
-  expect((await registry().fetch(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({payload:input})})).status).toBe(200);
+  const initialClaim=await registry().fetch(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({payload:input})});expect(initialClaim.status).toBe(200);await initialClaim.arrayBuffer();
   let release!:()=>void,enter!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve;}),entered=new Promise<void>(resolve=>{enter=resolve;});
   type Control={computerControlled(id:string,bot:Bot):Promise<boolean>};let original!:Control["computerControlled"];let first=true;
   await runInDurableObject(registry(),instance=>{const target=instance as unknown as Control;original=target.computerControlled;target.computerControlled=async(id,bot)=>{const controlled=await original.call(target,id,bot);if(id===owner.id&&first){first=false;enter();await gate;}return controlled;};});
@@ -87,19 +87,68 @@ describe("reviewed task blockers",()=>{
  it("validates at the BotDO effect boundary and pins a live journal dispatch until its receipt",async()=>{
   const owner=await bot(),op=crypto.randomUUID(),input={operationId:op,action:{type:"key",key:"Escape"}},url=`https://workspace/tasks/bot-slot/${owner.id}?kind=direct&key=${op}`;
   const claimed=await (await registry().fetch(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({payload:input})})).json<{token:string;generation:number}>();
-  await registry().fetch(`https://workspace/tasks/bot-slot/${owner.id}?key=${op}&token=${claimed.token}`,{method:"DELETE"});
+  await registry().fetch(`https://workspace/tasks/bot-slot/${owner.id}?key=${op}&token=${claimed.token}`,{method:"DELETE"}).then(response=>response.arrayBuffer());
   const record=await task(owner);await terminal(record.id,"waiting_approval");
   const stale=await root(owner).fetch("https://bot/computer/actions",{method:"POST",headers:{"content-type":"application/json","x-botspace-config":encodeURIComponent(JSON.stringify(owner)),"x-timber-direct-lease":JSON.stringify({key:op,...claimed})},body:JSON.stringify(input)});
-  expect(stale.status).toBe(409);expect(await effects(owner)).not.toContain(op);
+  expect(stale.status).toBe(409);await stale.arrayBuffer();expect(await effects(owner)).not.toContain(op);
   await api(`/v1/tasks/${record.id}/cancel`,{});await reconcile();
   let release!:()=>void,enter!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve;}),entered=new Promise<void>(resolve=>{enter=resolve;});
   type Dispatch={dispatchComputer(op:string,action:any):Promise<unknown>};let original!:Dispatch["dispatchComputer"];
   await runInDurableObject(root(owner),instance=>{const target=instance as unknown as Dispatch;original=target.dispatchComputer;target.dispatchComputer=async(id,action)=>{if(id===op){enter();await gate;}return original.call(target,id,action);};});
   const dispatch=api(`/v1/bots/${owner.id}/computer/actions`,input);await entered;const held=await slot(owner);
-  await registry().fetch(`https://workspace/tasks/bot-slot/${owner.id}?key=${op}&token=${held!.token}`,{method:"DELETE"});expect((await slot(owner))?.token).toBe(held!.token);
-  const next=await task(owner);expect(next.status).toBe("queued");release();expect((await dispatch).status).toBe(200);
+  await registry().fetch(`https://workspace/tasks/bot-slot/${owner.id}?key=${op}&token=${held!.token}`,{method:"DELETE"}).then(response=>response.arrayBuffer());expect((await slot(owner))?.token).toBe(held!.token);
+  const next=await task(owner,"fixture:approval",false);
+  await runInDurableObject(registry(),(_,state)=>state.storage.sql.exec("UPDATE tasks SET data=? WHERE id=?",JSON.stringify({...next,status:"queued",startImmediately:true}),next.id));
+  release();expect((await dispatch).status).toBe(200);
   await runInDurableObject(root(owner),instance=>{(instance as unknown as Dispatch).dispatchComputer=original;});
   await reconcile();await terminal(next.id,"waiting_approval");expect((await slot(owner))?.task_id).toBe(next.id);expect((await effects(owner)).filter(id=>id===op)).toHaveLength(1);
+ });
+ it("recovers a crash-left exact owner poll pin without leaking its lease or inventing another observation",async()=>{
+  const owner=await bot(),op=crypto.randomUUID();computerFixtureControl.execSession={command:"Pinned poll",pollsBeforeComplete:0};
+  try {expect((await api(`/v1/bots/${owner.id}/computer/actions`,{operationId:op,action:{type:"exec",command:"Pinned poll"}})).data.result.status).toBe("running");} finally {delete computerFixtureControl.execSession;}
+  const poll={operationId:crypto.randomUUID(),action:{type:"execPoll",processId:op}},held=await slot(owner);
+  const pin=await registry().fetch(`https://workspace/tasks/bot-slot/${owner.id}/direct-dispatch`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({lease:{key:op,token:held!.token,generation:held!.generation},...poll})});expect(pin.status).toBe(200);await pin.arrayBuffer();
+  await evictDurableObject(root(owner));await evictDurableObject(registry());await reconcile();
+  expect(await effects(owner)).toContain(poll.operationId);expect(await slot(owner)).toBeUndefined();
+  await runInDurableObject(registry(),(_,state)=>expect(state.storage.sql.exec("SELECT 1 FROM computer_admissions WHERE bot_id=?",owner.id).toArray()).toHaveLength(0));
+ });
+ it("retains an uncertain shared GUI pin through native reconciliation, Stop and eviction until exact journal recovery",async()=>{
+  const owner=await bot(),submitted=await api(`/v1/bots/${owner.id}/messages`,{operationId:crypto.randomUUID(),text:"fixture:gui-approval"});
+  let saved=submitted.data.run as Run;for(let n=0;n<100&&saved.status!=="waiting_approval";n++){await new Promise(resolve=>setTimeout(resolve,5));saved=(await api(`/v1/bots/${owner.id}/runs/${saved.id}`)).data.run;}expect(saved.status).toBe("waiting_approval");
+  const op=crypto.randomUUID(),input={operationId:op,action:{type:"key",key:"Escape"}};
+  computerFixtureControl.failure={status:503,body:{error:{code:"computer_unavailable"}}};
+  let next!:Task;
+  try {
+    expect((await api(`/v1/bots/${owner.id}/computer/actions`,input)).status).toBe(503);
+    expect((await api(`/v1/bots/${owner.id}/computer/actions`,input)).status).toBe(503);
+    expect((await api(`/v1/bots/${owner.id}/computer/queued-actions`)).data.actions).toEqual([]);
+    let originalFetch!: (request:Request)=>Promise<Response>;
+    await runInDurableObject(registry(),instance=>{const target=instance as unknown as {fetch(request:Request):Promise<Response>};originalFetch=target.fetch;target.fetch=request=>new URL(request.url).pathname.endsWith("/direct-dispatch")?Promise.resolve(Response.json({error:{code:"fixture_fence_unavailable"}},{status:503})):originalFetch.call(target,request);});
+    try {const failedFence=await api(`/v1/bots/${owner.id}/computer/actions`,input);expect(failedFence.status).toBe(503);expect(failedFence.data.preEffectRejected).not.toBe(true);}
+    finally {await runInDurableObject(registry(),instance=>{(instance as unknown as {fetch(request:Request):Promise<Response>}).fetch=originalFetch;});}
+    await runInDurableObject(registry(),(_,state)=>expect(state.storage.sql.exec("SELECT 1 FROM computer_admissions WHERE bot_id=? AND payload IS NOT NULL",owner.id).toArray()).toHaveLength(1));
+
+    expect((await api(`/v1/bots/${owner.id}/computer/actions`,{...input,action:{type:"key",key:"Enter"}})).data.error.code).toBe("operation_id_conflict");
+    await api(`/v1/bots/${owner.id}/runs/${saved.id}/cancel`,{});
+    await runInDurableObject(registry(),async(instance,state)=>{state.storage.sql.exec("UPDATE computer_admissions SET created_at=? WHERE bot_id=?",Date.now()-61_000,owner.id);await (instance as unknown as {reconcileAdmissions():Promise<void>}).reconcileAdmissions();expect(state.storage.sql.exec("SELECT 1 FROM computer_admissions WHERE bot_id=? AND payload IS NOT NULL",owner.id).toArray()).toHaveLength(1);});
+    await runInDurableObject(root(owner),(_,state)=>expect(state.storage.sql.exec("SELECT 1 FROM cancelled_agent_inputs WHERE operation_id=?",op).toArray()).toHaveLength(0));
+    next=await task(owner);expect(next.status).toBe("queued");expect((await slot(owner))?.task_id).toBe("@bot");
+  } finally {delete computerFixtureControl.failure;}
+  await evictDurableObject(root(owner));await evictDurableObject(registry());await reconcile();
+  expect(await effects(owner)).toContain(op);
+  await runInDurableObject(registry(),(_,state)=>{expect(state.storage.sql.exec("SELECT 1 FROM computer_admissions WHERE bot_id=? AND payload IS NOT NULL",owner.id).toArray()).toHaveLength(0);state.storage.sql.exec("UPDATE task_slots SET updated_at=? WHERE bot_id=?",Date.now()-6000,owner.id);});
+  await reconcile();await terminal(next.id,"waiting_approval");expect((await slot(owner))?.task_id).toBe(next.id);
+ });
+ it("enforces 32 pending direct intents, preserves receipts at capacity, and never approves the task model action",async()=>{
+  const owner=await bot(),record=await task(owner);await terminal(record.id,"waiting_approval");const inputs=Array.from({length:32},()=>({operationId:crypto.randomUUID(),action:{type:"key",key:"Escape"}}));
+  for(const input of inputs)expect((await api(`/v1/bots/${owner.id}/computer/actions`,input)).status).toBe(202);
+  const overflow={operationId:crypto.randomUUID(),action:{type:"key",key:"Enter"}};
+  expect((await api(`/v1/bots/${owner.id}/computer/actions`,overflow)).data.error.code).toBe("computer_queue_full");
+  expect((await api(`/v1/bots/${owner.id}/computer/actions`,inputs[0])).status).toBe(202);
+  expect((await api(`/v1/bots/${owner.id}/computer/actions`,{...inputs[0],action:{type:"key",key:"Enter"}})).data.error.code).toBe("operation_id_conflict");
+  expect((await api(`/v1/tasks/${record.id}/approvals`)).data.approvals.every((approval:any)=>approval.status==="pending")).toBe(true);expect(await effects(owner)).toEqual([]);
+  expect((await api(`/v1/bots/${owner.id}/computer/queued-actions/${inputs[0].operationId}/cancel`,{})).status).toBe(200);
+  expect((await api(`/v1/bots/${owner.id}/computer/actions`,overflow)).status).toBe(202);
  });
  it("stores normal inputs exactly once at contention, keeps task ownership, and wakes the same input after eviction",async()=>{
   const owner=await bot(),record=await task(owner);await terminal(record.id,"waiting_approval");const held=await slot(owner),op=crypto.randomUUID(),input={operationId:op,text:"Unchanged durable text"};
@@ -130,7 +179,7 @@ describe("reviewed task blockers",()=>{
   const owner=await bot(),record=await task(owner,status==="completed"?"Original task":"fixture:model-error");const original=await terminal(record.id,status);await reconcile();
   expect((await api(`/v1/tasks/${record.id}`)).data.task.status).toBe(status);
   const input={operationId:crypto.randomUUID(),text:"New explicit continuation"},continued=await api(`/v1/tasks/${record.id}/continue`,input);expect(continued.status).toBe(202);const newRun=await terminal(record.id,"completed");expect(newRun.id).not.toBe(original.id);expect(newRun.operationId).not.toBe(original.operationId);
-  expect((await api(`/v1/tasks/${record.id}/continue`,input)).status).toBe(202);const runs=(await api(`/v1/tasks/${record.id}/runs`)).data.runs;expect(runs).toHaveLength(2);expect(runs.find((r:Run)=>r.id===original.id).status).toBe(status);
+  expect((await api(`/v1/tasks/${record.id}/continue`,input)).status).toBe(202);expect((await api(`/v1/tasks/${record.id}/continue`,{...input,text:"Different continuation"})).data.error.code).toBe("operation_id_conflict");const runs=(await api(`/v1/tasks/${record.id}/runs`)).data.runs;expect(runs).toHaveLength(2);expect(runs.find((r:Run)=>r.id===original.id).status).toBe(status);
   const messages=(await api(`/v1/tasks/${record.id}/messages`)).data.messages;expect(messages.filter((m:any)=>m.role==="user").map((m:any)=>m.text)).toEqual([record.description,input.text]);
   expect((await api(`/v1/bots/${owner.id}/messages`)).data.messages).toEqual([]);
  });
@@ -149,17 +198,18 @@ describe("reviewed task blockers",()=>{
       state.storage.sql.exec("UPDATE tasks SET data=? WHERE id=?",JSON.stringify({...record,status:"running"}),record.id);
       state.storage.sql.exec("INSERT INTO task_slots(bot_id,task_id,token,generation,updated_at) VALUES(?,?,?,?,?)",source.id,record.id,crypto.randomUUID(),1,Date.now());
       const delegation={id,sourceBotId:source.id,sourceBotName:source.name,sourceRunId:run.id,targetBotId:target.id,targetBotName:target.name,path:[source.id,target.id],status:"queued",createdAt:new Date(Date.now()-24*60*60*1000-1).toISOString(),updatedAt:now};
-      state.storage.sql.exec("INSERT INTO agent_deliveries(id,source_bot_id,operation_id,fingerprint,phase,next_at,data) VALUES(?,?,?,?,'submit',0,?)",id,source.id,crypto.randomUUID(),"fixture",JSON.stringify({delegation,text:"Reciprocal task request",kind:"bot",sourceTaskId:record.id}));
+      state.storage.sql.exec("INSERT INTO agent_deliveries(id,source_bot_id,operation_id,fingerprint,phase,next_at,data) VALUES(?,?,?,?,'submit',?,?)",id,source.id,crypto.randomUUID(),"fixture",Date.now()+60_000,JSON.stringify({delegation,text:"Reciprocal task request",kind:"bot",sourceTaskId:record.id}));
     });
   }
-  await evictDurableObject(registry());expect(await runDurableObjectAlarm(registry())).toBe(true);
+  const advance=async()=>runInDurableObject(registry(),async(instance,state)=>{const scheduler=instance as unknown as {agents:{processOnce(id:string):Promise<void>};reconcileComputerSlots():Promise<void>};for(const id of ids){await scheduler.agents.processOnce(id);state.storage.sql.exec("UPDATE agent_deliveries SET next_at=? WHERE id=?",Date.now()+60_000,id);}await scheduler.reconcileComputerSlots();await state.storage.setAlarm(Date.now()+5000);});
+  await evictDurableObject(registry());await advance();
   await runInDurableObject(registry(),(_,state)=>{for(const id of ids){const row=state.storage.sql.exec<{phase:string;data:string}>("SELECT phase,data FROM agent_deliveries WHERE id=?",id).one();expect(row.phase).toBe("cancel");expect(JSON.parse(row.data).delegation).toMatchObject({status:"cancelled",error:expect.stringContaining("24-hour")});}});
   expect((await slot(a))?.task_id).toBe(ta.id);expect((await slot(b))?.task_id).toBe(tb.id);
-  await evictDurableObject(registry());expect(await runDurableObjectAlarm(registry())).toBe(true);
+  await evictDurableObject(registry());await advance();
   for(let n=0;n<ids.length;n++){const target=pairs[n].target;await runInDurableObject(root(target),(_,state)=>expect(state.storage.sql.exec("SELECT 1 FROM cancelled_agent_inputs WHERE operation_id=?",`delegate:${ids[n]}`).toArray()).toHaveLength(1));}
   await runInDurableObject(registry(),(_,state)=>{for(const id of ids)expect(state.storage.sql.exec<{phase:string}>("SELECT phase FROM agent_deliveries WHERE id=?",id).one().phase).toBe("result");});
   expect((await slot(a))?.task_id).toBe(ta.id);expect((await slot(b))?.task_id).toBe(tb.id);
-  expect(await runDurableObjectAlarm(registry())).toBe(true);await terminal(ta.id,"completed");await terminal(tb.id,"completed");await reconcile();
+  await advance();await terminal(ta.id,"completed");await terminal(tb.id,"completed");await reconcile();
   expect(await slot(a)).toBeUndefined();expect(await slot(b)).toBeUndefined();
   await runInDurableObject(registry(),(_,state)=>{for(const id of ids){const row=state.storage.sql.exec<{phase:string;data:string}>("SELECT phase,data FROM agent_deliveries WHERE id=?",id).one();expect(row.phase).toBe("done");expect(JSON.parse(row.data).delegation.status).toBe("cancelled");expect(JSON.parse(row.data).result).toContain("24-hour lifetime");}});
  });

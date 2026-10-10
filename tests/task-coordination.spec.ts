@@ -98,7 +98,7 @@ describe("task-scoped named-bot coordinator",()=>{
       await recovered.processOnce(delegation.id); // Deliver using persisted task scope.
       expect(f.row(delegation.id).phase).toBe("done");
       expect(f.calls.find(call=>call.path==="/agent-results")).toMatchObject({identity:`owner:task:${f.taskId}`,taskId:f.taskId,input:{operationId:`agent-result:${delegation.id}`,text:"Task result"}});
-      expect(f.reservations).toEqual([{botId:f.target.id},{botId:f.source.id,taskId:f.taskId}]);
+      expect(f.reservations).toEqual([{botId:f.source.id,taskId:f.taskId}]);
       const replay=await f.request("/agents/send",input);
       expect((await replay.json<{delegation:AgentDelegation}>()).delegation.id).toBe(delegation.id);
       await expect(f.request("/agents/send",{...input,sourceTaskId:undefined})).rejects.toMatchObject({code:"idempotency_conflict"});
@@ -161,7 +161,7 @@ describe("task-scoped named-bot coordinator",()=>{
       expect(f.row(delivery.delegation.id).phase).toBe("done");
       expect(f.calls).toHaveLength(1);
       expect(f.calls[0]).toMatchObject({identity:`owner:${f.source.id}`,path:"/agent-results",taskId:null});
-      expect(f.reservations).toEqual([{botId:f.source.id}]);
+      expect(f.reservations).toEqual([]);
     });
   });
 });
@@ -234,7 +234,7 @@ describe("task delegation scheduler integration",()=>{
     expect((await (await api(`/v1/bots/${source.id}/messages`)).json<{messages:Message[]}>()).messages).toEqual([expect.objectContaining({role:"user",text:"Ordinary chat waits without stealing task lease"})]);
     await runInDurableObject(registry(),async(instance,state)=>{
       await (instance as unknown as Scheduler).reconcileComputerSlots();
-      expect(state.storage.sql.exec("SELECT 1 FROM task_slots WHERE bot_id=?",source.id).toArray()).toHaveLength(0);
+      expect(state.storage.sql.exec("SELECT 1 FROM task_slots WHERE bot_id=? AND task_id=?",source.id,task.id).toArray()).toHaveLength(0);
       expect(JSON.parse(state.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",task.id).one().data).status).toBe("completed");
     });
   },60000);
@@ -296,7 +296,7 @@ describe("task delegation cancellation scheduler integration",()=>{
       await scheduler.agents.process(id);
       expect(state.storage.sql.exec<{phase:string}>("SELECT phase FROM agent_deliveries WHERE id=?",id).one().phase).toBe("done");
       await scheduler.reconcileComputerSlots();
-      expect(state.storage.sql.exec("SELECT 1 FROM task_slots WHERE bot_id=?",source.id).toArray()).toHaveLength(0);
+      expect(state.storage.sql.exec("SELECT 1 FROM task_slots WHERE bot_id=? AND task_id=?",source.id,task.id).toArray()).toHaveLength(0);
       expect(JSON.parse(state.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",task.id).one().data).status).toBe("cancelled");
     });
     const targetState=await (await api(`/v1/bots/${target.id}/runs/${targetRun.id}`)).json<{run:Run}>();
@@ -305,6 +305,6 @@ describe("task delegation cancellation scheduler integration",()=>{
     const taskRuns=(await (await api(`/v1/tasks/${task.id}/runs`)).json<{runs:Run[]}>()).runs;
     expect(taskRuns).toEqual([expect.objectContaining({id:sourceRun.id,status:"completed"})]);
     expect((await (await api(`/v1/tasks/${task.id}/messages`)).json<{messages:Message[]}>()).messages).toEqual([]);
-    expect((await (await api(`/v1/bots/${source.id}/messages`)).json<{messages:Message[]}>()).messages).toEqual([]);
+    expect((await (await api(`/v1/bots/${source.id}/messages`)).json<{messages:Message[]}>()).messages).toEqual([expect.objectContaining({role:"user",text:"Saved during named cancellation"})]);
   },60000);
 });
