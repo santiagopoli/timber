@@ -66,6 +66,7 @@ describe("Worker authentication and durable bot identities", () => {
     const health = await exports.default.fetch("https://botspace.test/health");
     expect(await health.json()).toEqual({ok: true, service: "botspace"});
     expect((await exports.default.fetch("https://botspace.test/v1/bots")).status).toBe(401);
+    expect((await exports.default.fetch("https://botspace.test/v1/tasks")).status).toBe(401);
   });
 
   it("fails closed when the deployed API secret has not been configured", async () => {

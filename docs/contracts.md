@@ -48,13 +48,13 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   the connected account's selectable models and supported reasoning/Fast options.
   A disconnected or unavailable catalogue has no invented model entries.
 - GET /v1/bots -> {bots:Bot[]}
-- POST /v1/bots {name,instructions?,model?,reasoningEffort?,fast?,computerApprovalMode?,allowNamedAgents?} -> 201 {bot:Bot}
+- POST /v1/bots {name,instructions?,model?,reasoningEffort?,fast?,computerApprovalMode?,allowNamedAgents?,allowTaskCreation?} -> 201 {bot:Bot}
 - GET /v1/bots/:id -> {bot:Bot}
 - GET /v1/bots/:id/summary -> {summary:{status,activeRuns,activeAgents,activeProcesses,lastMessage?}}.
   A passive SQL-only sidebar snapshot; it does not admit work, call inference or
   wake a computer. The latest user/assistant text is limited to 240 characters.
   Root work, temporary agents and managed processes have independent counts.
-- PATCH /v1/bots/:id {name?,instructions?,model?,reasoningEffort?,fast?,computerApprovalMode?,allowNamedAgents?} -> {bot:Bot}
+- PATCH /v1/bots/:id {name?,instructions?,model?,reasoningEffort?,fast?,computerApprovalMode?,allowNamedAgents?,allowTaskCreation?} -> {bot:Bot}
 - DELETE /v1/bots/:id -> 200 {botId,deleted:true}. Repeated deletion of the same
   known bot is idempotent; an unknown ID returns 404. Registry access is removed
   before cleanup. The agent and computer are stopped before their data and R2
@@ -212,6 +212,43 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   -> {approval:Approval}; exact stored arguments executed only once on approval.
 - GET /v1/bots/:id/artifacts/:artifactId -> authenticated bytes. All file access
   scoped to bot prefix. Generated HTML/SVG are attachments, never same-origin code.
+
+## Global tasks
+
+Tasks are owner-scoped records in WorkspaceDO. `GET /v1/tasks` is passive;
+`POST /v1/tasks` accepts `{operationId,title,description,botId,startImmediately?}`
+and returns `{task}` (201 for a new task; an identical idempotent replay returns
+200). `startImmediately` defaults to true; false leaves the task pending.
+`GET /v1/tasks/:id` returns task metadata. Task conversation data lives in a
+separate durable BotDO identity keyed by owner and task ID, initialized from the
+assigned bot's current configuration; the BotDO retains the assigned bot's
+computer/workspace identity, so no second computer is created. The task has its
+own transcript and run/event IDs.
+
+`POST /v1/tasks/:id/start` admits the description under stable operation ID
+`task-start:<taskId>`. `POST /v1/tasks/:id/messages`, `GET /messages`, `GET
+/runs`, and `GET /events` expose the task conversation. `POST /cancel` cancels its
+active runs and fences subsequent starts. A per-assigned-bot durable slot blocks
+task starts while the ordinary bot has an active run; it also rejects ordinary bot
+message admissions and owner computer actions while a task holds the slot. These
+blocked requests receive `409 computer_busy`, so task chat is not admitted as
+steering while the shared computer is occupied. Other tasks receive
+`409 task_slot_busy` until the current task is cancelled or its terminal run is
+observed through that task's runs list. The ordinary bot slot releases when its
+runs list observes no active work. Status and slot release are projected on runs
+reads, not by a background scheduler; clients must poll runs to release an idle
+slot.
+
+Bot deletion fences and cleans each assigned task's conversation/runtime before
+cleaning the shared computer. Cleanup retries leave bot deletion pending; task
+cleanup never destroys the assigned bot's computer.
+
+The `create_task` host tool is explicitly gated by the assigned bot's
+`allowTaskCreation` permission. Bot creation identity is taken from the active
+host run; model-supplied source IDs are ignored. Bot-created tasks start pending
+because their assigned bot is still executing the creating run; the owner can
+start them once the bot is idle. Task list pagination, reassignment, and task
+user-deletion are not available.
 
 ## Console sessions
 The cookie `__Host-timber_session` is Secure, HttpOnly, SameSite=Strict, host-only

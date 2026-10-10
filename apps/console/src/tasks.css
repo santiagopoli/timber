@@ -1,0 +1,69 @@
+#tasks-root{height:100%;min-width:0}
+#panel-tasks{padding:0;min-height:0;overflow:hidden}
+.timber-tasks{height:100%;min-height:0;display:flex;flex-direction:column;color:var(--ink);background:var(--surface);font-size:13px}
+.timber-tasks-topbar{min-height:0;display:flex;justify-content:flex-end;align-items:center;padding:4px 16px 0}
+.timber-tasks-quiet,.timber-tasks-icon-button{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:34px;padding:5px 9px;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--muted);font:inherit;cursor:pointer}
+.timber-tasks-quiet:hover,.timber-tasks-icon-button:hover{background:var(--soft);color:var(--ink)}
+.timber-tasks-quiet svg,.timber-tasks-icon-button svg,.timber-tasks-action svg{width:16px;height:16px;flex:none}
+.timber-tasks-overview{min-height:0;flex:1;overflow:auto;padding:8px 22px 24px;overscroll-behavior:contain}
+.timber-tasks-overview-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:6px 0 18px}
+.timber-tasks h2{font-size:19px;line-height:1.3;margin:0;font-weight:650;overflow-wrap:anywhere}
+.timber-tasks-overview-heading p{font-size:12px;color:var(--muted);margin:5px 0 0}
+.timber-tasks-action{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:36px;padding:7px 12px;border:1px solid var(--ink);border-radius:9px;background:var(--ink);color:var(--surface);font:inherit;font-weight:600;cursor:pointer}
+.timber-tasks-action:hover:not(:disabled){opacity:.86}
+.timber-tasks-action:disabled{opacity:.55;cursor:default}
+.timber-tasks-create{display:flex;flex-direction:column;gap:12px;padding:16px;margin-bottom:20px;border:1px solid var(--line);border-radius:12px;background:var(--soft)}
+.timber-tasks-create h3{margin:0;font-size:14px}
+.timber-tasks-create>label{display:flex;flex-direction:column;gap:6px;font-weight:550;font-size:12px}
+.timber-tasks-create input:not([type=checkbox]),.timber-tasks-create textarea,.timber-tasks-create select{box-sizing:border-box;width:100%;min-height:38px;padding:9px 10px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);font:inherit;font-weight:400}
+.timber-tasks-create textarea{resize:vertical;min-height:64px}
+.timber-tasks-checkbox{display:flex!important;align-items:center;flex-direction:row!important;gap:9px!important;min-height:28px}
+.timber-tasks-checkbox input{width:17px;height:17px;margin:0;accent-color:var(--ink)}
+.timber-tasks-form-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px}
+.timber-tasks-list{display:flex;flex-direction:column;gap:9px}
+.timber-tasks-card{display:flex;flex-direction:column;gap:9px;width:100%;min-width:0;padding:14px;text-align:left;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:11px;font:inherit;cursor:pointer}
+.timber-tasks-card:hover{background:var(--soft)}
+.timber-tasks-card-heading,.timber-tasks-card-footer{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.timber-tasks-card-heading strong{font-size:13px;overflow-wrap:anywhere}
+.timber-task-status{display:inline-flex;align-items:center;min-height:22px;padding:2px 8px;border-radius:999px;background:var(--soft);color:var(--muted);font-size:10px;font-weight:600;white-space:nowrap}
+.timber-task-status[data-status=running],.timber-task-status[data-status=queued]{color:var(--ink)}
+.timber-task-status[data-status=failed]{color:#b42318}
+.timber-task-status[data-status=completed]{color:#237a4b}
+.timber-task-status[data-status=waiting_approval],.timber-task-status[data-status=waiting_connection]{color:#9a6700}
+.timber-tasks-card-description{font-size:12px;line-height:1.45;color:var(--muted);white-space:pre-wrap;overflow-wrap:anywhere;max-height:60px;overflow:hidden}
+.timber-tasks-card-footer{font-size:11px;color:var(--muted)}
+.timber-tasks-card-footer time{margin-left:auto}
+.timber-tasks-empty{min-height:150px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:24px;text-align:center;color:var(--muted)}
+.timber-tasks-empty strong{font-size:14px;color:var(--ink)}
+.timber-tasks-empty span{max-width:390px;line-height:1.5}
+.timber-tasks-detail{min-height:0;flex:1;display:flex;flex-direction:column;gap:12px;padding:4px 18px 16px}
+.timber-tasks-detail-heading{display:flex;align-items:center;gap:9px;min-width:0}
+.timber-tasks-icon-button{width:35px;height:35px;flex:none;padding:0}
+.timber-tasks-title-block{min-width:0;flex:1}
+.timber-tasks-title-block h2{font-size:16px}
+.timber-tasks-subtitle{display:block;margin-top:4px;color:var(--muted);font-size:11px;text-transform:none}
+.timber-tasks-description{max-height:100px;overflow:auto;margin:0;padding:10px 12px;border-radius:9px;background:var(--soft);color:var(--muted);font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}
+.timber-tasks-messages{flex:1;min-height:90px;overflow:auto;overscroll-behavior:contain;display:flex;flex-direction:column;gap:15px;padding:10px 3px}
+.timber-task-message{min-width:0;padding:10px 12px;border-radius:11px}
+.timber-task-message-user{background:var(--soft);align-self:flex-end;width:min(92%,700px)}
+.timber-task-message-assistant{align-self:flex-start;width:min(100%,760px)}
+.timber-task-message-meta{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:7px;color:var(--muted);font-size:10px}
+.timber-task-message-meta strong{color:var(--ink);font-weight:600}
+.timber-task-markdown{font-size:13px;line-height:1.55;overflow-wrap:anywhere}
+.timber-task-markdown :first-child{margin-top:0}
+.timber-task-markdown :last-child{margin-bottom:0}
+.timber-tasks-controls{display:flex;align-items:center;justify-content:flex-end;gap:8px;min-height:34px}
+.timber-tasks-action.is-secondary{background:transparent;color:var(--ink);border-color:var(--line)}
+.timber-tasks-hint{font-size:12px;color:var(--muted);line-height:1.5}
+.timber-tasks-messages>.timber-tasks-hint{margin:auto;text-align:center}
+.timber-tasks-composer{display:flex;align-items:flex-end;gap:8px;padding:7px;border:1px solid var(--line);border-radius:13px;background:var(--surface)}
+.timber-tasks-composer textarea{resize:vertical;flex:1;min-width:0;min-height:42px;max-height:150px;border:0;outline:0;box-shadow:none;background:transparent;color:var(--ink);padding:8px;font:inherit;font-size:13px}
+.timber-tasks-composer button{display:inline-flex;align-items:center;justify-content:center;flex:none;width:36px;height:36px;border:0;border-radius:50%;background:var(--ink);color:var(--surface);cursor:pointer}
+.timber-tasks-composer button:disabled{opacity:.45;cursor:default}
+.timber-tasks-composer button svg{width:17px;height:17px}
+.timber-tasks-error{margin:0;color:#b42318;font-size:12px;line-height:1.45;overflow-wrap:anywhere}
+.timber-tasks-link{border:0;background:transparent;color:inherit;text-decoration:underline;cursor:pointer;font:inherit}
+.timber-tasks-spinner{width:16px;height:16px;animation:timber-tasks-spin .9s linear infinite}
+.timber-tasks-sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+@keyframes timber-tasks-spin{to{transform:rotate(360deg)}}
+@media(max-width:760px){.timber-tasks-overview{padding:8px 14px 18px}.timber-tasks-detail{padding:4px 12px 12px}.timber-tasks-overview-heading{align-items:flex-start}.timber-tasks-create{padding:13px}.timber-tasks-composer textarea{font-size:16px}.timber-tasks-composer button,.timber-tasks-action{min-height:42px}.timber-tasks-composer button{width:42px;height:42px}}

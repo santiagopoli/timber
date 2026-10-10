@@ -65,6 +65,7 @@ export class BotDO extends DurableObject<Env> {
   private takingControl=false;
   private suspending?:Promise<ComputerStatus>;
   private deleted=false;
+  private taskDeleting=false;
   private deleting?:Promise<void>;
   private closeStreams=new Set<()=>void>();
 
@@ -132,7 +133,40 @@ export class BotDO extends DurableObject<Env> {
     });
   }
 
-  private active():void {if(this.deleted) throw new ApiError(404,"not_found","Bot not found.");}
+  private active():void {if(this.deleted || this.taskDeleting) throw new ApiError(404,"not_found","Bot not found.");}
+  private async deleteTaskConversation(taskId:string,botId:string):Promise<void> {
+    if(!UUID.test(taskId) || !UUID.test(botId) || !this.ctx.id.equals(this.env.BOT.idFromName(`owner:task:${taskId}`))) throw new ApiError(403,"task_mismatch","Task identity mismatch.");
+    const config=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM config WHERE id=1").toArray()[0];
+    const tombstone=this.ctx.storage.sql.exec<{bot_id:string}>("SELECT bot_id FROM bot_deletion WHERE id=1").toArray()[0];
+    if(!config) {
+      if(tombstone && tombstone.bot_id!==botId) throw new ApiError(403,"task_mismatch","Task identity mismatch.");
+      this.ctx.storage.sql.exec("INSERT OR IGNORE INTO bot_deletion(id,bot_id) VALUES(1,?)",botId);this.deleted=true;return;
+    }
+    if((JSON.parse(config.data) as Bot).id!==botId || (tombstone && tombstone.bot_id!==botId)) throw new ApiError(403,"task_mismatch","Task identity mismatch.");
+    this.taskDeleting=true;
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO bot_deletion(id,bot_id) VALUES(1,?)",botId);
+    try {
+      if(this.deleted) {
+        // After eviction the durable tombstone prevents runtime recovery. Cancel
+        // any computer sessions left in the task's journal before removing it.
+        const processes=this.ctx.storage.sql.exec<{process_id:string;status:string}>("SELECT process_id,status FROM run_processes WHERE status='running' OR cancel_requested=1").toArray();
+        for(const process of processes) {const result=await this.computer.cancel(botId,process.process_id);if(result.status==="running")throw new Error("Task process cancellation is not confirmed");}
+      } else {
+        const active=this.ctx.storage.sql.exec<{id:string}>("SELECT id FROM runs WHERE json_extract(data,'$.status') IN ('queued','running','waiting_approval','waiting_connection')").toArray();
+        for(const run of active) await this.cancelRun(run.id);
+        await Promise.all([this.flushProcessCancellations(),this.flushRunCancellations()]);
+        this.deleted=true;
+        for(const close of this.closeStreams)close();
+        await this.runtime?.destroy();
+        await Promise.allSettled([...this.admitting.values(),...this.finishingApprovals.values(),...(this.recovering?[this.recovering]:[])]);
+      }
+      const tables=this.ctx.storage.sql.exec<{name:string}>("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name!='bot_deletion'").toArray();
+      this.ctx.storage.transactionSync(()=>{this.ctx.storage.sql.exec("PRAGMA defer_foreign_keys=ON");for(const table of tables)this.ctx.storage.sql.exec(`DELETE FROM "${table.name.replace(/"/g,'""')}"`);});
+      while(true){const keys=[...(await this.ctx.storage.list({limit:128})).keys()];if(!keys.length)break;await this.ctx.storage.delete(keys);}
+      await this.ctx.storage.deleteAlarm();
+    } catch {throw new ApiError(503,"task_cleanup_pending","Task execution is fenced, but shutdown is not yet confirmed.");}
+  }
+
   private async deleteBot(id:string):Promise<void> {
     if(this.deleting) return this.deleting;
     const previous=this.ctx.storage.sql.exec<{bot_id:string}>("SELECT bot_id FROM bot_deletion WHERE id=1").toArray()[0];
@@ -1320,6 +1354,12 @@ export class BotDO extends DurableObject<Env> {
     } else if(input.name==='send_to_bot') {
       const value=await agentCoordinatorRequest<{delegation:AgentDelegation}>(this.env,"/agents/send",{sourceBotId:run.botId,sourceRunId:run.id,operationId:input.operationId,targetBotId:args.botId,text:args.text});
       this.emit("delegation.updated",{...value,operationId:input.operationId,...(input.toolCallId?{toolCallId:input.toolCallId}:{})},run.id,`delegation:${input.operationId}`);result=completed(value);
+    } else if(input.name==='create_task') {
+      if(this.bot().allowTaskCreation!==true) throw new ApiError(403,'task_creation_not_allowed','The owner has not allowed this bot to create tasks.');
+      const registry=this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName('owner'));
+      const response=await registry.fetch('https://workspace/tasks/bot',{method:'POST',headers:{'content-type':'application/json','x-timber-internal':'task'},body:JSON.stringify({operationId:input.operationId,title:args.title,description:args.description,sourceBotId:run.botId,sourceRunId:run.id})});
+      const value=await response.json<{task?:unknown;error?:{code:string;message:string}}>();if(!response.ok)throw new ApiError(response.status,value.error?.code??'task_creation_failed',value.error?.message??'Task could not be created.');
+      result=completed(value);
     } else if(input.name==='load_skill') result=completed(args.name==='github-development'?githubDevelopmentSkill:workspaceAppsSkill);
     else if(input.name==='publish_app') {
       const app=await this.apps().publish({name:args.name as string,port:args.port as number,operationId:input.operationId});
@@ -1553,6 +1593,11 @@ export class BotDO extends DurableObject<Env> {
   async fetch(request:Request):Promise<Response> {
     try {
       const url=new URL(request.url),path=url.pathname;
+      if(path==="/task-delete" && request.method==="POST") {
+        if(request.headers.get("x-timber-internal")!=="task-cleanup")throw new ApiError(403,"internal_only","Task cleanup is internal.");
+        const taskId=request.headers.get("x-timber-task-id")??"",botId=request.headers.get("x-timber-bot-id")??"";
+        await this.deleteTaskConversation(taskId,botId);return json({taskId,deleted:true});
+      }
       if(path==="/delete" && request.method==="POST") {
         const id=request.headers.get("x-botspace-bot-id")??"";
         if(!UUID.test(id)) throw new ApiError(403,"internal_only","Missing internal bot identity.");

@@ -1,6 +1,7 @@
 import './src/styles.css';
 import { mountChat, mountToolActivity } from './src/chat.tsx';
 import { mountAgents } from './src/agents.tsx';
+import { mountTasks } from './src/tasks.tsx';
 import { hasBotMention } from './src/mentions.ts';
 import {agentColor} from './src/agent-colors.ts';
 import {modelBadgeLabel} from './src/model-identity.tsx';
@@ -23,6 +24,7 @@ import './src/layout.css';
   let botSummaryTimer,botSummaryLoading=false,botSummaryPending=false,botRenderKey='';
   const drafts = new Map(), draftMentions = new Map(), pendingMessages = new Map(), pendingActions = new Map(), computerPending = new Map(), stopping = new Set(), approvalWork = new Map(), approvalFeedback = new Map(), connectionWork = new Map(), appWork = new Map();
   let authenticated = false, bots = [], selected = null, currentRun = null, stoppableRun = null, generation = 0, authSession = 0;
+  let tasksView = null, showingTasks = false;
   let sessionController = new AbortController(), streamController, refreshTimer, progressTimer, computerStatusTimer;
   let computerStatusRequest = 0, currentPanel = 'conversation', workspaceExpanded = false, desktopFullscreen = false;
   const wideLayout = matchMedia('(min-width: 761px)'), tabletLayout = matchMedia('(max-width: 1099px)');
@@ -243,6 +245,14 @@ import './src/layout.css';
     onRefresh: () => void loadAgents(),
     onOpenBot: openAgentBot,
   });
+  function setupTasksView() {
+    const props={request:(path,options)=>request(path,options),bots,onClose:()=>{if(selected){showingTasks=false;$('tasks-nav').classList.remove('active');$('global-tasks-workspace').hidden=true;$('bot-workspace').hidden=false;document.body.dataset.mobileView='bot';history.pushState(null,'',`${location.pathname}${location.search}#bot=${encodeURIComponent(selected.id)}`);}else showBotList();}};
+    if(tasksView)tasksView.update(props);else tasksView=mountTasks($('global-tasks-root'),props);
+  }
+  function openTasks(updateHistory=true) {
+    if(!authenticated)return;showingTasks=true;setupTasksView();$('empty').hidden=true;$('bot-workspace').hidden=true;$('global-tasks-workspace').hidden=false;document.body.dataset.mobileView='tasks';$('tasks-nav').classList.add('active');
+    if(updateHistory)history.pushState(null,'',`${location.pathname}${location.search}#tasks`);
+  }
   function openAgents(id) {
     selectedAgentId=id || null;
     const open=()=>{showPanel('agents');renderAgents();syncAgentHash();};
@@ -334,7 +344,7 @@ import './src/layout.css';
   function disconnect(message = '') {
     desktop.disconnect(); workspace.clear();
     stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId=null; cancelStreamRender(); resetConversationHistory(); generation++; authSession++; authenticated = false; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
-    selected = null; currentRun = null; stoppableRun = null; bots = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
+    showingTasks=false;if($('global-tasks-workspace'))$('global-tasks-workspace').hidden=true;tasksView?.unmount();tasksView=null;selected = null; currentRun = null; stoppableRun = null; bots = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
     clearTimeout(botSummaryTimer);botSummaries.clear();botSummaryLoading=false;botSummaryPending=false;botRenderKey='';
     removedBots.clear(); deletionPending.clear(); deleteTarget = null; deleteBusy = false; editBotId = null; drafts.clear(); draftMentions.clear(); pendingMessages.clear(); acceptedImageIds.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); connectionWork.clear(); appWork.clear(); closeDialogs(); clearScreen();
     chatGPTConnected = false; chatGPTAccount = null; chatGPTBusy = false;
@@ -403,7 +413,7 @@ import './src/layout.css';
   }
   document.addEventListener('visibilitychange',()=>{if(document.hidden)clearTimeout(botSummaryTimer);else void refreshBotSummaries();});
   window.addEventListener('focus',()=>void refreshBotSummaries());
-  async function loadBots() { const session = authSession, result = await request('/v1/bots'); if (session !== authSession) return; const prior=new Map(bots.map(bot=>[bot.id,bot]));bots = result.bots.filter(bot => !removedBots.has(bot.id)).map(bot=>prior.get(bot.id)?.updatedAt>bot.updatedAt?prior.get(bot.id):bot); const refreshed=selected&&bots.find(bot=>bot.id===selected.id);if(refreshed&&refreshed.updatedAt>=selected.updatedAt&&!modelSettingsWork.has(selected.id)){selected=refreshed;updateBotHeader();}renderBots(); renderMessages();renderAgents();void refreshBotSummaries(); }
+  async function loadBots() { const session = authSession, result = await request('/v1/bots'); if (session !== authSession) return; const prior=new Map(bots.map(bot=>[bot.id,bot]));bots = result.bots.filter(bot => !removedBots.has(bot.id)).map(bot=>prior.get(bot.id)?.updatedAt>bot.updatedAt?prior.get(bot.id):bot); const refreshed=selected&&bots.find(bot=>bot.id===selected.id);if(refreshed&&refreshed.updatedAt>=selected.updatedAt&&!modelSettingsWork.has(selected.id)){selected=refreshed;updateBotHeader();}renderBots(); renderMessages();renderAgents();if(tasksView)setupTasksView();void refreshBotSummaries(); }
   const modelDescription=bot=>`${bot.model||'Model not recorded'}${bot.reasoningEffort?` · ${bot.reasoningEffort} reasoning`:''}${bot.fast?' · Fast mode':''}`;
   function decorateModelAvatar(avatar,bot){
     avatar.classList.add('timber-model-avatar');avatar.title=modelDescription(bot);avatar.dataset.model=bot.model||'';
@@ -446,6 +456,7 @@ import './src/layout.css';
   async function selectBot(bot, {replace = false} = {}) {
     if (removedBots.has(bot.id)) return;
     document.body.dataset.mobileView = 'bot';
+    showingTasks=false;$('global-tasks-workspace').hidden=true;$('tasks-nav').classList.remove('active');
     if (wideLayout.matches && tabletLayout.matches) {botsCollapsed = true; renderLayout();}
     if (selected?.id === bot.id) {
       history[replace ? 'replaceState' : 'pushState'](null, '', `${location.pathname}${location.search}#bot=${encodeURIComponent(bot.id)}`);
@@ -1179,6 +1190,7 @@ import './src/layout.css';
     $('connection').textContent = 'Connected'; $('empty').hidden = false; $('bot-workspace').hidden = true;
     void loadModelCatalog();
     void chatGPTTask(loadChatGPT);
+    if(location.hash==='#tasks'){openTasks(false);return;}
     const bot = bots.find(item => item.id === chosenHash()) || (!matchMedia('(max-width: 760px)').matches ? bots[0] : null);
     // Restore layout before the workspace becomes interactive. Late initial reads
     // must not close a menu or change the panel the user has already opened.
@@ -1187,6 +1199,8 @@ import './src/layout.css';
     else {botsCollapsed = false; showBotList(false);}
   }
   function showBotList(updateHistory = true) {
+    showingTasks=false;$('global-tasks-workspace').hidden=true;$('tasks-nav').classList.remove('active');
+    $('bot-workspace').hidden=!selected;$('empty').hidden=Boolean(selected);
     document.body.dataset.mobileView = 'bots';
     desktop.setActive(false); stopComputerStatus();
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
@@ -1217,7 +1231,8 @@ import './src/layout.css';
     finally {button.disabled = false;}
   });
   $('bot-search').addEventListener('input', renderBots); $('reload-bots').addEventListener('click', () => guarded(loadBots));
-  const navigateHistory = () => {const bot = bots.find(item => item.id === chosenHash()); if (bot) void guarded(() => selectBot(bot, {replace: true})); else showBotList(false);};
+  const navigateHistory = () => {if(location.hash==='#tasks'){openTasks(false);return;}const bot = bots.find(item => item.id === chosenHash()); if (bot) void guarded(() => selectBot(bot, {replace: true})); else showBotList(false);};
+  $('tasks-nav').addEventListener('click',()=>openTasks());
   window.addEventListener('hashchange', navigateHistory); window.addEventListener('popstate', navigateHistory);
   $('mobile-back')?.addEventListener('click', () => showBotList());
   $('mobile-account')?.addEventListener('click', () => $('settings-button').click());
@@ -1237,14 +1252,14 @@ import './src/layout.css';
   });
   $('create-form').addEventListener('submit', async (event) => {
     event.preventDefault(); const button = event.submitter || event.currentTarget.querySelector('[type=submit]'); button.disabled = true; $('create-error').textContent = '';
-    try { const { bot } = await request('/v1/bots', { method: 'POST', body: { name: $('bot-name').value.trim(), instructions: $('bot-instructions').value.trim(), ...readModelForm('bot'), computerApprovalMode: $('bot-computer-approval-mode').value, allowNamedAgents: $('bot-allow-named-agents').checked } }); $('create-form').reset(); $('bot-dialog').close(); $('bot-search').value = ''; bots = [bot, ...bots.filter((item) => item.id !== bot.id)]; renderBots(); await guarded(() => selectBot(bot)); }
+    try { const { bot } = await request('/v1/bots', { method: 'POST', body: { name: $('bot-name').value.trim(), instructions: $('bot-instructions').value.trim(), ...readModelForm('bot'), computerApprovalMode: $('bot-computer-approval-mode').value, allowNamedAgents: $('bot-allow-named-agents').checked, allowTaskCreation: $('bot-allow-task-creation').checked } }); $('create-form').reset(); $('bot-dialog').close(); $('bot-search').value = ''; bots = [bot, ...bots.filter((item) => item.id !== bot.id)]; renderBots(); await guarded(() => selectBot(bot)); }
     catch (error) { if (authenticated) $('create-error').textContent = errorText(error); } finally { button.disabled = false; }
   });
-  $('edit-bot').addEventListener('click', () => { if (!selected) return; if ($('panel-menu')) $('panel-menu').open = false; editBotId = selected.id; $('edit-name').value = selected.name; $('edit-instructions').value = selected.instructions; $('edit-computer-approval-mode').value = selected.computerApprovalMode === 'automatic' ? 'automatic' : 'ask'; $('edit-allow-named-agents').checked = selected.allowNamedAgents === true; $('edit-error').textContent = '';renderModelForm('edit',selected); $('edit-dialog').showModal(); $('edit-name').focus(); });
+  $('edit-bot').addEventListener('click', () => { if (!selected) return; if ($('panel-menu')) $('panel-menu').open = false; editBotId = selected.id; $('edit-name').value = selected.name; $('edit-instructions').value = selected.instructions; $('edit-computer-approval-mode').value = selected.computerApprovalMode === 'automatic' ? 'automatic' : 'ask'; $('edit-allow-named-agents').checked = selected.allowNamedAgents === true; $('edit-allow-task-creation').checked = selected.allowTaskCreation === true; $('edit-error').textContent = '';renderModelForm('edit',selected); $('edit-dialog').showModal(); $('edit-name').focus(); });
   for(const prefix of ['bot','edit'])$(`${prefix}-model`).addEventListener('change',()=>renderModelForm(prefix,{model:$(`${prefix}-model`).value,reasoningEffort:$(`${prefix}-reasoning`).value,fast:$(`${prefix}-fast`).checked}));
   $('edit-form').addEventListener('submit', async (event) => {
     event.preventDefault(); const button = event.submitter || event.currentTarget.querySelector('[type=submit]'), id = editBotId; if (!id) return; button.disabled = true; $('edit-error').textContent = '';
-    try { const { bot } = await request(botPath(id), { method: 'PATCH', body: { name: $('edit-name').value.trim(), instructions: $('edit-instructions').value.trim(), ...readModelForm('edit'), computerApprovalMode: $('edit-computer-approval-mode').value, allowNamedAgents: $('edit-allow-named-agents').checked } }); bots = bots.map((item) => item.id === bot.id ? bot : item); if (selected?.id === bot.id) { selected = bot; updateBotHeader(); renderMessages(); renderApprovals(); } renderBots(); $('edit-dialog').close(); }
+    try { const { bot } = await request(botPath(id), { method: 'PATCH', body: { name: $('edit-name').value.trim(), instructions: $('edit-instructions').value.trim(), ...readModelForm('edit'), computerApprovalMode: $('edit-computer-approval-mode').value, allowNamedAgents: $('edit-allow-named-agents').checked, allowTaskCreation: $('edit-allow-task-creation').checked } }); bots = bots.map((item) => item.id === bot.id ? bot : item); if (selected?.id === bot.id) { selected = bot; updateBotHeader(); renderMessages(); renderApprovals(); } renderBots(); $('edit-dialog').close(); }
     catch (error) { if (authenticated) $('edit-error').textContent = errorText(error); } finally { button.disabled = false; }
   });
   $('delete-bot').addEventListener('click', () => {const bot = bots.find(item => item.id === editBotId); if (bot) openDelete(bot);});

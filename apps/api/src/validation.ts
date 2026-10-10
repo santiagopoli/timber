@@ -48,10 +48,10 @@ export function parseMessage(value:unknown):{text:string;operationId:string;ment
   return {text,operationId:operationId(data.operationId),...(ids?.length?{attachments:ids}:{}),...(data.mentions===undefined?{}:{mentions:data.mentions as string[]})};
 
 }
-export function parseBotInput(value:unknown,patch=false):{name?:string;instructions?:string;model?:string;reasoningEffort?:string;fast?:boolean;computerApprovalMode?:ComputerApprovalMode;allowNamedAgents?:boolean} {
+export function parseBotInput(value:unknown,patch=false):{name?:string;instructions?:string;model?:string;reasoningEffort?:string;fast?:boolean;computerApprovalMode?:ComputerApprovalMode;allowNamedAgents?:boolean;allowTaskCreation?:boolean} {
   const data=object(value);
   if(data.runtime!==undefined && data.runtime!=="pi") invalid("runtime must be pi.");
-  const output:{name?:string;instructions?:string;model?:string;reasoningEffort?:string;fast?:boolean;computerApprovalMode?:ComputerApprovalMode;allowNamedAgents?:boolean}={};
+  const output:{name?:string;instructions?:string;model?:string;reasoningEffort?:string;fast?:boolean;computerApprovalMode?:ComputerApprovalMode;allowNamedAgents?:boolean;allowTaskCreation?:boolean}={};
   if(data.name!==undefined || !patch) {
     output.name=string(data.name,"name",80).trim();
     if(!output.name) invalid("name cannot be blank.");
@@ -74,7 +74,11 @@ export function parseBotInput(value:unknown,patch=false):{name?:string;instructi
     if(typeof data.allowNamedAgents!=="boolean") invalid("allowNamedAgents must be a boolean.");
     output.allowNamedAgents=data.allowNamedAgents;
   }
-  if(patch && !Object.keys(output).length) invalid("Provide name, instructions, model, reasoningEffort, fast, computerApprovalMode or allowNamedAgents.");
+  if(data.allowTaskCreation!==undefined) {
+    if(typeof data.allowTaskCreation!=="boolean") invalid("allowTaskCreation must be a boolean.");
+    output.allowTaskCreation=data.allowTaskCreation;
+  }
+  if(patch && !Object.keys(output).length) invalid("Provide name, instructions, model, reasoningEffort, fast, computerApprovalMode or allowNamedAgents or allowTaskCreation.");
   return output;
 }
 function finite(value:unknown,name:string,min:number,max:number):number {

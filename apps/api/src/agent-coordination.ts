@@ -92,7 +92,7 @@ export class AgentCoordinator {
     if(current.allowNamedAgents!==true) throw new ApiError(403,"named_agents_disabled","Enable Allow named agents for this bot before creating a named bot.");
     if(terminal.has(source.run.status)) throw new ApiError(409,"run_inactive","The source run is no longer active.");
     const now=new Date().toISOString();
-    const bot:Bot={id:crypto.randomUUID(),name:fields.name!,instructions:fields.instructions??"",runtime:"pi",model:current.model,...(current.reasoningEffort?{reasoningEffort:current.reasoningEffort}:{}),...(current.fast!==undefined?{fast:current.fast}:{}),computerApprovalMode:"ask",allowNamedAgents:false,createdByBotId:botId,createdAt:now,updatedAt:now};
+    const bot:Bot={id:crypto.randomUUID(),name:fields.name!,instructions:fields.instructions??"",runtime:"pi",model:current.model,...(current.reasoningEffort?{reasoningEffort:current.reasoningEffort}:{}),...(current.fast!==undefined?{fast:current.fast}:{}),computerApprovalMode:"ask",allowNamedAgents:false,allowTaskCreation:false,createdByBotId:botId,createdAt:now,updatedAt:now};
     this.ctx.storage.transactionSync(()=>{
       this.ctx.storage.sql.exec("INSERT INTO bots(id,data) VALUES(?,?)",bot.id,JSON.stringify(bot));
       this.ctx.storage.sql.exec("INSERT INTO agent_creations(source_bot_id,operation_id,fingerprint,bot_id) VALUES(?,?,?,?)",botId,op,hash,bot.id);
