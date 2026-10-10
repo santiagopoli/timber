@@ -105,6 +105,12 @@
     <p id="avatar-status" class="hint" role="status" aria-live="polite">Loading avatar settings…</p>
     <label for="avatar-theme-select">Global theme</label><select id="avatar-theme-select" disabled><option value="">No theme selected</option></select>
     <p id="avatar-theme-preview" class="avatar-theme-preview"></p>
+    <div id="avatar-reasoning-field" hidden>
+      <label for="avatar-reasoning-select">SVG reasoning</label>
+      <div class="row wrap"><select id="avatar-reasoning-select" aria-describedby="avatar-reasoning-help"></select><button id="avatar-save-reasoning" type="button" class="quiet">Save reasoning</button></div>
+      <p id="avatar-reasoning-help" class="hint">Saved per theme, independently of the bot’s reasoning. Applies to future generations.</p>
+      <p id="avatar-reasoning-status" class="hint" role="status" aria-live="polite"></p>
+    </div>
     <details class="avatar-collection-details"><summary>Browse 10 included themes</summary><p class="hint">Five example heads per style. Transparent artwork on solid circles. Generated avatars will vary.</p><div id="avatar-theme-gallery" class="avatar-theme-gallery"></div></details>
     <div class="row wrap"><button id="avatar-apply-theme" class="quiet" type="button" disabled>Apply theme</button><button id="avatar-generate-all" type="button" disabled>Regenerate all bots</button></div>
     <div id="avatar-jobs" class="avatar-jobs" aria-live="polite"></div>
@@ -116,6 +122,7 @@
         <label for="avatar-theme-subject">Subject <span class="hint">(optional)</span></label><input id="avatar-theme-subject" maxlength="160" placeholder="Animals, robots, forest spirits…">
         <p class="hint">Leave subject blank to let each bot choose. Heads are generated on transparent backgrounds; Timber adds the solid circle.</p>
         <label for="avatar-theme-model">Model</label><select id="avatar-theme-model" required></select>
+        <label id="avatar-theme-reasoning-field" for="avatar-theme-reasoning" hidden>SVG reasoning<select id="avatar-theme-reasoning"></select></label>
         <p id="avatar-image-capability" class="hint">Image generation capability is unavailable.</p>
         <button id="avatar-create-submit" type="submit">Create theme</button>
       </form>

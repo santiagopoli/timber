@@ -82,6 +82,25 @@ describe('honest avatar provider transport', () => {
       expect(preflight).toHaveBeenCalledTimes(1);
     }
   });
+  it('forwards explicit theme reasoning to validation and inference; defaults stay unset',async()=>{
+    for(const reasoningEffort of ['high',undefined]){
+      const {env,fetch}=mockEnv(async request=>{
+        expect((await request.json<{reasoning?:unknown}>()).reasoning).toEqual(reasoningEffort?{effort:reasoningEffort}:undefined);
+        return stream(event(completed()));
+      },async request=>{
+        expect(await request.json()).toEqual({model:input.model,...(reasoningEffort?{reasoningEffort}:{})});
+        return Response.json({settings:{model:input.model,reasoningEffort:'high'},model});
+      });
+      await generateVectorAvatar(env,{...input,reasoningEffort});expect(fetch).toHaveBeenCalledTimes(1);
+    }
+  });
+  it('never silently downgrades an unsupported or mismatched reasoning preference',async()=>{
+    for(const reasoningEffort of ['low','high']){
+      const {env,fetch}=mockEnv(()=>stream(event(completed())),()=>Response.json({settings:{model:input.model,reasoningEffort:'medium'},model}));
+      await expect(generateVectorAvatar(env,{...input,reasoningEffort})).rejects.toMatchObject({code:'avatar_reasoning_unavailable'});
+      expect(fetch).not.toHaveBeenCalled();
+    }
+  });
   it('never dispatches known Image API IDs even when text input is advertised', async () => {
     for (const id of ['gpt-image-2.5-sunburst', 'gpt-image-2.5-flare']) {
       const {env, fetch, preflight} = mockEnv(() => stream(event(completed())), () => Response.json({settings: {model: id}, model: {...model, id}}));

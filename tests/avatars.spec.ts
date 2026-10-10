@@ -99,6 +99,7 @@ describe('avatar HTTP boundary', () => {
     for (const [path, method, body] of [
       ['/v1/avatar-settings', 'GET', undefined], ['/v1/avatar-settings', 'PUT', { themeId: missing, operationId: 'unauth-select' }],
       ['/v1/avatar-themes', 'POST', { name: 'Test', kind: 'vector', prompt: 'Test', model: MODEL, operationId: 'unauth-theme' }],
+      ['/v1/avatar-themes', 'PATCH', { themeId: missing, reasoningEffort: null, expectedReasoningEffort: null, operationId: 'unauth-reasoning' }],
       ['/v1/avatar-generations', 'POST', { operationId: 'unauth-generate' }], ['/v1/avatar-models', 'GET', undefined],
       [`/v1/bots/${missing}/avatar`, 'GET', undefined],
     ] as const) await expectError(await api(path, method, body, false), 401, 'unauthorized');
@@ -227,6 +228,69 @@ describe('owner-local AvatarCoordinator journals', () => {
       const recovered = coordinator(state);
       expect(recovered.selection()).toEqual(leftSelection);
       expect(recovered.settings().jobs).toHaveLength(1);
+    });
+  });
+
+  it('persists per-theme reasoning, deduplicates edits and keeps admitted generation settings',async()=>{
+    await runInDurableObject(stub(),async(_instance,state)=>{
+      const provider=fakeProvider(),c=coordinator(state,provider),bot=seed(state),chosen=c.settings().themes[0],selection=c.selection();
+      const edit={themeId:chosen.id,reasoningEffort:'medium',expectedReasoningEffort:null,operationId:crypto.randomUUID()};
+      expect((await call(c,'/avatar-themes','PATCH',edit)).status).toBe(200);
+      expect(provider.calls).toHaveLength(0);expect(c.settings().jobs).toHaveLength(0);expect(c.selection()).toEqual(selection);
+      expect(coordinator(state,provider).settings().themes[0].reasoningEffort).toBe('medium');
+      await generate(c,bot.id);
+      const snapshot=state.storage.sql.exec<{theme:string}>('SELECT theme FROM avatar_jobs').one().theme;
+      expect(JSON.parse(snapshot).reasoningEffort).toBe('medium');
+      await expectError(await call(c,'/avatar-themes','PATCH',{...edit,reasoningEffort:null,operationId:crypto.randomUUID()}),409,'avatar_theme_changed');
+      const clear={...edit,reasoningEffort:null,expectedReasoningEffort:'medium',operationId:crypto.randomUUID()};
+      expect((await call(c,'/avatar-themes','PATCH',clear)).status).toBe(200);
+      expect((await call(c,'/avatar-themes','PATCH',edit)).status).toBe(200);
+      expect(c.settings().themes[0].reasoningEffort).toBeUndefined(); // Replaying an old save cannot undo a later edit.
+      await expectError(await call(c,'/avatar-themes','PATCH',{...edit,reasoningEffort:null}),409,'operation_conflict');
+      expect(c.settings().jobs[0].status).toBe('queued');expect(c.selection()).toEqual(selection);
+      expect(state.storage.sql.exec<{theme:string}>('SELECT theme FROM avatar_jobs').one().theme).toBe(snapshot);
+      await c.alarm();expect(provider.calls[0].reasoning).toEqual({effort:'medium'});
+      await generate(c,bot.id);await c.alarm();expect(provider.calls[1].reasoning).toBeUndefined();
+      expect(c.settings().avatars[0].status).toBe('ready');
+    });
+  });
+
+  it('validates reasoning against the theme model and rejects image or unsupported settings before generation',async()=>{
+    await runInDurableObject(stub(),async(_instance,state)=>{
+      const provider=fakeProvider(),c=coordinator(state,provider);
+      const create={operationId:crypto.randomUUID(),name:'Detailed SVG',kind:'vector',model:MODEL,style:'Paperfold',reasoningEffort:'medium'};
+      const created=await call(c,'/avatar-themes','POST',create);expect(created.status).toBe(201);
+      const saved=await created.json<{theme:AvatarTheme}>();expect(saved.theme.reasoningEffort).toBe('medium');
+      expect(await(await call(c,'/avatar-themes','POST',create)).json()).toEqual(saved);
+      for(const reasoningEffort of ['low','invented'])await expectError(await call(c,'/avatar-themes','POST',{...create,operationId:crypto.randomUUID(),reasoningEffort}),422,'avatar_reasoning_unavailable');
+      for(const reasoningEffort of ['',null,8])await expectError(await call(c,'/avatar-themes','POST',{...create,operationId:crypto.randomUUID(),reasoningEffort}),400,'invalid_request');
+      await expectError(await call(c,'/avatar-themes','POST',{...create,operationId:crypto.randomUUID(),kind:'image'}),400,'invalid_request');
+      const image=c.settings().themes.find(theme=>theme.kind==='image')!;
+      await expectError(await call(c,'/avatar-themes','PATCH',{themeId:image.id,operationId:crypto.randomUUID(),reasoningEffort:null,expectedReasoningEffort:null}),400,'invalid_request');
+      for(const extra of [{reasoningEffort:'high'},{model:'other'},{expectedReasoningEffort:undefined}]){
+        const result=await call(c,'/avatar-themes','PATCH',{themeId:saved.theme.id,operationId:crypto.randomUUID(),reasoningEffort:'medium',expectedReasoningEffort:'medium',...extra});
+        expect(result.status).toBe(extra.reasoningEffort?422:400);
+      }
+      // Account capabilities can change after a theme has been saved.
+      const unavailable=coordinator(state,fakeProvider({availableModels:[{...models[0],reasoningEfforts:['high']}]}));
+      await select(unavailable,saved.theme.id);seed(state);
+      await expectError(await call(unavailable,'/avatar-generations','POST',{operationId:crypto.randomUUID()}),422,'avatar_reasoning_unavailable');
+      expect(c.settings().jobs).toHaveLength(0);expect(provider.calls).toHaveLength(0);
+    });
+  });
+
+  it('rechecks the expected theme reasoning after asynchronous model discovery',async()=>{
+    await runInDurableObject(stub(),async(_instance,state)=>{
+      const c=coordinator(state),themeId=c.settings().themes[0].id;
+      const edit={themeId,reasoningEffort:'medium',expectedReasoningEffort:null,operationId:crypto.randomUUID()};
+      expect((await call(c,'/avatar-themes','PATCH',edit)).status).toBe(200);
+      let release!:()=>void,arrived!:()=>void;
+      const waiting=new Promise<void>(resolve=>{arrived=resolve;}),gate=new Promise<void>(resolve=>{release=resolve;});
+      const delayed=coordinator(state,fakeProvider({catalogue:async()=>{arrived();await gate;return Response.json({connected:true,models});}}));
+      const save=call(delayed,'/avatar-themes','PATCH',{...edit,expectedReasoningEffort:'medium',operationId:crypto.randomUUID()});
+      await waiting;
+      expect((await call(c,'/avatar-themes','PATCH',{...edit,reasoningEffort:null,expectedReasoningEffort:'medium',operationId:crypto.randomUUID()})).status).toBe(200);
+      release();await expectError(await save,409,'avatar_theme_changed');expect(c.settings().themes[0].reasoningEffort).toBeUndefined();
     });
   });
 

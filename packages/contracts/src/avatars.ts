@@ -14,7 +14,16 @@ export interface AvatarTheme {
   /** Stable built-in collection key; never accepted from theme creation input. */
   preset?: string;
   model: string;
+  /** SVG generation preference. Omitted uses the model's advertised default. */
+  reasoningEffort?: string;
   createdAt: string;
+}
+/** Changes future SVG generations only; admitted jobs retain their snapshot. */
+export interface AvatarThemeReasoningRequest {
+  themeId: string;
+  reasoningEffort: string | null;
+  expectedReasoningEffort: string | null;
+  operationId: string;
 }
 export interface AvatarSelection { themeId: string; revision: number; }
 export interface BotAvatar {

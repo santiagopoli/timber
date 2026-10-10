@@ -22,7 +22,7 @@ silhouette with a bound for long ears/antennae. PNG normalization precedes its
 The same optical normalization is used for all 50 gallery examples. Legacy prompt-only themes retain their original
 framing. Existing avatars remain visible until a replacement is ready.
 
-Creation accepts `{name,kind,style,subject?,model,operationId}`. An omitted or
+Creation accepts `{name,kind,style,subject?,model,reasoningEffort?,operationId}`. An omitted or
 blank subject lets the bot's purpose guide its character. Legacy `{prompt}`
 requests remain supported, but cannot be mixed with style/subject. The server
 composes the rendering prompt and records `framing: "circle"`; clients cannot
@@ -37,6 +37,21 @@ All preview artwork is served as local static assets under
 `/console/avatar-themes/`; no third-party image hosts or credentials are involved.
 Regeneration still follows the existing explicit selection, count and API
 billing confirmation flow.
+
+## SVG reasoning
+
+Settings → Bot avatars shows a reasoning selector for the selected SVG theme,
+including built-ins. The creation form also offers it beneath the model. Options
+come from the selected model’s connected catalogue. **Model default** leaves the
+effort unset; an explicit value is stored on that theme, independent of bot or
+promptbox reasoning. Image themes do not expose this text-model setting.
+
+Save reasoning changes future generations only. It does not regenerate avatars
+or alter queued/running jobs, which retain their original theme snapshot. The
+provider validates the effort and sends it as Responses `reasoning.effort`; it
+never silently downgrades an unsupported level. Concurrent settings edits are
+checked against the prior value and operation receipts prevent stale retries
+from overwriting newer preferences.
 
 ## Product behavior
 

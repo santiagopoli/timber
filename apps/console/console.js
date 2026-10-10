@@ -21,7 +21,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   const removedBots = new Set(), deletionPending = new Map();
   const botSummaries = new Map();
   const modelSettingsWork = new Set();
-  let avatarSettings = {themes:[],selection:null,avatars:[],jobs:[]}, avatarModels={connected:false,vectorModels:[],imageModels:[],imageAvailable:false}, avatarLoading=false, avatarPollTimer, avatarRequest=0, avatarThemeDraft='';
+  let avatarSettings = {themes:[],selection:null,avatars:[],jobs:[]}, avatarModels={connected:false,vectorModels:[],imageModels:[],imageAvailable:false}, avatarLoading=false, avatarPollTimer, avatarRequest=0, avatarThemeDraft='', avatarReasoningDraft=null;
   const avatarUrls = new Map(), avatarCacheDetails = new Map(), avatarFrames = new Map(), avatarLoads = new Map(), avatarLoadErrors = new Map(), avatarAdmissions = new Map();
   let modelCatalog={models:[],connected:false,defaultModel:''},modelCatalogLoading=false,modelCatalogError='',modelCatalogRequest=0;
   let botSummaryTimer,botSummaryLoading=false,botSummaryPending=false,botRenderKey='';
@@ -384,6 +384,26 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   }
   function renderGlobalAvatars(){document.querySelectorAll('.bot-item[data-bot-id]').forEach(button=>decorateGlobalAvatar(button.querySelector('.avatar'),button.dataset.botId));if(selected)decorateGlobalAvatar($('selected-avatar'),selected.id);}
   function avatarModelOption(option){return {id:option.id,label:option.name||option.label||option.id};}
+  function avatarReasoningOptions(select,modelId,value=''){
+    const model=avatarModels.vectorModels.find(model=>model.id===modelId),efforts=model?.reasoningEfforts||[];
+    select.replaceChildren();const fallback=document.createElement('option');fallback.value='';fallback.textContent=model?.defaultReasoningEffort?`Model default · ${model.defaultReasoningEffort}`:'Model default';select.append(fallback);
+    for(const effort of efforts){const option=document.createElement('option');option.value=effort;option.textContent=effort.charAt(0).toUpperCase()+effort.slice(1);select.append(option);}
+    if(value&&!efforts.includes(value)){const option=document.createElement('option');option.value=value;option.textContent=`${value} · unavailable`;option.disabled=true;select.append(option);}
+    select.value=value;select.disabled=avatarLoading;
+  }
+  function renderAvatarCreateReasoning(){
+    const vector=$('avatar-theme-kind').value==='vector',select=$('avatar-theme-reasoning'),modelId=$('avatar-theme-model').value,efforts=avatarModels.vectorModels.find(model=>model.id===modelId)?.reasoningEfforts||[];
+    $('avatar-theme-reasoning-field').hidden=!vector;
+    avatarReasoningOptions(select,modelId,vector&&efforts.includes(select.value)?select.value:'');
+  }
+  function renderAvatarReasoning(theme){
+    $('avatar-reasoning-field').hidden=theme?.kind!=='vector';
+    if(avatarReasoningDraft?.themeId!==theme?.id){avatarReasoningDraft=null;$('avatar-reasoning-status').textContent='';}
+    const value=avatarReasoningDraft?.value??theme?.reasoningEffort??'';
+    avatarReasoningOptions($('avatar-reasoning-select'),theme?.model,value);
+    const efforts=avatarModels.vectorModels.find(model=>model.id===theme?.model)?.reasoningEfforts||[];
+    $('avatar-save-reasoning').disabled=avatarLoading||!theme||value===(theme.reasoningEffort??'')||Boolean(value&&!efforts.includes(value));
+  }
   function renderAvatarForm(){
     const kind=$('avatar-theme-kind').value,availableOptions=kind==='vector'?avatarModels.vectorModels:avatarModels.imageModels,documentedImages=kind==='image'?(avatarModels.unavailableImageModels||[]):[],options=[...(availableOptions||[]),...documentedImages],select=$('avatar-theme-model'),prior=select.value;
     select.replaceChildren();for(const option of options){const value=avatarModelOption(option),entry=document.createElement('option');entry.value=value.id;entry.textContent=option.available===false?`${value.label} · unavailable · ${option.reason||'server image API is not configured'}`:value.label;entry.dataset.available=String(option.available!==false);select.append(entry);}
@@ -397,10 +417,12 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     $('avatar-image-capability').textContent=kind==='image'?imageInfo:disconnected?'No connected text-model catalogue. Connect the text-model account before generating SVG avatars.':avatarModels.error||'';
     $('avatar-image-capability').hidden=kind!=='image'&&!disconnected&&!avatarModels.error;
     $('avatar-create-submit').disabled=avatarLoading||!select.options.length;
+    renderAvatarCreateReasoning();
   }
   function renderAvatarCollection(){
     const selectedId=$('avatar-theme-select').value,theme=avatarSettings.themes.find(theme=>theme.id===selectedId);
     $('avatar-theme-preview').textContent=theme?.framing==='circle'?`${theme.subject||'Subject chosen by each bot'} · Heads on transparent backgrounds${theme.kind==='image'?' · Separately billed Image API':''}`:'';
+    renderAvatarReasoning(theme);
     renderAvatarThemeGallery($('avatar-theme-gallery'),{themes:avatarSettings.themes,selectedId,currentId:avatarSettings.selection?.themeId,busy:avatarLoading,onSelect:themeId=>{avatarThemeDraft=themeId;$('avatar-theme-select').value=themeId;$('avatar-apply-theme').disabled=avatarLoading||themeId===avatarSettings.selection?.themeId;renderAvatarCollection();}});
   }
   function renderAvatarSettings(){
@@ -426,10 +448,21 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     try{const result=await request('/v1/avatar-settings',{method:'PUT',body:{themeId,operationId:avatarOperationId()}});if(session!==authSession||!authenticated)return;avatarSettings=result;avatarThemeDraft='';pruneAvatarUrls();}
     finally{if(session===authSession&&authenticated){avatarLoading=false;renderAvatarSettings();scheduleAvatarPoll();}}
   }
+  async function saveAvatarReasoning(){
+    if(!authenticated||avatarLoading)return;
+    const session=authSession,theme=avatarSettings.themes.find(theme=>theme.id===$('avatar-theme-select').value);if(theme?.kind!=='vector')return;
+    const reasoningEffort=$('avatar-reasoning-select').value||null,expectedReasoningEffort=avatarReasoningDraft?avatarReasoningDraft.expected:theme.reasoningEffort??null;
+    avatarLoading=true;$('avatar-error').textContent='';$('avatar-reasoning-status').textContent='';renderAvatarSettings();
+    try{const result=await request('/v1/avatar-themes',{method:'PATCH',body:{themeId:theme.id,reasoningEffort,expectedReasoningEffort,operationId:avatarOperationId()}});if(session!==authSession||!authenticated)return;if(result.theme?.id!==theme.id)throw new Error('The server did not confirm the theme reasoning.');avatarSettings.themes=avatarSettings.themes.map(item=>item.id===theme.id?result.theme:item);avatarReasoningDraft=null;}
+    catch(error){if(session===authSession&&authenticated){if(error.code==='avatar_theme_changed'){avatarReasoningDraft=null;await loadAvatarSettings();}if(session===authSession&&authenticated)$('avatar-error').textContent=errorText(error);return;}}
+    finally{if(session===authSession&&authenticated){avatarLoading=false;renderAvatarSettings();}}
+    if(session===authSession&&authenticated)$('avatar-reasoning-status').textContent='Saved for future generations.';
+  }
   async function createAvatarTheme(event){
     event.preventDefault();if(!authenticated||avatarLoading)return;const session=authSession,name=$('avatar-theme-name').value.trim(),kind=$('avatar-theme-kind').value,style=$('avatar-theme-prompt').value.trim(),subject=$('avatar-theme-subject').value.trim(),model=$('avatar-theme-model').value;if(!name||!style||!model)return;
+    const reasoningEffort=kind==='vector'?$('avatar-theme-reasoning').value:'';
     avatarLoading=true;$('avatar-error').textContent='';renderAvatarSettings();
-    try{const result=await request('/v1/avatar-themes',{method:'POST',body:{name,kind,style,...(subject?{subject}:{}),model,operationId:avatarOperationId()}});if(session!==authSession||!authenticated)return;if(!result.theme)throw new Error('The server did not confirm the new theme.');avatarSettings.themes=[...avatarSettings.themes,result.theme];$('avatar-theme-name').value='';$('avatar-theme-prompt').value='';$('avatar-theme-subject').value='';}
+    try{const result=await request('/v1/avatar-themes',{method:'POST',body:{name,kind,style,...(subject?{subject}:{}),model,...(reasoningEffort?{reasoningEffort}:{}),operationId:avatarOperationId()}});if(session!==authSession||!authenticated)return;if(!result.theme)throw new Error('The server did not confirm the new theme.');avatarSettings.themes=[...avatarSettings.themes,result.theme];$('avatar-theme-name').value='';$('avatar-theme-prompt').value='';$('avatar-theme-subject').value='';$('avatar-theme-reasoning').value='';}
     catch(error){if(session===authSession&&authenticated)$('avatar-error').textContent=errorText(error);}
     finally{if(session===authSession&&authenticated){avatarLoading=false;renderAvatarSettings();}}
   }
@@ -465,7 +498,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   }
   function disconnect(message = '') {
     desktop.disconnect(); workspace.clear();
-    clearTimeout(avatarPollTimer);avatarRequest++;avatarThemeDraft='';avatarSettings={themes:[],selection:null,avatars:[],jobs:[]};avatarModels={connected:false,vectorModels:[],imageModels:[],imageAvailable:false};avatarLoading=false;avatarAdmissions.clear();revokeAvatarUrls();$('avatar-error').textContent='';$('avatar-status').textContent='Sign in to load avatar settings.';
+    clearTimeout(avatarPollTimer);avatarRequest++;avatarThemeDraft='';avatarReasoningDraft=null;avatarSettings={themes:[],selection:null,avatars:[],jobs:[]};avatarModels={connected:false,vectorModels:[],imageModels:[],imageAvailable:false};avatarLoading=false;avatarAdmissions.clear();revokeAvatarUrls();$('avatar-error').textContent='';$('avatar-status').textContent='Sign in to load avatar settings.';
     stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId=null; cancelStreamRender(); resetConversationHistory(); generation++; authSession++; authenticated = false; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
     selected = null; currentRun = null; stoppableRun = null; bots = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
     clearTimeout(botSummaryTimer);botSummaries.clear();botSummaryLoading=false;botSummaryPending=false;botRenderKey='';
@@ -1411,6 +1444,9 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   $('settings-button').addEventListener('click', () => { if ($('panel-menu')) $('panel-menu').open = false; $('settings-dialog').showModal(); avatarLoadErrors.clear(); void loadAvatarSettings(); void chatGPTTask(loadChatGPT); void loadGitHubStatus(); }); $('refresh-chatgpt').addEventListener('click', () => chatGPTTask(loadChatGPT));
   $('avatar-refresh').addEventListener('click', () => {avatarLoadErrors.clear();void loadAvatarSettings();});
   $('avatar-theme-kind').addEventListener('change', renderAvatarForm);
+  $('avatar-theme-model').addEventListener('change',renderAvatarCreateReasoning);
+  $('avatar-reasoning-select').addEventListener('change',()=>{const theme=avatarSettings.themes.find(theme=>theme.id===$('avatar-theme-select').value);if(!theme)return;avatarReasoningDraft={themeId:theme.id,value:$('avatar-reasoning-select').value,expected:avatarReasoningDraft?avatarReasoningDraft.expected:theme.reasoningEffort??null};$('avatar-reasoning-status').textContent='';renderAvatarReasoning(theme);});
+  $('avatar-save-reasoning').addEventListener('click',()=>void saveAvatarReasoning());
   $('avatar-theme-select').addEventListener('change', () => { avatarThemeDraft=$('avatar-theme-select').value; $('avatar-apply-theme').disabled = avatarLoading || !$('avatar-theme-select').value || $('avatar-theme-select').value===avatarSettings.selection?.themeId; renderAvatarCollection(); });
   $('avatar-apply-theme').addEventListener('click', () => void guarded(applyAvatarTheme));
   $('avatar-generate-all').addEventListener('click', () => void guarded(() => startAvatarGeneration()));

@@ -829,8 +829,9 @@ The authenticated owner's WorkspaceDO owns one global theme selection and a
 monotonic revision; bots have no theme override. Ten built-in themes (five SVG,
 five image) are seeded with stable IDs for both new and existing owners, without
 changing existing selection, revisions, custom themes, avatars or jobs. New owners
-start with Paperfold without scheduling inference. Themes are immutable shared
-design prompts with `kind:vector|image`, model and name. New themes separate
+start with Paperfold without scheduling inference. Theme design prompts, model,
+name and `kind:vector|image` are immutable. SVG themes also store an optional
+`reasoningEffort` preference for future generations. New themes separate
 `style` and optional `subject`, with `framing:"circle"`: transparent head artwork
 displayed on a solid circle supplied by the console. Built-ins also carry a
 server-assigned `preset` key for the static five-example gallery. These curated
@@ -860,13 +861,25 @@ regeneration on selection.
   or image generation has been tested. No credentials are returned to the client.
 - `GET /v1/avatar-settings` -> `AvatarSettings` with themes, global selection,
   avatar metadata and newest 100 jobs. It performs no inference or VM wakeup.
-- `POST /v1/avatar-themes` `{name,kind,style,subject?,model,operationId}` -> 201 `{theme}`.
+- `POST /v1/avatar-themes` `{name,kind,style,subject?,model,reasoningEffort?,operationId}` -> 201 `{theme}`.
   Style is required (up to 4,000 characters), subject is optional (up to 160);
   a blank subject is omitted. The server composes the head-only transparent prompt.
   Legacy `{name,kind,prompt,model,operationId}` remains supported with its original
   receipt fingerprint and framing; prompt cannot be combined with style/subject.
   Themes can be saved before provider configuration; a saved ID is not a capability
-  claim. SVG themes use an available connected-account **text** model.
+  claim. SVG themes use an available connected-account **text** model. An explicit
+  reasoning level requires the connected catalogue and must be supported by that
+  model. Omit it to use the model default; image themes reject it.
+- `PATCH /v1/avatar-themes` `{themeId,reasoningEffort,expectedReasoningEffort,operationId}`
+  -> `{theme}` updates only an SVG theme’s reasoning preference. Use `null` for
+  the model default; `expectedReasoningEffort` is the prior saved value (or null).
+  Stale edits return 409, including changes while catalogue validation is pending.
+  Receipt replay precedes current-value checks, never reapplies an old edit, and
+  returns the current theme. Saving neither changes the selection revision nor
+  schedules inference, invalidates avatars, or modifies existing job snapshots.
+  Creation and generation receipts also retain their original operation semantics.
+  Upcoming jobs snapshot this preference; provider validation and Responses
+  `reasoning.effort` honor an explicit value, otherwise retain the model default.
 - `PUT /v1/avatar-settings` `{themeId,operationId}` -> `AvatarSettings`. Switching
   increments revision and makes prior output stale; it neither hides the prior
   validated image nor automatically regenerates.
@@ -910,7 +923,7 @@ regeneration on selection.
 
 Generation receipt fingerprints include expected theme/revision, target bot, count and
 billing acknowledgement; receipts bind the exact admitted bot/job set;
-conflicting replays return 409. Jobs durably snapshot the selected immutable theme,
+conflicting replays return 409. Jobs durably snapshot the selected theme and reasoning preference,
 owner revision and bot identity before dispatch. Uncertain in-flight generation is
 interrupted, never automatically replayed. A replacement only becomes visible after
 provider output validation and successful publication; prior validated bytes are

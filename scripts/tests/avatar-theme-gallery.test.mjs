@@ -9,7 +9,7 @@ for(const [name,viewport] of [['desktop',{width:1280,height:1000}],['mobile',{wi
   const fixture=await createConsoleFixture();
   const browser=await chromium.launch({executablePath:process.env.CONSOLE_CHROMIUM_PATH||'/usr/bin/chromium',args:['--no-sandbox']});
   const themes=builtinAvatarThemes();let selection={themeId:themes[0].id,revision:1};
-  const calls=[],errors=[],assetFailures=[];
+  const calls=[],errors=[],assetFailures=[];let rejectReasoningOnce=false;
   const settings=()=>({themes,selection,avatars:[{botId:BOT_A,themeId:themes[0].id,revision:1,status:'ready',artifactId:'gallery-owl',mimeType:'image/svg+xml',updatedAt:'2026-10-10T00:00:00Z'}],jobs:[]});
   try{
     const page=await browser.newPage({viewport,deviceScaleFactor:2,colorScheme:name==='desktop'?'dark':'light',isMobile:name==='mobile',hasTouch:name==='mobile'});
@@ -19,10 +19,17 @@ for(const [name,viewport] of [['desktop',{width:1280,height:1000}],['mobile',{wi
       if(route.request().method()==='PUT'){const body=route.request().postDataJSON();calls.push({path:'selection',body});selection={themeId:body.themeId,revision:selection.revision+1};}
       await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(settings())});
     });
-    await page.route('**/v1/avatar-models',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:true,vectorModels:[{id:'gpt-6.1-sol',name:'GPT-6.1'}],imageModels:[],imageAvailable:false})}));
+    await page.route('**/v1/avatar-models',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:true,vectorModels:[{id:'gpt-6.1-sol',name:'GPT-6.1',reasoningEfforts:['medium','high'],defaultReasoningEffort:'medium'},{id:'fixed-model',name:'No reasoning options',reasoningEfforts:[]}],imageModels:[],imageAvailable:false})}));
     await page.route('**/v1/bots/*/avatar',route=>route.fulfill({status:200,contentType:'image/svg+xml',body:'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><path d="M32 32L64 44L96 32L96 80L64 108L32 80Z" fill="#ad794d"/></svg>'}));
     await page.route('**/v1/avatar-generations',async route=>{calls.push({path:'generation'});await route.fulfill({status:202,contentType:'application/json',body:'{"jobs":[]}'});});
     await page.route('**/v1/avatar-themes',async route=>{
+      if(route.request().method()==='PATCH'){
+        const body=route.request().postDataJSON();calls.push({path:'reasoning',body});const theme=themes.find(theme=>theme.id===body.themeId);
+        if(rejectReasoningOnce){rejectReasoningOnce=false;theme.reasoningEffort='medium';await route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:{code:'avatar_theme_changed',message:'The theme reasoning changed. Refresh before saving.'}})});return;}
+        assert.equal(body.expectedReasoningEffort,theme.reasoningEffort??null);
+        if(body.reasoningEffort===null)delete theme.reasoningEffort;else theme.reasoningEffort=body.reasoningEffort;
+        await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({theme})});return;
+      }
       const body=route.request().postDataJSON();calls.push({path:'theme',body});const theme={...body,id:crypto.randomUUID(),framing:'circle'};themes.push(theme);
       await route.fulfill({status:201,contentType:'application/json',body:JSON.stringify({theme})});
     });
@@ -60,6 +67,34 @@ for(const [name,viewport] of [['desktop',{width:1280,height:1000}],['mobile',{wi
     await page.waitForFunction(()=>document.getElementById('avatar-theme-name').value==='');assert.deepEqual({...calls.at(-1).body,operationId:undefined},{name:'Watercolor Animals',kind:'vector',style:'Watercolor washes',subject:'Animals',model:'gpt-6.1-sol',operationId:undefined});
     await page.locator('#avatar-theme-name').fill('Free watercolor');await page.locator('#avatar-theme-prompt').fill('Watercolor washes');await page.locator('#avatar-create-submit').click();
     await page.waitForFunction(()=>document.getElementById('avatar-theme-name').value==='');assert.equal(calls.at(-1).body.subject,undefined);
+    // Editing the theme changes future generation preferences without applying
+    // a theme, modifying bot settings or admitting an inference request.
+    await page.locator('#avatar-theme-select').selectOption(themes[0].id);
+    assert.equal(await page.locator('#avatar-reasoning-field').isVisible(),true);
+    assert.deepEqual(await page.locator('#avatar-reasoning-select option').allTextContents(),['Model default · medium','Medium','High']);
+    await page.locator('#avatar-reasoning-select').selectOption('high');
+    await page.locator('#avatar-refresh').click();await page.waitForFunction(()=>!document.getElementById('avatar-theme-select').disabled);
+    assert.equal(await page.locator('#avatar-reasoning-select').inputValue(),'high','refresh must preserve unsaved reasoning');
+    await page.locator('#avatar-save-reasoning').click();await page.waitForFunction(()=>document.getElementById('avatar-reasoning-status').textContent.includes('Saved'));
+    assert.equal(calls.at(-1).path,'reasoning');assert.equal(calls.at(-1).body.reasoningEffort,'high');assert.equal(calls.at(-1).body.expectedReasoningEffort,null);
+    await page.locator('#avatar-refresh').click();await page.waitForFunction(()=>!document.getElementById('avatar-theme-select').disabled);
+    assert.equal(await page.locator('#avatar-reasoning-select').inputValue(),'high');
+    if(evidence){await page.locator('#avatar-reasoning-field').scrollIntoViewIfNeeded();await page.locator('#avatar-reasoning-field').screenshot({path:`${evidence}/reasoning-${name}.png`});}
+    await page.locator('#avatar-theme-select').selectOption(themes[1].id);assert.equal(await page.locator('#avatar-reasoning-select').inputValue(),'');
+    await page.locator('#avatar-theme-select').selectOption(themes[0].id);assert.equal(await page.locator('#avatar-reasoning-select').inputValue(),'high');
+    await page.locator('#avatar-reasoning-select').selectOption('');await page.locator('#avatar-save-reasoning').click();await page.waitForFunction(()=>document.getElementById('avatar-reasoning-status').textContent.includes('Saved'));
+    assert.equal(calls.at(-1).body.reasoningEffort,null);assert.equal(calls.at(-1).body.expectedReasoningEffort,'high');
+    rejectReasoningOnce=true;await page.locator('#avatar-reasoning-select').selectOption('high');await page.locator('#avatar-save-reasoning').click();
+    await page.waitForFunction(()=>document.getElementById('avatar-error').textContent.includes('reasoning changed'));
+    assert.equal(await page.locator('#avatar-reasoning-select').inputValue(),'medium','a stale edit must show the latest saved preference');
+    await page.locator('#avatar-reasoning-select').selectOption('high');await page.locator('#avatar-save-reasoning').click();await page.waitForFunction(()=>document.getElementById('avatar-reasoning-status').textContent.includes('Saved'));
+    assert.equal(calls.at(-1).body.expectedReasoningEffort,'medium');
+    await page.locator('#avatar-theme-select').selectOption(themes[8].id);assert.equal(await page.locator('#avatar-reasoning-field').isVisible(),false);
+    assert.equal(calls.filter(call=>call.path==='generation').length,0);
+    await page.locator('#avatar-theme-name').fill('Careful SVG');await page.locator('#avatar-theme-prompt').fill('Paperfold');await page.locator('#avatar-theme-reasoning').selectOption('high');await page.locator('#avatar-create-submit').click();
+    await page.waitForFunction(()=>document.getElementById('avatar-theme-name').value==='');assert.equal(calls.at(-1).body.reasoningEffort,'high');
+    await page.locator('#avatar-theme-reasoning').selectOption('high');await page.locator('#avatar-theme-model').selectOption('fixed-model');assert.equal(await page.locator('#avatar-theme-reasoning').inputValue(),'');assert.equal(await page.locator('#avatar-theme-reasoning option').count(),1);
+    await page.locator('#avatar-theme-kind').selectOption('image');assert.equal(await page.locator('#avatar-theme-reasoning-field').isVisible(),false);
     assert.equal(calls.filter(call=>call.path==='generation').length,0);assert.deepEqual(errors,[]);assert.deepEqual(assetFailures,[]);
     if(evidence){
       await page.locator('#avatar-create-details').evaluate(n=>n.open=false);await page.locator('#settings-dialog').evaluate(n=>n.scrollTop=0);await page.screenshot({path:`${evidence}/settings-${name}.png`});
