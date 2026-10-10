@@ -12,15 +12,16 @@ before(async () => {
 });
 after(async () => {await browser?.close();});
 
-for (const width of [320, 390]) test(`mobile bot list shares its left alignment axis at ${width}px`, async () => {
+for (const width of [320, 390, 1024, 1440]) test(`bot list shares its left alignment axis at ${width}px`, async () => {
   const fixture = await createConsoleFixture();
-  const context = await browser.newContext({viewport: {width, height: 844}, isMobile: true, hasTouch: true});
+  const context = await browser.newContext({viewport: {width, height: width < 700 ? 844 : 900}, ...(width < 700 ? {isMobile: true, hasTouch: true} : {})});
   try {
     const page = await context.newPage();
     await page.goto(fixture.url);
     await page.locator('#token').fill(TEST_TOKEN);
     await page.locator('#connect-form button').click();
     await page.locator('#app').waitFor({state: 'visible'});
+    if (!await page.locator('#bot-search').isVisible()) await page.locator('#toggle-bots').click();
     await page.locator('#bot-search').waitFor({state: 'visible'});
     const geometry = await page.evaluate(() => {
       const box = selector => {
