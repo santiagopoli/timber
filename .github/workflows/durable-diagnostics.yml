@@ -2,6 +2,14 @@ name: Read durable production diagnostics
 on:
   workflow_dispatch:
     inputs:
+      scope:
+        description: Fixed read-only diagnostic to run
+        required: true
+        default: native
+        type: choice
+        options:
+          - native
+          - avatars
       hours:
         description: Hours of recent failure metadata to inspect (1 to 24)
         required: true
@@ -33,5 +41,6 @@ jobs:
           CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
           CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
           DIAGNOSTIC_HOURS: ${{ inputs.hours }}
+          DIAGNOSTIC_SCOPE: ${{ inputs.scope }}
           DIAGNOSTIC_RECIPIENT_PUBLIC_KEY: ${{ inputs.recipient_public_key }}
         run: node scripts/prod-durable-diagnostics.mjs

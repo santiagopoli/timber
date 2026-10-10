@@ -2,14 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
 import {generateKeyPairSync,privateDecrypt,createDecipheriv,createHash,constants} from 'node:crypto';
-import {BOT_LOOKUP,SCHEMA,FAILURE_QUERY,TASK_QUERY,PRIVATE_FAILURE_QUERY,collectDurable,rows,safeError,summarizeFailures,summarizeTasks,recipientPublicKey,encryptDetails} from '../prod-durable-diagnostics.mjs';
+import {BOT_LOOKUP,AVATAR_QUERY,summarizeAvatars,SCHEMA,FAILURE_QUERY,TASK_QUERY,PRIVATE_FAILURE_QUERY,collectDurable,rows,safeError,summarizeFailures,summarizeTasks,recipientPublicKey,encryptDetails} from '../prod-durable-diagnostics.mjs';
 
 const now=Date.parse('2026-10-09T19:45:00Z'),window={from:now-3600_000,to:now};
 const row={run_created_at:'2026-10-09T19:34:00Z',run_updated_at:'2026-10-09T19:35:00Z',run_status:'failed',error_code:'model_request_failed',native_reason:'model_error',detail_type:'text',detail_characters:123,detail_signature:'native_json_undefined'};
 const sqlResult=(columns,data)=>({success:true,result:{results:[{columns,rows:data,meta:{rows_written:0,rows_read:data.length}}]}});
 
 test('fixed SQL returns failure signatures without projecting raw native detail or user content',()=>{
-  for(const sql of [BOT_LOOKUP,SCHEMA,FAILURE_QUERY,TASK_QUERY,PRIVATE_FAILURE_QUERY]){
+  for(const sql of [BOT_LOOKUP,AVATAR_QUERY,SCHEMA,FAILURE_QUERY,TASK_QUERY,PRIVATE_FAILURE_QUERY]){
     assert.match(sql,/^(?:SELECT|WITH) /);
     assert.doesNotMatch(sql,/\b(?:INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE|ATTACH|PRAGMA)\b/i);
     assert.doesNotMatch(sql,/;/);
@@ -131,4 +131,18 @@ test('HTTP errors never include provider bodies and redirects are not followed',
     options=init;return new Response('private-canary',{status:403});
   }}),{message:'durable_diagnostics_http_403'});
   assert.equal(options.redirect,'manual');
+});
+test('avatar diagnostics inspect only fixed owner metadata and omit private job data',async()=>{
+  const db=new DatabaseSync(':memory:');
+  try{
+    db.exec('CREATE TABLE avatar_jobs(data TEXT); CREATE TABLE avatar_themes(id TEXT,data TEXT)');
+    db.prepare('INSERT INTO avatar_themes VALUES(?,?)').run('private-theme',JSON.stringify({kind:'image',prompt:'private-prompt'}));
+    db.prepare('INSERT INTO avatar_jobs VALUES(?)').run(JSON.stringify({createdAt:row.run_created_at,updatedAt:row.run_updated_at,status:'failed',themeId:'private-theme',botId:'private-bot',error:{code:'avatar_response_limit',message:'private-error'}}));
+    const records=db.prepare(AVATAR_QUERY).all();
+    assert.equal(records[0].kind,'image');assert.equal(records[0].error_code,'avatar_response_limit');assert.doesNotMatch(JSON.stringify(records),/private-/);
+    const ws='a'.repeat(32),calls=[],responses=[{success:true,result:[{id:ws,class:'WorkspaceDO',script:'timber-api',use_sqlite:true}]},sqlResult(Object.keys(records[0]),[Object.values(records[0])])];
+    const result=await collectDurable({now,env:{CLOUDFLARE_ACCOUNT_ID:ws,CLOUDFLARE_API_TOKEN:'secret-canary',DIAGNOSTIC_SCOPE:'avatars'},fetcher:async(url,init)=>{calls.push({url,init});return Response.json(responses.shift());}});
+    assert.equal(calls.length,2);assert.equal(JSON.parse(calls[1].init.body).queries[0].sql,AVATAR_QUERY);assert.equal(result.jobs[0].errorCode,'avatar_response_limit');
+    assert.doesNotMatch(JSON.stringify(summarizeAvatars([{...records[0],kind:'private-kind',status:'private-status',error_code:'private-error',token:'private-token'}],window)),/private-/);
+  }finally{db.close();}
 });
