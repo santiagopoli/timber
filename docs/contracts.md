@@ -466,24 +466,36 @@ explicit workspace reads, live-desktop lease renewals and successful app request
 renew it. A managed running process is active work: a durable ten-second maintenance
 alarm observes it and renews the computer lifetime without model inference.
 Explicit checkpoint, suspend and human desktop control reject while managed
-commands are active. Terminal command checkpoints are deferred until the active
-batch finishes; one checkpoint can cover the completed batch. Passive status
+commands are active. Tool results and effect receipts do not wait for workspace
+checkpoints. Writes, clones and terminal commands report `checkpointStatus:"pending"`;
+the action outcome is durable, while its filesystem changes are not yet saved.
+An alarm coalesces changes after 90 seconds without agent tool/runtime activity and
+without running managed commands. Passive process observations and desktop-viewer
+renewals do not postpone this capture. Runtime lease renewals defer it while a turn
+is active. One checkpoint can cover many completed actions. Passive status
 polling and an open chat do not keep the machine awake. A detached server outside
 managed execution alone does not keep it awake. Idle shutdown first checkpoints, then destroys
 the container; checkpoint failures defer shutdown and retry after one minute.
 Checkpoint persistence has its own durable retry intent, separate from execution.
-Uploads enforce the declared byte length with a streaming transfer and verify SHA-256.
+Archive creation holds the effect/workspace gates to capture consistent files;
+the background R2 transfer releases both gates, so new tools can execute during
+upload. Later writes have higher revisions and remain pending when an older upload
+finishes. Explicit checkpoint and suspend wait for an in-flight upload outside
+the gates, then capture fresh files. Deletion drains background uploads before
+acknowledging cleanup. Uploads enforce the declared byte length with a streaming transfer and verify SHA-256.
 The upload candidate is recorded before R2 admission; recovery checks its size and
 checksum and atomically publishes its pointer and affected operation receipts.
 A lost pointer write can therefore recover an existing upload without rerunning a
 command. A fresh explicit checkpoint or suspend always captures current files,
 including desktop changes made after any recovered upload.
 Transient persistence failures get one immediate retry, then durable retries with
-exponential delay capped at one minute. User activity cannot postpone this deadline.
+exponential delay capped at one minute. New activity defers filesystem capture to
+the quiet interval; recovery of an already committed R2 candidate needs no capture.
 `checkpointStatus` is `pending`, `saved`, or `failed`; routine saving is not an action
 error. Continued persistence failure becomes visible after three failed attempts;
 successful publication removes only the checkpoint warning and preserves command
-errors. Snapshot validation failures remain actionable immediately. If the original
+errors. Snapshot validation failures become actionable when the background capture
+is attempted. If the original
 computer was lost before upload, recovery reports unsaved files instead of starting
 a new computer or claiming that the old effects were saved.
 A separate fifteen-minute infrastructure inactivity timeout is the fallback.

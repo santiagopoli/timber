@@ -37,7 +37,9 @@ other engines can implement these boundaries without changing bot identity.
   Chromium, screenshots, mouse, keyboard and scrolling.
 - Persisted approvals for model-initiated effects, optional task budgets and operation IDs
   that prevent a repeated request from executing a completed action twice.
-- Workspace checkpoints in R2, restore on cold start, explicit suspend and idle stop.
+- Coalesced workspace checkpoints in R2 without waiting in tool results, restore
+  on cold start, explicit suspend and idle stop. Pending files can be lost if the
+  container fails before saving; effect receipts remain durable.
 - Protected API, developer console and CLI smoke tests.
 
 The admin console provides bot search, creation and configuration dialogs, a

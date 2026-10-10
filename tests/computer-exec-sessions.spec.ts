@@ -7,6 +7,12 @@ const bindings=env as unknown as {REAL_COMPUTER:DurableObjectNamespace};
 const request=(botId:string,operationId:string,action:object)=>new Request('https://computer/actions',{method:'POST',body:JSON.stringify({botId,operationId,action})});
 const stop=(botId:string,processId:string)=>new Request('https://computer/exec/cancel',{method:'POST',body:JSON.stringify({botId,processId})});
 const deferred=()=>{let resolve!:()=>void;const promise=new Promise<void>(done=>{resolve=done;});return {promise,resolve};};
+async function flush(instance:{alarm?:()=>void|Promise<void>},storage:DurableObjectStorage) {
+  await storage.put('checkpointQuietUntil',0);
+  const retry=await storage.get<Record<string,unknown>>('checkpointRetry');
+  if(retry) await storage.put('checkpointRetry',{...retry,nextAttemptAt:0});
+  await instance.alarm!();
+}
 afterEach(()=>vi.restoreAllMocks());
 
 function machine() {
@@ -76,7 +82,7 @@ describe('durable execution sessions',()=>{
       vm.sessions.set('running',{operationId:'running',processId:'running',status:'running',output:'old'});
       release.resolve();
       expect(await (await pending).json()).toMatchObject({status:'cancelled',output:'started\n'});
-      expect(vm.checkpoints).toBe(1);
+      expect(vm.checkpoints).toBe(0);
     });
   });
 
@@ -160,10 +166,12 @@ describe('durable execution sessions',()=>{
       vm.attach(instance);
       vm.sessions.set('recover',{operationId:'recover',processId:'recover',status:'completed',output:'final output',exitCode:0});
       const result=await (await instance.fetch(request(botId,'recover',{type:'exec',command:'one effect',yieldMs:0}))).json<ComputerResult>();
-      expect(result).toMatchObject({status:'completed',output:'final output',exitCode:0,checkpointId:expect.any(String)});
+      expect(result).toMatchObject({status:'completed',output:'final output',exitCode:0,checkpointStatus:'pending'});
       expect(await (await instance.fetch(request(botId,'another-poll',{type:'execPoll',processId:'recover'}))).json()).toEqual({...result,operationId:'another-poll'});
+      expect(vm.checkpoints).toBe(0);
+      await flush(instance,state.storage);
       expect(vm.actions.filter(value=>value.action.type==='exec')).toHaveLength(1);expect(vm.checkpoints).toBe(1);
-      expect(await state.storage.get('operation:recover')).toMatchObject({result});
+      expect(await state.storage.get('operation:recover')).toMatchObject({result:{...result,checkpointStatus:'saved',checkpointId:expect.any(String)}});
     });
   });
 
@@ -181,7 +189,7 @@ describe('durable execution sessions',()=>{
 
   it('defers checkpoints until all simultaneous commands finish and checkpoints the batch once',async()=>{
     const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId)),vm=machine();
-    await runInDurableObject(stub,async instance=>{
+    await runInDurableObject(stub,async(instance,state)=>{
       vm.attach(instance);
       for(const id of ['first','second']) await instance.fetch(request(botId,id,{type:'exec',command:id,yieldMs:0}));
       vm.sessions.set('first',{operationId:'first',processId:'first',status:'completed',output:'first',exitCode:0});
@@ -189,8 +197,11 @@ describe('durable execution sessions',()=>{
       expect(first.status).toBe('completed');expect(first.checkpointId).toBeUndefined();expect(first.checkpointStatus).toBe('pending');expect(first.error).toBeUndefined();expect(vm.checkpoints).toBe(0);
       vm.sessions.set('second',{operationId:'second',processId:'second',status:'completed',output:'second',exitCode:0});
       const second=await (await instance.fetch(request(botId,'poll-second',{type:'execPoll',processId:'second',yieldMs:0}))).json<ComputerResult>();
+      expect(second.checkpointStatus).toBe('pending');expect(vm.checkpoints).toBe(0);
+      await flush(instance,state.storage);
+      const secondSaved=await (await instance.fetch(request(botId,'poll-second-final',{type:'execPoll',processId:'second',yieldMs:0}))).json<ComputerResult>();
       const firstSaved=await (await instance.fetch(request(botId,'poll-first-final',{type:'execPoll',processId:'first',yieldMs:0}))).json<ComputerResult>();
-      expect(second.checkpointId).toBeTruthy();expect(firstSaved.checkpointId).toBe(second.checkpointId);expect(firstSaved.error).toBeUndefined();expect(vm.checkpoints).toBe(1);
+      expect(secondSaved.checkpointId).toBeTruthy();expect(firstSaved.checkpointId).toBe(secondSaved.checkpointId);expect(firstSaved.error).toBeUndefined();expect(vm.checkpoints).toBe(1);
     });
   });
 
@@ -204,6 +215,9 @@ describe('durable execution sessions',()=>{
       expect(await state.storage.getAlarm()).toBeGreaterThan(Date.now());
       vm.sessions.set('alarm-process',{operationId:'alarm-process',processId:'alarm-process',status:'completed',output:'done',exitCode:0});
       await instance.alarm!();
+      expect(await state.storage.get('operation:alarm-process')).toMatchObject({result:{status:'completed',checkpointStatus:'pending'}});
+      expect(vm.checkpoints).toBe(0);
+      await flush(instance,state.storage);
       expect(await state.storage.get('operation:alarm-process')).toMatchObject({result:{status:'completed',checkpointId:expect.any(String)}});
       expect(vm.checkpoints).toBe(1);expect(vm.container.running).toBe(true);
     });
@@ -237,7 +251,7 @@ describe('durable execution sessions',()=>{
     });
     await evictDurableObject(stub);
     await runInDurableObject(stub,async(instance,state)=>{
-      vm.attach(instance);await instance.alarm!();
+      vm.attach(instance);await instance.alarm!();await flush(instance,state.storage);
       expect(vm.sessions.get('cancel-recover')!.status).toBe('cancelled');
       expect(await state.storage.get('operation:cancel-recover')).toMatchObject({result:{status:'cancelled',checkpointId:expect.any(String)}});
       expect(vm.actions.filter(value=>value.action.type==='exec')).toHaveLength(1);
@@ -275,13 +289,13 @@ describe('durable execution sessions',()=>{
       const response=await instance.fetch(request(botId,'large-output',{type:'exec',command:'write lots of output',yieldMs:0}));
       expect(response.status).toBe(200);
       const result=await response.json<ComputerResult>();output=result.output;
-      expect(result).toMatchObject({status:'completed',checkpointId:expect.any(String)});
+      expect(result).toMatchObject({status:'completed',checkpointStatus:'pending'});
       expect(output).toBe(nativeOutput);expect(output).not.toContain('\ufffd');
       expect(new TextEncoder().encode(output).byteLength).toBe(128*1024);
     });
     await evictDurableObject(stub);
     const response=await stub.fetch(request(botId,'recover-large-output',{type:'execPoll',processId:'large-output'}));
-    expect(response.status).toBe(200);expect(await response.json()).toMatchObject({status:'completed',output,checkpointId:expect.any(String)});
+    expect(response.status).toBe(200);expect(await response.json()).toMatchObject({status:'completed',output,checkpointStatus:'pending'});
     expect(vm.actions.filter(value=>value.action.type==='exec')).toHaveLength(1);
   });
 });

@@ -92,8 +92,13 @@ the normal idle lease; an idle open tab alone does not keep a computer running f
 
 ## Persistence and limits
 
-After shell/file writes and before an intentional idle stop, the computer creates
-an immutable tar.gz workspace checkpoint. The server supplies SHA-256; R2 validates
+Shell/file tools return their journaled outcome without waiting for persistence.
+Their filesystem changes have `checkpointStatus:pending` until a durable alarm
+coalesces them after 90 seconds without agent tool/runtime activity and without
+active managed commands. Passive process observations and viewer renewals do not
+postpone this save. Before an intentional idle stop, or for an explicit checkpoint
+or suspension, the computer also creates a fresh immutable tar.gz checkpoint.
+The server supplies SHA-256; R2 validates
 the streamed upload, then the Durable Object updates the current checkpoint
 pointer. A new computer restores and verifies this checkpoint before tools run.
 
@@ -113,11 +118,18 @@ continues running it is reopened with the previous browser session. Tabs/profile
 data can survive; page JavaScript memory and in-flight interactions do not. Idle
 and explicit suspension leave Chromium closed.
 
-Managed tools are serialized, and checkpoint creation checks file/directory
+Managed effects and archive creation are serialized, but a background upload to
+R2 holds neither the effect nor workspace gate. New tools can run during upload;
+their revisions remain pending until a later snapshot includes them. Explicit
+checkpoint and suspend wait for the earlier upload and then capture fresh files.
+Checkpoint creation checks file/directory
 metadata to detect concurrent changes. Arbitrary detached shell jobs are not yet a
 supervised job system. Stop background writers before making a checkpoint. This
 is checkpoint persistence, not a transactional live disk or a VM memory snapshot.
-If upload fails, the action result explicitly says its files are not yet durable.
+An upload failure preserves the known action outcome and retries saving only;
+continuing or non-retryable failures add a checkpoint warning. A container failure
+before a successful save can lose pending files. Journals do not turn the container
+disk into a durable volume, and interrupted commands are never automatically replayed.
 
 The computer stops after five minutes without activity after a successful
 checkpoint. Active bot turns can call `touchCloudComputer` to extend that lease.
