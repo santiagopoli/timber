@@ -175,6 +175,84 @@ it("serializes concurrent admissions at the last native inbox slot",async()=>{
   } finally {release();}
 });
 
+
+it.each([false,true])("holds the last slot for an unconfirmed submit without blocking receipts, and releases it after failure (Stop: %s)",async(stop)=>{
+  const bot=await setup(),firstId=crypto.randomUUID();
+  let reject!: (error:Error)=>void,starts=0;
+  const receipt=new Promise<never>((_resolve,fail)=>{reject=fail;});
+  await runInDurableObject(stubFor(bot),(instance,state)=>{
+    const target=instance as unknown as Internals,original=target.runtime;
+    target.runtime={...original,
+      pending:async()=>Array.from({length:15},(_,index)=>({operationId:`occupied-${index}`,status:"queued" as const})),
+      submit:(text,input)=>{starts++;return input.operationId===firstId?receipt:original.submit(text,input);},
+    };
+    state.waitUntil(target.createRun({text:"Unconfirmed last slot",operationId:firstId}));
+  });
+  try {
+    for(let i=0;i<100 && starts===0;i++) await new Promise(resolve=>setTimeout(resolve,5));
+    expect(starts).toBe(1);
+    const duplicate=await send(bot,"Unconfirmed last slot",firstId);
+    const second=await send(bot,"Waiting behind the reservation");
+    await runInDurableObject(stubFor(bot),async(instance,state)=>{
+      await (instance as unknown as Internals).admit(second.operationId);
+      expect(state.storage.sql.exec<{admitted:number}>("SELECT admitted FROM submissions ORDER BY rowid").toArray().map(row=>row.admitted)).toEqual([0,0]);
+      expect(state.storage.sql.exec("SELECT * FROM admission_retries").toArray()).toHaveLength(0);
+    });
+    expect(starts).toBe(1);
+    if(stop) expect((await api(`/v1/bots/${bot.id}/runs/${duplicate.id}/cancel`,{})).status).toBe(200);
+    reject(new Error("Original submit receipt failed"));
+    await new Promise(resolve=>setTimeout(resolve,20));
+    await runInDurableObject(stubFor(bot),instance=>(instance as unknown as Internals).admit(second.operationId));
+    await until(bot,second,"completed");
+    expect(starts).toBe(2);
+    expect((await current(bot,duplicate)).status).toBe(stop?"cancelled":"queued");
+    const transcript=await messages(bot);
+    expect(transcript.filter(message=>message.runId===duplicate.id && message.role==="user")).toHaveLength(1);
+    expect(transcript.filter(message=>message.runId===duplicate.id && message.role==="assistant")).toHaveLength(0);
+    expect(transcript.filter(message=>message.runId===second.id && message.role==="assistant")).toHaveLength(1);
+  } finally {reject(new Error("test cleanup"));}
+});
+
+it("does not count sixteen native approval pauses with pending submit receipts as inbox reservations",async()=>{
+  const bot=await setup(),firstId=crypto.randomUUID();
+  let release!:()=>void;
+  const gate=new Promise<void>(resolve=>{release=resolve;});
+  await runInDurableObject(stubFor(bot),(instance,state)=>{
+    const target=instance as unknown as Internals,original=target.runtime;
+    target.runtime={...original,submit:async(text,input)=>{
+      const receipt=await original.submit(text,input);
+      if(text==="fixture:approval") {
+        // This deterministic adapter starts execution only when wait is called;
+        // model Pi placing/pausing the input before its submit receipt arrives.
+        await original.wait(input.operationId);
+        await gate;
+      }
+      return receipt;
+    }};
+    state.waitUntil(target.createRun({text:"fixture:approval",operationId:firstId}));
+  });
+  try {
+    const waiting:Run[]=[];
+    let first:Run|undefined;
+    for(let i=0;i<100 && !first;i++) {
+      first=await runInDurableObject(stubFor(bot),(_instance,state)=>{
+        const row=state.storage.sql.exec<{data:string}>("SELECT data FROM runs WHERE operation_id=?",firstId).toArray()[0];
+        return row?JSON.parse(row.data) as Run:undefined;
+      });
+      if(!first) await new Promise(resolve=>setTimeout(resolve,5));
+    }
+    expect(first).toBeDefined();
+    await until(bot,first!,"waiting_approval");waiting.push(first!);
+    for(let i=1;i<16;i++) {const run=await send(bot,"fixture:approval");await until(bot,run,"waiting_approval");waiting.push(run);}
+    const fresh=await send(bot,"New input while old submit receipts remain pending");
+    await until(bot,fresh,"completed");
+    for(const old of waiting) expect((await current(bot,old)).status).toBe("waiting_approval");
+    const transcript=await messages(bot);
+    expect(transcript.filter(message=>message.runId===fresh.id && message.role==="user")).toHaveLength(1);
+    expect(transcript.filter(message=>message.runId===fresh.id && message.role==="assistant")).toHaveLength(1);
+  } finally {release();}
+});
+
 it.each(["configuration","legacy"])("bounds explicit reopening of historical %s admission failures without duplicating messages",async(kind)=>{
   const bot=await setup(),runs:Run[]=[];
   await runInDurableObject(stubFor(bot),async(instance,state)=>{

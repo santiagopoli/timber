@@ -48,6 +48,7 @@ export class BotDO extends DurableObject<Env> {
   private computer:ReturnType<typeof createCloudComputerProvider>;
   private admitting=new Map<string,Promise<void>>();
   private admissionQueue:Promise<void>=Promise.resolve();
+  private admissionReservations=new Set<string>();
   private capacityWakes=new Map<string,Promise<void>>();
   private mentioning=new Map<string,Promise<void>>();
   private observing=new Set<string>();
@@ -772,7 +773,7 @@ export class BotDO extends DurableObject<Env> {
   private async deliverReceipt(operationId:string,runId:string):Promise<void> {
     const submission=this.ctx.storage.sql.exec<Submission>("SELECT * FROM submissions WHERE operation_id=?",operationId).toArray()[0];
     // The durable receipt must not wait behind an older admission RPC. Persist
-    // a wake before acknowledging, then let the same serialized lane deliver it.
+    // a wake before acknowledging, then let the capacity lane kick off delivery.
     // Never turn an already-admitted native queued input into a fresh delivery.
     if(this.admitting.size && submission && !submission.admitted && this.getRun(runId).status==="queued" && this.canAdmit(operationId,runId)) {
       await this.waitForCapacity(operationId,runId);
@@ -809,10 +810,9 @@ export class BotDO extends DurableObject<Env> {
     if(nativeOperationId.startsWith("mention:")) return this.dispatchMention(nativeOperationId);
     const existing=this.admitting.get(nativeOperationId);
     if(existing) return existing;
-    // Check and submit under one host admission lane. Different HTTP requests
-    // and Lifecycle wakes must not all observe the same last inbox slot.
-    const operation=this.admissionQueue.then(()=>this.admitOnce(nativeOperationId)).finally(()=>this.admitting.delete(nativeOperationId));
-    this.admissionQueue=operation.catch(()=>{});
+    // Deduplicate the entire delivery by exact input ID, but do not serialize
+    // its receipt: submit can remain pending after Pi has placed/paused an input.
+    const operation=this.admitOnce(nativeOperationId).finally(()=>this.admitting.delete(nativeOperationId));
     this.admitting.set(nativeOperationId,operation);
     return operation;
   }
@@ -833,30 +833,51 @@ export class BotDO extends DurableObject<Env> {
     if(!submission.admitted && retry && (retry.attempts>=maxAdmissionAttempts || retry.next_at>Date.now())) return;
     try {
       if(!submission.admitted) {
-        if(!submission.subagent_id) {
-          const pending=await this.runtime.pending();
-          // Running receipts are placed inputs, NOT concurrent generations.
-          // A lost receipt already present in Pi must bypass the capacity gate
-          // and be deduplicated/reconciled under its original operation ID.
-          if(pending.filter(input=>input.status==="queued").length>=maxNativeQueuedInputs
-            && !pending.some(input=>input.operationId===nativeOperationId)) {
-            const known=await this.runtime.operation(nativeOperationId);
-            if(known.status==="missing") {
-              if(!this.canAdmit(nativeOperationId,run.id)) return;
-              // Capacity waits are durable, but do not exhaust delivery retries.
-              await this.waitForCapacity(nativeOperationId,run.id);
-              return;
-            }
-          }
-        }
-        if(!this.canAdmit(nativeOperationId,run.id)) return;
-        if(submission.subagent_id) await this.runtime.sendSubagent(submission.subagent_id,submission.text,{operationId:nativeOperationId});
-        else {
+        if(submission.subagent_id) {
+          if(!this.canAdmit(nativeOperationId,run.id)) return;
+          await this.runtime.sendSubagent(submission.subagent_id,submission.text,{operationId:nativeOperationId});
+        } else {
           const message=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM messages WHERE source_key=?",`input:${nativeOperationId}`).toArray()[0];
           const attachments=message?(JSON.parse(message.data) as Message).attachments:undefined;
           const images=await Promise.all((attachments??[]).map(image=>this.readImage(image.artifactId)));
-          if(!this.canAdmit(nativeOperationId,run.id)) return;
-          await this.runtime.submit(submission.text,{...(run.model?{modelSettings:{model:run.model,reasoningEffort:run.reasoningEffort,fast:run.fast}}:{}),operationId:nativeOperationId,whenBusy:"steer",...(images.length?{images}:{})});
+          // Only capacity reconciliation, reservation and submit kickoff share
+          // the lane. Never await an indefinitely pending submit receipt in it.
+          const kickoff=this.admissionQueue.then(async()=>{
+            if(!this.canAdmit(nativeOperationId,run.id)) return;
+            const pending=await this.runtime.pending();
+            const states=new Map(pending.map(input=>[input.operationId,input.status]));
+            const queued=new Set(pending.filter(input=>input.status==="queued").map(input=>input.operationId));
+            // Pending submit RPCs may not yet be visible to Pi. Count their exact
+            // IDs once, not again when the native inbox already contains them.
+            // A placed or paused native input is no longer an inbox slot even
+            // if its transport receipt is still pending. After DO eviction Pi's
+            // durable operation state replaces these process-local reservations.
+            for(const reserved of this.admissionReservations) {
+              const status=states.get(reserved)??(await this.runtime.operation(reserved)).status;
+              if(status==="missing" || status==="queued") queued.add(reserved);
+            }
+            if(queued.size>=maxNativeQueuedInputs && !states.has(nativeOperationId)) {
+              const known=await this.runtime.operation(nativeOperationId);
+              if(known.status==="missing") return;
+            }
+            if(!this.canAdmit(nativeOperationId,run.id)) return;
+            this.admissionReservations.add(nativeOperationId);
+            const receipt=(async()=>{
+              try {return await this.runtime.submit(submission.text,{...(run.model?{modelSettings:{model:run.model,reasoningEffort:run.reasoningEffort,fast:run.fast}}:{}),operationId:nativeOperationId,whenBusy:"steer",...(images.length?{images}:{})});}
+              finally {this.admissionReservations.delete(nativeOperationId);}
+            })();
+            // Attach rejection handling before returning the wrapper. The outer
+            // admission consumes the original result, outside the short lane.
+            void receipt.catch(()=>{});
+            return {receipt};
+          });
+          this.admissionQueue=kickoff.then(()=>{},()=>{});
+          const started=await kickoff;
+          if(!started) {
+            if(this.canAdmit(nativeOperationId,run.id)) await this.waitForCapacity(nativeOperationId,run.id);
+            return;
+          }
+          await started.receipt;
         }
         if(this.deleted) return;
         const configurationFailure=this.ctx.storage.sql.exec("SELECT operation_id FROM configuration_admissions WHERE operation_id=?",nativeOperationId).toArray().length>0;
@@ -943,7 +964,10 @@ export class BotDO extends DurableObject<Env> {
       // Status-indexed accepted work only, not the full retained history.
       // admit() observes s.admitted=1 inputs without submitting them again.
       const rows=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs WHERE json_extract(data,'$.status') IN ('queued','running') ORDER BY rowid").toArray();
-      for(const row of rows) await this.admit(row.native_operation_id);
+      // One slow delivery must not starve unrelated recovered outbox inputs or
+      // approval finalizers. Exact-ID deduplication and the capacity lane still
+      // protect concurrent HTTP, recovery and Lifecycle admission.
+      for(const row of rows) this.ctx.waitUntil(this.admit(row.native_operation_id));
       // The computer provider deduplicates these operation IDs, including interrupted operations.
       const approvals=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM approvals").toArray().map(row=>JSON.parse(row.data) as Approval);
       for(const approval of approvals) if(approval.status==="executing") await this.finishApproval(approval);
