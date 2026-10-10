@@ -578,20 +578,22 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
       const latest=isSelected?latestConversationMessage:undefined;
       const activeAgents=isSelected&&!chatLoading?subagents.filter(agent=>!terminal.has(agent.status)).length:saved?.activeAgents||0;
       const latestText=latest?.text?.trim()||(latest?.attachments?.length?(latest.attachments.length===1?'Image':`${latest.attachments.length} images`):'');
-      return {bot,activity,activeAgents,preview:(latestText||saved?.lastMessage?.text||bot.instructions||'Start a conversation').trim().replace(/\s+/g,' ').slice(0,180)};
+      return {bot,activity,activeAgents,modelName:modelCatalog.models.find(model=>model.id===bot.model)?.name||bot.model,preview:(latestText||saved?.lastMessage?.text||bot.instructions||'Start a conversation').trim().replace(/\s+/g,' ').slice(0,180)};
     });
     const renderKey=JSON.stringify([bots.length,selected?.id,rows,[...deletionPending.values()]]);if(renderKey===botRenderKey)return;botRenderKey=renderKey;
     $('bot-count').textContent = String(bots.length); $('bot-list').replaceChildren();
     if (!matching.length) $('bot-list').append(emptyState(bots.length ? 'No matching bots' : 'No bots yet', bots.length ? 'Try another name or keyword.' : 'Create your first bot.'));
-    for (const {bot,activity,activeAgents,preview} of rows) {
+    for (const {bot,activity,activeAgents,modelName,preview} of rows) {
       const button = el('button', `bot-item${bot.id === selected?.id ? ' selected' : ''}`); button.type = 'button'; button.dataset.botId = bot.id;
-      const avatar=el('span','avatar timber-model-avatar',bot.name.slice(0,1).toUpperCase());avatar.dataset.agentColor=agentColor(bot.id);decorateModelAvatar(avatar,bot);
+      const avatar=el('span','avatar timber-model-avatar',bot.name.slice(0,1).toUpperCase());avatar.dataset.agentColor=agentColor(bot.id);decorateModelAvatar(avatar,bot,false);
       button.title=`${bot.name} · ${modelDescription(bot)}`;
       button.setAttribute('aria-pressed', String(bot.id === selected?.id)); button.append(avatar);
       const info=el('span','bot-info'),name=el('span','bot-name-line');name.append(el('span','bot-name',bot.name));
-      if(activity && activity!=='ready') {const status=el('span','bot-activity-status',statusLabel(activity));status.dataset.status=activity;name.append(status);}
-      else if(activeAgents){const status=el('span','bot-activity-status',`${activeAgents} ${activeAgents===1?'agent':'agents'} active`);status.dataset.status='running';name.append(status);}
-      const snippet=el('small','bot-preview',preview);snippet.title=preview;info.append(name,snippet);
+      if(modelName){const badge=el('span','bot-model-badge',modelName);badge.dataset.model=bot.model;badge.title=modelDescription(bot);name.append(badge);}
+      const detail=el('span','bot-preview-line'),snippet=el('small','bot-preview',preview);snippet.title=preview;detail.append(snippet);
+      if(activity && activity!=='ready') {const status=el('span','bot-activity-status',statusLabel(activity));status.dataset.status=activity;detail.append(status);}
+      else if(activeAgents){const status=el('span','bot-activity-status',`${activeAgents} ${activeAgents===1?'agent':'agents'} active`);status.dataset.status='running';detail.append(status);}
+      info.append(name,detail);
       button.append(info); button.addEventListener('click', () => guarded(() => selectBot(bot))); $('bot-list').append(button);
     }
     renderGlobalAvatars();
@@ -622,10 +624,10 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   window.addEventListener('focus',()=>void refreshBotSummaries());
   async function loadBots() { const session = authSession, result = await request('/v1/bots'); if (session !== authSession) return; const prior=new Map(bots.map(bot=>[bot.id,bot]));bots = result.bots.filter(bot => !removedBots.has(bot.id)).map(bot=>prior.get(bot.id)?.updatedAt>bot.updatedAt?prior.get(bot.id):bot); const refreshed=selected&&bots.find(bot=>bot.id===selected.id);if(refreshed&&refreshed.updatedAt>=selected.updatedAt&&!modelSettingsWork.has(selected.id)){selected=refreshed;updateBotHeader();}renderBots(); renderMessages();renderAgents();void refreshBotSummaries(); }
   const modelDescription=bot=>`${bot.model||'Model not recorded'}${bot.reasoningEffort?` · ${bot.reasoningEffort} reasoning`:''}${bot.fast?' · Fast mode':''}`;
-  function decorateModelAvatar(avatar,bot){
+  function decorateModelAvatar(avatar,bot,showBadge=true){
     avatar.classList.add('timber-model-avatar');avatar.title=modelDescription(bot);avatar.dataset.model=bot.model||'';
     avatar.querySelector('.timber-model-badge')?.remove();
-    if(bot.model){const badge=el('span','timber-model-badge',modelBadgeLabel(bot.model));badge.dataset.model=bot.model;badge.setAttribute('aria-hidden','true');avatar.append(badge);}
+    if(showBadge&&bot.model){const badge=el('span','timber-model-badge',modelBadgeLabel(bot.model));badge.dataset.model=bot.model;badge.setAttribute('aria-hidden','true');avatar.append(badge);}
   }
   function updateBotHeader() { $('selected-name').textContent = selected.name; $('selected-avatar').textContent = selected.name.slice(0, 1).toUpperCase();$('selected-avatar').dataset.agentColor=agentColor(selected.id);decorateModelAvatar($('selected-avatar'),selected);decorateGlobalAvatar($('selected-avatar'),selected.id); $('selected-model').textContent = `${selected.runtime} · ${modelDescription(selected)}`; $('selected-computer-mode').textContent = selected.computerApprovalMode === 'automatic' ? 'Computer · Use authorized' : 'Computer · Ask for each action'; }
   function modelSettingsState(){const error=modelCatalogError||modelCatalog.error;return {choices:(error?[]:modelCatalog.models).map(item=>({id:item.id,label:item.name,available:modelCatalog.connected,reasoningEfforts:item.reasoningEfforts||[],defaultReasoningEffort:item.defaultReasoningEffort,supportsFast:item.supportsFast===true})),loading:modelCatalogLoading,error,message:!modelCatalogLoading&&!modelCatalog.connected&&!error?'Connect ChatGPT in Settings to choose a model.':undefined};}
@@ -634,7 +636,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     const session=authSession,sequence=++modelCatalogRequest;modelCatalogLoading=true;modelCatalogError='';renderMessages();
     try{const result=await request('/v1/models');if(session!==authSession||sequence!==modelCatalogRequest)return;if(!Array.isArray(result.models))throw new Error('The available models could not be loaded.');modelCatalog=result;}
     catch(error){if(session!==authSession||sequence!==modelCatalogRequest)return;modelCatalogError=errorText(error);}
-    finally{if(session===authSession&&sequence===modelCatalogRequest){modelCatalogLoading=false;refreshModelForms();renderMessages();}}
+    finally{if(session===authSession&&sequence===modelCatalogRequest){modelCatalogLoading=false;refreshModelForms();renderBots();renderMessages();}}
   }
   async function updateModelSettings(botId,settings){
     if(!authenticated||selected?.id!==botId||modelSettingsWork.has(botId)||sendBusy.has(botId))throw new Error('Wait for the current request to finish.');

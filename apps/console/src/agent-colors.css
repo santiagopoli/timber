@@ -9,6 +9,9 @@
 .bot-info small.bot-preview{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
 .bot-name-line{display:flex;align-items:center;gap:7px;min-width:0}
 .bot-name-line .bot-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.bot-model-badge{margin-left:auto;flex:0 1 auto;min-width:0;max-width:65%;padding:2px 6px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--muted);font-size:10px;font-weight:400;line-height:1.4;white-space:normal;overflow-wrap:anywhere;text-align:right}
+.bot-preview-line{display:flex;align-items:baseline;gap:8px;min-width:0}
+.bot-preview-line .bot-preview{min-width:0;flex:1}
 .bot-activity-status{font-size:9px;color:var(--muted);margin-left:auto;flex:none;text-transform:none}
 .bot-activity-status[data-status=running],.bot-activity-status[data-status=queued]{color:var(--success)}
 .bot-activity-status[data-status=waiting_approval],.bot-activity-status[data-status=waiting_connection]{color:var(--ink)}
