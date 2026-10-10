@@ -1,5 +1,5 @@
 import {env,exports} from "cloudflare:workers";
-import {evictDurableObject,runDurableObjectAlarm,runInDurableObject} from "cloudflare:test";
+import {abortAllDurableObjects,evictDurableObject,runDurableObjectAlarm,runInDurableObject} from "cloudflare:test";
 import {describe,expect,it} from "vitest";
 import type {Bot,Task,Run} from "@botspace/contracts";
 import type {Env} from "../apps/api/src/env";
@@ -108,7 +108,9 @@ describe("reviewed task blockers",()=>{
   try {expect((await api(`/v1/bots/${owner.id}/computer/actions`,{operationId:op,action:{type:"exec",command:"Pinned poll"}})).data.result.status).toBe("running");} finally {delete computerFixtureControl.execSession;}
   const poll={operationId:crypto.randomUUID(),action:{type:"execPoll",processId:op}},held=await slot(owner);
   const pin=await registry().fetch(`https://workspace/tasks/bot-slot/${owner.id}/direct-dispatch`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({lease:{key:op,token:held!.token,generation:held!.generation},...poll})});expect(pin.status).toBe(200);await pin.arrayBuffer();
-  await evictDurableObject(root(owner));await evictDurableObject(registry());await reconcile();
+  // A crash must not wait for unrelated scheduler requests to drain.
+  // Computer session/effects and the exact dispatch pin all survive in SQL.
+  await abortAllDurableObjects();await reconcile();
   expect(await effects(owner)).toContain(poll.operationId);expect(await slot(owner)).toBeUndefined();
   await runInDurableObject(registry(),(_,state)=>expect(state.storage.sql.exec("SELECT 1 FROM computer_admissions WHERE bot_id=?",owner.id).toArray()).toHaveLength(0));
  });
