@@ -1,4 +1,5 @@
 import type { AvatarJob, AvatarSelection, AvatarSettings, AvatarTheme, Bot, BotAvatar } from '@botspace/contracts';
+import { avatarThemePrompt, builtinAvatarThemes } from '@botspace/contracts';
 import type { Env } from './env';
 import { ApiError, json } from './errors';
 import { body, operationId, string, UUID } from './validation';
@@ -42,14 +43,14 @@ export class AvatarCoordinator {
     ctx.storage.sql.exec('CREATE INDEX IF NOT EXISTS avatar_gc_pending ON avatar_gc(next_at)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS avatar_candidates (key TEXT PRIMARY KEY,bot_id TEXT NOT NULL,job_id TEXT NOT NULL)');
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS avatar_jobs_pending ON avatar_jobs(json_extract(data,'$.status'),next_at)");
-    // Only initialize once. No inference is implicit in startup or theme selection.
-    if (!ctx.storage.sql.exec('SELECT id FROM avatar_themes LIMIT 1').toArray().length) {
-      const theme: AvatarTheme = { id: crypto.randomUUID(), name: 'Paper sculpture', kind: 'vector', model: env.BOTSPACE_DEFAULT_MODEL?.startsWith('@cf/') ? 'gpt-6.1-sol' : env.BOTSPACE_DEFAULT_MODEL ?? 'gpt-6.1-sol', prompt: 'A minimal, geometric paper-sculpture character. Warm ivory, teal, amber and charcoal palette, clear angular shapes, consistent lighting and visual weight. Distinct silhouette reflecting each bot’s purpose, no text or letters. Transparent background, no circle, circular frame, border, badge or container.', createdAt: now() };
-      ctx.storage.transactionSync(() => {
-        ctx.storage.sql.exec('INSERT INTO avatar_themes(id,data) VALUES(?,?)', theme.id, JSON.stringify(theme));
-        ctx.storage.sql.exec('INSERT INTO avatar_selection(singleton,data) VALUES(1,?)', JSON.stringify({ themeId: theme.id, revision: 1 }));
-      });
-    }
+    // Add the collection to both new and existing workspaces. Stable identities
+    // preserve custom/legacy themes, selection, revision and already-paid jobs.
+    // Neither startup nor selection schedules inference.
+    const presets = builtinAvatarThemes(env.BOTSPACE_DEFAULT_MODEL?.startsWith('@cf/') ? 'gpt-6.1-sol' : env.BOTSPACE_DEFAULT_MODEL ?? 'gpt-6.1-sol');
+    ctx.storage.transactionSync(() => {
+      for (const theme of presets) ctx.storage.sql.exec('INSERT OR IGNORE INTO avatar_themes(id,data) VALUES(?,?)', theme.id, JSON.stringify(theme));
+      ctx.storage.sql.exec('INSERT OR IGNORE INTO avatar_selection(singleton,data) VALUES(1,?)', JSON.stringify({ themeId: presets[0].id, revision: 1 }));
+    });
     // Restart after provider dispatch: never silently run a possibly paid call again.
     for (const row of ctx.storage.sql.exec<{id:string;data:string;output:string|null}>("SELECT id,data,output FROM avatar_jobs WHERE json_extract(data,'$.status')='running'").toArray()) {
       if (!row.output) {
@@ -87,6 +88,15 @@ export class AvatarCoordinator {
     const row = this.ctx.storage.sql.exec<{data:string}>('SELECT data FROM avatar_themes WHERE id=?', themeId).toArray()[0];
     if (!row) throw new ApiError(404, 'avatar_theme_not_found', 'Avatar theme not found.');
     return JSON.parse(row.data);
+  }
+  private async validateReasoning(kind:AvatarTheme['kind'], modelId:string, effort:string): Promise<void> {
+    if(kind!=='vector')throw new ApiError(400,'invalid_request','Reasoning is only available for SVG themes.');
+    const catalog=await avatarModelCatalog(this.env);
+    if(catalog.error)throw new ApiError(503,'avatar_model_catalog_unavailable',catalog.error);
+    if(!catalog.connected)throw new ApiError(409,'chatgpt_not_connected','Connect OpenAI before choosing avatar reasoning.');
+    const model=catalog.vectorModels.find(model=>model.id===modelId);
+    if(!model)throw new ApiError(422,'avatar_model_unavailable','The theme’s text model is not available to the connected OpenAI account.');
+    if(!model.reasoningEfforts.includes(effort))throw new ApiError(422,'avatar_reasoning_unavailable','This reasoning level is not supported by the theme’s model. Refresh the model catalogue.');
   }
   private job(jobId:string): StoredJob | undefined {
     return this.ctx.storage.sql.exec<StoredJob>('SELECT data,theme,bot,output,artifact_id,attempts,next_at FROM avatar_jobs WHERE id=?', jobId).toArray()[0];
@@ -130,19 +140,54 @@ export class AvatarCoordinator {
     if (path === '/avatar-models' && request.method === 'GET') return json(await avatarModelCatalog(this.env));
     if (path === '/avatar-settings' && request.method === 'GET') return json(this.settings());
     if (path === '/avatar-themes' && request.method === 'POST') {
-      const input=await body(request); keys(input,['name','kind','prompt','model','operationId']);
-      const operation=operationId(input.operationId), name=string(input.name,'name',80).trim(), prompt=string(input.prompt,'prompt',8000).trim(), model=string(input.model,'model',180).trim();
-      if (!name || !prompt || !model || !['vector','image'].includes(input.kind as string)) throw new ApiError(400,'invalid_request','A name, prompt, model and vector/image kind are required.');
+      const input=await body(request); keys(input,['name','kind','prompt','style','subject','model','reasoningEffort','operationId']);
+      const operation=operationId(input.operationId), name=string(input.name,'name',80).trim(), model=string(input.model,'model',180).trim();
+      if (input.style !== undefined && input.prompt !== undefined || input.subject !== undefined && input.style === undefined) throw new ApiError(400,'invalid_request','Use style with an optional subject, or a legacy prompt.');
+      const style=input.style===undefined?undefined:string(input.style,'style',4000).trim();
+      const subject=input.subject===undefined?undefined:string(input.subject,'subject',160,0).trim()||undefined;
+      const prompt=style===undefined?string(input.prompt,'prompt',8000).trim():avatarThemePrompt(style,subject);
+      if (!name || !prompt || style==='' || !model || !['vector','image'].includes(input.kind as string)) throw new ApiError(400,'invalid_request','A name, style, model and vector/image kind are required.');
       if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(model)) throw new ApiError(400,'invalid_request','Avatar models must be identifiers from the existing OpenAI connection.');
-      const fingerprint=JSON.stringify({type:'theme',name,kind:input.kind,prompt,model});
+      const reasoningEffort=input.reasoningEffort===undefined?undefined:string(input.reasoningEffort,'reasoningEffort',128).trim();
+      if(reasoningEffort==='')throw new ApiError(400,'invalid_request','Omit reasoningEffort to use the model default.');
+      const fingerprint=JSON.stringify({type:'theme',name,kind:input.kind,prompt,model,...(style===undefined?{}:{style,subject}),...(reasoningEffort===undefined?{}:{reasoningEffort})});
       const replay=this.receipt(operation,fingerprint) as {themeId?:string;theme?:AvatarTheme}|undefined;
       if(replay) return json({theme:replay.themeId?this.theme(replay.themeId):replay.theme},201);
-      const theme:AvatarTheme={id:crypto.randomUUID(),name,kind:input.kind as AvatarTheme['kind'],prompt,model,createdAt:now()};
+      if(reasoningEffort!==undefined){
+        await this.validateReasoning(input.kind as AvatarTheme['kind'],model,reasoningEffort);
+        const concurrent=this.receipt(operation,fingerprint) as {themeId:string}|undefined;
+        if(concurrent)return json({theme:this.theme(concurrent.themeId)},201);
+      }
+      const theme:AvatarTheme={id:crypto.randomUUID(),name,kind:input.kind as AvatarTheme['kind'],prompt,model,createdAt:now(),...(style===undefined?{}:{style,subject,framing:'circle' as const}),...(reasoningEffort===undefined?{}:{reasoningEffort})};
       this.ctx.storage.transactionSync(()=>{
         this.ctx.storage.sql.exec('INSERT INTO avatar_themes(id,data) VALUES(?,?)',theme.id,JSON.stringify(theme));
         this.saveReceipt(operation,fingerprint,{themeId:theme.id});
       });
       return json({theme},201);
+    }
+    if (path === '/avatar-themes' && request.method === 'PATCH') {
+      const input=await body(request);keys(input,['themeId','reasoningEffort','expectedReasoningEffort','operationId']);
+      const themeId=id(input.themeId,'themeId'),operation=operationId(input.operationId);
+      const effort=(value:unknown)=>value===null?null:string(value,'reasoningEffort',128).trim();
+      const reasoningEffort=effort(input.reasoningEffort),expectedReasoningEffort=effort(input.expectedReasoningEffort);
+      if(reasoningEffort===''||expectedReasoningEffort==='')throw new ApiError(400,'invalid_request','Use null for the model default.');
+      const fingerprint=JSON.stringify({type:'theme-reasoning',themeId,reasoningEffort,expectedReasoningEffort});
+      if(this.receipt(operation,fingerprint))return json({theme:this.theme(themeId)});
+      const selected=this.theme(themeId);
+      if(selected.kind!=='vector')throw new ApiError(400,'invalid_request','Reasoning is only available for SVG themes.');
+      if((selected.reasoningEffort??null)!==expectedReasoningEffort)throw new ApiError(409,'avatar_theme_changed','The theme reasoning changed. Refresh before saving.');
+      if(reasoningEffort!==null)await this.validateReasoning(selected.kind,selected.model,reasoningEffort);
+      // Discovery can yield to another settings request. Recheck the receipt
+      // and preference before writing; retries never overwrite a later edit.
+      if(this.receipt(operation,fingerprint))return json({theme:this.theme(themeId)});
+      const theme=this.theme(themeId);
+      if((theme.reasoningEffort??null)!==expectedReasoningEffort)throw new ApiError(409,'avatar_theme_changed','The theme reasoning changed. Refresh before saving.');
+      if(reasoningEffort===null)delete theme.reasoningEffort;else theme.reasoningEffort=reasoningEffort;
+      this.ctx.storage.transactionSync(()=>{
+        this.ctx.storage.sql.exec('UPDATE avatar_themes SET data=? WHERE id=?',JSON.stringify(theme),themeId);
+        this.saveReceipt(operation,fingerprint,{themeId});
+      });
+      return json({theme});
     }
     if (path === '/avatar-settings' && request.method === 'PUT') {
       const input=await body(request);keys(input,['themeId','operationId']);
@@ -207,6 +252,7 @@ export class AvatarCoordinator {
         if(catalog.error)throw new ApiError(503,'avatar_model_catalog_unavailable',catalog.error);
         if(!catalog.connected)throw new ApiError(409,'chatgpt_not_connected','Connect OpenAI before generating avatars.');
         if(!catalog.vectorModels.some(model=>model.id===theme.model))throw new ApiError(422,'avatar_model_unavailable','The theme’s text model is not available to the connected OpenAI account. Create a theme with an available model.');
+        if(theme.reasoningEffort!==undefined&&!catalog.vectorModels.find(model=>model.id===theme.model)!.reasoningEfforts.includes(theme.reasoningEffort))throw new ApiError(422,'avatar_reasoning_unavailable','The theme’s reasoning level is no longer supported. Update the theme reasoning before generating.');
       }
       // Recheck bot membership after discovery as well.
       const admittedRows=this.ctx.storage.sql.exec<{data:string}>(botId?'SELECT data FROM bots WHERE id=?':'SELECT data FROM bots ORDER BY rowid',...(botId?[botId]:[])).toArray();
@@ -315,7 +361,7 @@ export class AvatarCoordinator {
         // Durable running marker precedes dispatch. Recovery never reissues it.
         const controller=new AbortController();this.generating={botId:job.botId,controller};
         try {
-          const input={model:theme.model,prompt:theme.prompt,botName:bot.name,botInstructions:bot.instructions};
+          const input={model:theme.model,reasoningEffort:theme.reasoningEffort,prompt:theme.prompt,botName:bot.name,botInstructions:bot.instructions,transparentBackground:theme.framing==='circle'};
           output=await validate(await (theme.kind==='image'?generateImageAvatar(this.env,input,controller.signal):generateVectorAvatar(this.env,input,controller.signal)));
         }
         finally {this.generating=undefined;}

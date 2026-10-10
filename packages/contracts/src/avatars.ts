@@ -6,8 +6,24 @@ export interface AvatarTheme {
   name: string;
   kind: 'vector' | 'image';
   prompt: string;
+  /** Structured design data. Older custom themes may only have a prompt. */
+  style?: string;
+  subject?: string;
+  /** Transparent head artwork, displayed on a solid circle by the client. */
+  framing?: 'circle';
+  /** Stable built-in collection key; never accepted from theme creation input. */
+  preset?: string;
   model: string;
+  /** SVG generation preference. Omitted uses the model's advertised default. */
+  reasoningEffort?: string;
   createdAt: string;
+}
+/** Changes future SVG generations only; admitted jobs retain their snapshot. */
+export interface AvatarThemeReasoningRequest {
+  themeId: string;
+  reasoningEffort: string | null;
+  expectedReasoningEffort: string | null;
+  operationId: string;
 }
 export interface AvatarSelection { themeId: string; revision: number; }
 export interface BotAvatar {

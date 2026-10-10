@@ -2,6 +2,7 @@ import { env, exports } from 'cloudflare:workers';
 import { runInDurableObject } from 'cloudflare:test';
 import { describe, expect, it, vi } from 'vitest';
 import type { AvatarJob, AvatarSettings, AvatarTheme, Bot, ModelOption } from '@botspace/contracts';
+import { AVATAR_THEME_PRESETS, builtinAvatarThemes } from '@botspace/contracts';
 import type { Env } from '../apps/api/src/env';
 import { AvatarCoordinator } from '../apps/api/src/avatars';
 import { errorResponse } from '../apps/api/src/errors';
@@ -98,6 +99,7 @@ describe('avatar HTTP boundary', () => {
     for (const [path, method, body] of [
       ['/v1/avatar-settings', 'GET', undefined], ['/v1/avatar-settings', 'PUT', { themeId: missing, operationId: 'unauth-select' }],
       ['/v1/avatar-themes', 'POST', { name: 'Test', kind: 'vector', prompt: 'Test', model: MODEL, operationId: 'unauth-theme' }],
+      ['/v1/avatar-themes', 'PATCH', { themeId: missing, reasoningEffort: null, expectedReasoningEffort: null, operationId: 'unauth-reasoning' }],
       ['/v1/avatar-generations', 'POST', { operationId: 'unauth-generate' }], ['/v1/avatar-models', 'GET', undefined],
       [`/v1/bots/${missing}/avatar`, 'GET', undefined],
     ] as const) await expectError(await api(path, method, body, false), 401, 'unauthorized');
@@ -141,6 +143,49 @@ describe('avatar HTTP boundary', () => {
 });
 
 describe('owner-local AvatarCoordinator journals', () => {
+  it('ships five SVG and five image themes without inference and preserves legacy state on upgrade',async()=>{
+    await runInDurableObject(stub(),async(_instance,state)=>{
+      const provider=fakeProvider(),c=coordinator(state,provider);
+      expect(c.settings().themes).toEqual(builtinAvatarThemes());
+      expect(c.settings().themes.filter(theme=>theme.kind==='vector')).toHaveLength(5);
+      expect(c.settings().themes.filter(theme=>theme.kind==='image')).toHaveLength(5);
+      expect(c.settings().jobs).toEqual([]);
+      expect(provider.catalogueCalls()).toBe(0);expect(provider.calls).toHaveLength(0);
+      const legacy=await theme(c,'Existing owner theme'),bot=seed(state);
+      await select(c,legacy.id);await generate(c,bot.id);
+      // Simulate an owner predating the collection, with an existing selection
+      // and queued snapshot. Startup must neither switch it nor replay work.
+      for(const preset of AVATAR_THEME_PRESETS)state.storage.sql.exec('DELETE FROM avatar_themes WHERE id=?',preset.id);
+      const before=c.settings();
+      const snapshot=state.storage.sql.exec('SELECT theme,bot FROM avatar_jobs').toArray();
+      const restored=coordinator(state,provider).settings();
+      expect(restored.themes).toHaveLength(11);
+      expect(restored.themes.find(theme=>theme.id===legacy.id)).toEqual(legacy);
+      expect({...restored,themes:before.themes}).toEqual(before);
+      expect(state.storage.sql.exec('SELECT theme,bot FROM avatar_jobs').toArray()).toEqual(snapshot);
+      expect(coordinator(state,provider).settings()).toEqual(restored);
+      expect(provider.calls).toHaveLength(0);
+    });
+  });
+  it('persists style and optional subject as head artwork while keeping legacy receipt compatibility',async()=>{
+    await runInDurableObject(stub(),async(_instance,state)=>{
+      const provider=fakeProvider(),c=coordinator(state,provider);
+      const input={operationId:crypto.randomUUID(),name:'Watercolor Animals',kind:'image',model:'gpt-image-2.5-sunburst',style:'Soft watercolor washes',subject:'Animals'};
+      const response=await call(c,'/avatar-themes','POST',input);expect(response.status).toBe(201);
+      const saved=await response.json<{theme:AvatarTheme}>();
+      expect(saved.theme).toMatchObject({style:input.style,subject:'Animals',framing:'circle'});
+      expect(saved.theme.preset).toBeUndefined();
+      expect(saved.theme.prompt).toContain('Head only');expect(saved.theme.prompt).toContain('Subject family: Animals');
+      expect(saved.theme.prompt).toContain('truly transparent background');
+      expect(await (await call(c,'/avatar-themes','POST',input)).json()).toEqual(saved);
+      await expectError(await call(c,'/avatar-themes','POST',{...input,subject:'Robots'}),409,'operation_conflict');
+      const free=await (await call(c,'/avatar-themes','POST',{...input,operationId:crypto.randomUUID(),subject:''})).json<{theme:AvatarTheme}>();
+      expect(free.theme.subject).toBeUndefined();expect(free.theme.prompt).toContain('choose a distinctive character');
+      for(const extra of [{style:' '},{subject:'x'.repeat(161)},{prompt:'Conflicting legacy prompt'},{preset:'clay'}])await expectError(await call(c,'/avatar-themes','POST',{...input,operationId:crypto.randomUUID(),...extra}),400,'invalid_request');
+      const legacy=await theme(c);expect(legacy.style).toBeUndefined();expect(legacy.framing).toBeUndefined();
+      expect(provider.catalogueCalls()).toBe(0);expect(provider.calls).toHaveLength(0);
+    });
+  });
   it('honors supplied vector global preconditions without permitting a per-bot model override',async()=>{
     await runInDurableObject(stub(),async(_instance,state)=>{
       const provider=fakeProvider(),c=coordinator(state,provider),bot=seed(state),confirmed=c.selection()!;
@@ -183,6 +228,69 @@ describe('owner-local AvatarCoordinator journals', () => {
       const recovered = coordinator(state);
       expect(recovered.selection()).toEqual(leftSelection);
       expect(recovered.settings().jobs).toHaveLength(1);
+    });
+  });
+
+  it('persists per-theme reasoning, deduplicates edits and keeps admitted generation settings',async()=>{
+    await runInDurableObject(stub(),async(_instance,state)=>{
+      const provider=fakeProvider(),c=coordinator(state,provider),bot=seed(state),chosen=c.settings().themes[0],selection=c.selection();
+      const edit={themeId:chosen.id,reasoningEffort:'medium',expectedReasoningEffort:null,operationId:crypto.randomUUID()};
+      expect((await call(c,'/avatar-themes','PATCH',edit)).status).toBe(200);
+      expect(provider.calls).toHaveLength(0);expect(c.settings().jobs).toHaveLength(0);expect(c.selection()).toEqual(selection);
+      expect(coordinator(state,provider).settings().themes[0].reasoningEffort).toBe('medium');
+      await generate(c,bot.id);
+      const snapshot=state.storage.sql.exec<{theme:string}>('SELECT theme FROM avatar_jobs').one().theme;
+      expect(JSON.parse(snapshot).reasoningEffort).toBe('medium');
+      await expectError(await call(c,'/avatar-themes','PATCH',{...edit,reasoningEffort:null,operationId:crypto.randomUUID()}),409,'avatar_theme_changed');
+      const clear={...edit,reasoningEffort:null,expectedReasoningEffort:'medium',operationId:crypto.randomUUID()};
+      expect((await call(c,'/avatar-themes','PATCH',clear)).status).toBe(200);
+      expect((await call(c,'/avatar-themes','PATCH',edit)).status).toBe(200);
+      expect(c.settings().themes[0].reasoningEffort).toBeUndefined(); // Replaying an old save cannot undo a later edit.
+      await expectError(await call(c,'/avatar-themes','PATCH',{...edit,reasoningEffort:null}),409,'operation_conflict');
+      expect(c.settings().jobs[0].status).toBe('queued');expect(c.selection()).toEqual(selection);
+      expect(state.storage.sql.exec<{theme:string}>('SELECT theme FROM avatar_jobs').one().theme).toBe(snapshot);
+      await c.alarm();expect(provider.calls[0].reasoning).toEqual({effort:'medium'});
+      await generate(c,bot.id);await c.alarm();expect(provider.calls[1].reasoning).toBeUndefined();
+      expect(c.settings().avatars[0].status).toBe('ready');
+    });
+  });
+
+  it('validates reasoning against the theme model and rejects image or unsupported settings before generation',async()=>{
+    await runInDurableObject(stub(),async(_instance,state)=>{
+      const provider=fakeProvider(),c=coordinator(state,provider);
+      const create={operationId:crypto.randomUUID(),name:'Detailed SVG',kind:'vector',model:MODEL,style:'Paperfold',reasoningEffort:'medium'};
+      const created=await call(c,'/avatar-themes','POST',create);expect(created.status).toBe(201);
+      const saved=await created.json<{theme:AvatarTheme}>();expect(saved.theme.reasoningEffort).toBe('medium');
+      expect(await(await call(c,'/avatar-themes','POST',create)).json()).toEqual(saved);
+      for(const reasoningEffort of ['low','invented'])await expectError(await call(c,'/avatar-themes','POST',{...create,operationId:crypto.randomUUID(),reasoningEffort}),422,'avatar_reasoning_unavailable');
+      for(const reasoningEffort of ['',null,8])await expectError(await call(c,'/avatar-themes','POST',{...create,operationId:crypto.randomUUID(),reasoningEffort}),400,'invalid_request');
+      await expectError(await call(c,'/avatar-themes','POST',{...create,operationId:crypto.randomUUID(),kind:'image'}),400,'invalid_request');
+      const image=c.settings().themes.find(theme=>theme.kind==='image')!;
+      await expectError(await call(c,'/avatar-themes','PATCH',{themeId:image.id,operationId:crypto.randomUUID(),reasoningEffort:null,expectedReasoningEffort:null}),400,'invalid_request');
+      for(const extra of [{reasoningEffort:'high'},{model:'other'},{expectedReasoningEffort:undefined}]){
+        const result=await call(c,'/avatar-themes','PATCH',{themeId:saved.theme.id,operationId:crypto.randomUUID(),reasoningEffort:'medium',expectedReasoningEffort:'medium',...extra});
+        expect(result.status).toBe(extra.reasoningEffort?422:400);
+      }
+      // Account capabilities can change after a theme has been saved.
+      const unavailable=coordinator(state,fakeProvider({availableModels:[{...models[0],reasoningEfforts:['high']}]}));
+      await select(unavailable,saved.theme.id);seed(state);
+      await expectError(await call(unavailable,'/avatar-generations','POST',{operationId:crypto.randomUUID()}),422,'avatar_reasoning_unavailable');
+      expect(c.settings().jobs).toHaveLength(0);expect(provider.calls).toHaveLength(0);
+    });
+  });
+
+  it('rechecks the expected theme reasoning after asynchronous model discovery',async()=>{
+    await runInDurableObject(stub(),async(_instance,state)=>{
+      const c=coordinator(state),themeId=c.settings().themes[0].id;
+      const edit={themeId,reasoningEffort:'medium',expectedReasoningEffort:null,operationId:crypto.randomUUID()};
+      expect((await call(c,'/avatar-themes','PATCH',edit)).status).toBe(200);
+      let release!:()=>void,arrived!:()=>void;
+      const waiting=new Promise<void>(resolve=>{arrived=resolve;}),gate=new Promise<void>(resolve=>{release=resolve;});
+      const delayed=coordinator(state,fakeProvider({catalogue:async()=>{arrived();await gate;return Response.json({connected:true,models});}}));
+      const save=call(delayed,'/avatar-themes','PATCH',{...edit,expectedReasoningEffort:'medium',operationId:crypto.randomUUID()});
+      await waiting;
+      expect((await call(c,'/avatar-themes','PATCH',{...edit,reasoningEffort:null,expectedReasoningEffort:'medium',operationId:crypto.randomUUID()})).status).toBe(200);
+      release();await expectError(await save,409,'avatar_theme_changed');expect(c.settings().themes[0].reasoningEffort).toBeUndefined();
     });
   });
 

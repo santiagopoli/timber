@@ -10,6 +10,8 @@ import './src/agent-colors.css';
 import { createDesktopViewer } from './src/desktop.ts';
 import { mountWorkspaceExplorer } from './src/workspace.tsx';
 import './src/layout.css';
+import { renderAvatarThemeGallery } from './src/avatar-theme-gallery.ts';
+import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
 
 (() => {
   'use strict';
@@ -20,8 +22,9 @@ import './src/layout.css';
   const removedBots = new Set(), deletionPending = new Map();
   const botSummaries = new Map();
   const modelSettingsWork = new Set();
-  let avatarSettings = {themes:[],selection:null,avatars:[],jobs:[]}, avatarModels={connected:false,vectorModels:[],imageModels:[],imageAvailable:false}, avatarLoading=false, avatarPollTimer, avatarRequest=0;
-  const avatarUrls = new Map(), avatarCacheDetails = new Map(), avatarLoads = new Map(), avatarLoadErrors = new Map(), avatarAdmissions = new Map();
+  let avatarSettings = {themes:[],selection:null,avatars:[],jobs:[]}, avatarModels={connected:false,vectorModels:[],imageModels:[],imageAvailable:false}, avatarLoading=false, avatarPollTimer, avatarRequest=0, avatarHistoryPage=0, avatarThemeDraft='', avatarReasoningDraft=null;
+  const avatarUrls = new Map(), avatarCacheDetails = new Map(), avatarFrames = new Map(), avatarLoads = new Map(), avatarLoadErrors = new Map(), avatarAdmissions = new Map();
+
   let modelCatalog={models:[],connected:false,defaultModel:''},modelCatalogLoading=false,modelCatalogError='',modelCatalogRequest=0;
   let botSummaryTimer,botSummaryLoading=false,botSummaryPending=false,botRenderKey='';
   const drafts = new Map(), draftMentions = new Map(), pendingMessages = new Map(), pendingActions = new Map(), computerPending = new Map(), stopping = new Set(), approvalWork = new Map(), approvalFeedback = new Map(), connectionWork = new Map(), appWork = new Map();
@@ -339,11 +342,11 @@ import './src/layout.css';
   const avatarPending = job => ['queued','running'].includes(job.status);
   const avatarOperationId = () => `avatar:${crypto.randomUUID()}`;
   const avatarKey = avatar => `${avatar.botId}:${avatar.themeId}:${avatar.revision}:${avatar.artifactId}`;
-  function revokeAvatarUrls(){for(const url of avatarUrls.values())URL.revokeObjectURL(url);avatarUrls.clear();avatarCacheDetails.clear();avatarLoads.clear();avatarLoadErrors.clear();document.querySelectorAll('.timber-avatar-image').forEach(node=>node.remove());}
+  function revokeAvatarUrls(){for(const url of avatarUrls.values())URL.revokeObjectURL(url);avatarUrls.clear();avatarCacheDetails.clear();avatarFrames.clear();avatarLoads.clear();avatarLoadErrors.clear();document.querySelectorAll('.timber-avatar-image').forEach(node=>node.remove());}
   function cachedAvatar(botId){const entries=[...avatarUrls].filter(([key])=>key.split(':',1)[0]===botId);const desired=selectedAvatar(botId);const key=desired&&avatarKey(desired);return entries.find(([entry])=>entry===key)||entries.at(-1);}
   function pruneAvatarUrls(){
     const liveBots=new Set(bots.map(bot=>bot.id)),used=new Set([...document.querySelectorAll('.timber-avatar-image')].map(node=>node.getAttribute('src')));
-    for(const [key,url] of avatarUrls){const botId=key.split(':',1)[0],cached=cachedAvatar(botId);if(!liveBots.has(botId)||(key!==cached?.[0]&&!used.has(url))){URL.revokeObjectURL(url);avatarUrls.delete(key);avatarCacheDetails.delete(key);}}
+    for(const [key,url] of avatarUrls){const botId=key.split(':',1)[0],cached=cachedAvatar(botId);if(!liveBots.has(botId)||(key!==cached?.[0]&&!used.has(url))){URL.revokeObjectURL(url);avatarUrls.delete(key);avatarCacheDetails.delete(key);avatarFrames.delete(key);}}
     for(const key of avatarLoadErrors.keys()){const botId=key.split(':',1)[0],desired=selectedAvatar(botId);if(!liveBots.has(botId)||!desired||key!==avatarKey(desired))avatarLoadErrors.delete(key);}
   }
   function selectedAvatar(botId){const ready=avatarSettings.avatars.filter(item=>item.botId===botId&&['ready','obsolete'].includes(item.status)).sort((a,b)=>Date.parse(b.updatedAt||'')-Date.parse(a.updatedAt||''));const selection=avatarSettings.selection;return ready.find(item=>item.status==='ready'&&item.themeId===selection?.themeId&&item.revision===selection?.revision)||ready[0]||null;}
@@ -366,19 +369,22 @@ import './src/layout.css';
       if(session!==authSession||selectedAvatar(botId)?.artifactId!==avatar.artifactId)return null;
       const mime=(blob.type||response.headers.get('content-type')||'').split(';')[0].trim().toLowerCase();
       if(!['image/svg+xml','image/png'].includes(mime)||mime!==avatar.mimeType.toLowerCase())throw new Error('Unsupported avatar image.');
-      const thumbnail=await makeAvatarThumbnail(blob,mime);
+      const framed=avatarSettings.themes.some(theme=>theme.id===avatar.themeId&&theme.framing==='circle');
+      const normalized=framed?await normalizeAvatarHead(blob,mime):{blob:await makeAvatarThumbnail(blob,mime)};
+      const thumbnail=normalized.blob;
       if(session!==authSession||selectedAvatar(botId)?.artifactId!==avatar.artifactId)return null;
       const url=URL.createObjectURL(new Blob([thumbnail],{type:mime}));
       try{const image=new Image();image.src=url;await image.decode();if(session!==authSession||selectedAvatar(botId)?.artifactId!==avatar.artifactId){URL.revokeObjectURL(url);return null;}}
       catch(error){URL.revokeObjectURL(url);throw error;}
+      if(normalized.frame)avatarFrames.set(key,normalized.frame);
       avatarUrls.set(key,url);avatarCacheDetails.set(key,avatar);return url;
     })().finally(()=>avatarLoads.delete(key));
     avatarLoads.set(key,promise);return promise;
   }
-  function putAvatarImage(node,avatar,url){const image=document.createElement('img');image.className='timber-avatar-image';image.alt='';image.setAttribute('aria-hidden','true');image.src=url;node.querySelector('.timber-avatar-image')?.remove();node.prepend(image);node.dataset.avatarArtifact=avatar.artifactId;node.classList.toggle('avatar-vector',avatar.mimeType==='image/svg+xml');node.classList.toggle('avatar-image',avatar.mimeType!=='image/svg+xml');}
+  function putAvatarImage(node,avatar,url){const image=document.createElement('img');image.className='timber-avatar-image';image.alt='';image.setAttribute('aria-hidden','true');image.src=url;const frame=avatarFrames.get(avatarKey(avatar));if(frame)applyAvatarFrame(image,frame);node.querySelector('.timber-avatar-image')?.remove();node.prepend(image);node.dataset.avatarArtifact=avatar.artifactId;node.classList.toggle('avatar-vector',avatar.mimeType==='image/svg+xml');node.classList.toggle('avatar-image',avatar.mimeType!=='image/svg+xml');node.classList.toggle('avatar-head',avatarSettings.themes.some(theme=>theme.id===avatar.themeId&&theme.framing==='circle'));}
   function decorateGlobalAvatar(node,botId){
     if(node.dataset.avatarBotId!==botId){node.querySelector('.timber-avatar-image')?.remove();node.dataset.avatarArtifact='';node.dataset.avatarBotId=botId;}
-    const avatar=selectedAvatar(botId);node.classList.remove('avatar-vector','avatar-image','avatar-stale');if(!avatar){node.querySelector('.timber-avatar-image')?.remove();node.dataset.avatarArtifact='';node.dataset.avatarRevision='';return;}
+    const avatar=selectedAvatar(botId);node.classList.remove('avatar-vector','avatar-image','avatar-stale');if(!avatar){node.classList.remove('avatar-head');node.querySelector('.timber-avatar-image')?.remove();node.dataset.avatarArtifact='';node.dataset.avatarRevision='';return;}
     node.dataset.avatarRevision=String(avatar.revision);node.classList.add(avatar.mimeType==='image/svg+xml'?'avatar-vector':'avatar-image');if(avatarIsStale(avatar))node.classList.add('avatar-stale');
     if(node.dataset.avatarArtifact===avatar.artifactId&&node.querySelector('.timber-avatar-image'))return;
     // Recreated Settings/sidebar nodes also retain the last decoded image while
@@ -389,6 +395,26 @@ import './src/layout.css';
   }
   function renderGlobalAvatars(){document.querySelectorAll('.bot-item[data-bot-id]').forEach(button=>decorateGlobalAvatar(button.querySelector('.avatar'),button.dataset.botId));if(selected)decorateGlobalAvatar($('selected-avatar'),selected.id);}
   function avatarModelOption(option){return {id:option.id,label:option.name||option.label||option.id};}
+  function avatarReasoningOptions(select,modelId,value=''){
+    const model=avatarModels.vectorModels.find(model=>model.id===modelId),efforts=model?.reasoningEfforts||[];
+    select.replaceChildren();const fallback=document.createElement('option');fallback.value='';fallback.textContent=model?.defaultReasoningEffort?`Model default · ${model.defaultReasoningEffort}`:'Model default';select.append(fallback);
+    for(const effort of efforts){const option=document.createElement('option');option.value=effort;option.textContent=effort.charAt(0).toUpperCase()+effort.slice(1);select.append(option);}
+    if(value&&!efforts.includes(value)){const option=document.createElement('option');option.value=value;option.textContent=`${value} · unavailable`;option.disabled=true;select.append(option);}
+    select.value=value;select.disabled=avatarLoading;
+  }
+  function renderAvatarCreateReasoning(){
+    const vector=$('avatar-theme-kind').value==='vector',select=$('avatar-theme-reasoning'),modelId=$('avatar-theme-model').value,efforts=avatarModels.vectorModels.find(model=>model.id===modelId)?.reasoningEfforts||[];
+    $('avatar-theme-reasoning-field').hidden=!vector;
+    avatarReasoningOptions(select,modelId,vector&&efforts.includes(select.value)?select.value:'');
+  }
+  function renderAvatarReasoning(theme){
+    $('avatar-reasoning-field').hidden=theme?.kind!=='vector';
+    if(avatarReasoningDraft?.themeId!==theme?.id){avatarReasoningDraft=null;$('avatar-reasoning-status').textContent='';}
+    const value=avatarReasoningDraft?.value??theme?.reasoningEffort??'';
+    avatarReasoningOptions($('avatar-reasoning-select'),theme?.model,value);
+    const efforts=avatarModels.vectorModels.find(model=>model.id===theme?.model)?.reasoningEfforts||[];
+    $('avatar-save-reasoning').disabled=avatarLoading||!theme||value===(theme.reasoningEffort??'')||Boolean(value&&!efforts.includes(value));
+  }
   function renderAvatarForm(){
     const kind=$('avatar-theme-kind').value,availableOptions=kind==='vector'?avatarModels.vectorModels:avatarModels.imageModels,documentedImages=kind==='image'?(avatarModels.unavailableImageModels||[]):[],options=[...(availableOptions||[]),...documentedImages],select=$('avatar-theme-model'),prior=select.value;
     select.replaceChildren();for(const option of options){const value=avatarModelOption(option),entry=document.createElement('option');entry.value=value.id;entry.textContent=option.available===false?`${value.label} · unavailable · ${option.reason||'server image API is not configured'}`:value.label;entry.dataset.available=String(option.available!==false);select.append(entry);}
@@ -402,34 +428,99 @@ import './src/layout.css';
     $('avatar-image-capability').textContent=kind==='image'?imageInfo:disconnected?'No connected text-model catalogue. Connect the text-model account before generating SVG avatars.':avatarModels.error||'';
     $('avatar-image-capability').hidden=kind!=='image'&&!disconnected&&!avatarModels.error;
     $('avatar-create-submit').disabled=avatarLoading||!select.options.length;
+    renderAvatarCreateReasoning();
+  }
+  function renderAvatarCollection(){
+    const selectedId=$('avatar-theme-select').value,theme=avatarSettings.themes.find(theme=>theme.id===selectedId);
+    $('avatar-theme-preview').textContent=theme?.framing==='circle'?`${theme.subject||'Subject chosen by each bot'} · Heads on transparent backgrounds${theme.kind==='image'?' · Separately billed Image API':''}`:'';
+    renderAvatarReasoning(theme);
+    renderAvatarThemeGallery($('avatar-theme-gallery'),{themes:avatarSettings.themes,selectedId,currentId:avatarSettings.selection?.themeId,busy:avatarLoading,onSelect:themeId=>{avatarThemeDraft=themeId;$('avatar-theme-select').value=themeId;$('avatar-apply-theme').disabled=avatarLoading||themeId===avatarSettings.selection?.themeId;renderAvatarCollection();}});
+  }
+  // Creation order identifies attempts; a late failure update must not replace
+  // a newer success. The API returns newest-created jobs first for timestamp ties.
+  function avatarJobGroups(){
+    const ordered=[...new Map(avatarSettings.jobs.map(job=>[job.id,job])).values()].sort((a,b)=>Date.parse(b.createdAt)-Date.parse(a.createdAt)),groups=new Map();
+    for(const job of ordered){if(!groups.has(job.botId))groups.set(job.botId,{botId:job.botId,jobs:[],active:[]});const group=groups.get(job.botId);group.jobs.push(job);if(avatarPending(job))group.active.push(job);}
+    const current=[...groups.values()].map(group=>({...group,job:group.active[0]||group.jobs[0]})).sort((a,b)=>Number(Boolean(b.active.length))-Number(Boolean(a.active.length)));
+    const represented=new Set(current.map(group=>group.job.id));
+    return {current,history:ordered.filter(job=>!avatarPending(job)&&!represented.has(job.id))};
+  }
+  function avatarJobMatchesSelection(job){return job.themeId===avatarSettings.selection?.themeId&&job.revision===avatarSettings.selection?.revision;}
+  function avatarJobCanRetry(job){const group=avatarJobGroups().current.find(group=>group.botId===job.botId);return Boolean(group&&group.job.id===job.id&&!group.active.length&&['failed','interrupted'].includes(job.status)&&avatarJobMatchesSelection(job)&&bots.some(bot=>bot.id===job.botId));}
+  async function retryAvatarJob(job){
+    if(avatarLoading||avatarAdmissions.has('all')||avatarAdmissions.has(job.botId))return;
+    // Recheck the exact failed attempt before admitting fresh work: a newer
+    // successful/active job or selection change makes this Retry obsolete.
+    const refreshed=await loadAvatarSettings();
+    if(!authenticated||!refreshed)return;
+    const latest=avatarSettings.jobs.find(item=>item.id===job.id);
+    if(!latest||latest.status!==job.status||latest.themeId!==job.themeId||latest.revision!==job.revision||!avatarJobCanRetry(latest)){$('avatar-error').textContent='This avatar attempt is no longer current. Review the refreshed status before regenerating.';return;}
+    const theme=avatarSettings.themes.find(item=>item.id===latest.themeId);
+    if(theme?.kind==='image'?avatarModels.imageAvailable!==true:!avatarModels.connected){$('avatar-error').textContent='Avatar generation is currently unavailable.';return;}
+    await startAvatarGeneration(latest.botId);
+  }
+  function avatarJobRow(job,{historical=false,identified=false,retry=false}={}){
+    const row=el('div','avatar-job');row.dataset.jobStatus=job.status;row.dataset.jobId=job.id;row.dataset.botId=job.botId;row.dataset.jobRevision=String(job.revision);
+    row.append(el('strong','',`${bots.find(bot=>bot.id===job.botId)?.name||'Bot'} · ${job.status}`));
+    const theme=avatarSettings.themes.find(theme=>theme.id===job.themeId),date=new Date(job.createdAt);
+    const context=el('p','hint',`${historical?'Earlier attempt · ':''}${theme?.name||job.themeId} · revision ${job.revision}${avatarJobMatchesSelection(job)?'':' · previous selection'} · `),time=el('time','',Number.isNaN(date.getTime())?job.createdAt:date.toLocaleString(undefined,{timeZoneName:'short'}));time.dateTime=job.createdAt;if(!Number.isNaN(date.getTime()))time.setAttribute('aria-label',date.toLocaleString(undefined,{timeZoneName:'long'}));context.append(time);if(historical||identified)context.append(document.createTextNode(` · attempt ${job.id}`));row.append(context);
+    if(job.error?.message)row.append(el('p','hint',job.error.message));
+    if(job.status==='interrupted')row.append(el('p','avatar-interrupted-warning','Previous inference outcome is unconfirmed. Regenerate starts a fresh operation; the earlier request will not be replayed.'));
+    if(retry){const button=el('button','quiet',job.status==='interrupted'?'Regenerate':'Retry');button.type='button';button.disabled=avatarLoading||avatarAdmissions.has('all')||avatarAdmissions.has(job.botId);button.setAttribute('aria-label',`${button.textContent} avatar for ${bots.find(bot=>bot.id===job.botId)?.name||'bot'}, revision ${job.revision}`);button.addEventListener('click',()=>void guarded(()=>retryAvatarJob(job)));row.append(button);}
+    return row;
+  }
+  function renderAvatarJobs(generationUnavailable){
+    const root=$('avatar-jobs'),oldHistory=root.querySelector('#avatar-job-history'),historyOpen=oldHistory?.open||false,openActive=new Set([...root.querySelectorAll('.avatar-active-attempts[open]')].map(node=>node.dataset.botId));root.replaceChildren();
+    for(const [key,admission] of avatarAdmissions){const row=el('div','avatar-job avatar-admission');row.append(el('strong','',`${key==='all'?'All bots':bots.find(bot=>bot.id===key)?.name||'Bot'} · generation request receipt is unknown`));row.append(el('p','hint','Refresh checks whether it was accepted; if not, resend uses the same operation ID and arguments.'));const retry=el('button','quiet','Check / resend safely');retry.type='button';retry.disabled=avatarLoading;retry.addEventListener('click',()=>void guarded(()=>startAvatarGeneration(admission.botId,true,admission)));row.append(retry);root.append(row);}
+    const {current,history}=avatarJobGroups(),list=el('div','avatar-current-jobs');list.id='avatar-current-jobs';list.setAttribute('role','region');list.setAttribute('aria-label','Current avatar generation status');
+    for(const group of current){const row=avatarJobRow(group.job,{retry:!generationUnavailable&&avatarJobCanRetry(group.job)});row.classList.add('avatar-current-job');
+      if(group.active.length>1){row.append(el('p','hint',`${group.active.length} active attempts · ${group.active.filter(job=>job.status==='running').length} running, ${group.active.filter(job=>job.status==='queued').length} queued`));const details=el('details','avatar-active-attempts');details.dataset.botId=group.botId;details.open=openActive.has(group.botId);details.append(el('summary','',`Inspect all ${group.active.length} active attempts`));const attempts=el('div','avatar-active-job-list'),renderAttempts=()=>{attempts.replaceChildren();if(details.open)for(const job of group.active)attempts.append(avatarJobRow(job,{identified:true}));};details.append(attempts);renderAttempts();details.addEventListener('toggle',renderAttempts);row.append(details);}
+      list.append(row);
+    }
+    root.append(list);
+    if(!history.length){avatarHistoryPage=0;return;}
+    const pageSize=10,pages=Math.ceil(history.length/pageSize);avatarHistoryPage=Math.min(avatarHistoryPage,pages-1);
+    const details=el('details','setup-details avatar-job-history');details.id='avatar-job-history';details.setAttribute('aria-live','off');details.open=historyOpen;details.append(el('summary','',`Earlier avatar attempts (${history.length})`),el('p','hint','Superseded attempts from the recent jobs returned by the server. History is read-only; regeneration uses the current status above.'));
+    const items=el('div','avatar-history-page');for(const job of history.slice(avatarHistoryPage*pageSize,(avatarHistoryPage+1)*pageSize))items.append(avatarJobRow(job,{historical:true}));details.append(items);
+    if(pages>1){const controls=el('div','row wrap avatar-history-controls'),label=el('span','hint',`Page ${avatarHistoryPage+1} of ${pages}`);label.setAttribute('role','status');for(const [name,delta,disabled] of [['Previous attempts',-1,avatarHistoryPage===0],['Next attempts',1,avatarHistoryPage===pages-1]]){const button=el('button','quiet',name);button.type='button';button.disabled=disabled;button.addEventListener('click',()=>{avatarHistoryPage+=delta;renderAvatarJobs(generationUnavailable);const updated=$('avatar-job-history');updated.open=true;const target=updated.querySelector(`button:nth-of-type(${delta===1?2:1})`);(target?.disabled?updated.querySelector('button:not(:disabled)'):target)?.focus();});controls.append(button);}controls.append(label);details.append(controls);}
+    root.append(details);
   }
   function renderAvatarSettings(){
     const status=$('avatar-status'),select=$('avatar-theme-select'),current=avatarSettings.selection;
     const currentTheme=avatarSettings.themes.find(theme=>theme.id===current?.themeId),generationUnavailable=currentTheme?.kind==='image'?avatarModels.imageAvailable!==true:!avatarModels.connected;
     status.textContent=avatarLoading?'Loading global avatar settings…':current?`Global selection · revision ${current.revision}${currentTheme?.kind==='image'&&avatarModels.imageAvailable!==true?' · Image generation unavailable.':''}`:'Choose a global avatar theme to get started.';
     select.replaceChildren();const none=document.createElement('option');none.value='';none.textContent='Choose a theme';select.append(none);
-    for(const theme of avatarSettings.themes){const option=document.createElement('option');option.value=theme.id;option.textContent=`${theme.name} · ${theme.kind}`;select.append(option);}select.value=current?.themeId||'';select.disabled=avatarLoading||!avatarSettings.themes.length;
+    for(const theme of avatarSettings.themes){const option=document.createElement('option');option.value=theme.id;option.textContent=`${theme.name} · ${theme.kind}`;select.append(option);}select.value=avatarSettings.themes.some(theme=>theme.id===avatarThemeDraft)?avatarThemeDraft:current?.themeId||'';select.disabled=avatarLoading||!avatarSettings.themes.length;
     $('avatar-apply-theme').disabled=avatarLoading||!select.value||select.value===current?.themeId;
     $('avatar-generate-all').disabled=avatarLoading||!current||generationUnavailable||!bots.length||avatarAdmissions.has('all')||avatarSettings.jobs.some(avatarPending);
-    const jobs=$('avatar-jobs');jobs.replaceChildren();
-    for(const [key,admission] of avatarAdmissions){const row=el('div','avatar-job avatar-admission');row.append(el('strong','','Generation request receipt is unknown'));row.append(el('p','hint','Refresh checks whether it was accepted; if not, resend uses the same operation ID and arguments.'));const retry=el('button','quiet','Check / resend safely');retry.type='button';retry.disabled=avatarLoading;retry.addEventListener('click',()=>void guarded(()=>startAvatarGeneration(admission.botId,true,admission)));row.append(retry);jobs.append(row);}
-    for(const job of [...avatarSettings.jobs].sort((a,b)=>Date.parse(b.updatedAt)-Date.parse(a.updatedAt)).slice(0,30)){const row=el('div','avatar-job');row.dataset.jobStatus=job.status;row.append(el('strong','',`${bots.find(bot=>bot.id===job.botId)?.name||'Bot'} · ${job.status}`));if(job.error?.message)row.append(el('p','hint',job.error.message));if(job.status==='interrupted')row.append(el('p','avatar-interrupted-warning','Previous inference outcome is unconfirmed. Regenerate starts a fresh operation; the earlier request will not be replayed.'));if(['failed','interrupted'].includes(job.status)){const retry=el('button','quiet',job.status==='interrupted'?'Regenerate':'Retry');retry.type='button';retry.disabled=avatarLoading||avatarAdmissions.has(job.botId);retry.addEventListener('click',()=>void guarded(()=>startAvatarGeneration(job.botId)));row.append(retry);}jobs.append(row);}
+    renderAvatarJobs(generationUnavailable);
     const botList=$('avatar-bot-list');botList.replaceChildren();for(const bot of bots){const avatar=el('span','avatar avatar-small',bot.name.slice(0,1).toUpperCase());avatar.dataset.agentColor=agentColor(bot.id);decorateGlobalAvatar(avatar,bot.id);const row=el('div','avatar-bot-row');row.append(avatar,el('span','',bot.name));const state=selectedAvatar(bot.id);const imageError=state&&avatarLoadErrors.has(`${bot.id}:${state.themeId}:${state.revision}:${state.artifactId}`);row.append(el('small',imageError?'error':'hint',imageError?'Could not load avatar image. Refresh to try again.':state?(avatarIsStale(state)?'Stale · previous theme':'Ready'):'No avatar yet'));if(imageError)row.lastChild.setAttribute('role','alert');if(current){const button=el('button','quiet','Regenerate');button.type='button';button.disabled=avatarLoading||generationUnavailable||avatarAdmissions.has(bot.id)||avatarSettings.jobs.some(job=>job.botId===bot.id&&avatarPending(job));button.addEventListener('click',()=>void guarded(()=>startAvatarGeneration(bot.id)));row.append(button);}botList.append(row);}
-    renderAvatarForm();renderGlobalAvatars();
+    renderAvatarForm();renderAvatarCollection();renderGlobalAvatars();
   }
-  async function loadAvatarSettings(){if(!authenticated)return;const session=authSession,sequence=++avatarRequest;avatarLoading=true;$('avatar-error').textContent='';renderAvatarSettings();try{const [settings,models]=await Promise.all([request('/v1/avatar-settings'),request('/v1/avatar-models')]);if(session!==authSession||sequence!==avatarRequest)return;if(!Array.isArray(settings.themes)||!Array.isArray(settings.avatars)||!Array.isArray(settings.jobs))throw new Error('The avatar settings response was invalid.');avatarSettings=settings;avatarModels=models;for(const [key,admission] of avatarAdmissions){if(settings.jobs.some(job=>job.operationId===admission.operationId))avatarAdmissions.delete(key);}pruneAvatarUrls();}
+  async function loadAvatarSettings(){if(!authenticated)return;const session=authSession,sequence=++avatarRequest;avatarLoading=true;$('avatar-error').textContent='';renderAvatarSettings();try{const [settings,models]=await Promise.all([request('/v1/avatar-settings'),request('/v1/avatar-models')]);if(session!==authSession||sequence!==avatarRequest)return;if(!Array.isArray(settings.themes)||!Array.isArray(settings.avatars)||!Array.isArray(settings.jobs))throw new Error('The avatar settings response was invalid.');avatarSettings=settings;avatarModels=models;for(const [key,admission] of avatarAdmissions){if(settings.jobs.some(job=>job.operationId===admission.operationId))avatarAdmissions.delete(key);}pruneAvatarUrls();return true;}
     catch(error){if(session!==authSession||sequence!==avatarRequest)return;$('avatar-error').textContent=errorText(error);}finally{if(session===authSession&&sequence===avatarRequest){avatarLoading=false;renderAvatarSettings();scheduleAvatarPoll();}}
   }
   function scheduleAvatarPoll(){clearTimeout(avatarPollTimer);if(authenticated&&(avatarSettings.jobs.some(avatarPending)||avatarAdmissions.size)&&!document.hidden)avatarPollTimer=setTimeout(()=>void loadAvatarSettings(),2500);}
   async function applyAvatarTheme(){
     if(!authenticated)return;const session=authSession,themeId=$('avatar-theme-select').value;if(!themeId)return;avatarLoading=true;renderAvatarSettings();
-    try{const result=await request('/v1/avatar-settings',{method:'PUT',body:{themeId,operationId:avatarOperationId()}});if(session!==authSession||!authenticated)return;avatarSettings=result;pruneAvatarUrls();}
+    try{const result=await request('/v1/avatar-settings',{method:'PUT',body:{themeId,operationId:avatarOperationId()}});if(session!==authSession||!authenticated)return;avatarSettings=result;avatarThemeDraft='';pruneAvatarUrls();}
     finally{if(session===authSession&&authenticated){avatarLoading=false;renderAvatarSettings();scheduleAvatarPoll();}}
   }
+  async function saveAvatarReasoning(){
+    if(!authenticated||avatarLoading)return;
+    const session=authSession,theme=avatarSettings.themes.find(theme=>theme.id===$('avatar-theme-select').value);if(theme?.kind!=='vector')return;
+    const reasoningEffort=$('avatar-reasoning-select').value||null,expectedReasoningEffort=avatarReasoningDraft?avatarReasoningDraft.expected:theme.reasoningEffort??null;
+    avatarLoading=true;$('avatar-error').textContent='';$('avatar-reasoning-status').textContent='';renderAvatarSettings();
+    try{const result=await request('/v1/avatar-themes',{method:'PATCH',body:{themeId:theme.id,reasoningEffort,expectedReasoningEffort,operationId:avatarOperationId()}});if(session!==authSession||!authenticated)return;if(result.theme?.id!==theme.id)throw new Error('The server did not confirm the theme reasoning.');avatarSettings.themes=avatarSettings.themes.map(item=>item.id===theme.id?result.theme:item);avatarReasoningDraft=null;}
+    catch(error){if(session===authSession&&authenticated){if(error.code==='avatar_theme_changed'){avatarReasoningDraft=null;await loadAvatarSettings();}if(session===authSession&&authenticated)$('avatar-error').textContent=errorText(error);return;}}
+    finally{if(session===authSession&&authenticated){avatarLoading=false;renderAvatarSettings();}}
+    if(session===authSession&&authenticated)$('avatar-reasoning-status').textContent='Saved for future generations.';
+  }
   async function createAvatarTheme(event){
-    event.preventDefault();if(!authenticated||avatarLoading)return;const session=authSession,name=$('avatar-theme-name').value.trim(),kind=$('avatar-theme-kind').value,prompt=$('avatar-theme-prompt').value.trim(),model=$('avatar-theme-model').value;if(!name||!prompt||!model)return;
+    event.preventDefault();if(!authenticated||avatarLoading)return;const session=authSession,name=$('avatar-theme-name').value.trim(),kind=$('avatar-theme-kind').value,style=$('avatar-theme-prompt').value.trim(),subject=$('avatar-theme-subject').value.trim(),model=$('avatar-theme-model').value;if(!name||!style||!model)return;
+    const reasoningEffort=kind==='vector'?$('avatar-theme-reasoning').value:'';
     avatarLoading=true;$('avatar-error').textContent='';renderAvatarSettings();
-    try{const result=await request('/v1/avatar-themes',{method:'POST',body:{name,kind,prompt,model,operationId:avatarOperationId()}});if(session!==authSession||!authenticated)return;if(!result.theme)throw new Error('The server did not confirm the new theme.');avatarSettings.themes=[...avatarSettings.themes,result.theme];$('avatar-theme-name').value='';$('avatar-theme-prompt').value='';}
+    try{const result=await request('/v1/avatar-themes',{method:'POST',body:{name,kind,style,...(subject?{subject}:{}),model,...(reasoningEffort?{reasoningEffort}:{}),operationId:avatarOperationId()}});if(session!==authSession||!authenticated)return;if(!result.theme)throw new Error('The server did not confirm the new theme.');avatarSettings.themes=[...avatarSettings.themes,result.theme];$('avatar-theme-name').value='';$('avatar-theme-prompt').value='';$('avatar-theme-subject').value='';$('avatar-theme-reasoning').value='';}
     catch(error){if(session===authSession&&authenticated)$('avatar-error').textContent=errorText(error);}
     finally{if(session===authSession&&authenticated){avatarLoading=false;renderAvatarSettings();}}
   }
@@ -440,7 +531,7 @@ import './src/layout.css';
     try{
       if(checkBeforeResend){const snapshot=await request('/v1/avatar-settings');if(session!==authSession||!authenticated)return;avatarSettings=snapshot;const known=snapshot.jobs?.some(job=>job.operationId===admission.operationId);if(known){avatarAdmissions.delete(key);return;}}
       const result=await request('/v1/avatar-generations',{method:'POST',body:admission});if(session!==authSession||!authenticated)return;
-      if(Array.isArray(result.jobs)){const byId=new Map(avatarSettings.jobs.map(job=>[job.id,job]));for(const job of result.jobs)byId.set(job.id,job);avatarSettings.jobs=[...byId.values()];}
+      if(Array.isArray(result.jobs)){const byId=new Map(result.jobs.map(job=>[job.id,job]));for(const job of avatarSettings.jobs)if(!byId.has(job.id))byId.set(job.id,job);avatarSettings.jobs=[...byId.values()];}
       avatarAdmissions.delete(key);
     }catch(error){
       if(session!==authSession||!authenticated)return;
@@ -465,7 +556,8 @@ import './src/layout.css';
   }
   function disconnect(message = '') {
     desktop.disconnect(); workspace.clear();
-    clearTimeout(avatarPollTimer);avatarRequest++;avatarSettings={themes:[],selection:null,avatars:[],jobs:[]};avatarModels={connected:false,vectorModels:[],imageModels:[],imageAvailable:false};avatarLoading=false;avatarAdmissions.clear();revokeAvatarUrls();$('avatar-error').textContent='';$('avatar-status').textContent='Sign in to load avatar settings.';
+    clearTimeout(avatarPollTimer);avatarRequest++;avatarHistoryPage=0;avatarThemeDraft='';avatarReasoningDraft=null;avatarSettings={themes:[],selection:null,avatars:[],jobs:[]};avatarModels={connected:false,vectorModels:[],imageModels:[],imageAvailable:false};avatarLoading=false;avatarAdmissions.clear();revokeAvatarUrls();$('avatar-error').textContent='';$('avatar-status').textContent='Sign in to load avatar settings.';
+
     stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId=null; cancelStreamRender(); resetConversationHistory(); generation++; authSession++; authenticated = false; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
     showingTasks=false;if($('global-tasks-workspace'))$('global-tasks-workspace').hidden=true;tasksView?.unmount();tasksView=null;selected = null; currentRun = null; stoppableRun = null; bots = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
     clearTimeout(botSummaryTimer);botSummaries.clear();botSummaryLoading=false;botSummaryPending=false;botRenderKey='';
@@ -1416,7 +1508,10 @@ import './src/layout.css';
   $('settings-button').addEventListener('click', () => { if ($('panel-menu')) $('panel-menu').open = false; $('settings-dialog').showModal(); avatarLoadErrors.clear(); void loadAvatarSettings(); void chatGPTTask(loadChatGPT); void loadGitHubStatus(); }); $('refresh-chatgpt').addEventListener('click', () => chatGPTTask(loadChatGPT));
   $('avatar-refresh').addEventListener('click', () => {avatarLoadErrors.clear();void loadAvatarSettings();});
   $('avatar-theme-kind').addEventListener('change', renderAvatarForm);
-  $('avatar-theme-select').addEventListener('change', () => { $('avatar-apply-theme').disabled = !$('avatar-theme-select').value || $('avatar-theme-select').value===avatarSettings.selection?.themeId; });
+  $('avatar-theme-model').addEventListener('change',renderAvatarCreateReasoning);
+  $('avatar-reasoning-select').addEventListener('change',()=>{const theme=avatarSettings.themes.find(theme=>theme.id===$('avatar-theme-select').value);if(!theme)return;avatarReasoningDraft={themeId:theme.id,value:$('avatar-reasoning-select').value,expected:avatarReasoningDraft?avatarReasoningDraft.expected:theme.reasoningEffort??null};$('avatar-reasoning-status').textContent='';renderAvatarReasoning(theme);});
+  $('avatar-save-reasoning').addEventListener('click',()=>void saveAvatarReasoning());
+  $('avatar-theme-select').addEventListener('change', () => { avatarThemeDraft=$('avatar-theme-select').value; $('avatar-apply-theme').disabled = avatarLoading || !$('avatar-theme-select').value || $('avatar-theme-select').value===avatarSettings.selection?.themeId; renderAvatarCollection(); });
   $('avatar-apply-theme').addEventListener('click', () => void guarded(applyAvatarTheme));
   $('avatar-generate-all').addEventListener('click', () => void guarded(() => startAvatarGeneration()));
   $('avatar-create-form').addEventListener('submit', event => void createAvatarTheme(event));
