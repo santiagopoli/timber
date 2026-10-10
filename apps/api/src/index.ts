@@ -1,7 +1,7 @@
 import { authenticate, consoleSession } from "./auth";
 import { ApiError, errorResponse, json } from "./errors";
 import type { Env } from "./env";
-import { UUID, operationId as validateOperationId } from "./validation";
+import { UUID, operationId as validateOperationId, parseAction } from "./validation";
 import type { Bot } from "@botspace/contracts";
 export { WorkspaceDO } from "./workspace";
 export { BotDO } from "./bot";
@@ -9,6 +9,27 @@ export { GitHubAuthDO } from "./github";
 export { WorkspacePreviewGateway } from "./workspace-apps";
 export { ChatGPTAuthDO } from "./chatgpt";
 export { ComputerDO } from "@botspace/computer";
+
+/** Drain or cancel an incoming body when a route rejects before forwarding it.
+ * Workerd treats returning while a POST stream remains unread as an error. */
+async function discardRequestBody(request:Request):Promise<void> {
+  if(!request.body || request.bodyUsed || request.body.locked) return;
+  try { await request.body.cancel(); } catch { /* A forwarded/locked stream is already owned elsewhere. */ }
+}
+
+async function beginAdmission(env:Env,botId:string,operationId:string,taskId?:string):Promise<string> {
+  const path=`https://workspace/tasks/bot-slot/${botId}/admissions`;
+  const response=await env.WORKSPACE.get(env.WORKSPACE.idFromName("owner")).fetch(new Request(path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId,...taskId?{taskId}:{}})}));
+  if(!response.ok)throw new ApiError(response.status,"computer_busy","The bot's shared computer is occupied; retry when its current work finishes.");
+  return (await response.json<{token:string}>()).token;
+}
+async function completeAdmission(env:Env,botId:string,token:string):Promise<void> {
+  await env.WORKSPACE.get(env.WORKSPACE.idFromName("owner")).fetch(`https://workspace/tasks/bot-slot/${botId}/admissions/${token}`,{method:"DELETE"});
+}
+async function bodyOperationId(request:Request):Promise<string> {
+  try {const input=await request.clone().json() as {operationId?:unknown};return validateOperationId(input.operationId);}
+  catch(error) {await discardRequestBody(request);throw error;}
+}
 
 function internalRequest(request:Request,url:string):Request {
   const headers=new Headers();
@@ -18,6 +39,7 @@ function internalRequest(request:Request,url:string):Request {
 }
 export default {
   async fetch(request:Request,env:Env):Promise<Response> {
+    let requestBodyForwarded=false;
     try {
       const url=new URL(request.url);
       if(url.pathname==="/health" && request.method==="GET") return json({ok:true,service:"botspace"});
@@ -76,7 +98,7 @@ export default {
         if(verification?request.method!=="POST":!["GET","POST","DELETE"].includes(request.method)) throw new ApiError(405,"method_not_allowed","Method not allowed.");
         if(!env.CHATGPT) throw new ApiError(503,"chatgpt_not_configured","ChatGPT connections are not configured on this server.");
         const connection=env.CHATGPT.get(env.CHATGPT.idFromName(owner));
-        return connection.fetch(internalRequest(request,`https://chatgpt/${verification?"verify":""}`));
+        requestBodyForwarded=true;return connection.fetch(internalRequest(request,`https://chatgpt/${verification?"verify":""}`));
       }
       if(url.pathname==="/v1/connections/github/connect") {
         if(request.method!=="POST") throw new ApiError(405,"method_not_allowed","Method not allowed.");
@@ -86,26 +108,14 @@ export default {
       if(url.pathname==="/v1/connections/github") {
         if(!["GET","DELETE"].includes(request.method)) throw new ApiError(405,"method_not_allowed","Method not allowed.");
         if(!env.GITHUB) throw new ApiError(503,"github_not_configured","GitHub is not configured.");
-        return env.GITHUB.get(env.GITHUB.idFromName(owner)).fetch(internalRequest(request,"https://github/status"));
+        requestBodyForwarded=true;return env.GITHUB.get(env.GITHUB.idFromName(owner)).fetch(internalRequest(request,"https://github/status"));
       }
       const registry=env.WORKSPACE.get(env.WORKSPACE.idFromName(owner));
       if(url.pathname==="/v1/tasks") {
         if(request.method==="GET") return registry.fetch(new Request("https://workspace/tasks"));
         if(request.method!=="POST") throw new ApiError(405,"method_not_allowed","Method not allowed.");
-        const created=await registry.fetch(internalRequest(request,"https://workspace/tasks"));
+        requestBodyForwarded=true;const created=await registry.fetch(internalRequest(request,"https://workspace/tasks"));
         if(!created.ok) return created;
-        const result=await created.clone().json<{task: {id:string;botId:string;status:string;description:string;title:string}}>();
-        if(result.task.status==="queued") {
-          const botRecord=await registry.fetch(`https://workspace/${result.task.botId}`);
-          if(!botRecord.ok) return botRecord;
-          const {bot}=await botRecord.json<{bot:Bot}>();
-          const claim=await registry.fetch(`https://workspace/tasks/${result.task.id}/claim`,{method:"POST"});if(!claim.ok) {await registry.fetch(`https://workspace/tasks/${result.task.id}`,{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({status:"pending"})});return json({task:{...result.task,status:"pending"}},created.status);}
-          const stub=env.BOT.get(env.BOT.idFromName(`${owner}:task:${result.task.id}`));
-          const headers=new Headers({"content-type":"application/json","x-botspace-config":encodeURIComponent(JSON.stringify(bot))});
-          const started=await stub.fetch(new Request("https://task/messages",{method:"POST",headers,body:JSON.stringify({operationId:`task-start:${result.task.id}`,text:result.task.description||result.task.title})}));
-          if(!started.ok) {await registry.fetch(`https://workspace/tasks/${result.task.id}/release`,{method:"POST"});await registry.fetch(`https://workspace/tasks/${result.task.id}`,{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({status:"pending"})});return started;}
-          await registry.fetch(`https://workspace/tasks/${result.task.id}`,{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({status:"running"})});
-        }
         return created;
       }
       const taskRoute=/^\/v1\/tasks\/([0-9a-f-]{36})(?:\/(messages|runs|events|start|cancel))?$/.exec(url.pathname);
@@ -120,46 +130,51 @@ export default {
         if(!endpoint) {if(request.method!=="GET")throw new ApiError(405,"method_not_allowed","Method not allowed.");return json({task});}
         const stub=env.BOT.get(env.BOT.idFromName(`${owner}:task:${taskId}`));
         const headers=new Headers();headers.set("x-botspace-config",encodeURIComponent(JSON.stringify(bot)));
+        headers.set("x-timber-task-id",taskId);
         const contentType=request.headers.get("content-type");if(contentType)headers.set("content-type",contentType);
         const lastEvent=request.headers.get("last-event-id");if(lastEvent)headers.set("last-event-id",lastEvent);
         if(endpoint==="start") {
           if(request.method!=="POST") throw new ApiError(405,"method_not_allowed","Method not allowed.");
-          if(task.status==="cancelled") throw new ApiError(409,"task_cancelled","Cancelled tasks cannot be started.");
-          const requestBody=await request.clone().json().catch(()=>({})) as {operationId?:unknown};
-          const startOperation=requestBody.operationId===undefined?`task-start:${taskId}`:validateOperationId(requestBody.operationId);
-          const claim=await registry.fetch(`https://workspace/tasks/${taskId}/claim`,{method:"POST"});if(!claim.ok)return claim;
-          const startHeaders=new Headers(headers);startHeaders.set("content-type","application/json");
-          const started=await stub.fetch(new Request("https://task/messages",{method:"POST",headers:startHeaders,body:JSON.stringify({operationId:startOperation,text:task.description||task.title})}));
-          if(started.ok) await registry.fetch(`https://workspace/tasks/${taskId}`,{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({status:"running"})}); else await registry.fetch(`https://workspace/tasks/${taskId}/release`,{method:"POST"});
-          return started;
+          await discardRequestBody(request);
+          const forwarded=await registry.fetch(new Request(`https://workspace/tasks/${taskId}/start`,{method:"POST"}));
+          return forwarded;
         }
         if(endpoint==="cancel") {
           if(request.method!=="POST") throw new ApiError(405,"method_not_allowed","Method not allowed.");
-          const runs=await stub.fetch(new Request("https://task/runs",{headers}));if(!runs.ok)return runs;
-          const data=await runs.json<{activeRuns:Array<{id:string}>}>();
+          await discardRequestBody(request);
+          if(["completed","failed","cancelled"].includes(task.status)) throw new ApiError(409,"task_terminal","A terminal task cannot be cancelled.");
+          const persisted=await registry.fetch(`https://workspace/tasks/${taskId}`,{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({status:"cancelling",cancelRequested:true})});
+          if(!persisted.ok)return persisted;
+          const [runs,processes]=await Promise.all([
+            stub.fetch(new Request("https://task/runs",{headers})),
+            stub.fetch(new Request("https://task/cancel-processes",{method:"POST",headers:(()=>{const h=new Headers(headers);h.set("x-timber-internal","task");return h;})()})),
+          ]);
+          if(!runs.ok||!processes.ok)return json({taskId,cancelRequested:true,confirmed:false,runCount:0});
+          const data=await runs.json<{activeRuns:Array<{id:string}>}>(),processState=await processes.json<{confirmed:boolean}>();
           const outcomes=await Promise.all(data.activeRuns.map(run=>stub.fetch(new Request(`https://task/runs/${run.id}/cancel`,{method:"POST",headers}))));
-          await registry.fetch(`https://workspace/tasks/${taskId}`,{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({status:"cancelled"})});
-          await registry.fetch(`https://workspace/tasks/${taskId}/release`,{method:"POST"});
-          return json({taskId,cancelled:true,runCount:outcomes.length});
+          const failed=outcomes.some(outcome=>!outcome.ok);
+          return json({taskId,cancelRequested:true,confirmed:!failed&&processState.confirmed&&data.activeRuns.length===0,runCount:outcomes.length});
         }
-        if(endpoint==="messages" && request.method==="POST" && task.status==="cancelled") throw new ApiError(409,"task_cancelled","Cancelled tasks cannot accept new messages.");
-        if(endpoint==="messages" && request.method==="POST") {const claim=await registry.fetch(`https://workspace/tasks/${taskId}/claim`,{method:"POST"});if(!claim.ok)return claim;}
+        if(endpoint==="messages" && request.method==="POST" && task.status==="cancelled") {await discardRequestBody(request);throw new ApiError(409,"task_cancelled","Cancelled tasks cannot accept new messages.");}
+        if(endpoint==="messages" && request.method==="POST" && !["running","waiting_approval","waiting_connection"].includes(task.status)) {await discardRequestBody(request);throw new ApiError(409,"task_not_running","This task is not currently running; wait for it to start before messaging it.");}
+        let admissionToken:string|undefined;
+        if(endpoint==="messages" && request.method==="POST") admissionToken=await beginAdmission(env,task.botId,await bodyOperationId(request),taskId);
+        requestBodyForwarded=true;
         const response=await stub.fetch(new Request(`https://task/${endpoint}${url.search}`,{method:request.method,headers,body:["GET","HEAD"].includes(request.method)?undefined:request.body,redirect:"manual",signal:request.signal}));
-        if(endpoint==="messages" && request.method==="POST" && response.ok) await registry.fetch(`https://workspace/tasks/${taskId}`,{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({status:"running"})});
-        if(endpoint==="messages" && request.method==="POST" && !response.ok) await registry.fetch(`https://workspace/tasks/${taskId}/release`,{method:"POST"});
-        if(endpoint==="runs" && request.method==="GET" && response.ok) {const runs=await response.clone().json<{activeRuns:Array<{status:string}>;runs:Array<{status:string}>}>();if(runs.activeRuns.length) {const state=runs.activeRuns[0].status;if(["queued","running","waiting_approval","waiting_connection"].includes(state)) await registry.fetch(`https://workspace/tasks/${taskId}`,{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({status:state})});} else {await registry.fetch(`https://workspace/tasks/${taskId}/release`,{method:"POST"});const status=runs.runs[0]?.status; if(status==="completed"||status==="failed"||status==="cancelled") await registry.fetch(`https://workspace/tasks/${taskId}`,{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({status})});}}
+        if(admissionToken)await completeAdmission(env,task.botId,admissionToken);
+
         return response;
       }
       if(url.pathname==="/v1/bots") {
         if(!["GET","POST"].includes(request.method)) throw new ApiError(405,"method_not_allowed","Method not allowed.");
-        return registry.fetch(internalRequest(request,"https://workspace/"));
+        requestBodyForwarded=true;return registry.fetch(internalRequest(request,"https://workspace/"));
       }
       const match=/^\/v1\/bots\/([^/]+)(\/.*)?$/.exec(url.pathname);
       if(!match || !UUID.test(match[1])) throw new ApiError(404,"not_found","Bot not found.");
       const botId=match[1];
       const tail=match[2]??"";
       if(["/agent-messages","/agent-results","/agent-cancel"].includes(tail)) throw new ApiError(404,"not_found","Endpoint not found.");
-      if(tail==="" && ["PATCH","DELETE"].includes(request.method)) return registry.fetch(internalRequest(request,`https://workspace/${botId}`));
+      if(tail==="" && ["PATCH","DELETE"].includes(request.method)) {requestBodyForwarded=true;return registry.fetch(internalRequest(request,`https://workspace/${botId}`));}
       const record=await registry.fetch(`https://workspace/${botId}`);
       if(!record.ok) return record;
       const {bot}=await record.json<{bot:Bot}>();
@@ -179,15 +194,42 @@ export default {
       if(contentType) headers.set("content-type",contentType);
       const lastEvent=request.headers.get("last-event-id");
       if(lastEvent) headers.set("last-event-id",lastEvent);
-      if(tail==="/messages" && request.method==="POST") {
-        const reservation=await registry.fetch(`https://workspace/tasks/bot-slot/${botId}`,{method:"POST"});if(!reservation.ok)return reservation;
+      let admissionToken:string|undefined;
+      const agentMessage=/^\/agents\/([^/]+)\/messages$/.exec(tail);
+      let decodedAgentId="";try{decodedAgentId=agentMessage?decodeURIComponent(agentMessage[1]):"";}catch{}
+      const isRunAdmission=tail==="/messages"&&request.method==="POST"||!!agentMessage&&UUID.test(decodedAgentId)&&request.method==="POST";
+      if(isRunAdmission) admissionToken=await beginAdmission(env,botId,await bodyOperationId(request));
+      if(tail==="/computer/actions" && request.method==="POST") {
+        const raw=await request.text();
+        let input:{operationId?:unknown;action?:{type?:unknown;processId?:unknown}};
+        try {input=JSON.parse(raw) as typeof input;} catch {input={};}
+        const op=validateOperationId(input.operationId),action=parseAction(input.action);
+        const directInput={operationId:op,action};
+        if(["readFile","listFiles","screenshot"].includes(action.type)) {
+          return await stub.fetch(new Request(`https://bot${tail}${url.search}`,{method:"POST",headers,body:JSON.stringify(directInput),redirect:"manual",signal:request.signal}));
+        }
+        const key=(action.type==="execPoll"||action.type==="execCancel")?validateOperationId(action.processId):op;
+        const reservation=await registry.fetch(new Request(`https://workspace/tasks/bot-slot/${botId}?kind=direct&key=${encodeURIComponent(key)}`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({payload:directInput})}));
+        if(!reservation.ok)return reservation;
+        const {token,shared,admissionToken,key:leaseKey}=await reservation.json<{token:string;shared?:boolean;admissionToken?:string;key?:string}>();
+        const direct=new Request(`https://bot${tail}${url.search}`,{method:"POST",headers,body:JSON.stringify(directInput),redirect:"manual",signal:request.signal});
+        const response=await stub.fetch(direct);
+        if(shared&&admissionToken)await completeAdmission(env,botId,admissionToken);
+        if(!shared&&response.ok) {
+          try {
+            const result=(await response.clone().json<{result:{status:string;processId?:string;checkpointStatus?:string}}>()).result;
+            if(result.status==="running"&&result.processId) await registry.fetch(`https://workspace/tasks/bot-slot/${botId}/direct-process?key=${encodeURIComponent(key)}&token=${encodeURIComponent(token)}`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({processId:result.processId})});
+            if(["completed","failed","cancelled"].includes(result.status)&&result.checkpointStatus!=="pending") await registry.fetch(`https://workspace/tasks/bot-slot/${botId}?key=${encodeURIComponent(leaseKey??key)}&token=${encodeURIComponent(token)}`,{method:"DELETE"});
+          } catch { /* An unreadable/uncertain receipt keeps the lease held. */ }
+        }
+        return response;
       }
-      const mutation=tail==="/computer/actions" && request.method==="POST" || tail==="/computer/suspend" && request.method==="POST" || tail==="/computer/live-session" && request.method==="POST" || /^\/approvals\/[^/]+$/.test(tail) && request.method==="POST";
-      if(mutation) {const reservation=await registry.fetch(`https://workspace/tasks/bot-slot/${botId}`,{method:"POST"});if(!reservation.ok)return reservation;}
+      const mutation=tail==="/computer/suspend" && request.method==="POST" || tail==="/computer/live-session" && request.method==="POST" || /^\/approvals\/[^/]+$/.test(tail) && request.method==="POST";
+      if(mutation) admissionToken=await beginAdmission(env,botId,`mutation:${crypto.randomUUID()}`);
+      requestBodyForwarded=true;
       const response=await stub.fetch(new Request(`https://bot${tail||"/"}${url.search}`,{method:request.method,headers,body:["GET","HEAD"].includes(request.method)?undefined:request.body,redirect:"manual",signal:request.signal}));
-      if(tail==="/runs" && request.method==="GET" && response.ok) {const runPage=await response.clone().json<{activeRuns:unknown[]}>();if(!runPage.activeRuns.length)await registry.fetch(`https://workspace/tasks/bot-slot/${botId}`,{method:"DELETE"});}
-      if((tail==="/messages" && request.method==="POST" && !response.ok) || mutation) {const runs=await stub.fetch(new Request("https://bot/runs",{headers}));if(runs.ok && !(await runs.json<{activeRuns:unknown[]}>()).activeRuns.length)await registry.fetch(`https://workspace/tasks/bot-slot/${botId}`,{method:"DELETE"});}
+      if(admissionToken)await completeAdmission(env,botId,admissionToken);
       return response;
-    } catch(error) {return errorResponse(error);}
+    } catch(error) {return errorResponse(error);} finally {if(!requestBodyForwarded)await discardRequestBody(request);}
   },
 } satisfies ExportedHandler<Env>;

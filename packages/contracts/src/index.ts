@@ -40,7 +40,7 @@ export type ComputerAction =
 export interface ComputerResult { operationId:string;status:"running"|"completed"|"failed"|"interrupted"|"cancelled";processId?:string;processKnown?:boolean;output?:string;exitCode?:number;artifactId?:string;mimeType?:string;checkpointId?:string;checkpointStatus?:"pending"|"saved"|"failed";error?:string; }
 export interface ComputerStatus { id:string;provider:"cloudflare";state:"stopped"|"starting"|"running"|"unavailable";capabilities:string[];lastCheckpointId?:string;error?:{code:string;message:string}; }
 export interface Approval {id:string;botId:string;runId:string;operationId:string;toolCallId?:string;action:ComputerAction;status:"pending"|"approved"|"denied"|"executing"|"completed"|"failed"|"interrupted";createdAt:string;expiresAt:string;result?:ComputerResult;}
-export interface ComputerProvider {exec(botId:string,operationId:string,action:ComputerAction):Promise<ComputerResult>;cancel(botId:string,processId:string):Promise<ComputerResult>;status(botId:string):Promise<ComputerStatus>;checkpoint(botId:string):Promise<ComputerResult>;}
+export interface ComputerProvider {exec(botId:string,operationId:string,action:ComputerAction):Promise<ComputerResult>;cancel(botId:string,processId:string):Promise<ComputerResult>;status(botId:string):Promise<ComputerStatus>;checkpoint(botId:string):Promise<ComputerResult>;controlled?(botId:string):Promise<boolean>;}
 export interface ApiError {error:{code:string;message:string};}
 
 export interface ConnectionRequest {id:string;botId:string;runId:string;nativeOperationId?:string;provider:"github";repository?:string;permission:"read"|"write";status:"pending"|"connected"|"cancelled";createdAt:string;}
@@ -49,6 +49,6 @@ export type {MemoryCategory,MemoryActor,MemoryState,MemorySource,MemoryEntry,Mem
 export interface CompactionReceipt {id:string;reason:"manual"|"threshold"|"overflow";status:"running"|"completed"|"unchanged"|"failed"|"cancelled";summaryApplied:boolean;error?:string;createdAt?:string;startedAt?:string;summaryCreatedAt?:string;firstKeptEntryId?:number;summarizedEntries?:number;estimatedTokensBefore?:number;historyRetained?:true;}
 export interface BotContextStatus {automatic:true;estimatedTokens:number;activeEntries:number;contextWindow:number;compactions:CompactionReceipt[];historyRetained:true;}
 
-export type TaskStatus = "pending" | "queued" | "running" | "waiting_approval" | "waiting_connection" | "completed" | "failed" | "cancelled";
+export type TaskStatus = "pending" | "queued" | "running" | "waiting_approval" | "waiting_connection" | "cancelling" | "completed" | "failed" | "cancelled";
 export interface Task { id:string; title:string; description:string; botId:string; botName:string; creator:"owner"|"bot"; createdByBotId?:string; sourceRunId?:string; status:TaskStatus; startImmediately:boolean; createdAt:string; updatedAt:string; lastActivity?:string; }
 export interface TaskPage { tasks:Task[]; }

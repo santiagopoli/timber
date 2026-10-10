@@ -34,7 +34,7 @@ export async function agentCoordinatorRequest<T>(env:Env,path:string,input?:unkn
 /** Durable outbox kept in the same object as the authoritative bot registry. */
 export class AgentCoordinator {
   private working=new Map<string,Promise<void>>();
-  constructor(private ctx:DurableObjectState,private env:Env,private rearm:()=>Promise<void>) {
+  constructor(private ctx:DurableObjectState,private env:Env,private rearm:()=>Promise<void>,private reserveComputer:(botId:string,operationId:string)=>string,private completeComputer:(token:string)=>void) {
     ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS agent_creations (source_bot_id TEXT NOT NULL,operation_id TEXT NOT NULL,fingerprint TEXT NOT NULL,bot_id TEXT NOT NULL,PRIMARY KEY(source_bot_id,operation_id));
       CREATE TABLE IF NOT EXISTS agent_deliveries (id TEXT PRIMARY KEY,source_bot_id TEXT NOT NULL,operation_id TEXT NOT NULL,fingerprint TEXT NOT NULL,phase TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL,data TEXT NOT NULL,UNIQUE(source_bot_id,operation_id));
@@ -51,9 +51,19 @@ export class AgentCoordinator {
   }
   private async botRequest<T>(botId:string,path:string,input?:unknown,method="GET"):Promise<T> {
     const bot=this.bot(botId);
+    // Agent delivery and result inputs are internal run admissions. Reserve in
+    // this WorkspaceDO directly (rather than recursively calling its own
+    // fetch handler) so an alarm-driven outbox retry cannot deadlock itself.
+    let admission:string|undefined;
+    if(method==="POST"&&(path==="/agent-messages"||path==="/agent-results")) {
+      const op=input&&typeof input==="object"?(input as {operationId?:unknown}).operationId:undefined;
+      if(typeof op!=="string")throw new ApiError(400,"invalid_request","Agent delivery operationId is required.");
+      admission=this.reserveComputer(botId,op);
+    }
     const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),30_000);
     try {
       const response=await this.env.BOT.get(this.env.BOT.idFromName(`owner:${botId}`)).fetch(new Request(`https://bot${path}`,{method,signal:controller.signal,headers:{"content-type":"application/json","x-timber-internal":"agents","x-botspace-config":encodeURIComponent(JSON.stringify(bot))},...(input===undefined?{}:{body:JSON.stringify(input)})}));
+      if(admission)this.completeComputer(admission);
       if(!response.ok) {
         // BotDO public diagnostics are reviewed, but arbitrary provider responses
         // are never copied into another bot's transcript.
@@ -220,11 +230,18 @@ export class AgentCoordinator {
         } else this.save(delivery,"observe",run.status.startsWith("waiting_")?15_000:3000);
       } else {
         const provenance:MessageProvenance={kind:"delegation_result",sourceBotId:d.targetBotId,sourceBotName:d.targetBotName,...(d.targetRunId?{sourceRunId:d.targetRunId}:{}),delegationId:d.id};
-        await this.botRequest(d.sourceBotId,"/agent-results",{delegation:d,status:d.status,text:delivery.result??"The delegated task finished without a response.",provenance},"POST");
+        await this.botRequest(d.sourceBotId,"/agent-results",{operationId:`agent-result:${d.id}`,delegation:d,status:d.status,text:delivery.result??"The delegated task finished without a response.",provenance},"POST");
         if(this.unchanged(row)) this.save(delivery,"done");
       }
     } catch(error) {
       if(!this.unchanged(row)) return;
+      if(error instanceof ApiError && error.code==="computer_busy" && row.phase!=="cancel") {
+        // Computer contention is expected while a task or direct action owns
+        // the shared device. Preserve the durable delivery without consuming
+        // the finite transport-failure retry budget.
+        this.save(delivery,row.phase,5000,row.attempts);
+        return;
+      }
       if(row.phase==="cancel") {
         // Cancellation is safety-critical: retain the durable fence request
         // across transport outages until the exact target acknowledges it.

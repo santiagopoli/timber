@@ -13,15 +13,15 @@ export type TasksProps = {
   onClose?: () => void;
   onOpenBot?: (botId: string) => void;
 };
-type TaskStatus = 'pending'|'queued'|'running'|'waiting_approval'|'waiting_connection'|'completed'|'failed'|'cancelled'|string;
+type TaskStatus = 'pending'|'queued'|'running'|'waiting_approval'|'waiting_connection'|'cancelling'|'completed'|'failed'|'cancelled'|string;
 type Task = {id:string;title:string;description?:string;botId:string;botName?:string;status:TaskStatus;createdAt?:string;updatedAt?:string;lastActivity?:string};
 type TaskMessage = {id?:string;role?:string;text?:string;content?:string;createdAt?:string};
 const isRecord = (value: unknown): value is Record<string, unknown> => Boolean(value && typeof value === 'object' && !Array.isArray(value));
 const text = (value: unknown) => typeof value === 'string' ? value : '';
 const label = (value: string) => value.replaceAll('_',' ');
 const date = (value?: string) => value ? new Date(value).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
-const activeStatuses = new Set(['queued','running','waiting_approval','waiting_connection']);
-const statusName = (status: string) => (({pending:'Pending',queued:'Queued',running:'Running',waiting_approval:'Needs approval',waiting_connection:'Needs connection',completed:'Completed',failed:'Failed',cancelled:'Cancelled'} as Record<string,string>)[status] || label(status));
+const activeStatuses = new Set(['queued','running','waiting_approval','waiting_connection','cancelling']);
+const statusName = (status: string) => (({pending:'Pending',queued:'Queued',running:'Running',waiting_approval:'Needs approval',waiting_connection:'Needs connection',cancelling:'Cancelling',completed:'Completed',failed:'Failed',cancelled:'Cancelled'} as Record<string,string>)[status] || label(status));
 function taskList(value: unknown): Task[] {
   const source = Array.isArray(value) ? value : isRecord(value) && Array.isArray(value.tasks) ? value.tasks : [];
   return source.filter(isRecord).map(item => ({id:text(item.id),title:text(item.title)||'Untitled task',description:text(item.description),botId:text(item.botId),botName:text(item.botName),status:text(item.status)||'pending',createdAt:text(item.createdAt),updatedAt:text(item.updatedAt),lastActivity:text(item.lastActivity)})).filter(item=>item.id);
@@ -44,12 +44,8 @@ function TaskView({props}:{props:TasksProps}) {
   const loadTasks=useCallback(async(signal?:AbortSignal)=>{
     try {
       const result=await props.request('/v1/tasks',{signal});if(signal?.aborted)return;
-      const current=taskList(result),active=current.filter(task=>activeStatuses.has(task.status));
-      // Runs reads project terminal status and release durable computer slots.
-      await Promise.all(active.map(task=>props.request(`/v1/tasks/${encodeURIComponent(task.id)}/runs`,{signal}).catch(()=>undefined)));
-      if(signal?.aborted)return;
-      const latest=active.length?await props.request('/v1/tasks',{signal}):result;
-      if(!signal?.aborted){setTasks(taskList(latest));setLoadError('');}
+      const current=taskList(result);
+      if(!signal?.aborted){setTasks(current);setLoadError('');}
     }
     catch(reason){if(!signal?.aborted)setLoadError(reason instanceof Error?reason.message:'Could not load tasks.');}
     finally{if(!signal?.aborted)setLoading(false);}
@@ -59,7 +55,6 @@ function TaskView({props}:{props:TasksProps}) {
   const loadDetail=useCallback(async(id:string,signal?:AbortSignal)=>{
     setLoadingMessages(true);setLoadError('');
     try {
-      await props.request(`/v1/tasks/${encodeURIComponent(id)}/runs`,{signal}).catch(()=>undefined);
       const [taskResult,messageResult]=await Promise.all([props.request(`/v1/tasks/${encodeURIComponent(id)}`,{signal}),props.request(`/v1/tasks/${encodeURIComponent(id)}/messages`,{signal})]);
       if(signal?.aborted)return;
       setDetail(taskDetail(taskResult)||tasks.find(item=>item.id===id)||null);setMessages(messageList(messageResult));
@@ -112,10 +107,10 @@ function TaskView({props}:{props:TasksProps}) {
     {error&&<p className="timber-tasks-error" role="alert">{error}</p>}
     <div className="timber-tasks-controls">
       {detail?.status==='pending'&&<button type="button" className="timber-tasks-action" disabled={busy} onClick={()=>void action('start')}>{busy?<LoaderCircleIcon className="timber-tasks-spinner"/>:<ArrowUpIcon/>}{busy?'Starting…':'Start task'}</button>}
-      {detail&&activeStatuses.has(detail.status)&&<button type="button" className="timber-tasks-action is-secondary" disabled={busy} onClick={()=>void action('cancel')}>{busy?<LoaderCircleIcon className="timber-tasks-spinner"/>:<SquareIcon/>}{busy?'Working…':'Cancel task'}</button>}
+      {detail&&activeStatuses.has(detail.status)&&detail.status!=='cancelling'&&<button type="button" className="timber-tasks-action is-secondary" disabled={busy} onClick={()=>void action('cancel')}>{busy?<LoaderCircleIcon className="timber-tasks-spinner"/>:<SquareIcon/>}{busy?'Working…':'Cancel task'}</button>}
       {detail?.status&&['completed','failed','cancelled'].includes(detail.status)&&<span className="timber-tasks-hint">This task is {statusName(detail.status).toLowerCase()}.</span>}
     </div>
-    {detail?.status!=='cancelled'&&<form className="timber-tasks-composer" onSubmit={event=>void send(event)}><label className="timber-tasks-sr-only" htmlFor="timber-task-draft">Message this task</label><textarea id="timber-task-draft" rows={2} value={draft} onChange={event=>setDraft(event.currentTarget.value)} placeholder="Message this task…"/><button type="submit" aria-label="Send task message" disabled={busy||!draft.trim()}>{busy?<LoaderCircleIcon className="timber-tasks-spinner"/>:<ArrowUpIcon/>}</button></form>}
+    {detail&&['running','waiting_approval','waiting_connection'].includes(detail.status)&&<form className="timber-tasks-composer" onSubmit={event=>void send(event)}><label className="timber-tasks-sr-only" htmlFor="timber-task-draft">Message this task</label><textarea id="timber-task-draft" rows={2} value={draft} onChange={event=>setDraft(event.currentTarget.value)} placeholder="Message this task…"/><button type="submit" aria-label="Send task message" disabled={busy||!draft.trim()}>{busy?<LoaderCircleIcon className="timber-tasks-spinner"/>:<ArrowUpIcon/>}</button></form>}
   </section> : <section className="timber-tasks-overview">
     <header className="timber-tasks-overview-heading"><div><h2>Tasks</h2><p>Independent work and conversations across your bots.</p></div><button type="button" className="timber-tasks-action" onClick={()=>{setShowCreate(value=>!value);setError('')}}><PlusIcon/>{showCreate?'Close':'New task'}</button></header>
     {showCreate&&<form className="timber-tasks-create" onSubmit={event=>void create(event)}><h3>Create a task</h3><label>Title<input autoFocus required maxLength={160} value={title} onChange={event=>setTitle(event.currentTarget.value)} placeholder="What needs to be done?"/></label><label>Description<textarea rows={3} value={description} onChange={event=>setDescription(event.currentTarget.value)} placeholder="Add context or instructions (optional)"/></label><label>Assigned bot<select required value={botId} onChange={event=>setBotId(event.currentTarget.value)}><option value="" disabled>Select a bot</option>{props.bots.map(bot=><option value={bot.id} key={bot.id}>{bot.name}</option>)}</select></label><label className="timber-tasks-checkbox"><input type="checkbox" checked={startImmediately} onChange={event=>setStartImmediately(event.currentTarget.checked)}/>Start immediately</label>{error&&<p className="timber-tasks-error" role="alert">{error}</p>}<div className="timber-tasks-form-actions"><button type="button" className="timber-tasks-quiet" onClick={()=>setShowCreate(false)}>Cancel</button><button type="submit" className="timber-tasks-action" disabled={creating||!props.bots.length||!title.trim()}>{creating&&<LoaderCircleIcon className="timber-tasks-spinner"/>}{creating?'Creating…':'Create task'}</button></div>{!props.bots.length&&<p className="timber-tasks-hint">Create a bot before assigning a task.</p>}</form>}

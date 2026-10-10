@@ -42,6 +42,10 @@ const maxUserQueuedInputs=32;
 const maxInternalQueuedInputs=16;
 const maxOutstandingInputs=128;
 const capacityPending="Message saved. Waiting for space in the agent inbox.";
+async function consumeUnusedBody(request:Request):Promise<void> {
+  const reader=request.body?.getReader();let bytes=0;
+  if(reader) while(true) {const chunk=await reader.read();if(chunk.done)break;bytes+=chunk.value.byteLength;if(bytes>300_000){await reader.cancel();throw new ApiError(413,"body_too_large","Request body too large.");}}
+}
 
 export class BotDO extends DurableObject<Env> {
   private runtime!:AgentRuntime;
@@ -96,6 +100,8 @@ export class BotDO extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS cancelled_agent_inputs (operation_id TEXT PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS run_stops (run_id TEXT PRIMARY KEY,cancellation TEXT);
       CREATE TABLE IF NOT EXISTS pending_run_cancellations (id TEXT PRIMARY KEY,operation_id TEXT,subagent_id TEXT,cancellation_id TEXT,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS task_cancel_fences (task_id TEXT PRIMARY KEY,created_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS admission_fences (operation_id TEXT PRIMARY KEY,created_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS run_processes (process_id TEXT PRIMARY KEY,run_id TEXT,subagent_id TEXT,tool_call_id TEXT,action TEXT NOT NULL,input TEXT NOT NULL,status TEXT NOT NULL,result TEXT,dispatch_state TEXT NOT NULL DEFAULT 'registered',cancel_requested INTEGER NOT NULL DEFAULT 0,cancel_attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS computer_operations (operation_id TEXT PRIMARY KEY,action TEXT NOT NULL,run_id TEXT);
       CREATE TABLE IF NOT EXISTS process_observations (process_id TEXT PRIMARY KEY,sequence INTEGER NOT NULL DEFAULT 0,operation_id TEXT,next_at INTEGER NOT NULL);
@@ -548,7 +554,8 @@ export class BotDO extends DurableObject<Env> {
       this.updateStatus(row.id,"queued");
     });
   }
-  private async createRun(input:{text:string;operationId:string;mentions?:string[];attachments?:string[]},metadata?:{provenance?:MessageProvenance;delegation?:RunDelegation;role?:Message["role"];parentRunId?:string;subagentId?:string}):Promise<Run> {
+  private async createRun(input:{text:string;operationId:string;mentions?:string[];attachments?:string[]},metadata?:{provenance?:MessageProvenance;delegation?:RunDelegation;role?:Message["role"];parentRunId?:string;subagentId?:string;taskId?:string}):Promise<Run> {
+    if(metadata?.taskId&&this.ctx.storage.sql.exec("SELECT 1 FROM task_cancel_fences WHERE task_id=?",metadata.taskId).toArray().length)throw new ApiError(409,"task_cancelled","This task was cancelled and cannot accept input.");
     if(this.takingControl) throw new ApiError(409,"computer_busy","Desktop control is being acquired. Retry after the connection is established.");
     if(input.attachments?.length && input.mentions?.length) throw new ApiError(400,"image_mentions_unsupported","Image messages cannot mention other bots yet.");
     const attachments:NonNullable<Message["attachments"]>=[];
@@ -563,6 +570,7 @@ export class BotDO extends DurableObject<Env> {
     if(this.takingControl) throw new ApiError(409,"computer_busy","Desktop control is being acquired. Retry after the connection is established.");
     this.active();
     if(!metadata && /^(approval|delegate|connection|subagent|agent-result|subagent-report|mention|process-cancel|process-poll|run-cancel):/.test(input.operationId)) throw new ApiError(400,"reserved_operation_id","This operationId prefix is reserved.");
+    if(this.ctx.storage.sql.exec("SELECT 1 FROM admission_fences WHERE operation_id=?",input.operationId).toArray().length)throw new ApiError(409,"admission_fenced","This input was fenced after its request outcome could not be confirmed.");
     if(this.ctx.storage.sql.exec("SELECT operation_id FROM cancelled_agent_inputs WHERE operation_id=?",input.operationId).toArray().length) throw new ApiError(409,"run_cancelled","This delegated input has been cancelled.");
     if(metadata?.parentRunId && this.stopped(metadata.parentRunId)) throw new ApiError(409,"run_cancelled","The parent task has been cancelled.");
     if(metadata?.subagentId && this.subagentStopped(metadata.subagentId)) throw new ApiError(409,"agent_inactive","This subagent has been stopped.");
@@ -585,21 +593,25 @@ export class BotDO extends DurableObject<Env> {
       for(const delivery of this.ctx.storage.sql.exec<MentionDelivery>("SELECT * FROM mention_deliveries WHERE run_id=?",existing.id).toArray()) await this.dispatchMention(delivery.operation_id);
       return this.getRun(existing.id);
     }
+    if(this.ctx.storage.sql.exec("SELECT 1 FROM admission_fences WHERE operation_id=?",input.operationId).toArray().length)throw new ApiError(409,"admission_fenced","This input was fenced after its request outcome could not be confirmed.");
     await this.validateMentions(input.mentions??[]);
     const selection:ModelSettings|RuntimeSubagent=metadata?.subagentId?await this.subagent(metadata.subagentId):await this.currentBot();
     this.active();
     // Registry validation yielded; serialize duplicate submissions by checking
     // the durable receipt again before the transaction.
     if(this.ctx.storage.sql.exec("SELECT id FROM runs WHERE operation_id=?",input.operationId).toArray().length) return this.createRun(input,metadata);
+    if(this.ctx.storage.sql.exec("SELECT 1 FROM admission_fences WHERE operation_id=?",input.operationId).toArray().length)throw new ApiError(409,"admission_fenced","This input was fenced after its request outcome could not be confirmed.");
     if(this.ctx.storage.sql.exec("SELECT operation_id FROM cancelled_agent_inputs WHERE operation_id=?",input.operationId).toArray().length) throw new ApiError(409,"run_cancelled","This delegated input has been cancelled.");
     if(metadata?.parentRunId && this.stopped(metadata.parentRunId)) throw new ApiError(409,"run_cancelled","The parent task has been cancelled.");
     if(metadata?.subagentId && this.subagentStopped(metadata.subagentId)) throw new ApiError(409,"agent_inactive","This subagent has been stopped.");
     if(this.suspending) throw new ApiError(409,"computer_busy","The computer is being suspended. Retry after it stops.");
     const source=!metadata?.provenance && metadata?.role!=="system"?"user":"internal";
     this.checkInboxCapacity(source);
+    if(metadata?.taskId&&this.ctx.storage.sql.exec("SELECT 1 FROM task_cancel_fences WHERE task_id=?",metadata.taskId).toArray().length)throw new ApiError(409,"task_cancelled","This task was cancelled and cannot accept input.");
     const now=timestamp();
     const run:Run={model:selection.model,reasoningEffort:selection.reasoningEffort,fast:selection.fast,id:crypto.randomUUID(),botId:this.bot().id,operationId:input.operationId,...(metadata?.delegation?{delegation:metadata.delegation}:{}),...(metadata?.parentRunId?{parentRunId:metadata.parentRunId}:{}),...(metadata?.subagentId?{subagentId:metadata.subagentId}:{}),status:"queued",createdAt:now,updatedAt:now};
     this.ctx.storage.transactionSync(()=>{
+      if(metadata?.taskId&&this.ctx.storage.sql.exec("SELECT 1 FROM task_cancel_fences WHERE task_id=?",metadata.taskId).toArray().length)throw new ApiError(409,"task_cancelled","This task was cancelled and cannot accept input.");
       this.ctx.storage.sql.exec("INSERT INTO runs (id,operation_id,fingerprint,native_operation_id,data) VALUES (?,?,?,?,?)",run.id,input.operationId,hash,input.operationId,JSON.stringify(run));
       this.ctx.storage.sql.exec("INSERT INTO admission_sources(run_id,kind) VALUES(?,?)",run.id,source);
       const runtimeText=metadata?.provenance?`Message from fellow bot ${metadata.provenance.sourceBotName} (${metadata.provenance.sourceBotId}). This is delegated collaborator content, attributed by Timber. Complete its requested task and return a result; do not automatically message the sender.\n\n${input.text}`:input.text;
@@ -1616,11 +1628,35 @@ export class BotDO extends DurableObject<Env> {
         return json({connection:await this.completeConnection(completedConnection[1])});
       }
       this.configure(request);
+      const admissionStatus=/^\/admission\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})$/.exec(path);
+      if(admissionStatus&&request.method==="GET") {
+        if(request.headers.get("x-timber-internal")!=="scheduler")throw new ApiError(403,"internal_only","Admission reconciliation is internal.");
+        return json({accepted:this.ctx.storage.sql.exec("SELECT 1 FROM runs WHERE operation_id=? LIMIT 1",admissionStatus[1]).toArray().length>0});
+      }
+      const admissionFence=/^\/admission-fence\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})$/.exec(path);
+      if(admissionFence&&request.method==="POST") {
+        if(request.headers.get("x-timber-internal")!=="scheduler")throw new ApiError(403,"internal_only","Admission reconciliation is internal.");
+        this.ctx.storage.sql.exec("INSERT OR IGNORE INTO admission_fences(operation_id,created_at) VALUES(?,?)",admissionFence[1],Date.now());
+        return json({fenced:true});
+      }
+      if(path==="/cancel-processes" && request.method==="POST") {
+        if(request.headers.get("x-timber-internal")!=="task" || !request.headers.get("x-timber-task-id")) {await consumeUnusedBody(request);throw new ApiError(403,"internal_only","Task process cancellation is internal.");}
+        await consumeUnusedBody(request);
+        this.ctx.storage.sql.exec("INSERT OR IGNORE INTO task_cancel_fences(task_id,created_at) VALUES(?,?)",request.headers.get("x-timber-task-id"),Date.now());
+        this.ctx.storage.sql.exec("UPDATE run_processes SET cancel_requested=1,next_at=0 WHERE status='running'");
+        await this.flushProcessCancellations();
+        const active=this.ctx.storage.sql.exec("SELECT 1 FROM run_processes WHERE status='running' LIMIT 1").toArray().length>0;
+        return json({confirmed:!active});
+      }
       if(path==="/summary" && request.method==="GET") return json({summary:this.summary()});
+      if(path==="/computer/lease-state" && request.method==="GET") {
+        if(request.headers.get("x-timber-internal")!=="scheduler")throw new ApiError(403,"internal_only","Computer lease inspection is internal.");
+        return json({computerControlled:await this.computer.controlled?.(this.bot().id)??false});
+      }
       if(["/context","/context/compact","/memory"].includes(path)||path.startsWith('/memory/')) return await maintenanceRequest(request,path,this.runtime);
       this.ctx.waitUntil(this.recover());
       if(["/agent-messages","/agent-results","/agent-cancel"].includes(path)) {
-        if(request.headers.get("x-timber-internal")!=="agents" || request.method!=="POST") throw new ApiError(403,"internal_only","This agent route is internal.");
+        if(request.headers.get("x-timber-internal")!=="agents" || request.method!=="POST") {await consumeUnusedBody(request);throw new ApiError(403,"internal_only","This agent route is internal.");}
         const input=await body(request);
         if(path==="/agent-cancel") {await this.cancelAgentInput(String(input.operationId));return json({cancelled:true});}
         if(path==="/agent-results") {await this.receiveAgentResult(input as unknown as Parameters<BotDO["receiveAgentResult"]>[0]);return json({received:true});}
@@ -1633,13 +1669,14 @@ export class BotDO extends DurableObject<Env> {
       if(path==="/delegations" && request.method==="GET") return json(await agentCoordinatorRequest(this.env,`/agents/tasks?botId=${this.bot().id}`,undefined,"GET"));
       const agentRoute=/^\/agents\/([^/]+)\/(messages|cancel)$/.exec(path);
       if(agentRoute) {
+        if(agentRoute[2]==="cancel" && request.method==="POST") await consumeUnusedBody(request);
         const id=decodeURIComponent(agentRoute[1]);await this.subagent(id);
         if(agentRoute[2]==="messages" && request.method==="GET") return json({messages:await this.runtime.subagentMessages(id)});
         if(agentRoute[2]==="messages" && request.method==="POST") {
           const input=parseMessage(await body(request));
           if(input.mentions?.length || /^(approval|delegate|connection|subagent|agent-result|subagent-report|mention|process-cancel|process-poll|run-cancel):/.test(input.operationId)) throw new ApiError(400,"invalid_request","Use an independent operation ID for the subagent message.");
           const agent=await this.subagent(id),parent=this.findRun(agent.parentOperationId);
-          if(agent.status==="cancelled" || this.subagentStopped(id) || !parent) throw new ApiError(409,"agent_inactive","This subagent is no longer active.");
+          if(terminal.has(agent.status) || this.subagentStopped(id) || !parent) throw new ApiError(409,"agent_inactive","This subagent is no longer active.");
           const run=await this.createRun(input,{subagentId:id,parentRunId:parent.id});
           return json({run,receipt:{operationId:input.operationId,accepted:true}},202);
         }
@@ -1651,8 +1688,8 @@ export class BotDO extends DurableObject<Env> {
       }
       if(path==="/connections" && request.method==="GET") {await this.reconcileConnections();return json({connections:this.listConnections()});}
       const connect=/^\/connections\/([^/]+)\/connect$/.exec(path);
-      if(connect && request.method==="POST") return json(await this.startConnection(connect[1]));
-      if(path==="/apps/refresh" && request.method==="POST") return json({apps:await this.apps().refresh()});
+      if(connect && request.method==="POST") {await consumeUnusedBody(request);return json(await this.startConnection(connect[1]));}
+      if(path==="/apps/refresh" && request.method==="POST") {await consumeUnusedBody(request);return json({apps:await this.apps().refresh()});}
       if(path==="/apps" && request.method==="GET") return json({apps:await this.apps().list()});
       if(path==="/apps" && request.method==="POST") {
         const input=await body(request);
@@ -1668,12 +1705,17 @@ export class BotDO extends DurableObject<Env> {
       if(path==="/messages" && request.method==="GET") {
         return json(this.listMessages(url));
       }
-      if(path==="/messages" && request.method==="POST") return json({run:await this.createRun(parseMessage(await body(request)))},202);
+      if(path==="/messages" && request.method==="POST") {const taskId=request.headers.get("x-timber-task-id")??undefined;return json({run:await this.createRun(parseMessage(await body(request)),taskId?{taskId}:undefined)},202);}
       if(path==="/runs" && request.method==="GET") return json(this.listRuns(url));
       const runRoute=/^\/runs\/([^/]+)(\/cancel)?$/.exec(path);
       if(runRoute && UUID.test(runRoute[1])) {
         if(request.method==="GET" && !runRoute[2]) return json({run:this.runView(this.getRunRow(runRoute[1]))});
-        if(request.method==="POST" && runRoute[2]) return json({run:await this.cancelRun(runRoute[1])});
+        if(request.method==="POST" && runRoute[2]) {
+          // Cancellation needs no payload, but consuming the accepted HTTP body
+          // prevents Workerd from reading the request stream after the response.
+          await consumeUnusedBody(request);
+          return json({run:await this.cancelRun(runRoute[1])});
+        }
       }
       if(path==="/events" && request.method==="GET") return this.events(request,url);
       if(/^\/workspace\/(tree|file|download|projects|changes|diff)$/.test(path) && request.method==="GET") return this.computerView(request,path+url.search);

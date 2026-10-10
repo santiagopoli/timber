@@ -272,6 +272,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       if(!this.container?.running) throw new ComputerProviderError("computer_app_not_running");
       return this.container.getTcpPort(port).fetch(new Request(`http://127.0.0.1:${port}/`,{headers:{Upgrade:"websocket",Authorization:`Bearer ${this.token}`,"Sec-WebSocket-Protocol":"binary"}}));
     },()=>this.touch());
+    if(url.pathname==="/desktop/control" && request.method==="GET") return Response.json({controlled:await this.live.controlled()});
     if(url.pathname==="/desktop" && request.method==="POST") {
       const input=await request.json<{mode?:unknown;replaces?:unknown}>();
       if(input.mode!=="view" && input.mode!=="control") throw new ComputerProviderError("computer_invalid_request");
@@ -1156,6 +1157,13 @@ export function createCloudComputerProvider(binding: DurableObjectNamespace): Co
     exec:(botId,operationId,action) => rpc<ComputerResult>(binding,botId,"/actions",{operationId,action}),
     status:botId => rpc<ComputerStatus>(binding,botId,"/status"),
     checkpoint:botId => rpc<ComputerResult>(binding,botId,"/actions",{operationId:crypto.randomUUID(),action:{type:"checkpoint"}}),
+    controlled:async botId => {
+      let response:Response;
+      try {response=await binding.get(binding.idFromName(botId)).fetch("https://computer.internal/desktop/control",{headers:{"x-timber-bot-id":botId}});}
+      catch {throw new ComputerProviderError("computer_unavailable");}
+      if(!response.ok)throw new ComputerProviderError("computer_unavailable");
+      return (await response.json<{controlled:boolean}>()).controlled;
+    },
     cancel:(botId,processId)=>rpc<ComputerResult>(binding,botId,'/exec/cancel',{processId}),
   };
 }

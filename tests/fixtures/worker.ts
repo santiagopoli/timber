@@ -9,7 +9,7 @@ export class KeylessChatGPTAuthDO extends ChatGPTAuthDO {
 }
 export {default, WorkspaceDO, BotDO} from "../../apps/api/src/index";
 export {ComputerDO as RealComputerDO} from "../../packages/computer/src/index";
-export const computerFixtureControl: {gate?: Promise<void>; status?: ComputerResult["status"]; failure?: {status: number; body: unknown};deleteFailure?:boolean;execSession?:{command?:string;pollsBeforeComplete?:number}} = {};
+export const computerFixtureControl: {gate?: Promise<void>; status?: ComputerResult["status"]; controlled?:boolean; failure?: {status: number; body: unknown};deleteFailure?:boolean;execSession?:{command?:string;pollsBeforeComplete?:number}} = {};
 
 /** Test-only effects journal. This does not launch a container or implement tools. */
 export class ComputerDO extends DurableObject {
@@ -20,8 +20,11 @@ export class ComputerDO extends DurableObject {
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS exec_sessions (id TEXT PRIMARY KEY,result TEXT NOT NULL,polls INTEGER NOT NULL DEFAULT 0,remaining INTEGER NOT NULL DEFAULT 0)");
   }
   async fetch(request: Request) {
-    const input = await request.json<{botId: string; operationId: string; processId?:string; action: ComputerAction}>();
     const path = new URL(request.url).pathname;
+    // The real DesktopSessions RPC is a read-only GET; tests default to no
+    // interactive GUI control unless a case explicitly configures it.
+    if(path==="/desktop/control" && request.method==="GET") return Response.json({controlled:computerFixtureControl.controlled??false});
+    const input = await request.json<{botId: string; operationId: string; processId?:string; action: ComputerAction}>();
     if(path==="/delete") {
       if(computerFixtureControl.deleteFailure) return Response.json({error:{code:"computer_unavailable"}},{status:503});
       this.ctx.storage.sql.exec("INSERT OR IGNORE INTO deletion(id) VALUES(1)");
