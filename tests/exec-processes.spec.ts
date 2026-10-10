@@ -23,6 +23,8 @@ function insertRun(state:DurableObjectState,bot:Bot,extra:Partial<Run>={}):Run {
 async function setup(mode:"ask"|"automatic"="automatic") {
   const {bot}=await (await api("/v1/bots",{name:"Process ownership",computerApprovalMode:mode})).json<{bot:Bot}>();
   await (await api(`/v1/bots/${bot.id}/messages`)).text();
+  // Synthetic admitted runs below still need the real conversation lease.
+  await (await bindings.WORKSPACE.get(bindings.WORKSPACE.idFromName("owner")).fetch(`https://workspace/tasks/bot-slot/${bot.id}`,{method:"POST"})).arrayBuffer();
   return bot;
 }
 const request=(run:Run,action:ComputerAction,operationId=crypto.randomUUID()):RuntimeToolRequest=>({operationId,runOperationId:run.operationId,action,signal:new AbortController().signal});

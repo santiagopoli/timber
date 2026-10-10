@@ -28,7 +28,9 @@ function deferred() {
 }
 async function activeBot() {
   const {bot} = await (await api('/v1/bots', {name: 'Tool activity', computerApprovalMode: 'automatic'})).json<{bot: Bot}>();
-  await api(`/v1/bots/${bot.id}/messages`);
+  await (await api(`/v1/bots/${bot.id}/messages`)).arrayBuffer();
+  // Keep the production execution lease while synthesizing the held run.
+  await (await bindings.WORKSPACE.get(bindings.WORKSPACE.idFromName("owner")).fetch(`https://workspace/tasks/bot-slot/${bot.id}`, {method: "POST"})).arrayBuffer();
   const now = new Date().toISOString();
   const run: Run = {id: crypto.randomUUID(), botId: bot.id, operationId: crypto.randomUUID(), status: 'running', createdAt: now, updatedAt: now};
   // Hold a real host run open without a model racing the deliberately delayed

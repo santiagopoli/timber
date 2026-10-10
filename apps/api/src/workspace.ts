@@ -495,9 +495,11 @@ export class WorkspaceDO extends DurableObject<Env> {
         if(intent?.state==="cancelled")throw new ApiError(409,"action_cancelled","This queued action was cancelled and will not execute.");
         if(intent&&intent.payload!==JSON.stringify({operationId:op,action}))throw new ApiError(409,"operation_id_conflict","Queued action operationId was already used for different input.");
         if(lease?.admissionToken) {
-          const admission=this.ctx.storage.sql.exec("SELECT 1 FROM computer_admissions WHERE token=? AND bot_id=? AND task_id='@bot' AND operation_id=? AND slot_token=?",lease.admissionToken,botId,op,slot.token).toArray()[0];
+          const admission=this.ctx.storage.sql.exec<{payload:string|null}>("SELECT payload FROM computer_admissions WHERE token=? AND bot_id=? AND task_id='@bot' AND operation_id=? AND slot_token=?",lease.admissionToken,botId,op,slot.token).toArray()[0];
           if(!admission)throw new ApiError(409,"computer_lease_stale","The direct admission is no longer valid.");
-          this.ctx.storage.sql.exec("UPDATE computer_admissions SET payload=? WHERE token=?",JSON.stringify({operationId:op,action}),lease.admissionToken);
+          const payload=JSON.stringify({operationId:op,action});
+          if(admission.payload&&admission.payload!==payload)throw new ApiError(409,"operation_id_conflict","The pinned computer action arguments changed.");
+          this.ctx.storage.sql.exec("UPDATE computer_admissions SET payload=? WHERE token=? AND payload IS NULL",payload,lease.admissionToken);
           return json({token:lease.admissionToken});
         }
         const existing=this.ctx.storage.sql.exec<{token:string;payload:string|null}>("SELECT token,payload FROM computer_admissions WHERE bot_id=? AND task_id=? AND operation_id=? AND slot_token=?",botId,holder,op,slot.token).toArray()[0];

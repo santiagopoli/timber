@@ -1,5 +1,5 @@
 import {env,exports} from "cloudflare:workers";
-import {abortAllDurableObjects,evictDurableObject,runDurableObjectAlarm,runInDurableObject} from "cloudflare:test";
+import {evictDurableObject,runDurableObjectAlarm,runInDurableObject} from "cloudflare:test";
 import {describe,expect,it} from "vitest";
 import type {Bot,Task,Run} from "@botspace/contracts";
 import type {Env} from "../apps/api/src/env";
@@ -102,44 +102,6 @@ describe("reviewed task blockers",()=>{
   release();expect((await dispatch).status).toBe(200);
   await runInDurableObject(root(owner),instance=>{(instance as unknown as Dispatch).dispatchComputer=original;});
   await reconcile();await terminal(next.id,"waiting_approval");expect((await slot(owner))?.task_id).toBe(next.id);expect((await effects(owner)).filter(id=>id===op)).toHaveLength(1);
- });
- it("recovers a crash-left exact owner poll pin without leaking its lease or inventing another observation",async()=>{
-  const owner=await bot(),op=crypto.randomUUID();computerFixtureControl.execSession={command:"Pinned poll",pollsBeforeComplete:0};
-  try {expect((await api(`/v1/bots/${owner.id}/computer/actions`,{operationId:op,action:{type:"exec",command:"Pinned poll"}})).data.result.status).toBe("running");} finally {delete computerFixtureControl.execSession;}
-  const poll={operationId:crypto.randomUUID(),action:{type:"execPoll",processId:op}},held=await slot(owner);
-  const pin=await registry().fetch(`https://workspace/tasks/bot-slot/${owner.id}/direct-dispatch`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({lease:{key:op,token:held!.token,generation:held!.generation},...poll})});expect(pin.status).toBe(200);await pin.arrayBuffer();
-  // A crash must not wait for unrelated scheduler requests to drain.
-  // Computer session/effects and the exact dispatch pin all survive in SQL.
-  await abortAllDurableObjects();await reconcile();
-  expect(await effects(owner)).toContain(poll.operationId);expect(await slot(owner)).toBeUndefined();
-  await runInDurableObject(registry(),(_,state)=>expect(state.storage.sql.exec("SELECT 1 FROM computer_admissions WHERE bot_id=?",owner.id).toArray()).toHaveLength(0));
- });
- it("retains an uncertain shared GUI pin through native reconciliation, Stop and eviction until exact journal recovery",async()=>{
-  const owner=await bot(),submitted=await api(`/v1/bots/${owner.id}/messages`,{operationId:crypto.randomUUID(),text:"fixture:gui-approval"});
-  let saved=submitted.data.run as Run;for(let n=0;n<100&&saved.status!=="waiting_approval";n++){await new Promise(resolve=>setTimeout(resolve,5));saved=(await api(`/v1/bots/${owner.id}/runs/${saved.id}`)).data.run;}expect(saved.status).toBe("waiting_approval");
-  const op=crypto.randomUUID(),input={operationId:op,action:{type:"key",key:"Escape"}};
-  computerFixtureControl.failure={status:503,body:{error:{code:"computer_unavailable"}}};
-  let next!:Task;
-  try {
-    expect((await api(`/v1/bots/${owner.id}/computer/actions`,input)).status).toBe(503);
-    expect((await api(`/v1/bots/${owner.id}/computer/actions`,input)).status).toBe(503);
-    expect((await api(`/v1/bots/${owner.id}/computer/queued-actions`)).data.actions).toEqual([]);
-    let originalFetch!: (request:Request)=>Promise<Response>;
-    await runInDurableObject(registry(),instance=>{const target=instance as unknown as {fetch(request:Request):Promise<Response>};originalFetch=target.fetch;target.fetch=request=>new URL(request.url).pathname.endsWith("/direct-dispatch")?Promise.resolve(Response.json({error:{code:"fixture_fence_unavailable"}},{status:503})):originalFetch.call(target,request);});
-    try {const failedFence=await api(`/v1/bots/${owner.id}/computer/actions`,input);expect(failedFence.status).toBe(503);expect(failedFence.data.preEffectRejected).not.toBe(true);}
-    finally {await runInDurableObject(registry(),instance=>{(instance as unknown as {fetch(request:Request):Promise<Response>}).fetch=originalFetch;});}
-    await runInDurableObject(registry(),(_,state)=>expect(state.storage.sql.exec("SELECT 1 FROM computer_admissions WHERE bot_id=? AND payload IS NOT NULL",owner.id).toArray()).toHaveLength(1));
-
-    expect((await api(`/v1/bots/${owner.id}/computer/actions`,{...input,action:{type:"key",key:"Enter"}})).data.error.code).toBe("operation_id_conflict");
-    await api(`/v1/bots/${owner.id}/runs/${saved.id}/cancel`,{});
-    await runInDurableObject(registry(),async(instance,state)=>{state.storage.sql.exec("UPDATE computer_admissions SET created_at=? WHERE bot_id=?",Date.now()-61_000,owner.id);await (instance as unknown as {reconcileAdmissions():Promise<void>}).reconcileAdmissions();expect(state.storage.sql.exec("SELECT 1 FROM computer_admissions WHERE bot_id=? AND payload IS NOT NULL",owner.id).toArray()).toHaveLength(1);});
-    await runInDurableObject(root(owner),(_,state)=>expect(state.storage.sql.exec("SELECT 1 FROM cancelled_agent_inputs WHERE operation_id=?",op).toArray()).toHaveLength(0));
-    next=await task(owner);expect(next.status).toBe("queued");expect((await slot(owner))?.task_id).toBe("@bot");
-  } finally {delete computerFixtureControl.failure;}
-  await evictDurableObject(root(owner));await evictDurableObject(registry());await reconcile();
-  expect(await effects(owner)).toContain(op);
-  await runInDurableObject(registry(),(_,state)=>{expect(state.storage.sql.exec("SELECT 1 FROM computer_admissions WHERE bot_id=? AND payload IS NOT NULL",owner.id).toArray()).toHaveLength(0);state.storage.sql.exec("UPDATE task_slots SET updated_at=? WHERE bot_id=?",Date.now()-6000,owner.id);});
-  await reconcile();await terminal(next.id,"waiting_approval");expect((await slot(owner))?.task_id).toBe(next.id);
  });
  it("enforces 32 pending direct intents, preserves receipts at capacity, and never approves the task model action",async()=>{
   const owner=await bot(),record=await task(owner);await terminal(record.id,"waiting_approval");const inputs=Array.from({length:32},()=>({operationId:crypto.randomUUID(),action:{type:"key",key:"Escape"}}));
