@@ -173,6 +173,12 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   maximum retries, retry time and safe error category. Exhausted empty responses
   fail as `model_empty_response`. A native completion containing only progress
   without a pending host decision does not claim task completion.
+  A final answer that explicitly promises a next action or says the task still
+  needs validation, publication or deployment receives up to two durable internal
+  continuations in the same native run. The host retains prior tool results and
+  never replays them merely to continue. Internal continuation prompts are hidden
+  from the public transcript. A real approval, connection or Stop still takes
+  precedence, and the guard is bounded so an inaccessible task cannot loop forever.
   Host-dispatched actions persist `tool.started` before execution and include an
   allowlisted `input` display summary (command, path, coordinates or other public
   parameters). Completion repeats that summary with the result, using the same

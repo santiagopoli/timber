@@ -13,6 +13,7 @@ import type { ModelSettings } from '@botspace/contracts';
 import { createModelSettings, ModelConfigurationError } from './model-settings.js';
 import { CHATGPT_MODEL, createChatGPTProvider } from './chatgpt.js';
 import { createBudget } from './budget.js';
+import { createStopGate } from './stop-gate.js';
 import { createSubagents } from './subagents.js';
 import { archivedEntries, createMaintenance } from './maintenance.js';
 import type { AgentRuntime, RuntimePause, PiRuntimeOptions, RuntimeApprovalSummary, RuntimeEvent, RuntimeMessage, RuntimeOperation, RuntimeOperationResult, RuntimeReceipt } from './types.js';
@@ -36,6 +37,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
     generation: options.maxGenerations,
     tool: options.maxToolCalls,
   });
+  const stopGate = createStopGate(options.storage);
   options.storage.sql.exec('CREATE TABLE IF NOT EXISTS botspace_runtime_pauses (operation_id TEXT PRIMARY KEY, approval TEXT NOT NULL)');
   // Native task memos disappear at settlement; retain generation attribution so
   // every joined input can resolve the same answer after recovery.
@@ -242,7 +244,15 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
             requestFailures.set(marker,{error});
             return {messages:[marker,...request.messages.slice(1)]};
           }
-        },onYield:async(_answer,api)=>{await maintenance.onYield(api.conversationId,Number(api.taskId));}}),hook(CompactionTask,{beforeCompact:async(input,api,context)=>{await maintenance.recordCompaction(input,api,context);await maintenance.beforeCompact(api.conversationId,String(api.taskId));}})],
+        },onYield:async(answer,api,context)=>{
+          const live=await api.snapshot(LiveDoc,api.conversationId,context);
+          const operationId=live?.run?await resolveInputs(live.run.inputs):undefined;
+          if(operationId && !paused(operationId) && !await stopped(operationId)) {
+            const nudge=stopGate.onYield(operationId,String(api.taskId),textContent(answer.content));
+            if(nudge)return {continue:nudge};
+          }
+          await maintenance.onYield(api.conversationId,Number(api.taskId));
+        }}),hook(CompactionTask,{beforeCompact:async(input,api,context)=>{await maintenance.recordCompaction(input,api,context);await maintenance.beforeCompact(api.conversationId,String(api.taskId));}})],
         sections: [{key:'durable_memory',render:input=>maintenance.prompt(input.conversationId)}, { key: 'preamble', tag: false, render: async input => {
           const bot = await options.getBot();
           const child = await subagents.forConversation(input.conversationId);
@@ -265,6 +275,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
             'Your computer is a reusable cloud Linux desktop. Files belong under /workspace.',
             'Use only the provided tools. Never invent tool results or claim an action succeeded without its result.',
             'After a tool result, continue the task: inspect failures, make a safe corrective attempt when appropriate, and provide a visible final answer describing the outcome. A successful tool call alone is not a final answer. Never leave the user waiting for a follow-up prompt to hear what happened.',
+            'Do not end a task by describing the next step as future work. Finish the authorized work now, including verification and delivery when requested. If a real external blocker prevents completion, explain the blocker and the remaining work plainly. A command timeout you chose is not by itself a reason to abandon the task; inspect its recorded output and effects, then continue safely.',
             bot.computerApprovalMode === 'automatic'
               ? 'Current computer approval mode: automatic. The host authorizes new computer actions under this mode without per-action approval. Use the tools without inventing a manual approval requirement.'
               : 'Current computer approval mode: ask. Actions requiring approval must wait for a host approval decision; a user request to retry is not itself approval to execute.',
