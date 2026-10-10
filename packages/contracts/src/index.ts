@@ -1,4 +1,5 @@
 export * from './models.js';
+export * from './model-catalog.js';
 export * from './model-errors.js';
 export type RunStatus = "queued" | "running" | "waiting_approval" | "waiting_connection" | "completed" | "failed" | "cancelled" | "interrupted";
 export type ComputerApprovalMode = "ask" | "automatic";

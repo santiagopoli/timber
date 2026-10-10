@@ -751,7 +751,7 @@ it('projects a safe billing failure from a real provider error response', async 
   const state = await (await request('/inspect')).json<{ events: { event: string }[] }>();
   const failure = state.events.map(row => JSON.parse(row.event)).find(event => event.type === 'run.failed');
   expect(failure.data.errorCode).toBe('model_billing_required');
-  expect(failure.data.publicMessage).toContain('paid Workers AI');
+  expect(failure.data.publicMessage).toContain('paid access or available billing credits');
   expect(JSON.stringify(failure)).not.toContain('Private example detail');
 });
 

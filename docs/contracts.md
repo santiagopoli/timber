@@ -10,7 +10,8 @@ that conversation. v1 is cloud-only; no iOS implementation in this milestone.
 - SQLite-backed DOs; R2 bucket FILES for immutable checkpoints and artifacts.
 - First engine Pi through official PiHarness. Default model gpt-6.1-sol via
   the user's explicitly authorized ChatGPT plan. Explicit @cf/ models retain
-  Workers AI. No automatic fallback to separately billed inference.
+  Workers AI. When OPENROUTER_API_KEY is configured, the same concrete model can
+  use separately billed OpenRouter inference after subscription quota exhaustion.
 - ComputerDO owns one reusable Linux desktop container, lazily started.
 - Private single-owner MVP. BOTSPACE_API_TOKEN is a Worker secret; every /v1
   data API request requires Authorization: Bearer token or a valid same-origin
@@ -44,8 +45,9 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   with revoked:boolean. A failed remote revocation is explicit.
 - POST /v1/connections/chatgpt/verify performs one small real inference and only
   returns {ok:true,model} after response.completed.
-- GET /v1/models -> {models:ModelOption[],connected,defaultModel,error?}. Returns
-  the connected account's selectable models and supported reasoning/Fast options.
+- GET /v1/models -> {models:ModelOption[],connected,defaultModel,error?,sources?}. Returns
+  the combined connected catalogs, deduplicated by exact model identity, with
+  ordered public routes and supported reasoning/Fast options of the preferred route.
   A disconnected or unavailable catalogue has no invented model entries.
 - GET /v1/bots -> {bots:Bot[]}
 - POST /v1/bots {name,instructions?,model?,reasoningEffort?,fast?,computerApprovalMode?,allowNamedAgents?} -> 201 {bot:Bot}
@@ -244,7 +246,41 @@ in requests to api.openai.com. It exposes no token-read route. Pi receives a fet
 transport port, never OAuth credentials. OAuth is completed on the user's local
 loopback callback and imported over the authenticated HTTPS API. No iOS app.
 
-### Account model settings
+### Combined model catalogs and routing
+Sources implement independent discovery and normalize into `ModelOption` entries.
+The shared merge accepts source IDs and numeric priorities. ChatGPT has priority
+0; OpenRouter has priority 10 and is enabled only by the server secret
+`OPENROUTER_API_KEY`. OpenRouter discovery uses its authenticated `/models/user`
+endpoint, with concurrent reads coalesced and a five-minute, credential-scoped
+cache. Only concrete text models supporting tools are selectable; `latest`
+aliases, batch-only variants, classifiers and image generators are excluded.
+
+Public model IDs represent exact identities, independent of transport. The
+explicit `openai/` prefix is removed for OpenAI models so existing bot IDs remain
+valid and `openai/gpt-6.1-sol` can share one entry with subscription `gpt-6.1-sol`.
+Dates, version suffixes and variants remain distinct. Other sources can provide
+an explicit `canonicalId`; display names are never used for deduplication.
+`routes` retains each source's concrete ID, capabilities and optional per-million
+token prices. The preferred route supplies the selectable settings; capabilities
+are not unioned across providers. Partial discovery errors appear in `sources`
+and do not hide healthy catalogs. If all configured sources fail, `error` is set.
+
+Every admission snapshots the concrete model, selected settings and ordered routes
+in its immutable native model reference. Subscription inference is tried first.
+If it terminates with a quota error before emitting any content or tool call,
+the same generation can try OpenRouter for that exact model using API credits.
+The bot's model never changes. Recorded tool results are forwarded, not executed
+again. Fallback requires compatible reasoning/Fast and image capabilities and
+enough advertised context/output capacity. Authentication failures, throttling,
+server errors, Stop and partially streamed responses never trigger paid fallback.
+If the connected ChatGPT catalog is temporarily unavailable, OpenAI-model
+admission waits for discovery instead of starting paid inference; other families
+from healthy sources remain usable.
+No fallback exists without an independently configured OpenRouter credential and
+an exact alternate route. The native assistant record retains the actual provider
+and upstream model ID. Later generations try the subscription first again.
+
+### ChatGPT account model settings
 ChatGPT model discovery calls `GET https://api.openai.com/v1/models` using the
 same OAuth connection as inference. Only entries with `visibility:"list"` appear,
 in provider order. Public options contain the model ID/name, supported reasoning
@@ -256,11 +292,12 @@ The catalogue cache lasts five minutes and belongs to a connection revision.
 Import and disconnect invalidate it. Network discovery runs outside the token
 refresh lock; a delayed response from an old connection cannot populate the new
 cache or authorize inference under a replacement account. Catalogue failures are
-explicit and never trigger another provider or separately billed API access.
+explicit. A healthy alternate catalog remains usable if one source fails;
+source errors remain visible without inventing models or capabilities.
 
 `Bot.model`, `Bot.reasoningEffort?` and `Bot.fast?` are persisted configuration.
-Explicit selections on creation or PATCH must be available to the connected
-account. Changing the model clears omitted reasoning/Fast settings before applying
+Explicit selections on creation or PATCH must be available in a connected
+catalog. Changing the model clears omitted reasoning/Fast settings before applying
 that model's default reasoning effort and `fast:false`. Legacy bots without an
 explicit effort use the provider's advertised default; Timber does not force
 `low`. Creation without explicit model settings remains possible before connecting
@@ -279,7 +316,7 @@ Run records retain their admitted model settings. Temporary subagents inherit
 their parent's selection by default and may choose another supported model,
 reasoning effort or Fast setting at spawn; existing child selections remain
 independent of later bot configuration edits. `list_models` exposes the same
-account options to the model.
+combined catalog options to the model.
 
 Shared types live in @botspace/contracts. Runtime implementer owns its concrete
 types and exports createPiRuntime({owner,ai,model,instructions,tools,...}) or agrees

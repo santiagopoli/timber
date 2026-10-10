@@ -10,6 +10,7 @@ import { computerActivityInput, hostActivityInput } from "./tool-activity";
 import type { Env } from "./env";
 import { ApiError, errorResponse, json } from "./errors";
 import { body, fingerprint, operationId, parseAction, parseMessage, UUID } from "./validation";
+import {modelCatalog,openRouterRequest} from './model-catalog';
 
 type JsonRow = {data:string};
 type RunRow = JsonRow & {id:string;operation_id:string;fingerprint:string;native_operation_id:string};
@@ -107,6 +108,8 @@ export class BotDO extends DurableObject<Env> {
       ai:env.AI,
       maxGenerations:parseRuntimeLimit(env.BOTSPACE_MAX_GENERATIONS,"BOTSPACE_MAX_GENERATIONS"),
       maxToolCalls:parseRuntimeLimit(env.BOTSPACE_MAX_TOOL_CALLS,"BOTSPACE_MAX_TOOL_CALLS"),
+      models:()=>modelCatalog(env),
+      ...(env.OPENROUTER_API_KEY?{openrouter:{fetch:(request:Request)=>openRouterRequest(env,request)}}:{}),
       ...(env.CHATGPT?{chatgpt:{models:async()=>{
         const connection=env.CHATGPT!.get(env.CHATGPT!.idFromName("owner"));
         const response=await connection.fetch(new Request("https://chatgpt/models"));

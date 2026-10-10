@@ -10,8 +10,13 @@ The default model is `gpt-6.1-sol` through the user's connected ChatGPT plan.
 The host supplies `chatgpt: { fetch(request): Promise<Response>, models(): Promise<ModelCatalog> }`, which receives
 only credential-free POST requests to `https://api.openai.com/v1/responses` and
 injects OAuth in its separate authentication object. The runtime never reads
-tokens or environment API keys. An absent connection or exhausted allowance
-fails explicitly; there is no billed fallback. Explicit `@cf/` model IDs retain
+tokens or environment API keys. The host can additionally supply `models()` for
+the combined catalog and `openrouter: {fetch(request)}` for a separately billed,
+credential-free transport. When that catalog includes an exact alternate route,
+quota exhaustion before any partial output can continue the same generation via
+OpenRouter. Fallback never changes the concrete model or replays saved tool calls;
+it respects reasoning, Fast, images and context capacity. Other failures do not
+switch providers. Explicit `@cf/` model IDs retain
 Workers AI. Named bot instructions are rendered before every request. Pi and
 Agents packages are pinned because the durable harness is beta.
 
@@ -121,9 +126,9 @@ iOS, local execution, or a secrets-entry UI. Its host interfaces leave those
 separate from the Pi integration.
 
 
-Model choices are account-scoped. Native model references include a persisted,
+Model choices combine the host's configured sources. Native model references include a persisted,
 immutable configuration so prepared generations, compaction and recovered child
-conversations retain the selected model, reasoning and Fast tier. The adapter
+conversations retain the selected model, reasoning, Fast tier and ordered routes. The adapter
 sends the public provider model ID on the wire; internal configuration IDs and
 OAuth credentials never enter the request payload. New runs snapshot bot settings
 before admission, while retries keep the original snapshot.

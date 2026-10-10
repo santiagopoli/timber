@@ -1,5 +1,5 @@
 import { Type, createAssistantMessageEventStream, type AssistantMessage } from '@earendil-works/pi-ai';
-import { createModels } from '@earendil-works/pi-ai/models';
+import { createModels,type Provider } from '@earendil-works/pi-ai/models';
 import {
   AgentDoc, CompactionTask, configure, createRegistry, defineDoc, defineTool, GenerationTask, Harness, hook, InboxDoc, LiveDoc, ProviderDoc, ROOT_CONVERSATION_ID,
   type AgentEvent, type AgentEventStream, type ConversationId, type HookApi, type Storage, type SubmissionId, type TaskId, type Tx,
@@ -12,6 +12,7 @@ import { computerToolOperationId, computerTools, hostTools, type ToolBridge } fr
 import type { ModelSettings } from '@botspace/contracts';
 import { createModelSettings, ModelConfigurationError } from './model-settings.js';
 import { CHATGPT_MODEL, createChatGPTProvider } from './chatgpt.js';
+import {createOpenRouterProvider,withQuotaFallback} from './model-routing.js';
 import { createBudget } from './budget.js';
 import { createStopGate } from './stop-gate.js';
 import { createSubagents } from './subagents.js';
@@ -30,8 +31,10 @@ const Stops = defineDoc<{operations: Record<string, {cancellationId?: string}>; 
 
 export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<Env>): AgentRuntime {
   const ai = createAI({ binding: options.ai });
-  const modelSettings = createModelSettings(options.storage,options.chatgpt,id=>ai(id));
+  const modelSettings = createModelSettings(options.storage,options.chatgpt,id=>ai(id),options.models);
   const chatgpt = createChatGPTProvider(options.chatgpt,modelSettings.models);
+  const openrouter=createOpenRouterProvider(options.openrouter,modelSettings.models);
+  const providers=new Map<string,Provider>([['chatgpt',chatgpt],['openrouter',openrouter]]);
   const resolveModel = modelSettings.resolve;
   const consume = createBudget(options.storage, {
     generation: options.maxGenerations,
@@ -157,7 +160,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
       storage = context.storage;
       background = context.context;
       const models = createModels();
-      for (const provider of [ai.provider, chatgpt]) models.setProvider({
+      for (const provider of [ai.provider, withQuotaFallback(chatgpt,providers),withQuotaFallback(openrouter,providers)]) models.setProvider({
         ...provider,
         streamSimple(model, context, streamOptions) {
           const output = createAssistantMessageEventStream();

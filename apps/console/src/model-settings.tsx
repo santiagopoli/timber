@@ -5,7 +5,7 @@ import type {ModelSettings as InferenceSettings} from '../../../packages/contrac
 import './model-settings.css';
 
 export type ModelChoice = {
-  id:string;label:string;available:boolean;unavailableReason?:string;
+  id:string;label:string;available:boolean;unavailableReason?:string;sourceLabel?:string;
   reasoningEfforts:string[];defaultReasoningEffort?:string;supportsFast:boolean;
 };
 export type ModelSelection = InferenceSettings;
@@ -27,7 +27,7 @@ export function ModelSettings({value,state,onChange,onRefresh,disabled=false}: {
     void update({model:id,...(reasoningEffort?{reasoningEffort}:{}),fast:Boolean(value.fast&&choice.supportsFast)});
   };
   return <div className="timber-model-settings">
-    <Popover.Root open={open} onOpenChange={setOpen}>
+    <Popover.Root open={open} onOpenChange={value=>{setOpen(value);if(value)onRefresh();}}>
       <Popover.Trigger asChild><button type="button" className="timber-model-trigger" aria-label={`Model settings: ${current?.label||value.model}`} title={`${value.model}${value.reasoningEffort?` · ${effortLabel(value.reasoningEffort)} reasoning`:''}${value.fast?' · Fast':''}`}>
         <span>{current?.label||value.model}</span>{value.reasoningEffort&&<small>{effortLabel(value.reasoningEffort)}</small>}{value.fast&&<ZapIcon aria-label="Fast mode"/>}{saving?<LoaderCircleIcon className="timber-spinner" aria-label="Saving model settings"/>:<ChevronDownIcon aria-hidden="true"/>}
       </button></Popover.Trigger>
@@ -43,6 +43,7 @@ export function ModelSettings({value,state,onChange,onRefresh,disabled=false}: {
             {state.choices.map(choice=><option key={choice.id} value={choice.id} disabled={!choice.available}>{choice.label}{choice.available?'':' · Unavailable'}</option>)}
           </select></label>
           {current?.unavailableReason&&<p className="timber-model-help">{current.unavailableReason}</p>}
+          {current?.sourceLabel&&<p className="timber-model-help">{current.sourceLabel}</p>}
           {Boolean(current?.reasoningEfforts.length)&&<label className="timber-model-field">Reasoning<select aria-label="Reasoning effort" value={value.reasoningEffort||current?.defaultReasoningEffort||''} disabled={disabled||saving||!current?.available} onChange={event=>void update({...value,reasoningEffort:event.currentTarget.value})}>
             {!value.reasoningEffort&&!current?.defaultReasoningEffort&&<option value="" disabled>Provider default</option>}
             {current?.reasoningEfforts.map(effort=><option key={effort} value={effort}>{effortLabel(effort)}</option>)}

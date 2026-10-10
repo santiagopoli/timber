@@ -83,7 +83,7 @@ export function classifyFailure(reason: string, detail: unknown): { errorCode: s
     return { errorCode: 'model_output_limit', publicMessage: 'The model response exceeded this bot’s output limit.' };
   }
   if (/paid(?:\s+access|\s+plan|\s+account)|(?:billing|payment).*(?:required|exhausted|disabled|not enabled)|insufficient\s+(?:balance|credits)|free\s+(?:tier|plan)/i.test(text)) {
-    return { errorCode: 'model_billing_required', publicMessage: 'The selected model requires paid Workers AI access or available billing credits.' };
+    return modelFailure('model_billing_required');
   }
   if (reason === 'no_model' || /(?:model.*(?:not found|does not exist|unavailable)|unknown model)/i.test(text)) {
     return { errorCode: 'model_unavailable', publicMessage: 'The selected model is not available to this runtime or account.' };

@@ -1,12 +1,21 @@
 /** Account-scoped inference choices; no credentials or provider raw metadata. */
 export interface ModelSettings { model:string; reasoningEffort?:string; fast?:boolean; }
 export interface ModelOption {
-  id:string; name:string; description?:string; provider:'openai';
+  id:string; name:string; description?:string; provider:string;
   reasoningEfforts:string[]; defaultReasoningEffort?:string; supportsFast:boolean;
   fastServiceTier?:string; contextWindow?:number; maxOutputTokens?:number;
   inputModalities?:('text'|'image')[]; supportsReasoningSummary?:boolean;
+  /** Exact model identity shared across catalogs; never a display-name match. */
+  canonicalId?:string;
+  routes?:ModelRoute[];
 }
-export interface ModelCatalog {models:ModelOption[];connected:boolean;defaultModel:string;error?:string;}
+export interface ModelRoute extends Omit<ModelOption,'routes'|'canonicalId'> {
+  source:string;
+  /** The source's concrete inference ID, which can differ from the public ID. */
+  modelId:string;
+  pricing?:{input:number;output:number;cachedInput?:number};
+}
+export interface ModelCatalog {models:ModelOption[];connected:boolean;defaultModel:string;error?:string;sources?:{id:string;connected:boolean;error?:string}[];}
 const record=(value:unknown):Record<string,unknown>=>value&&typeof value==='object'&&!Array.isArray(value)?value as Record<string,unknown>:{};
 const token=(value:unknown):value is string=>typeof value==='string'&&/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(value);
 const positive=(value:unknown)=>typeof value==='number'&&Number.isSafeInteger(value)&&value>0?value:undefined;

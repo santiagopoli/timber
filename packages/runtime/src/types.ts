@@ -98,6 +98,9 @@ export interface PiRuntimeOptions<Env extends object> {
   ai: AISettings['binding'];
   /** Host-owned OAuth transport; the runtime never receives account credentials. */
   chatgpt?: { fetch(request: Request): Promise<Response>; models?(): Promise<ModelCatalog> };
+  /** Combined public catalog and host-owned paid inference transport; no credentials. */
+  models?(): Promise<ModelCatalog>;
+  openrouter?: {fetch(request:Request):Promise<Response>};
   getBot(): Promise<Pick<Bot, 'name' | 'instructions' | 'model' | 'reasoningEffort' | 'fast' | 'computerApprovalMode'>>;
   getApprovalContext?(): Promise<RuntimeApprovalContext>;
   tools: RuntimeTools;

@@ -60,7 +60,7 @@ export function parseBotInput(value:unknown,patch=false):{name?:string;instructi
   if(data.instructions!==undefined) output.instructions=string(data.instructions,"instructions",16_000,0);
   if(data.model!==undefined) {
     output.model=string(data.model,"model",180);
-    if(!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(output.model) && !/^@cf\/[A-Za-z0-9._/-]+$/.test(output.model)) invalid("model must be an account model identifier or an explicit Workers AI @cf/ model identifier.");
+    if(!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(output.model) && !/^(?:@cf\/)?[A-Za-z0-9][A-Za-z0-9._:-]*(?:\/[A-Za-z0-9][A-Za-z0-9._:-]*)+$/.test(output.model)) invalid("model must be a concrete catalog model identifier or an explicit Workers AI @cf/ model identifier.");
   }
   if(data.reasoningEffort!==undefined) {
     output.reasoningEffort=string(data.reasoningEffort,"reasoningEffort",128);

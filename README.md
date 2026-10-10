@@ -348,14 +348,33 @@ console shows the account and verification status, and can disconnect it. If
 remote revocation cannot be confirmed, local credentials are still removed and
 the console tells you to revoke access in ChatGPT settings.
 
-The subscription allowance is shared and limited. Exhaustion, unsupported access
-or a revoked session stops the run with an explicit error; Timber does not switch
-to API billing or another model. Existing bots retain their model selection;
-new bots use the configured default (`gpt-6.1-sol` unless changed). The model
-picker lists the connected account’s actual available models. Fast uses the
+The subscription allowance is shared and limited. Existing bots retain their
+concrete model selection; new bots use the configured default (`gpt-6.1-sol`
+unless changed). The picker combines configured catalogs and shows one entry per
+exact model identity, preferring the ChatGPT subscription over OpenRouter. Fast uses the
 provider’s Fast/Priority tier and may consume allowance faster; reasoning levels
 are model-specific. Explicit `@cf/...` model IDs remain available
 through the API and smoke command for deliberate Workers AI usage.
+
+To enable OpenRouter discovery and inference, set the server-only Worker secret:
+
+```sh
+npx wrangler secret put OPENROUTER_API_KEY --config apps/api/wrangler.production.jsonc
+```
+
+For local development, use the same secret in the ignored `.dev.vars` file.
+Never put it in Worker `vars`, browser settings, or bot instructions. The catalog
+refreshes from OpenRouter's authenticated model API with a five-minute cache;
+model names and versions are discovered, not maintained in a static allowlist.
+Latest aliases and models without agent tool support are excluded.
+
+Configuring OpenRouter also enables **paid fallback for the same concrete model**
+when ChatGPT exhausts its subscription allowance before producing content.
+Fallback preserves recorded tool history and requires compatible selected
+settings and context capacity. Fast selections are not silently downgraded.
+Authentication failures, ordinary rate limits and partial responses still stop
+or follow normal retry policy; they do not trigger paid fallback. Without this
+secret and an exact alternate model route, quota exhaustion remains an error.
 
 This is a personal, self-hosted integration using the documented
 [Sign in with ChatGPT flow](https://developers.openai.com/siwc/token-sharing-open-source).

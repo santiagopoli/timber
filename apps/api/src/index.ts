@@ -3,6 +3,7 @@ import { ApiError, errorResponse, json } from "./errors";
 import type { Env } from "./env";
 import { UUID } from "./validation";
 import type { Bot } from "@botspace/contracts";
+import {modelCatalog} from './model-catalog';
 export { WorkspaceDO } from "./workspace";
 export { BotDO } from "./bot";
 export { GitHubAuthDO } from "./github";
@@ -74,8 +75,7 @@ export default {
       if(!url.pathname.startsWith("/v1/")) throw new ApiError(404,"not_found","Endpoint not found.");
       if(url.pathname==="/v1/models") {
         if(request.method!=="GET")throw new ApiError(405,"method_not_allowed","Method not allowed.");
-        if(!env.CHATGPT)return json({models:[],connected:false,defaultModel:env.BOTSPACE_DEFAULT_MODEL??"gpt-6.1-sol",error:"ChatGPT connections are not configured on this server."});
-        return env.CHATGPT.get(env.CHATGPT.idFromName(owner)).fetch("https://chatgpt/models");
+        return json(await modelCatalog(env,owner));
       }
       if(url.pathname==="/v1/connections/chatgpt" || url.pathname==="/v1/connections/chatgpt/verify") {
         const verification=url.pathname.endsWith("/verify");

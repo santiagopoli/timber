@@ -9,6 +9,8 @@ export interface Env {
   CHATGPT_CREDENTIAL_KEY?: string;
   /** Server-only Worker secret. Explicitly billed Image API; never exposed to clients. */
   OPENAI_API_KEY?: string;
+  /** Server-only inference credential. Enables the OpenRouter catalog and paid quota fallback. */
+  OPENROUTER_API_KEY?: string;
   FILES: R2Bucket;
   AI: Ai;
   ASSETS?: Fetcher;
