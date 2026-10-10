@@ -365,8 +365,12 @@ describe('explicit server-only OpenAI Image API', () => {
   it('POSTs one PNG image to the fixed endpoint for both reviewed IDs, no Responses fallback or URL follow', async () => {
     for (const id of ['gpt-image-2.5-sunburst', 'gpt-image-2.5-flare']) {
       const fetch = vi.fn(async (url: string, options: RequestInit) => {
+        // Use workerd's real Request validation, not just a permissive fetch
+        // mock: redirect:"error" previously passed tests but failed in prod.
+        const request = new Request(url, options);
+        expect(request.redirect).toBe('manual');
         expect(url).toBe('https://api.openai.com/v1/images/generations');
-        expect(options).toMatchObject({method: 'POST', redirect: 'error'});
+        expect(options).toMatchObject({method: 'POST', redirect: 'manual'});
         expect(new Headers(options.headers).get('authorization')).toBe(`Bearer ${imageEnv.OPENAI_API_KEY}`);
         const body = JSON.parse(options.body as string);
         expect(body).toMatchObject({model: id, n: 1, size: '1024x1024', quality: 'low', output_format: 'png'});
@@ -376,6 +380,17 @@ describe('explicit server-only OpenAI Image API', () => {
         return Response.json({data: [{b64_json: png}], usage: {total_tokens: 1}});
       }); vi.stubGlobal('fetch', fetch);
       expect(await generateImageAvatar(imageEnv, {...imageInput, model: id})).toBe(png);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    }
+  });
+  it('rejects redirects without following a destination or repeating the image request',async()=>{
+    for(const status of [301,302,303,307,308]){
+      const fetch=vi.fn(async(url:string,options:RequestInit)=>{
+        const request=new Request(url,options);expect(request.redirect).toBe('manual');
+        expect(request.url).toBe('https://api.openai.com/v1/images/generations');
+        return new Response(null,{status,headers:{location:'https://untrusted.test/image'}});
+      });vi.stubGlobal('fetch',fetch);
+      await expect(generateImageAvatar(imageEnv,imageInput)).rejects.toMatchObject({code:'avatar_image_generation_failed'});
       expect(fetch).toHaveBeenCalledTimes(1);
     }
   });

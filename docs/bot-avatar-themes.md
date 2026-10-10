@@ -73,6 +73,11 @@ Image avatars use the actual OpenAI Image API provider when its server-side API
 configuration is present. The catalogue lists only configured official IDs
 `gpt-image-2.5-sunburst` and `gpt-image-2.5-flare`; availability is independent of
 whether SIWC is connected. Image API usage is billed separately from ChatGPT/SIWC.
+The request uses Workers-supported `redirect:"manual"` and rejects every non-2xx
+response. It never follows provider redirects. `redirect:"error"` is unsupported
+by workerd and previously caused image generation to fail before contacting
+OpenAI; regression tests now validate the request options with the real Worker
+`Request` implementation rather than only a permissive fetch mock.
 The catalogue says explicitly that the cost is unknown; Timber does not invent a
 price. The UI asks for explicit confirmation of the exact number of images and the
 separate API billing before submitting, sending that count as `confirmedCount`.
