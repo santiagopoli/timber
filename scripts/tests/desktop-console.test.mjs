@@ -7,6 +7,7 @@ import {WebSocketServer} from 'ws';
 import {createConsoleFixture,TEST_TOKEN,BOT_A,BOT_B} from './console-fixture.mjs';
 let browser;
 const openPanel=async(page,panel)=>{if(!await page.locator(`#tab-${panel}`).isVisible())await page.locator('#panel-menu > summary').click();await page.locator(`#tab-${panel}`).click();};
+const sendMessage=page=>page.locator('#message-form').getByRole('button',{name:/^Send(?: message)?(?:\s|$)/}).click();
 before(async()=>{browser=await chromium.launch({headless:true,...(process.env.CONSOLE_CHROMIUM_PATH?{executablePath:process.env.CONSOLE_CHROMIUM_PATH}:{}),...(process.env.CONSOLE_CHROMIUM_ARGS?{args:JSON.parse(process.env.CONSOLE_CHROMIUM_ARGS)}:{})});});
 after(async()=>{await browser?.close();});
 
@@ -335,7 +336,7 @@ for (const fallback of [false,true]) test(`fullscreen ${fallback?'fallback':'nat
   assert.equal(await page.locator('#message').count(),1,'there is only one composer');
   assert.equal(await page.locator('#message').inputValue(),'Draft before fullscreen');
   const before=state.sockets[0].inputs.filter(input=>input.type===4).length;
-  await page.locator('#message').fill('Continue with this instruction');await page.locator('#message').press('Enter');
+  await page.locator('#message').fill('Continue with this instruction');await sendMessage(page);
   await until(()=>fixture.calls.some(call=>call.path===`/v1/bots/${BOT_A}/messages`&&call.body?.text==='Continue with this instruction'));
   assert.equal(fixture.calls.filter(call=>call.path.endsWith('/cancel')).length,0);
   assert.equal(state.sockets[0].inputs.filter(input=>input.type===4).length,before,'typing into Timber never types into the remote desktop');

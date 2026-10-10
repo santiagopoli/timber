@@ -2770,7 +2770,7 @@ for (const width of [1440, 390]) {
       let release; state.messageResponseGates.set(BOT_A, new Promise(resolve => {release = resolve;}));
       try {
         await page.locator('#message').fill('New multiline request\n'.repeat(10));
-        await page.locator('#message').press('Enter');
+        await sendMessage(page);
         await page.waitForFunction(() => document.querySelector('.timber-delivery'));
         await atChatBottom(page);
       } finally {release(); state.messageResponseGates.delete(BOT_A);}
@@ -2797,7 +2797,7 @@ for (const width of [1440, 390]) {
       let reviewed;
       try {
         await page.locator('#message').fill('A request with delayed acknowledgement\n'.repeat(10));
-        await page.locator('#message').press('Enter'); await page.locator('.timber-delivery').waitFor(); await atChatBottom(page);
+        await sendMessage(page); await page.locator('.timber-delivery').waitFor(); await atChatBottom(page);
         await page.locator('#messages').evaluate(node => {node.scrollTop = 250;});
         await page.getByRole('button', {name: 'Jump to latest message'}).waitFor();
         reviewed = await chatScroll(page);
