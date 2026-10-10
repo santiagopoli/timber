@@ -19,7 +19,7 @@ import './src/layout.css';
   const removedBots = new Set(), deletionPending = new Map();
   const botSummaries = new Map();
   const modelSettingsWork = new Set();
-  let avatarSettings = {themes:[],selection:null,avatars:[],jobs:[]}, avatarModels={connected:false,vectorModels:[],imageModels:[],imageAvailable:false}, avatarLoading=false, avatarPollTimer, avatarRequest=0;
+  let avatarSettings = {themes:[],selection:null,avatars:[],jobs:[]}, avatarModels={connected:false,vectorModels:[],imageModels:[],imageAvailable:false}, avatarLoading=false, avatarPollTimer, avatarRequest=0, avatarHistoryPage=0;
   const avatarUrls = new Map(), avatarCacheDetails = new Map(), avatarLoads = new Map(), avatarLoadErrors = new Map(), avatarAdmissions = new Map();
   let modelCatalog={models:[],connected:false,defaultModel:''},modelCatalogLoading=false,modelCatalogError='',modelCatalogRequest=0;
   let botSummaryTimer,botSummaryLoading=false,botSummaryPending=false,botRenderKey='';
@@ -393,6 +393,55 @@ import './src/layout.css';
     $('avatar-image-capability').hidden=kind!=='image'&&!disconnected&&!avatarModels.error;
     $('avatar-create-submit').disabled=avatarLoading||!select.options.length;
   }
+  // Creation order identifies attempts; a late failure update must not replace
+  // a newer success. The API returns newest-created jobs first for timestamp ties.
+  function avatarJobGroups(){
+    const ordered=[...new Map(avatarSettings.jobs.map(job=>[job.id,job])).values()].sort((a,b)=>Date.parse(b.createdAt)-Date.parse(a.createdAt)),groups=new Map();
+    for(const job of ordered){if(!groups.has(job.botId))groups.set(job.botId,{botId:job.botId,jobs:[],active:[]});const group=groups.get(job.botId);group.jobs.push(job);if(avatarPending(job))group.active.push(job);}
+    const current=[...groups.values()].map(group=>({...group,job:group.active[0]||group.jobs[0]})).sort((a,b)=>Number(Boolean(b.active.length))-Number(Boolean(a.active.length)));
+    const represented=new Set(current.map(group=>group.job.id));
+    return {current,history:ordered.filter(job=>!avatarPending(job)&&!represented.has(job.id))};
+  }
+  function avatarJobMatchesSelection(job){return job.themeId===avatarSettings.selection?.themeId&&job.revision===avatarSettings.selection?.revision;}
+  function avatarJobCanRetry(job){const group=avatarJobGroups().current.find(group=>group.botId===job.botId);return Boolean(group&&group.job.id===job.id&&!group.active.length&&['failed','interrupted'].includes(job.status)&&avatarJobMatchesSelection(job)&&bots.some(bot=>bot.id===job.botId));}
+  async function retryAvatarJob(job){
+    if(avatarLoading||avatarAdmissions.has('all')||avatarAdmissions.has(job.botId))return;
+    // Recheck the exact failed attempt before admitting fresh work: a newer
+    // successful/active job or selection change makes this Retry obsolete.
+    const refreshed=await loadAvatarSettings();
+    if(!authenticated||!refreshed)return;
+    const latest=avatarSettings.jobs.find(item=>item.id===job.id);
+    if(!latest||latest.status!==job.status||latest.themeId!==job.themeId||latest.revision!==job.revision||!avatarJobCanRetry(latest)){$('avatar-error').textContent='This avatar attempt is no longer current. Review the refreshed status before regenerating.';return;}
+    const theme=avatarSettings.themes.find(item=>item.id===latest.themeId);
+    if(theme?.kind==='image'?avatarModels.imageAvailable!==true:!avatarModels.connected){$('avatar-error').textContent='Avatar generation is currently unavailable.';return;}
+    await startAvatarGeneration(latest.botId);
+  }
+  function avatarJobRow(job,{historical=false,identified=false,retry=false}={}){
+    const row=el('div','avatar-job');row.dataset.jobStatus=job.status;row.dataset.jobId=job.id;row.dataset.botId=job.botId;row.dataset.jobRevision=String(job.revision);
+    row.append(el('strong','',`${bots.find(bot=>bot.id===job.botId)?.name||'Bot'} · ${job.status}`));
+    const theme=avatarSettings.themes.find(theme=>theme.id===job.themeId),date=new Date(job.createdAt);
+    const context=el('p','hint',`${historical?'Earlier attempt · ':''}${theme?.name||job.themeId} · revision ${job.revision}${avatarJobMatchesSelection(job)?'':' · previous selection'} · `),time=el('time','',Number.isNaN(date.getTime())?job.createdAt:date.toLocaleString(undefined,{timeZoneName:'short'}));time.dateTime=job.createdAt;if(!Number.isNaN(date.getTime()))time.setAttribute('aria-label',date.toLocaleString(undefined,{timeZoneName:'long'}));context.append(time);if(historical||identified)context.append(document.createTextNode(` · attempt ${job.id}`));row.append(context);
+    if(job.error?.message)row.append(el('p','hint',job.error.message));
+    if(job.status==='interrupted')row.append(el('p','avatar-interrupted-warning','Previous inference outcome is unconfirmed. Regenerate starts a fresh operation; the earlier request will not be replayed.'));
+    if(retry){const button=el('button','quiet',job.status==='interrupted'?'Regenerate':'Retry');button.type='button';button.disabled=avatarLoading||avatarAdmissions.has('all')||avatarAdmissions.has(job.botId);button.setAttribute('aria-label',`${button.textContent} avatar for ${bots.find(bot=>bot.id===job.botId)?.name||'bot'}, revision ${job.revision}`);button.addEventListener('click',()=>void guarded(()=>retryAvatarJob(job)));row.append(button);}
+    return row;
+  }
+  function renderAvatarJobs(generationUnavailable){
+    const root=$('avatar-jobs'),oldHistory=root.querySelector('#avatar-job-history'),historyOpen=oldHistory?.open||false,openActive=new Set([...root.querySelectorAll('.avatar-active-attempts[open]')].map(node=>node.dataset.botId));root.replaceChildren();
+    for(const [key,admission] of avatarAdmissions){const row=el('div','avatar-job avatar-admission');row.append(el('strong','',`${key==='all'?'All bots':bots.find(bot=>bot.id===key)?.name||'Bot'} · generation request receipt is unknown`));row.append(el('p','hint','Refresh checks whether it was accepted; if not, resend uses the same operation ID and arguments.'));const retry=el('button','quiet','Check / resend safely');retry.type='button';retry.disabled=avatarLoading;retry.addEventListener('click',()=>void guarded(()=>startAvatarGeneration(admission.botId,true,admission)));row.append(retry);root.append(row);}
+    const {current,history}=avatarJobGroups(),list=el('div','avatar-current-jobs');list.id='avatar-current-jobs';list.setAttribute('role','region');list.setAttribute('aria-label','Current avatar generation status');
+    for(const group of current){const row=avatarJobRow(group.job,{retry:!generationUnavailable&&avatarJobCanRetry(group.job)});row.classList.add('avatar-current-job');
+      if(group.active.length>1){row.append(el('p','hint',`${group.active.length} active attempts · ${group.active.filter(job=>job.status==='running').length} running, ${group.active.filter(job=>job.status==='queued').length} queued`));const details=el('details','avatar-active-attempts');details.dataset.botId=group.botId;details.open=openActive.has(group.botId);details.append(el('summary','',`Inspect all ${group.active.length} active attempts`));const attempts=el('div','avatar-active-job-list'),renderAttempts=()=>{attempts.replaceChildren();if(details.open)for(const job of group.active)attempts.append(avatarJobRow(job,{identified:true}));};details.append(attempts);renderAttempts();details.addEventListener('toggle',renderAttempts);row.append(details);}
+      list.append(row);
+    }
+    root.append(list);
+    if(!history.length){avatarHistoryPage=0;return;}
+    const pageSize=10,pages=Math.ceil(history.length/pageSize);avatarHistoryPage=Math.min(avatarHistoryPage,pages-1);
+    const details=el('details','setup-details avatar-job-history');details.id='avatar-job-history';details.setAttribute('aria-live','off');details.open=historyOpen;details.append(el('summary','',`Earlier avatar attempts (${history.length})`),el('p','hint','Superseded attempts from the recent jobs returned by the server. History is read-only; regeneration uses the current status above.'));
+    const items=el('div','avatar-history-page');for(const job of history.slice(avatarHistoryPage*pageSize,(avatarHistoryPage+1)*pageSize))items.append(avatarJobRow(job,{historical:true}));details.append(items);
+    if(pages>1){const controls=el('div','row wrap avatar-history-controls'),label=el('span','hint',`Page ${avatarHistoryPage+1} of ${pages}`);label.setAttribute('role','status');for(const [name,delta,disabled] of [['Previous attempts',-1,avatarHistoryPage===0],['Next attempts',1,avatarHistoryPage===pages-1]]){const button=el('button','quiet',name);button.type='button';button.disabled=disabled;button.addEventListener('click',()=>{avatarHistoryPage+=delta;renderAvatarJobs(generationUnavailable);const updated=$('avatar-job-history');updated.open=true;const target=updated.querySelector(`button:nth-of-type(${delta===1?2:1})`);(target?.disabled?updated.querySelector('button:not(:disabled)'):target)?.focus();});controls.append(button);}controls.append(label);details.append(controls);}
+    root.append(details);
+  }
   function renderAvatarSettings(){
     const status=$('avatar-status'),select=$('avatar-theme-select'),current=avatarSettings.selection;
     const currentTheme=avatarSettings.themes.find(theme=>theme.id===current?.themeId),generationUnavailable=currentTheme?.kind==='image'?avatarModels.imageAvailable!==true:!avatarModels.connected;
@@ -401,13 +450,11 @@ import './src/layout.css';
     for(const theme of avatarSettings.themes){const option=document.createElement('option');option.value=theme.id;option.textContent=`${theme.name} · ${theme.kind}`;select.append(option);}select.value=current?.themeId||'';select.disabled=avatarLoading||!avatarSettings.themes.length;
     $('avatar-apply-theme').disabled=avatarLoading||!select.value||select.value===current?.themeId;
     $('avatar-generate-all').disabled=avatarLoading||!current||generationUnavailable||!bots.length||avatarAdmissions.has('all')||avatarSettings.jobs.some(avatarPending);
-    const jobs=$('avatar-jobs');jobs.replaceChildren();
-    for(const [key,admission] of avatarAdmissions){const row=el('div','avatar-job avatar-admission');row.append(el('strong','','Generation request receipt is unknown'));row.append(el('p','hint','Refresh checks whether it was accepted; if not, resend uses the same operation ID and arguments.'));const retry=el('button','quiet','Check / resend safely');retry.type='button';retry.disabled=avatarLoading;retry.addEventListener('click',()=>void guarded(()=>startAvatarGeneration(admission.botId,true,admission)));row.append(retry);jobs.append(row);}
-    for(const job of [...avatarSettings.jobs].sort((a,b)=>Date.parse(b.updatedAt)-Date.parse(a.updatedAt)).slice(0,30)){const row=el('div','avatar-job');row.dataset.jobStatus=job.status;row.append(el('strong','',`${bots.find(bot=>bot.id===job.botId)?.name||'Bot'} · ${job.status}`));if(job.error?.message)row.append(el('p','hint',job.error.message));if(job.status==='interrupted')row.append(el('p','avatar-interrupted-warning','Previous inference outcome is unconfirmed. Regenerate starts a fresh operation; the earlier request will not be replayed.'));if(['failed','interrupted'].includes(job.status)){const retry=el('button','quiet',job.status==='interrupted'?'Regenerate':'Retry');retry.type='button';retry.disabled=avatarLoading||avatarAdmissions.has(job.botId);retry.addEventListener('click',()=>void guarded(()=>startAvatarGeneration(job.botId)));row.append(retry);}jobs.append(row);}
+    renderAvatarJobs(generationUnavailable);
     const botList=$('avatar-bot-list');botList.replaceChildren();for(const bot of bots){const avatar=el('span','avatar avatar-small',bot.name.slice(0,1).toUpperCase());avatar.dataset.agentColor=agentColor(bot.id);decorateGlobalAvatar(avatar,bot.id);const row=el('div','avatar-bot-row');row.append(avatar,el('span','',bot.name));const state=selectedAvatar(bot.id);const imageError=state&&avatarLoadErrors.has(`${bot.id}:${state.themeId}:${state.revision}:${state.artifactId}`);row.append(el('small',imageError?'error':'hint',imageError?'Could not load avatar image. Refresh to try again.':state?(avatarIsStale(state)?'Stale · previous theme':'Ready'):'No avatar yet'));if(imageError)row.lastChild.setAttribute('role','alert');if(current){const button=el('button','quiet','Regenerate');button.type='button';button.disabled=avatarLoading||generationUnavailable||avatarAdmissions.has(bot.id)||avatarSettings.jobs.some(job=>job.botId===bot.id&&avatarPending(job));button.addEventListener('click',()=>void guarded(()=>startAvatarGeneration(bot.id)));row.append(button);}botList.append(row);}
     renderAvatarForm();renderGlobalAvatars();
   }
-  async function loadAvatarSettings(){if(!authenticated)return;const session=authSession,sequence=++avatarRequest;avatarLoading=true;$('avatar-error').textContent='';renderAvatarSettings();try{const [settings,models]=await Promise.all([request('/v1/avatar-settings'),request('/v1/avatar-models')]);if(session!==authSession||sequence!==avatarRequest)return;if(!Array.isArray(settings.themes)||!Array.isArray(settings.avatars)||!Array.isArray(settings.jobs))throw new Error('The avatar settings response was invalid.');avatarSettings=settings;avatarModels=models;for(const [key,admission] of avatarAdmissions){if(settings.jobs.some(job=>job.operationId===admission.operationId))avatarAdmissions.delete(key);}pruneAvatarUrls();}
+  async function loadAvatarSettings(){if(!authenticated)return;const session=authSession,sequence=++avatarRequest;avatarLoading=true;$('avatar-error').textContent='';renderAvatarSettings();try{const [settings,models]=await Promise.all([request('/v1/avatar-settings'),request('/v1/avatar-models')]);if(session!==authSession||sequence!==avatarRequest)return;if(!Array.isArray(settings.themes)||!Array.isArray(settings.avatars)||!Array.isArray(settings.jobs))throw new Error('The avatar settings response was invalid.');avatarSettings=settings;avatarModels=models;for(const [key,admission] of avatarAdmissions){if(settings.jobs.some(job=>job.operationId===admission.operationId))avatarAdmissions.delete(key);}pruneAvatarUrls();return true;}
     catch(error){if(session!==authSession||sequence!==avatarRequest)return;$('avatar-error').textContent=errorText(error);}finally{if(session===authSession&&sequence===avatarRequest){avatarLoading=false;renderAvatarSettings();scheduleAvatarPoll();}}
   }
   function scheduleAvatarPoll(){clearTimeout(avatarPollTimer);if(authenticated&&(avatarSettings.jobs.some(avatarPending)||avatarAdmissions.size)&&!document.hidden)avatarPollTimer=setTimeout(()=>void loadAvatarSettings(),2500);}
@@ -430,7 +477,7 @@ import './src/layout.css';
     try{
       if(checkBeforeResend){const snapshot=await request('/v1/avatar-settings');if(session!==authSession||!authenticated)return;avatarSettings=snapshot;const known=snapshot.jobs?.some(job=>job.operationId===admission.operationId);if(known){avatarAdmissions.delete(key);return;}}
       const result=await request('/v1/avatar-generations',{method:'POST',body:admission});if(session!==authSession||!authenticated)return;
-      if(Array.isArray(result.jobs)){const byId=new Map(avatarSettings.jobs.map(job=>[job.id,job]));for(const job of result.jobs)byId.set(job.id,job);avatarSettings.jobs=[...byId.values()];}
+      if(Array.isArray(result.jobs)){const byId=new Map(result.jobs.map(job=>[job.id,job]));for(const job of avatarSettings.jobs)if(!byId.has(job.id))byId.set(job.id,job);avatarSettings.jobs=[...byId.values()];}
       avatarAdmissions.delete(key);
     }catch(error){
       if(session!==authSession||!authenticated)return;
@@ -455,7 +502,7 @@ import './src/layout.css';
   }
   function disconnect(message = '') {
     desktop.disconnect(); workspace.clear();
-    clearTimeout(avatarPollTimer);avatarRequest++;avatarSettings={themes:[],selection:null,avatars:[],jobs:[]};avatarModels={connected:false,vectorModels:[],imageModels:[],imageAvailable:false};avatarLoading=false;avatarAdmissions.clear();revokeAvatarUrls();$('avatar-error').textContent='';$('avatar-status').textContent='Sign in to load avatar settings.';
+    clearTimeout(avatarPollTimer);avatarRequest++;avatarSettings={themes:[],selection:null,avatars:[],jobs:[]};avatarHistoryPage=0;avatarModels={connected:false,vectorModels:[],imageModels:[],imageAvailable:false};avatarLoading=false;avatarAdmissions.clear();revokeAvatarUrls();$('avatar-error').textContent='';$('avatar-status').textContent='Sign in to load avatar settings.';
     stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId=null; cancelStreamRender(); resetConversationHistory(); generation++; authSession++; authenticated = false; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
     selected = null; currentRun = null; stoppableRun = null; bots = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
     clearTimeout(botSummaryTimer);botSummaries.clear();botSummaryLoading=false;botSummaryPending=false;botRenderKey='';

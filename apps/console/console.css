@@ -325,3 +325,14 @@ dialog{max-width:calc(100vw - 24px);padding:20px;max-height:calc(var(--app-heigh
 .avatar-vector .timber-model-badge{display:none!important}
 .avatar-interrupted-warning{grid-column:1/-1;margin:0;color:var(--danger);font-size:12px;line-height:1.45}
 .avatar-admission{border-style:dashed}
+
+/* Status stays one row per bot; attempt history is deliberately separate. */
+.avatar-current-jobs,.avatar-history-page{display:grid;gap:8px;min-width:0}
+.avatar-job strong,.avatar-job p,.avatar-active-attempts summary{overflow-wrap:anywhere;min-width:0}
+.avatar-active-attempts{grid-column:1/-1;min-width:0}
+.avatar-active-attempts summary{cursor:pointer;min-height:44px;padding:12px 0}
+.avatar-active-attempts .avatar-job{margin-top:8px}
+.avatar-job-history{min-width:0}
+.avatar-job-history>summary{min-height:44px;padding:12px 0}
+.avatar-history-controls{margin-top:8px}
+@media(max-width:480px){.avatar-job{gap:6px}.avatar-job button{max-width:100%}.avatar-history-controls button{flex:1;white-space:normal}}

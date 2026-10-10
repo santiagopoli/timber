@@ -1,7 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {chromium} from 'playwright';
-import {createConsoleFixture,TEST_TOKEN,BOT_A} from './console-fixture.mjs';
+import {createConsoleFixture,TEST_TOKEN,BOT_A,BOT_B} from './console-fixture.mjs';
 
 // Keep the mutation response pending so these regressions exercise the loading
 // render deterministically, rather than depending on CI/network timing.
@@ -199,5 +199,80 @@ for(const timing of ['before POST','before uncertain resend'])test(`image consen
   assert.equal(accepted.length,1);const fresh=accepted[0];assert.equal(fresh.expectedThemeId,'flare-theme');assert.equal(fresh.expectedRevision,2);
   assert.notEqual(fresh.operationId,calls[0].operationId);assert.equal(fresh.confirmedCount,2);assert.equal(fresh.acknowledgeApiBilling,true);
   const confirmations=await page.evaluate(()=>window.__avatarConfirmations);assert.match(confirmations[0],/gpt-image-2.5-sunburst/);assert.match(confirmations[1],/gpt-image-2.5-flare/);
+ }finally{await browser.close();await fixture.close();}
+});
+
+// Avatar current-status and retained attempt history regressions.
+const theme={id:'paper',name:'Paper',kind:'vector',prompt:'Angular geometry',model:'gpt-6.1-sol'};
+function job(id,botId,status,index,extra={}){
+ const createdAt=new Date(Date.UTC(2026,9,1,0,0,index)).toISOString();
+ return {id,botId,status,operationId:`operation-${id}`,themeId:'paper',revision:1,createdAt,updatedAt:createdAt,...extra};
+}
+async function openSettings(page,fixture,mobile){
+ await page.goto(fixture.url);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('#app').waitFor({state:'visible'});
+ if(mobile&&await page.locator('#mobile-back').isVisible())await page.locator('#mobile-back').click();
+ await page.locator('#settings-button').click();await page.waitForFunction(()=>document.querySelector('#avatar-status').textContent==='Global selection · revision 1');
+}
+for(const mobile of [false,true])test(`avatar status bounds repeated attempts with separate accessible history (${mobile?'mobile':'desktop'})`,async()=>{
+ const fixture=await createConsoleFixture(),browser=await chromium.launch({executablePath:process.env.CONSOLE_CHROMIUM_PATH||'/usr/bin/chromium',args:['--no-sandbox']});
+ let jobs=Array.from({length:72},(_,i)=>job(`earlier-${i}`,i%2?BOT_A:BOT_B,i%3?'completed':'failed',i,{error:i%3?undefined:{message:'Historical avatar response did not contain completed text'}})).reverse();
+ const calls=[],errors=[];
+ try{
+  const page=await browser.newPage({viewport:mobile?{width:390,height:844}:{width:1280,height:900},isMobile:mobile,hasTouch:mobile});page.setDefaultTimeout(10000);page.on('pageerror',error=>errors.push(error.message));
+  await page.route('**/v1/avatar-settings',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({themes:[theme],selection:{themeId:'paper',revision:1},avatars:[],jobs})}));
+  await page.route('**/v1/avatar-models',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:true,vectorModels:[{id:theme.model}],imageModels:[],imageAvailable:false})}));
+  await page.route('**/v1/avatar-generations',async route=>{
+   const body=route.request().postDataJSON();calls.push(body);const targets=body.botId?[body.botId]:[BOT_A,BOT_B],incoming=targets.map((botId,i)=>job(`accepted-${calls.length}-${i}`,botId,'queued',100+calls.length*100,{operationId:body.operationId}));jobs=[...incoming,...jobs];
+   await route.fulfill({status:202,contentType:'application/json',body:JSON.stringify({jobs:incoming})});
+  });
+  await openSettings(page,fixture,mobile);
+  const current=page.locator('#avatar-current-jobs > .avatar-current-job'),history=page.locator('#avatar-job-history');
+  assert.equal(await current.count(),2);assert.equal(await history.getAttribute('open'),null);assert.equal(await page.locator('#avatar-job-history .avatar-job').count(),10);assert.equal(await history.getByRole('button',{name:/Retry|Regenerate/}).count(),0);
+  await history.locator('summary').focus();await page.keyboard.press('Enter');assert.equal(await history.evaluate(node=>node.open),true);assert.ok((await history.locator('summary').boundingBox()).height>=44);
+  assert.match(await history.textContent(),/Earlier attempt · Paper · revision 1/);assert.match(await history.textContent(),/attempt earlier-/);assert.match(await history.locator('time').first().getAttribute('datetime'),/^2026-10-01T/);assert.ok(await history.locator('time').first().getAttribute('aria-label'),'timestamps expose the local timezone to assistive technology');
+  await history.getByRole('button',{name:'Next attempts',exact:true}).click();assert.match(await history.textContent(),/Page 2 of 7/);assert.equal(await history.locator('.avatar-job').count(),10);
+  for(let pageNumber=3;pageNumber<=7;pageNumber++)await history.getByRole('button',{name:'Next attempts',exact:true}).click();
+  assert.match(await history.textContent(),/Page 7 of 7/);assert.equal(await history.getByRole('button',{name:'Next attempts',exact:true}).isDisabled(),true);assert.equal(await history.getByRole('button',{name:'Previous attempts',exact:true}).evaluate(node=>node===document.activeElement),true,'last-page navigation retains keyboard focus on an enabled control');
+  await history.locator('summary').click();
+  // Repeated full batches and retries never add another current row for a bot.
+  for(let round=0;round<3;round++){
+   await page.locator('#avatar-generate-all').click();await page.waitForFunction(()=>document.querySelectorAll('#avatar-current-jobs > [data-job-status="queued"]').length===2);
+   assert.equal(await current.count(),2);assert.equal(await current.getByRole('button',{name:/Retry/}).count(),0);
+   jobs=jobs.map(item=>item.id.startsWith(`accepted-${calls.length}-`)?{...item,status:'completed'}:item);await page.locator('#avatar-refresh').click();await page.waitForFunction(()=>document.querySelectorAll('#avatar-current-jobs > [data-job-status="completed"]').length===2);
+  }
+  jobs.unshift(job('latest-failure',BOT_A,'failed',450,{error:{message:'Existing generation failed'}}));await page.locator('#avatar-refresh').click();await page.locator('#avatar-current-jobs > [data-job-id="latest-failure"]').waitFor();
+  await current.getByRole('button',{name:'Retry avatar for Ada, revision 1',exact:true}).click();await page.waitForFunction(()=>document.querySelector('#avatar-current-jobs > [data-job-status="queued"]'));
+  assert.equal(calls.at(-1).botId,BOT_A);assert.equal(calls.at(-1).expectedRevision,1);assert.equal(calls.at(-1).expectedThemeId,'paper');assert.equal(new Set(calls.map(body=>body.operationId)).size,calls.length);assert.equal(await current.count(),2);
+  // Late terminal updates never beat newer created success. Multiple genuine
+  // active jobs, even older than that success, remain truthfully inspectable.
+  jobs=[job('newer-success',BOT_A,'completed',1000),job('late-old-failure',BOT_A,'failed',800,{updatedAt:'2026-10-10T00:00:00.000Z',error:{message:'Old failure updated late'}}),job('newer-linus-success',BOT_B,'completed',900),job('active-one',BOT_B,'running',1),job('active-two',BOT_B,'queued',2),...jobs.filter(item=>!['queued','running'].includes(item.status))];
+  await page.locator('#avatar-refresh').click();await page.locator('#avatar-current-jobs > [data-job-id="newer-success"]').waitFor();
+  assert.equal(await current.first().getAttribute('data-bot-id'),BOT_B);assert.equal(await current.count(),2);assert.equal(await current.getByRole('button',{name:/Retry/}).count(),0);assert.match(await current.first().textContent(),/2 active attempts · 1 running, 1 queued/);
+  assert.equal(await page.locator('.avatar-active-attempts .avatar-job').count(),0,'closed active details do not mount hidden attempt rows');await current.getByText('Inspect all 2 active attempts',{exact:true}).click();await page.locator('.avatar-active-attempts [data-job-status="running"]').waitFor({state:'visible'});assert.equal(await page.locator('.avatar-active-attempts [data-job-status="running"]').isVisible(),true);assert.equal(await page.locator('.avatar-active-attempts [data-job-status="queued"]').isVisible(),true);assert.match(await page.locator('.avatar-active-attempts').textContent(),/attempt active-one/);
+  await history.locator('summary').click();assert.equal(await history.getByRole('button',{name:/Retry|Regenerate/}).count(),0);
+  const geometry=await page.evaluate(()=>{const modal=document.querySelector('#settings-dialog');return {documentWidth:document.documentElement.scrollWidth,viewport:innerWidth,width:modal.clientWidth,scrollWidth:modal.scrollWidth};});assert.ok(geometry.documentWidth<=geometry.viewport);assert.ok(geometry.scrollWidth<=geometry.width);assert.deepEqual(errors,[]);
+ }finally{await browser.close();await fixture.close();}
+});
+
+test('Retry rechecks exact failed job and revision, suppressing stale failures without inference',async()=>{
+ const fixture=await createConsoleFixture(),browser=await chromium.launch({executablePath:process.env.CONSOLE_CHROMIUM_PATH||'/usr/bin/chromium',args:['--no-sandbox']});
+ let jobs=[job('failed-current',BOT_A,'failed',1)],selection={themeId:'paper',revision:1},getError=false,imageMode=false;const calls=[];
+ try{
+  const page=await browser.newPage({viewport:{width:1280,height:900}});page.setDefaultTimeout(10000);
+  await page.route('**/v1/avatar-settings',route=>route.fulfill({status:getError?503:200,contentType:'application/json',body:JSON.stringify(getError?{error:{message:'Status refresh unavailable'}}:{themes:[imageMode?{...theme,id:'image-paper',kind:'image',model:'gpt-image-2.5-sunburst'}:theme],selection,avatars:[],jobs})}));
+  await page.route('**/v1/avatar-models',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:true,vectorModels:[{id:theme.model}],imageModels:imageMode?[{id:'gpt-image-2.5-sunburst'}]:[],imageAvailable:imageMode,imageBilling:{costKnown:false,message:'Separately billed OpenAI API access, not ChatGPT.'}})}));
+  await page.route('**/v1/avatar-generations',route=>{calls.push(route.request().postDataJSON());return route.fulfill({status:202,contentType:'application/json',body:JSON.stringify({jobs:[]})});});
+  await openSettings(page,fixture,false);
+  const retry=page.getByRole('button',{name:'Retry avatar for Ada, revision 1',exact:true});
+  getError=true;await retry.click();await page.getByText('Status refresh unavailable',{exact:true}).waitFor();assert.equal(calls.length,0,'failed refresh cannot authorize a retry');getError=false;
+  jobs.unshift(job('newer-active',BOT_A,'running',2));await retry.click();await page.getByText('This avatar attempt is no longer current. Review the refreshed status before regenerating.',{exact:true}).waitFor();assert.equal(calls.length,0);assert.equal(await retry.count(),0);
+  jobs=[job('failed-new',BOT_A,'failed',3)];selection={themeId:'paper',revision:2};await page.locator('#avatar-refresh').click();await page.waitForFunction(()=>document.querySelector('#avatar-status').textContent==='Global selection · revision 2');assert.equal(await page.locator('#avatar-current-jobs').getByRole('button',{name:/Retry/}).count(),0,'a failure from an earlier revision is not retryable');assert.match(await page.locator('#avatar-current-jobs').textContent(),/previous selection/);
+  // A theme change between the displayed failure and passive retry check is
+  // rejected too, with no substitution of the new revision into old Retry.
+  jobs=[job('failed-new',BOT_A,'failed',3,{revision:2})];await page.locator('#avatar-refresh').click();const revisionTwo=page.getByRole('button',{name:'Retry avatar for Ada, revision 2',exact:true});await revisionTwo.waitFor();selection={themeId:'paper',revision:3};await revisionTwo.click();await page.getByText('This avatar attempt is no longer current. Review the refreshed status before regenerating.',{exact:true}).waitFor();assert.equal(calls.length,0);
+  // A current image failure still needs fresh, exact one-image billing consent.
+  imageMode=true;selection={themeId:'image-paper',revision:4};jobs=[job('image-failure',BOT_A,'failed',4,{themeId:'image-paper',revision:4})];await page.locator('#avatar-refresh').click();const imageRetry=page.getByRole('button',{name:'Retry avatar for Ada, revision 4',exact:true});await imageRetry.waitFor();
+  await page.evaluate(()=>{window.__avatarRetryConfirmations=[];window.confirm=message=>{window.__avatarRetryConfirmations.push(message);return false;};});await imageRetry.click();await page.waitForFunction(()=>window.__avatarRetryConfirmations.length===1);assert.equal(calls.length,0,'declined image consent admits no generation');
+  await page.evaluate(()=>{window.confirm=message=>{window.__avatarRetryConfirmations.push(message);return true;};});const admitted=page.waitForResponse(response=>response.url().endsWith('/v1/avatar-generations')&&response.status()===202);await imageRetry.click();await admitted;assert.equal(calls.length,1);assert.equal(calls[0].expectedThemeId,'image-paper');assert.equal(calls[0].expectedRevision,4);assert.equal(calls[0].confirmedCount,1);assert.equal(calls[0].acknowledgeApiBilling,true);assert.equal(calls[0].botId,BOT_A);assert.match(await page.evaluate(()=>window.__avatarRetryConfirmations.at(-1)),/exactly 1 image.*1 bot/);
  }finally{await browser.close();await fixture.close();}
 });
