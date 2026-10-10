@@ -1,6 +1,7 @@
 import type { EntryRecord } from '@earendil-works/pi-durable';
 import type { RuntimeMessage } from './types.js';
 import {MODEL_FAILURES, classifyModelFailure, modelFailure, type ModelErrorCode} from '@botspace/contracts';
+import { CONTINUATION_PREFIX } from './stop-gate.js';
 
 /** Do not expose provider-specific payloads or private reasoning in the app. */
 export function textContent(content: unknown): string {
@@ -17,6 +18,7 @@ export function normalizeEntries(entries: readonly EntryRecord[]): RuntimeMessag
     if (message.role === 'assistant' && ['error', 'aborted'].includes(message.stopReason)) return [];
     const text = textContent(message.content);
     if (!text) return [];
+    if (role === 'user' && text.startsWith(CONTINUATION_PREFIX)) return [];
     const timestamp = 'timestamp' in message ? message.timestamp : undefined;
     const kind = message.role === 'assistant'
       ? message.content.some(part => part.type === 'toolCall') ? 'progress'

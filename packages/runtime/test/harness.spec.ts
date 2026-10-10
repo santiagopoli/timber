@@ -3,6 +3,7 @@ import { abortAllDurableObjects, reset, runDurableObjectAlarm, runInDurableObjec
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import type { HarnessProbe } from './worker.js';
 import { createBudget } from '../src/budget.js';
+import { createStopGate } from '../src/stop-gate.js';
 import { PiHarness } from 'agents/harness/pi';
 import {configure,ROOT_CONVERSATION_ID} from '@earendil-works/pi-durable';
 import {SHARED_ALLOWANCE_MESSAGE} from './responses-fixture.js';
@@ -833,6 +834,48 @@ it('honors an explicitly configured generation limit with ChatGPT subscription i
   expect(await (await request('/wait?id=chatgpt-loop')).json()).toMatchObject({ status: 'unanswered' });
   const state = await (await request('/inspect')).json<{ calls: unknown[] }>();
   expect(state.calls).toHaveLength(5);
+});
+
+it('continues an unfinished final answer in the same durable run and hides the internal nudge', async () => {
+  const namespace=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE;
+  const stub=namespace.getByName(probeId);
+  await request('/host-context',{mode:'automatic'});
+  await request('/submit',{text:'request-unfinished-stop',operationId:'finish-without-push',chatgpt:true});
+  const finished=await (await request('/wait?id=finish-without-push')).json();
+  expect(finished).toMatchObject({status:'done',text:'Validación y entrega completadas.'});
+  const before=await (await request('/inspect')).json<{calls:{input:string}[];toolCalls:{input:string}[];messages:{role:string;text:string}[]}>();
+  expect(before.calls).toHaveLength(4);
+  expect(before.toolCalls).toHaveLength(2);
+  expect(before.messages.filter(message=>message.role==='user')).toHaveLength(1);
+  expect(before.messages.some(message=>message.text.includes('[Timber internal continuation]'))).toBe(false);
+  await runInDurableObject(stub,(_instance,state)=>{
+    expect(state.storage.sql.exec("SELECT operation_id FROM timber_stop_nudges WHERE operation_id='finish-without-push'").toArray()).toHaveLength(1);
+  });
+  await abortAllDurableObjects();
+  expect(await (await request('/wait?id=finish-without-push')).json()).toMatchObject({status:'done',text:'Validación y entrega completadas.'});
+  const after=await (await request('/inspect')).json<{calls:unknown[];toolCalls:unknown[]}>();
+  expect(after.calls).toHaveLength(4);
+  expect(after.toolCalls).toHaveLength(2);
+});
+
+it('bounds stop nudges by durable generation identity without treating quoted or status-only text as action', async () => {
+  await request('/submit',{text:'Hello',operationId:'prepare-stop-gate'});
+  const stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+  await runInDurableObject(stub,(_instance,state)=>{
+    const gate=createStopGate(state.storage);
+    expect(gate.onYield('status-only','g1','Falta validar y desplegar.')).toBeUndefined();
+    expect(gate.onYield('status-only','g2','> Voy a desplegar.\nYa está listo.')).toBeUndefined();
+    state.storage.sql.exec("INSERT INTO botspace_runtime_budget(operation_id,kind,item_id) VALUES('action','tool','one')");
+    const unfinished='Todavía no está desplegado. Falta validar y desplegar.';
+    expect(gate.onYield('action','g3',unfinished)).toContain('[Timber internal continuation]');
+    expect(gate.onYield('action','g3',unfinished)).toContain('[Timber internal continuation]');
+    expect(gate.onYield('action','g4',unfinished)).toContain('[Timber internal continuation]');
+    expect(gate.onYield('action','g5',unfinished)).toBeUndefined();
+    expect(gate.onYield('action','g6','La validación y la entrega quedaron completadas.')).toBeUndefined();
+    expect(state.storage.sql.exec("SELECT task_id FROM timber_stop_nudges WHERE operation_id='action'").toArray()).toHaveLength(2);
+    expect(createStopGate(state.storage).onYield('action','g3','Voy a revisar.')).toContain('[Timber internal continuation]');
+    expect(createStopGate(state.storage).onYield('action','g7','Voy a revisar.')).toBeUndefined();
+  });
 });
 
 it('finishes a long task beyond the old round/tool caps, including after a hard restart', async () => {

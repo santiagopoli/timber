@@ -129,6 +129,125 @@ describe('honest avatar provider transport', () => {
     expect(await generateVectorAvatar(env, input)).toContain('xmlns="http://www.w3.org/2000/svg"');
     expect(fetch).toHaveBeenCalledTimes(1);
   });
+  // Synthetic Responses wire fixture, not a captured production/provider log.
+  // Mirrors runtime/test/responses-fixture.ts and the SDK's complete item shape.
+  const streamedMessage = {id: 'msg_avatar', type: 'message', role: 'assistant', status: 'completed', content: [{type: 'output_text', text: svg, annotations: []}]};
+  function itemStream(items: Record<string, unknown>[] = [streamedMessage]): Record<string, unknown>[] {
+    return [
+      {type: 'response.created', response: {id: 'resp_avatar', status: 'in_progress', output: []}},
+      ...items.flatMap((item, output_index) => [
+        {type: 'response.output_item.added', output_index, item: {...item, status: 'in_progress', ...(item.type === 'message' ? {content: []} : {})}},
+        ...(item.type === 'message' ? [{type: 'response.output_text.delta', output_index, item_id: item.id, content_index: 0, delta: svg}] : []),
+        {type: 'response.output_item.done', output_index, item},
+      ]),
+      {type: 'response.completed', response: {id: 'resp_avatar', status: 'completed', output: []}},
+    ];
+  }
+  const wire = (events: Record<string, unknown>[]) => events.map(event).join('');
+  it('accepts complete identified streamed items when the completed summary has empty output, without retry', async () => {
+    const items = [{id: 'rs_avatar', type: 'reasoning', summary: []}, streamedMessage];
+    for (const step of [1, 7, 4096]) {
+      const {env, fetch, preflight} = mockEnv(() => stream(wire(itemStream(items)) + 'data: [DONE]\n\n', step));
+      expect(await generateVectorAvatar(env, input)).toContain('<path');
+      expect(fetch).toHaveBeenCalledTimes(1); expect(preflight).toHaveBeenCalledTimes(1);
+    }
+  });
+  it('accepts minimal created/added/done/completed proof without any text deltas', async () => {
+    const events = itemStream().filter(item => item.type !== 'response.output_text.delta');
+    const {env, fetch} = mockEnv(() => stream(wire(events), 1));
+    expect(await generateVectorAvatar(env, input)).toContain('<path');
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it('accepts the realistic Pi fixture lifecycle with a full authoritative final snapshot', async () => {
+    const items = [{id: 'rs_avatar', type: 'reasoning', summary: [], encrypted_content: 'synthetic-fixture-ciphertext'}, streamedMessage];
+    const events = itemStream(items);
+    events[events.length - 1] = {type: 'response.completed', response: {id: 'resp_avatar', object: 'response', status: 'completed', output: items, usage: {input_tokens: 10, output_tokens: 8, total_tokens: 18}}};
+    const namedFrames = events.map((value, sequence_number) => `event: ${value.type}\ndata: ${JSON.stringify({...value, sequence_number})}\n\n`).join('');
+    const {env, fetch} = mockEnv(() => stream(namedFrames, 7));
+    expect(await generateVectorAvatar(env, input)).toContain('<path');
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it('orders complete items by output_index, without concatenating repeated deltas or snapshots', async () => {
+    const parts = [svg.slice(0, 25), svg.slice(25)];
+    const items = parts.map((text, i) => ({...streamedMessage, id: `msg_${i}`, content: [{type: 'output_text', text}]}));
+    const original = itemStream(items);
+    // Both items are introduced first; completion arrival order is independent.
+    const events = [0, 1, 4, 2, 5, 6, 3, 7].map(index => original[index]);
+    const {env} = mockEnv(() => stream(wire(events), 3));
+    expect(await generateVectorAvatar(env, input)).toContain('<path');
+  });
+  it('keeps a nonempty completed snapshot authoritative and never patches invalid terminal output', async () => {
+    const events = itemStream();
+    events[events.length - 1] = completed();
+    const {env} = mockEnv(() => stream(wire(events)));
+    expect(await generateVectorAvatar(env, input)).toContain('<path');
+    for (const output of [
+      [{...streamedMessage, status: 'incomplete'}],
+      [{...streamedMessage, content: [{type: 'refusal', refusal: 'private-provider-body'}]}],
+      [{type: 'function_call', name: 'image_generation', arguments: '{}'}],
+      [{...streamedMessage, content: [{type: 'output_text', text: ''}]}],
+    ]) {
+      const invalid = [...itemStream().slice(0, -1), {type: 'response.completed', response: {id: 'resp_avatar', status: 'completed', output}}];
+      const {env, fetch} = mockEnv(() => stream(wire(invalid)));
+      await expect(generateVectorAvatar(env, input)).rejects.toMatchObject({code: 'avatar_response_invalid'});
+      expect(fetch).toHaveBeenCalledTimes(1);
+    }
+  });
+  it('fails closed for incomplete, conflicting or unsupported streamed completion proofs', async () => {
+    const base = itemStream();
+    const copy = () => structuredClone(base);
+    const cases: Record<string, unknown>[][] = [
+      base.slice(1), // no response identity
+      base.filter(item => item.type !== 'response.output_item.added'),
+      [base[0], base[3], base[1], base[2], base[4]], // done-before-added is deliberately not a completion proof
+      base.filter(item => item.type !== 'response.output_item.done'), // deltas alone
+      base.slice(0, -1), // complete item is not a terminal response
+      itemStream([{...streamedMessage, status: 'in_progress'}]),
+      itemStream([{...streamedMessage, status: undefined}]),
+      itemStream([{...streamedMessage, id: ''}]),
+      itemStream([{...streamedMessage, id: 'x'.repeat(257)}]),
+      itemStream([streamedMessage, streamedMessage]), // duplicate ID across indexes
+      itemStream([{...streamedMessage, role: 'user'}]),
+      itemStream([{...streamedMessage, content: [{type: 'refusal', refusal: 'private-provider-body'}]}]),
+      itemStream([{id: 'fc_avatar', type: 'function_call', status: 'completed', name: 'exec', arguments: '{}'}, streamedMessage]),
+      itemStream([{id: 'rs_avatar', type: 'reasoning', status: 'incomplete'}, streamedMessage]),
+      itemStream([{...streamedMessage, content: [{type: 'output_text', text: ''}]}]),
+      [...base.slice(0, -1), {type: 'response.refusal.delta', delta: 'private-provider-body'}, base.at(-1)!],
+      [...base.slice(0, -1), base[0], base.at(-1)!], // duplicate created
+      [...base.slice(0, -1), base[3], base.at(-1)!], // duplicate done
+      [...base.slice(0, -1), {type: 'response.output_item.added', output_index: 1, item: {...streamedMessage, id: 'unfinished', status: 'in_progress'}}, base.at(-1)!],
+      [...base, base[2]], // output after terminal
+      [...base.slice(0, -1), {type: 'response.incomplete'}],
+      [...base, {type: 'response.failed', response: {error: {message: 'private-provider-body'}}}],
+    ];
+    for (const change of [
+      (events: Record<string, unknown>[]) => {events[3].item = {...streamedMessage, id: 'different'};},
+      (events: Record<string, unknown>[]) => {events[3].item = {...streamedMessage, type: 'reasoning'};},
+      (events: Record<string, unknown>[]) => {events[4].response = {id: 'different', status: 'completed', output: []};},
+      (events: Record<string, unknown>[]) => {events[1].output_index = 1; events[3].output_index = 1;},
+      (events: Record<string, unknown>[]) => {events[1].output_index = -1;},
+      (events: Record<string, unknown>[]) => {events[3].output_index = 0.5;},
+      (events: Record<string, unknown>[]) => {events[1].output_index = 256;},
+      (events: Record<string, unknown>[]) => {events[4].response = {id: 'resp_avatar', status: 'incomplete', output: []};},
+    ]) {const events = copy(); change(events); cases.push(events);}
+    for (const events of cases) {
+      const {env, fetch} = mockEnv(() => stream(wire(events), 7));
+      await expect(generateVectorAvatar(env, input)).rejects.not.toThrow('private-provider-body');
+      expect(fetch).toHaveBeenCalledTimes(1);
+    }
+  });
+  it('preserves genuinely empty completed responses and bounds/sanitizes streamed snapshots', async () => {
+    const noText = [itemStream([]), itemStream([{id: 'rs_avatar', type: 'reasoning', summary: []}])];
+    for (const events of noText) {
+      const {env} = mockEnv(() => stream(wire(events)));
+      await expect(generateVectorAvatar(env, input)).rejects.toMatchObject({code: 'avatar_response_invalid', message: 'The avatar response did not contain completed text.'});
+    }
+    for (const [text, code] of [['x'.repeat(33_000), 'avatar_response_limit'], ['<svg><script>active</script></svg>', 'avatar_svg_invalid']]) {
+      const {env, fetch} = mockEnv(() => stream(wire(itemStream([{...streamedMessage, content: [{type: 'output_text', text}]}]))));
+      await expect(generateVectorAvatar(env, input)).rejects.toMatchObject({code});
+      expect(fetch).toHaveBeenCalledTimes(1);
+    }
+  });
   it('accepts CRLF, comments and multiline SSE JSON only after a complete frame', async () => {
     const json = JSON.stringify(completed(), null, 2).split('\n').map(line => `data: ${line}`).join('\r\n');
     const {env} = mockEnv(() => stream(`: heartbeat\r\nevent: response.completed\r\n${json}\r\n\r\n`, 3));

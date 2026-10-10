@@ -4,6 +4,7 @@ export const SHARED_ALLOWANCE_MESSAGE='The ChatGPT user has reached their Subscr
 
 /** Wire-format OpenAI fixture. No model behavior, credentials, or Pi internals mocked. */
 export function responsesFixture(payload: { input: Record<string, unknown>[] }, requestNumber = 1): Response {
+  if (JSON.stringify(payload.input).includes('request-unfinished-stop')) return unfinishedStopResponse(payload.input);
   const userIndex = payload.input.map(item => item.role === 'user').lastIndexOf(true);
   const user = payload.input[userIndex];
   const text = JSON.stringify(user);
@@ -63,6 +64,27 @@ export function responsesFixture(payload: { input: Record<string, unknown>[] }, 
   else if (text.includes('incomplete-response')) events.push({ type: 'response.incomplete', response: { ...response, status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } } });
   else if (!text.includes('truncated-stream') && !(hasToolOutput && text.includes('recover-stream-once') && requestNumber === 2)) events.push({ type: 'response.completed', response });
   return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
+}
+
+function unfinishedStopResponse(history: Record<string, unknown>[]): Response {
+  const toolResults=history.filter(item=>item.type==='function_call_output').length;
+  const nudged=JSON.stringify(history).includes('[Timber internal continuation]');
+  const call=toolResults===0?{name:'exec',arguments:{command:'echo fixture'}}:toolResults===1&&nudged?{name:'read_file',arguments:{path:'/workspace/test.txt'}}:undefined;
+  const answer=toolResults===1&&!nudged
+    ? 'La corrección sigue sin publicar. Falta validar y desplegar; ahora corresponde ejecutar la revisión.'
+    : 'Validación y entrega completadas.';
+  const item=call
+    ? {type:'function_call',id:`fc_stop_${toolResults}`,call_id:`call_stop_${toolResults}`,name:call.name,namespace:TOOL_NAMESPACE,arguments:JSON.stringify(call.arguments),status:'completed'}
+    : {type:'message',id:`msg_stop_${toolResults}`,role:'assistant',status:'completed',content:[{type:'output_text',text:answer,annotations:[]}]};
+  const response={id:`resp_stop_${toolResults}`,object:'response',status:'completed',output:[item],usage:{input_tokens:10,output_tokens:8,total_tokens:18}};
+  const events=[
+    {type:'response.created',response:{...response,output:[],status:'in_progress'}},
+    {type:'response.output_item.added',output_index:0,item:{...item,...(call?{arguments:''}:{content:[]}),status:'in_progress'}},
+    call?{type:'response.function_call_arguments.delta',output_index:0,delta:JSON.stringify(call.arguments)}:{type:'response.output_text.delta',output_index:0,content_index:0,delta:answer},
+    {type:'response.output_item.done',output_index:0,item},
+    {type:'response.completed',response},
+  ];
+  return new Response(events.map(event=>`data: ${JSON.stringify(event)}\n\n`).join('')+'data: [DONE]\n\n',{headers:{'content-type':'text/event-stream'}});
 }
 
 /** The provider follows the process ID returned by the real runtime tool bridge. */
