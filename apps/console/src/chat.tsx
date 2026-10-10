@@ -25,6 +25,7 @@ import {collectCompactions, CompactionPill, type CompactionItem} from './compact
 import {mergeToolResult, mergeToolStatus, runOutcomes, toolActivityState, toolFailureSummary} from './cancellation-presentation';
 
 const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
+const activeAgentStatuses = new Set(['queued', 'running', 'waiting_approval', 'waiting_connection']);
 const timestamp = (value?: string) => value ? Date.parse(value) || 0 : 0;
 const time = (value?: string) => value ? new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
 const label = (value: string) => value.replaceAll('_', ' ');
@@ -697,7 +698,9 @@ function ChatAgents({model, callbacks, headerTarget}: {model: ChatModel; callbac
   const [expanded, setExpanded] = useState(false);
   const listId = useId();
   const toggle = useRef<HTMLButtonElement>(null);
-  const count = model.subagents.length + model.delegations.length;
+  const activeSubagents = useMemo(() => model.subagents.filter(agent => activeAgentStatuses.has(agent.status)), [model.subagents]);
+  const activeDelegations = useMemo(() => model.delegations.filter(delegation => activeAgentStatuses.has(delegation.status)), [model.delegations]);
+  const count = activeSubagents.length + activeDelegations.length;
   useEffect(() => {if (!count) setExpanded(false);}, [count]);
   if (!count || !headerTarget) return null;
   return <>
@@ -711,8 +714,8 @@ function ChatAgents({model, callbacks, headerTarget}: {model: ChatModel; callbac
     }}>
       {expanded && <>
         <div className="timber-chat-agent-list">
-          {model.subagents.map(agent => <button type="button" key={agent.id} data-chat-agent={agent.id} onClick={() => callbacks.onOpenAgents(agent.id)}><span className="timber-chat-agent-name">{agent.name}</span><span className="status" data-status={agent.status}>{label(agent.status)}</span></button>)}
-          {model.delegations.map(delegation => <button type="button" key={delegation.id} data-chat-delegation={delegation.id} onClick={() => callbacks.onOpenAgents()}><span className="timber-chat-agent-name">{delegation.targetBotName}</span><span className="status" data-status={delegation.status}>{label(delegation.status)}</span></button>)}
+          {activeSubagents.map(agent => <button type="button" key={agent.id} data-chat-agent={agent.id} onClick={() => callbacks.onOpenAgents(agent.id)}><span className="timber-chat-agent-name">{agent.name}</span><span className="status" data-status={agent.status}>{label(agent.status)}</span></button>)}
+          {activeDelegations.map(delegation => <button type="button" key={delegation.id} data-chat-delegation={delegation.id} onClick={() => callbacks.onOpenAgents()}><span className="timber-chat-agent-name">{delegation.targetBotName}</span><span className="status" data-status={delegation.status}>{label(delegation.status)}</span></button>)}
         </div>
         <button type="button" className="timber-chat-agent-manage" onClick={() => callbacks.onOpenAgents()}>View all agents<ExternalLinkIcon aria-hidden="true"/></button>
       </>}

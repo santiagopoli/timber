@@ -14,6 +14,7 @@ import './src/layout.css';
   'use strict';
   const $ = (id) => document.getElementById(id);
   const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
+  const activeAgentStatuses = new Set(['queued', 'running', 'waiting_approval', 'waiting_connection']);
   const guiActions = new Set(['navigate', 'click', 'move', 'doubleClick', 'drag', 'type', 'key', 'scroll']);
   const removedBots = new Set(), deletionPending = new Map();
   const botSummaries = new Map();
@@ -510,7 +511,7 @@ import './src/layout.css';
   function renderAgents() {
     if (deferStreamRender('agents')) return;
     if (!selected || !authenticated) return;
-    $('agent-count').textContent = String(subagents.length);
+    $('agent-count').textContent = String(subagents.filter(agent => activeAgentStatuses.has(agent.status)).length + delegations.filter(task => activeAgentStatuses.has(task.status)).length);
     agentsView.update({botId:selected.id,botName:selected.name,botModel:selected.model,agents:subagents,namedAgents:bots.filter(bot=>bot.createdByBotId===selected.id),delegations,loading:agentsLoading,error:agentsError,selectedAgentId,revision:agentsRevision,events:agentEvents,runs:runValues(),collaborationEvents});
   }
   async function loadAgents(version = generation) {
@@ -1136,6 +1137,7 @@ import './src/layout.css';
     $('back-to-chat').hidden = !open || docked;
     desktop.setActive(currentPanel === 'computer');
     activity.setActive(authenticated && currentPanel === 'activity');
+    agentsView.setActive(authenticated && currentPanel === 'agents');
     syncChatDock();
   }
   function showPanel(name, focus = false) {

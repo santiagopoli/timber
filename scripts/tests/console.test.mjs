@@ -1911,7 +1911,7 @@ test('undelivered subagent reports remain visible after reload without changing 
     const stamp=new Date().toISOString(),agentId='child-report';
     state.agents.set(BOT_A,[{id:agentId,name:'Researcher',task:'Review persistence',parentOperationId:'parent',operationId:'child',status:'completed',result:'The review is complete.',createdAt:stamp,updatedAt:stamp}]);
     state.agentMessages.set(agentId,[{id:'saved-result',role:'assistant',text:'The review is complete.',createdAt:stamp}]);
-    await login();await page.locator('[data-chat-agents-toggle]').click();await page.locator(`[data-chat-agent="${agentId}"]`).click();await page.getByText('The review is complete.',{exact:true}).waitFor();
+    await login();await openPanel(page,'agents');await page.locator(`[data-agent-id="${agentId}"]`).click();await page.getByText('The review is complete.',{exact:true}).waitFor();
     const message='The subagent result is saved, but its parent could not be notified.';
     state.emit(BOT_A,'subagent.report_failed',{subagentId:agentId,errorCode:'parent_report_failed',message});
     await page.locator(`[data-agent-report-error="${agentId}"]`).filter({hasText:message}).waitFor();

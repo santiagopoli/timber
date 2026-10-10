@@ -1,4 +1,4 @@
-import {useEffect, useRef, useState} from 'react';
+import {createElement, memo, useEffect, useMemo, useRef, useState} from 'react';
 import {createRoot} from 'react-dom/client';
 import {ArrowLeftIcon, ArrowUpIcon, GitBranchIcon, LoaderCircleIcon, RefreshCwIcon} from 'lucide-react';
 import type {AgentDelegation, Bot, BotEvent, Run, Subagent} from '../../../packages/contracts/src/index';
@@ -112,32 +112,63 @@ function AgentConversation({model, agent, callbacks}: {model: AgentsModel; agent
   </div>;
 }
 
-function Agents({model, callbacks}: {model: AgentsModel; callbacks: Callbacks}) {
-  const selected = model.agents.find(agent => agent.id === model.selectedAgentId);
-  if (selected) return <AgentConversation key={`${model.botId}:${selected.id}`} model={model} agent={selected} callbacks={callbacks}/>;
+// Historical cards are plain previews: conversations/Markdown mount only after
+// selection. A live child update should not rerender every completed card.
+const AgentCard = memo(function AgentCard({agent, parentName, botName, onSelect}: {agent:Subagent;parentName?:string;botName:string;onSelect:Callbacks['onSelect']}) {
+  return <button type="button" className="timber-agent-card" data-agent-id={agent.id} onClick={() => onSelect(agent.id)}>
+    <span className="timber-agent-card-heading"><span className="timber-collaborator-avatar timber-model-avatar is-subagent" data-agent-color={agentColor(agent.id)} title={agent.model} aria-hidden="true">{agent.name.slice(0,1)}<ModelBadge model={agent.model}/></span><strong>{agent.name}</strong><span className="status" data-status={agent.status}>{label(agent.status)}</span></span>
+    <span className="hint">{agent.parentSubagentId ? `Subagent of ${parentName || 'another agent'}` : `Created by ${botName}`}</span>
+    {agent.model&&<span className="hint" data-agent-model={agent.model}>{agent.model}</span>}
+    <span className="timber-agent-task">{agent.task}</span>
+    {agent.error && <span className="error">{agent.error}</span>}<span className="timber-agent-card-footer"><time>{date(agent.updatedAt)}</time><span>Open conversation →</span></span>
+  </button>;
+});
+
+const sameItems = <T,>(left: T[], right: T[]) => left === right || left.length === right.length && left.every((item, index) => item === right[index]);
+
+type OverviewProps = Pick<AgentsModel, 'agents'|'namedAgents'|'delegations'|'botId'|'botName'|'loading'|'error'> & {callbacks:Callbacks};
+const AgentsOverview = memo(function AgentsOverview({agents, namedAgents, delegations, botId, botName, loading, error, callbacks}: OverviewProps) {
+  // One index replaces a find() per nested card (quadratic with large history).
+  const parentNames = useMemo(() => new Map(agents.map(agent => [agent.id, agent.name])), [agents]);
   return <div className="timber-agents">
     <div className="section-title"><h2>Agents</h2><button type="button" className="quiet" onClick={callbacks.onRefresh}>Refresh</button></div>
-    {model.error && <p className="error" role="alert">{model.error}</p>}
+    {error && <p className="error" role="alert">{error}</p>}
     <h3>Temporary subagents</h3>
-    {!model.agents.length && <p className="hint">{model.loading ? 'Loading agents…' : 'Subagents created for this bot’s tasks appear here, with their conversations and progress.'}</p>}
-    <div className="timber-agent-list">{model.agents.map(agent => <button type="button" key={agent.id} className="timber-agent-card" data-agent-id={agent.id} onClick={() => callbacks.onSelect(agent.id)}>
-      <span className="timber-agent-card-heading"><span className="timber-collaborator-avatar timber-model-avatar is-subagent" data-agent-color={agentColor(agent.id)} title={agent.model} aria-hidden="true">{agent.name.slice(0,1)}<ModelBadge model={agent.model}/></span><strong>{agent.name}</strong><span className="status" data-status={agent.status}>{label(agent.status)}</span></span>
-      <span className="hint">{agent.parentSubagentId ? `Subagent of ${model.agents.find(item => item.id === agent.parentSubagentId)?.name || 'another agent'}` : `Created by ${model.botName}`}</span>
-      {agent.model&&<span className="hint" data-agent-model={agent.model}>{agent.model}</span>}
-      <span className="timber-agent-task">{agent.task}</span>
-      {agent.error && <span className="error">{agent.error}</span>}<span className="timber-agent-card-footer"><time>{date(agent.updatedAt)}</time><span>Open conversation →</span></span>
-    </button>)}</div>
-    {model.namedAgents.length > 0 && <><h3>Named agents</h3><div className="timber-agent-list">{model.namedAgents.map(bot=><button type="button" className="timber-agent-card" key={bot.id} data-named-agent={bot.id} onClick={()=>callbacks.onOpenBot(bot.id)}><span className="timber-agent-card-heading"><strong>{bot.name}</strong><span className="hint">Persistent bot</span></span><span className="timber-agent-task">{bot.instructions || `Created by ${model.botName}`}</span><span className="timber-agent-card-footer">Open conversation →</span></button>)}</div></>}
+    {!agents.length && <p className="hint">{loading ? 'Loading agents…' : 'Subagents created for this bot’s tasks appear here, with their conversations and progress.'}</p>}
+    <div className="timber-agent-list">{agents.map(agent => <AgentCard key={agent.id} agent={agent} parentName={agent.parentSubagentId ? parentNames.get(agent.parentSubagentId) : undefined} botName={botName} onSelect={callbacks.onSelect}/>)}</div>
+    {namedAgents.length > 0 && <><h3>Named agents</h3><div className="timber-agent-list">{namedAgents.map(bot=><button type="button" className="timber-agent-card" key={bot.id} data-named-agent={bot.id} onClick={()=>callbacks.onOpenBot(bot.id)}><span className="timber-agent-card-heading"><strong>{bot.name}</strong><span className="hint">Persistent bot</span></span><span className="timber-agent-task">{bot.instructions || `Created by ${botName}`}</span><span className="timber-agent-card-footer">Open conversation →</span></button>)}</div></>}
     <h3>Bot collaboration</h3>
-    {!model.delegations.length && <p className="hint">Mention another bot with @ in chat, or ask this bot to delegate a task.</p>}
-    <div className="timber-agent-list">{model.delegations.map(delegation => <article key={delegation.id} className="timber-agent-card" data-delegation-id={delegation.id}>
+    {!delegations.length && <p className="hint">Mention another bot with @ in chat, or ask this bot to delegate a task.</p>}
+    <div className="timber-agent-list">{delegations.map(delegation => <article key={delegation.id} className="timber-agent-card" data-delegation-id={delegation.id}>
       <div className="timber-agent-card-heading"><strong>{delegation.sourceBotName} → {delegation.targetBotName}</strong><span className="status" data-status={delegation.status}>{label(delegation.status)}</span></div>
-      {delegation.error && <p className="error">{delegation.error}</p>}<div className="timber-agent-card-footer"><time>{date(delegation.updatedAt)}</time><button type="button" className="quiet" onClick={() => callbacks.onOpenBot(delegation.targetBotId === model.botId ? delegation.sourceBotId : delegation.targetBotId)}>Open {delegation.targetBotId === model.botId ? delegation.sourceBotName : delegation.targetBotName}</button></div>
+      {delegation.error && <p className="error">{delegation.error}</p>}<div className="timber-agent-card-footer"><time>{date(delegation.updatedAt)}</time><button type="button" className="quiet" onClick={() => callbacks.onOpenBot(delegation.targetBotId === botId ? delegation.sourceBotId : delegation.targetBotId)}>Open {delegation.targetBotId === botId ? delegation.sourceBotName : delegation.targetBotName}</button></div>
     </article>)}</div>
   </div>;
+}, (previous, next) => previous.botId === next.botId && previous.botName === next.botName && previous.loading === next.loading && previous.error === next.error && previous.callbacks === next.callbacks && sameItems(previous.agents, next.agents) && sameItems(previous.namedAgents, next.namedAgents) && sameItems(previous.delegations, next.delegations));
+
+function Agents({model, callbacks}: {model: AgentsModel; callbacks: Callbacks}) {
+  const selected = model.selectedAgentId ? model.agents.find(agent => agent.id === model.selectedAgentId) : undefined;
+  if (selected) return <AgentConversation key={`${model.botId}:${selected.id}`} model={model} agent={selected} callbacks={callbacks}/>;
+  return <AgentsOverview agents={model.agents} namedAgents={model.namedAgents} delegations={model.delegations} botId={model.botId} botName={model.botName} loading={model.loading} error={model.error} callbacks={callbacks}/>;
 }
 
 export function mountAgents(element: HTMLElement, callbacks: Callbacks) {
-  const root = createRoot(element);
-  return {update(model: AgentsModel) {root.render(<Agents key={model.botId} model={model} callbacks={callbacks}/>);}, clear() {root.render(null);}};
+  let root: ReturnType<typeof createRoot> | null = null;
+  let model: AgentsModel | null = null, rendered: AgentsModel | null = null;
+  let active = false;
+  const render = () => {
+    if (!active || !model || rendered === model) return;
+    root ||= createRoot(element);
+    root.render(createElement(Agents, {key: model.botId, model, callbacks}));
+    rendered = model;
+  };
+  return {
+    // Keep only the latest complete model, including direct-route selection.
+    // Hidden updates perform no React work and never enumerate historical cards.
+    update(next: AgentsModel) {model = next;render();},
+    setActive(next: boolean) {active = next;render();},
+    // Retain an opened tree while hidden (composer drafts/scroll survive), but
+    // discard it on a bot/session reset so stale requests/state cannot leak.
+    clear() {model = null;rendered = null;root?.unmount();root = null;},
+  };
 }
