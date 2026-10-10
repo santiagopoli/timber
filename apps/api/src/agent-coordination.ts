@@ -5,7 +5,8 @@ import { body, fingerprint, parseBotInput, string, UUID } from "./validation";
 
 type JsonRow={data:string};
 type Phase="submit"|"observe"|"result"|"cancel"|"done";
-type Delivery={delegation:AgentDelegation;text:string;kind:"bot"|"mention";result?:string};
+type Delivery={delegation:AgentDelegation;text:string;kind:"bot"|"mention";result?:string;sourceTaskId?:string};
+type SourceTask={botId:string;status:string;cancelRequested?:boolean;deleting?:boolean};
 type DeliveryRow={id:string;source_bot_id:string;operation_id:string;fingerprint:string;phase:Phase;attempts:number;next_at:number;data:string};
 const terminal=new Set<RunStatus>(["completed","failed","cancelled","interrupted"]);
 const maxAttempts=5;
@@ -34,7 +35,7 @@ export async function agentCoordinatorRequest<T>(env:Env,path:string,input?:unkn
 /** Durable outbox kept in the same object as the authoritative bot registry. */
 export class AgentCoordinator {
   private working=new Map<string,Promise<void>>();
-  constructor(private ctx:DurableObjectState,private env:Env,private rearm:()=>Promise<void>,private reserveComputer:(botId:string,operationId:string)=>string,private completeComputer:(token:string)=>void) {
+  constructor(private ctx:DurableObjectState,private env:Env,private rearm:()=>Promise<void>,private reserveComputer:(botId:string,operationId:string,taskId?:string)=>string,private completeComputer:(token:string)=>void) {
     ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS agent_creations (source_bot_id TEXT NOT NULL,operation_id TEXT NOT NULL,fingerprint TEXT NOT NULL,bot_id TEXT NOT NULL,PRIMARY KEY(source_bot_id,operation_id));
       CREATE TABLE IF NOT EXISTS agent_deliveries (id TEXT PRIMARY KEY,source_bot_id TEXT NOT NULL,operation_id TEXT NOT NULL,fingerprint TEXT NOT NULL,phase TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL,data TEXT NOT NULL,UNIQUE(source_bot_id,operation_id));
@@ -49,8 +50,23 @@ export class AgentCoordinator {
     if(!row) throw new ApiError(404,"not_found","Bot not found.");
     return JSON.parse(row.data) as Bot;
   }
-  private async botRequest<T>(botId:string,path:string,input?:unknown,method="GET"):Promise<T> {
+  private sourceTask(botId:string,taskId?:string):SourceTask|undefined {
+    if(taskId===undefined) return;
+    const row=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM tasks WHERE id=?",taskId).toArray()[0];
+    if(!row) throw new ApiError(404,"not_found","Source task not found.");
+    const task=JSON.parse(row.data) as SourceTask;
+    if(task.botId!==botId) throw new ApiError(403,"agent_source_mismatch","The source task is not assigned to this bot.");
+    return task;
+  }
+  private taskStopped(task:SourceTask|undefined):boolean {
+    return !!task && (!!task.cancelRequested || !!task.deleting || task.status==="cancelled" || task.status==="cancelling");
+  }
+  private sourceTaskId(input:Record<string,unknown>):string|undefined {
+    return input.sourceTaskId===undefined?undefined:identifier(input.sourceTaskId,"sourceTaskId");
+  }
+  private async botRequest<T>(botId:string,path:string,input?:unknown,method="GET",taskId?:string):Promise<T> {
     const bot=this.bot(botId);
+    this.sourceTask(botId,taskId);
     // Agent delivery and result inputs are internal run admissions. Reserve in
     // this WorkspaceDO directly (rather than recursively calling its own
     // fetch handler) so an alarm-driven outbox retry cannot deadlock itself.
@@ -58,15 +74,16 @@ export class AgentCoordinator {
     if(method==="POST"&&(path==="/agent-messages"||path==="/agent-results")) {
       const op=input&&typeof input==="object"?(input as {operationId?:unknown}).operationId:undefined;
       if(typeof op!=="string")throw new ApiError(400,"invalid_request","Agent delivery operationId is required.");
-      admission=this.reserveComputer(botId,op);
+      admission=this.reserveComputer(botId,op,taskId);
     }
     const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),30_000);
     try {
-      const response=await this.env.BOT.get(this.env.BOT.idFromName(`owner:${botId}`)).fetch(new Request(`https://bot${path}`,{method,signal:controller.signal,headers:{"content-type":"application/json","x-timber-internal":"agents","x-botspace-config":encodeURIComponent(JSON.stringify(bot))},...(input===undefined?{}:{body:JSON.stringify(input)})}));
+      const response=await this.env.BOT.get(this.env.BOT.idFromName(taskId?`owner:task:${taskId}`:`owner:${botId}`)).fetch(new Request(`https://bot${path}`,{method,signal:controller.signal,headers:{"content-type":"application/json","x-timber-internal":"agents","x-botspace-config":encodeURIComponent(JSON.stringify(bot)),...(taskId?{"x-timber-task-id":taskId}:{})},...(input===undefined?{}:{body:JSON.stringify(input)})}));
       if(admission)this.completeComputer(admission);
       if(!response.ok) {
-        // BotDO public diagnostics are reviewed, but arbitrary provider responses
-        // are never copied into another bot's transcript.
+        // Drain the response so its stream does not pin the target DO. Arbitrary
+        // provider diagnostics are never copied into another bot's transcript.
+        await response.arrayBuffer();
         throw new ApiError(response.status,"agent_delivery_failed","The agent message could not be delivered.");
       }
       return await response.json<T>();
@@ -74,10 +91,11 @@ export class AgentCoordinator {
   }
   private async source(input:Record<string,unknown>):Promise<{bot:Bot;run:Run;operationId:string}> {
     const botId=identifier(input.sourceBotId,"sourceBotId"),runId=identifier(input.sourceRunId,"sourceRunId");
-    const operationId=toolOperationId(input.operationId);
+    const operationId=toolOperationId(input.operationId),taskId=this.sourceTaskId(input);
     this.bot(botId);
-    const {run}=await this.botRequest<{run:Run}>(botId,`/runs/${runId}`);
+    const {run}=await this.botRequest<{run:Run}>(botId,`/runs/${runId}`,undefined,"GET",taskId);
     if(run.botId!==botId || run.id!==runId) throw new ApiError(403,"agent_source_mismatch","The agent source run does not belong to this bot.");
+    if(this.taskStopped(this.sourceTask(botId,taskId))) throw new ApiError(409,"run_inactive","The source task is no longer active.");
     return {bot:this.bot(botId),run,operationId};
   }
   private previousCreation(botId:string,operationId:string,hash:string):Bot|undefined {
@@ -88,9 +106,9 @@ export class AgentCoordinator {
   }
   private async create(input:Record<string,unknown>):Promise<Response> {
     const botId=identifier(input.sourceBotId,"sourceBotId"),runId=identifier(input.sourceRunId,"sourceRunId"),op=toolOperationId(input.operationId);
-    const fields=parseBotInput({name:input.name,instructions:input.instructions});
-    const hash=await fingerprint({sourceRunId:runId,name:fields.name,instructions:fields.instructions??""});
-    this.bot(botId);
+    const fields=parseBotInput({name:input.name,instructions:input.instructions}),sourceTaskId=this.sourceTaskId(input);
+    const hash=await fingerprint({sourceRunId:runId,name:fields.name,instructions:fields.instructions??"",...(sourceTaskId?{sourceTaskId}:{})});
+    this.bot(botId);this.sourceTask(botId,sourceTaskId);
     const previous=this.previousCreation(botId,op,hash);
     if(previous) return json({bot:previous},201);
     const source=await this.source(input);
@@ -100,7 +118,7 @@ export class AgentCoordinator {
     if(raced) return json({bot:raced},201);
     const current=this.bot(botId);
     if(current.allowNamedAgents!==true) throw new ApiError(403,"named_agents_disabled","Enable Allow named agents for this bot before creating a named bot.");
-    if(terminal.has(source.run.status)) throw new ApiError(409,"run_inactive","The source run is no longer active.");
+    if(source.run.cancellation || terminal.has(source.run.status)) throw new ApiError(409,"run_inactive","The source run is no longer active.");
     const now=new Date().toISOString();
     const bot:Bot={id:crypto.randomUUID(),name:fields.name!,instructions:fields.instructions??"",runtime:"pi",model:current.model,...(current.reasoningEffort?{reasoningEffort:current.reasoningEffort}:{}),...(current.fast!==undefined?{fast:current.fast}:{}),computerApprovalMode:"ask",allowNamedAgents:false,allowTaskCreation:false,createdByBotId:botId,createdAt:now,updatedAt:now};
     this.ctx.storage.transactionSync(()=>{
@@ -120,9 +138,9 @@ export class AgentCoordinator {
     const text=string(input.text,"text",32_000);
     if(!text.trim()) throw new ApiError(400,"invalid_request","text cannot be blank.");
     if(input.kind!==undefined && input.kind!=="bot" && input.kind!=="mention") throw new ApiError(400,"invalid_request","Invalid agent message kind.");
-    const kind=input.kind==="mention"?"mention":"bot";
-    const hash=await fingerprint({sourceRunId:runId,targetBotId:targetId,text,kind});
-    this.bot(botId);
+    const kind=input.kind==="mention"?"mention":"bot",sourceTaskId=this.sourceTaskId(input);
+    const hash=await fingerprint({sourceRunId:runId,targetBotId:targetId,text,kind,...(sourceTaskId?{sourceTaskId}:{})});
+    this.bot(botId);this.sourceTask(botId,sourceTaskId);
     const previous=this.previousDelivery(botId,op,hash);
     if(previous) {await this.rearm();return json({delegation:previous},202);}
     const source=await this.source(input);
@@ -138,7 +156,7 @@ export class AgentCoordinator {
     if(active>=8) throw new ApiError(429,"delegation_limit","This bot already has eight pending delegations. Wait for a result before sending another.");
     const now=new Date().toISOString();
     const delegation:AgentDelegation={id:crypto.randomUUID(),sourceBotId:botId,sourceBotName:source.bot.name,sourceRunId:runId,targetBotId:targetId,targetBotName:target.name,path:[...lineage,targetId],status:"queued",createdAt:now,updatedAt:now};
-    const delivery:Delivery={delegation,text,kind};
+    const delivery:Delivery={delegation,text,kind,...(sourceTaskId?{sourceTaskId}:{})};
     this.ctx.storage.sql.exec("INSERT INTO agent_deliveries(id,source_bot_id,operation_id,fingerprint,phase,next_at,data) VALUES(?,?,?,?,?,?,?)",delegation.id,botId,op,hash,"submit",Date.now(),JSON.stringify(delivery));
     // The alarm is durable before acknowledging the receipt. The HTTP request
     // never waits for another model or a reciprocal message.
@@ -191,16 +209,28 @@ export class AgentCoordinator {
           await this.botRequest(d.targetBotId,"/agent-cancel",{operationId:`delegate:${d.id}`},"POST");
         } catch(error) {if(!(error instanceof ApiError && error.status===404)) throw error;}
         if(!this.unchanged(row)) return;
-        try {this.bot(d.sourceBotId);delivery.result=d.error??"The delegated task was cancelled.";this.save(delivery,"result");}
+        try {
+          this.bot(d.sourceBotId);
+          if(this.taskStopped(this.sourceTask(d.sourceBotId,delivery.sourceTaskId))) {this.save(delivery,"done");return;}
+          delivery.result=d.error??"The delegated task was cancelled.";this.save(delivery,"result");
+        }
         catch {this.ctx.storage.sql.exec("DELETE FROM agent_deliveries WHERE id=?",id);}
         return;
       }
       // Deleting the source revokes its outstanding delivery authority.
       this.bot(d.sourceBotId);
+      const sourceTask=this.sourceTask(d.sourceBotId,delivery.sourceTaskId);
+      if(this.taskStopped(sourceTask)) {
+        // A terminal target can still own background processes or children.
+        // Even a queued result must fence its exact delegated input before the
+        // source task's slot can be released after Stop.
+        this.cancel(delivery,"The source task was cancelled.");
+        return;
+      }
       if(row.phase==="submit" || row.phase==="observe") {
-        const {run:sourceRun}=await this.botRequest<{run:Run}>(d.sourceBotId,`/runs/${d.sourceRunId}`);
+        const {run:sourceRun}=await this.botRequest<{run:Run}>(d.sourceBotId,`/runs/${d.sourceRunId}`,undefined,"GET",delivery.sourceTaskId);
         if(!this.unchanged(row)) return;
-        if(sourceRun.cancellation || sourceRun.status==="cancelled") {
+        if(this.taskStopped(this.sourceTask(d.sourceBotId,delivery.sourceTaskId)) || sourceRun.cancellation || sourceRun.status==="cancelled") {
           this.cancel(delivery,"The source run was cancelled.");return;
         }
       }
@@ -230,8 +260,11 @@ export class AgentCoordinator {
         } else this.save(delivery,"observe",run.status.startsWith("waiting_")?15_000:3000);
       } else {
         const provenance:MessageProvenance={kind:"delegation_result",sourceBotId:d.targetBotId,sourceBotName:d.targetBotName,...(d.targetRunId?{sourceRunId:d.targetRunId}:{}),delegationId:d.id};
-        await this.botRequest(d.sourceBotId,"/agent-results",{operationId:`agent-result:${d.id}`,delegation:d,status:d.status,text:delivery.result??"The delegated task finished without a response.",provenance},"POST");
-        if(this.unchanged(row)) this.save(delivery,"done");
+        await this.botRequest(d.sourceBotId,"/agent-results",{operationId:`agent-result:${d.id}`,delegation:d,status:d.status,text:delivery.result??"The delegated task finished without a response.",provenance},"POST",delivery.sourceTaskId);
+        if(this.unchanged(row)) {
+          if(this.taskStopped(this.sourceTask(d.sourceBotId,delivery.sourceTaskId))) this.cancel(delivery,"The source task was cancelled.");
+          else this.save(delivery,"done");
+        }
       }
     } catch(error) {
       if(!this.unchanged(row)) return;
@@ -250,7 +283,10 @@ export class AgentCoordinator {
       }
       // A removed source has no conversation to notify. A removed target is a
       // terminal, visible failure in the surviving source's conversation.
-      try {this.bot(d.sourceBotId);} catch {this.cancel(delivery,"The source bot was deleted.",true);return;}
+      try {
+        this.bot(d.sourceBotId);
+        if(this.taskStopped(this.sourceTask(d.sourceBotId,delivery.sourceTaskId))) {this.cancel(delivery,"The source task was cancelled.");return;}
+      } catch {this.cancel(delivery,delivery.sourceTaskId?"The source bot or task was deleted.":"The source bot was deleted.",true);return;}
       const attempts=row.attempts+1;
       if(error instanceof ApiError && error.status===404 && row.phase!=="result") this.failed(delivery,"The target bot or delegated run is no longer available.");
       else if(attempts>=maxAttempts) {

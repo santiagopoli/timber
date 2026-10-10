@@ -124,7 +124,7 @@ export default {
         if(!created.ok) return created;
         return created;
       }
-      const taskRoute=/^\/v1\/tasks\/([0-9a-f-]{36})(?:\/(messages|runs|events|start|cancel))?$/.exec(url.pathname);
+      const taskRoute=/^\/v1\/tasks\/([0-9a-f-]{36})(?:\/(messages|runs(?:\/[0-9a-f-]{36}(?:\/cancel)?)?|events|start|cancel|approvals(?:\/[0-9a-f-]{36})?|agents(?:\/[^/]+\/(?:messages|cancel))?|connections(?:\/[^/]+\/connect)?))?$/.exec(url.pathname);
       if(taskRoute) {
         const [,taskId,endpoint]=taskRoute;
         const taskResponse=await registry.fetch(`https://workspace/tasks/${taskId}`);
@@ -164,7 +164,9 @@ export default {
         if(endpoint==="messages" && request.method==="POST" && task.status==="cancelled") {await discardRequestBody(request);throw new ApiError(409,"task_cancelled","Cancelled tasks cannot accept new messages.");}
         if(endpoint==="messages" && request.method==="POST" && !["running","waiting_approval","waiting_connection"].includes(task.status)) {await discardRequestBody(request);throw new ApiError(409,"task_not_running","This task is not currently running; wait for it to start before messaging it.");}
         let admissionToken:string|undefined;
-        if(endpoint==="messages" && request.method==="POST") admissionToken=await beginAdmission(env,task.botId,await bodyOperationId(request),taskId);
+        const taskInput=endpoint==="messages"||/^agents\/[^/]+\/messages$/.test(endpoint);
+        if(taskInput&&request.method==="POST")admissionToken=await beginAdmission(env,task.botId,await bodyOperationId(request),taskId);
+        if(/^approvals\/[^/]+$/.test(endpoint)&&request.method==="POST")admissionToken=await beginAdmission(env,task.botId,`mutation:${crypto.randomUUID()}`,taskId);
         requestBodyForwarded=true;
         const response=await stub.fetch(new Request(`https://task/${endpoint}${url.search}`,{method:request.method,headers,body:["GET","HEAD"].includes(request.method)?undefined:request.body,redirect:"manual",signal:request.signal}));
         if(admissionToken)await completeAdmission(env,task.botId,admissionToken);
@@ -207,7 +209,7 @@ export default {
       let admissionToken:string|undefined;
       const agentMessage=/^\/agents\/([^/]+)\/messages$/.exec(tail);
       let decodedAgentId="";try{decodedAgentId=agentMessage?decodeURIComponent(agentMessage[1]):"";}catch{}
-      const isRunAdmission=tail==="/messages"&&request.method==="POST"||!!agentMessage&&UUID.test(decodedAgentId)&&request.method==="POST";
+      const isRunAdmission=tail==="/messages"&&request.method==="POST"||!!agentMessage&&!!decodedAgentId&&request.method==="POST";
       if(isRunAdmission) admissionToken=await beginAdmission(env,botId,await bodyOperationId(request));
       if(tail==="/computer/actions" && request.method==="POST") {
         const raw=await request.text();

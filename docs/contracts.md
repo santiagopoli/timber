@@ -2,8 +2,9 @@
 
 ## Product and naming
 The product is Timber. A Bot has a name, instructions, runtime,
-model and a single persistent conversation. Tasks/runs are inside
-that conversation. v1 is cloud-only; no iOS implementation in this milestone.
+model and a single persistent conversation. Runs project accepted inputs inside
+that conversation. Standalone global tasks have their own conversations and share
+the assigned bot’s computer, never its ordinary chat transcript. v1 is cloud-only; no iOS implementation in this milestone.
 
 ## Deployment
 - One Cloudflare Worker, WorkspaceDO registry, BotDO per bot, ComputerDO per bot.
@@ -228,16 +229,22 @@ own transcript and run/event IDs.
 `POST /v1/tasks/:id/start` admits the description under stable operation ID
 `task-start:<taskId>`. `POST /v1/tasks/:id/messages`, `GET /messages`, `GET
 /runs`, and `GET /events` expose the task conversation. `POST /cancel` cancels its
-active runs and fences subsequent starts. A per-assigned-bot durable slot blocks
+active runs and fences subsequent starts. Task-scoped `/approvals`,
+`/approvals/:approvalId`, `/agents`, `/agents/:agentId/messages`,
+`/agents/:agentId/cancel`, `/runs/:runId`, `/runs/:runId/cancel` and `/connections`
+reuse the isolated conversation’s decision/run APIs; decisions are never applied
+to the assigned bot’s ordinary chat. A per-assigned-bot durable slot blocks
 task starts while the ordinary bot has an active run; it also rejects ordinary bot
 message admissions and owner computer actions while a task holds the slot. These
 blocked requests receive `409 computer_busy`, so task chat is not admitted as
-steering while the shared computer is occupied. Other tasks receive
-`409 task_slot_busy` until the current task is cancelled or its terminal run is
-observed through that task's runs list. The ordinary bot slot releases when its
-runs list observes no active work. Status and slot release are projected on runs
-reads, not by a background scheduler; clients must poll runs to release an idle
-slot.
+steering while the shared computer is occupied. Other tasks remain durably `queued` and are admitted FIFO by the WorkspaceDO alarm
+once run and managed-process termination is confirmed. No browser polling is
+needed to release an idle lease or start queued tasks. Snapshot-based release is
+fenced by lease token/generation, pending admissions, unacknowledged native
+cancellations and named result/cancellation outboxes so stale observations
+cannot free a replacement holder. Ordinary inputs retain the separate 32/16
+backlogs, native 16-input inbox and 128-unresolved circuit breaker; these are not
+replaced by a task execution count.
 
 Bot deletion fences and cleans each assigned task's conversation/runtime before
 cleaning the shared computer. Cleanup retries leave bot deletion pending; task
@@ -245,9 +252,9 @@ cleanup never destroys the assigned bot's computer.
 
 The `create_task` host tool is explicitly gated by the assigned bot's
 `allowTaskCreation` permission. Bot creation identity is taken from the active
-host run; model-supplied source IDs are ignored. Bot-created tasks start pending
-because their assigned bot is still executing the creating run; the owner can
-start them once the bot is idle. Task list pagination, reassignment, and task
+host run; model-supplied source IDs are ignored. Bot-created tasks accept `startImmediately?:boolean`, default true. They queue
+behind their creating conversation and start through the durable scheduler when
+its shared computer is idle; false explicitly saves a pending task. Task list pagination, reassignment, and task
 user-deletion are not available.
 
 ## Console sessions
