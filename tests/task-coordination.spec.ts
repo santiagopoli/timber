@@ -209,7 +209,7 @@ describe("task delegation scheduler integration",()=>{
       expect(state.storage.sql.exec<{task_id:string}>("SELECT task_id FROM task_slots WHERE bot_id=?",source.id).one().task_id).toBe(task.id);
       expect(JSON.parse(state.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",task.id).one().data).status).toBe("running");
     });
-    expect((await api(`/v1/bots/${source.id}/messages`,{operationId:crypto.randomUUID(),text:"Ordinary chat must remain blocked"})).status).toBe(409);
+    expect((await api(`/v1/bots/${source.id}/messages`,{operationId:crypto.randomUUID(),text:"Ordinary chat waits without stealing task lease"})).status).toBe(202);
     await runInDurableObject(registry(),async(instance,state)=>{
       const scheduler=instance as unknown as Scheduler;
       await scheduler.agents.process(delegation.id); // Observe target completion.
@@ -231,7 +231,7 @@ describe("task delegation scheduler integration",()=>{
     const taskMessages=(await (await api(`/v1/tasks/${task.id}/messages`)).json<{messages:Message[]}>()).messages;
     expect(taskMessages).toContainEqual(expect.objectContaining({runId:sourceRun.id,text:"Named helper result for the isolated task.",provenance:expect.objectContaining({kind:"delegation_result",delegationId:delegation.id})}));
     expect(taskMessages.some(message=>message.runId===continuation!.id&&message.role==="assistant")).toBe(true);
-    expect((await (await api(`/v1/bots/${source.id}/messages`)).json<{messages:Message[]}>()).messages).toEqual([]);
+    expect((await (await api(`/v1/bots/${source.id}/messages`)).json<{messages:Message[]}>()).messages).toEqual([expect.objectContaining({role:"user",text:"Ordinary chat waits without stealing task lease"})]);
     await runInDurableObject(registry(),async(instance,state)=>{
       await (instance as unknown as Scheduler).reconcileComputerSlots();
       expect(state.storage.sql.exec("SELECT 1 FROM task_slots WHERE bot_id=?",source.id).toArray()).toHaveLength(0);
@@ -287,7 +287,7 @@ describe("task delegation cancellation scheduler integration",()=>{
         await scheduler.reconcileComputerSlots();
         expect(state.storage.sql.exec<{task_id:string}>("SELECT task_id FROM task_slots WHERE bot_id=?",source.id).one().task_id).toBe(task.id);
       });
-      expect((await api(`/v1/bots/${source.id}/messages`,{operationId:crypto.randomUUID(),text:"Still blocked during named cancellation"})).status).toBe(409);
+      expect((await api(`/v1/bots/${source.id}/messages`,{operationId:crypto.randomUUID(),text:"Saved during named cancellation"})).status).toBe(202);
     } finally {
       await runInDurableObject(targetStub,instance=>{(instance as unknown as {fetch(request:Request):Promise<Response>}).fetch=original!;});
     }

@@ -42,6 +42,7 @@ const maxUserQueuedInputs=32;
 const maxInternalQueuedInputs=16;
 const maxOutstandingInputs=128;
 const capacityPending="Message saved. Waiting for space in the agent inbox.";
+const computerPending="Message saved. Waiting for this bot’s shared computer.";
 async function consumeUnusedBody(request:Request):Promise<void> {
   const reader=request.body?.getReader();let bytes=0;
   if(reader) while(true) {const chunk=await reader.read();if(chunk.done)break;bytes+=chunk.value.byteLength;if(bytes>300_000){await reader.cancel();throw new ApiError(413,"body_too_large","Request body too large.");}}
@@ -88,6 +89,7 @@ export class BotDO extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS runs_status_idx ON runs (json_extract(data,'$.status'));
       CREATE TABLE IF NOT EXISTS submissions (operation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, text TEXT NOT NULL, admitted INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS admission_sources (run_id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('user','internal')));
+      CREATE TABLE IF NOT EXISTS execution_claims (operation_id TEXT PRIMARY KEY,run_id TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS capacity_waits (operation_id TEXT PRIMARY KEY,run_id TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS capacity_waits_run_idx ON capacity_waits(run_id);
       CREATE TABLE IF NOT EXISTS admission_retries (operation_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL, next_at INTEGER NOT NULL);
@@ -235,7 +237,7 @@ export class BotDO extends DurableObject<Env> {
     if(!raw) throw new ApiError(403,"internal_only","Missing internal configuration.");
     this.acceptConfig(JSON.parse(decodeURIComponent(raw)) as Bot);
   }
-  private async currentBot():Promise<Bot> {
+  private async currentBot(validateExecution=true):Promise<Bot> {
     const id=this.bot().id;
     try {
       const registry=this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName("owner"));
@@ -243,10 +245,12 @@ export class BotDO extends DurableObject<Env> {
       if(!response.ok) throw new Error("Bot configuration unavailable");
       const {bot}=await response.json<{bot:Bot}>();
       const taskId=this.taskId();
-      const lease=await registry.fetch(`https://workspace/tasks/bot-slot/${id}`);
-      if(!lease.ok)throw new Error("Computer lease unavailable");
-      const {holder}=await lease.json<{holder:string|null}>();
-      if(taskId?holder!==taskId:holder!==null&&holder!=="@bot")throw new ApiError(409,"computer_busy","This conversation no longer owns the shared computer.");
+      if(validateExecution) {
+        const lease=await registry.fetch(`https://workspace/tasks/bot-slot/${id}`);
+        if(!lease.ok)throw new Error("Computer lease unavailable");
+        const {holder}=await lease.json<{holder:string|null}>();
+        if(taskId?holder!==taskId:holder!=="@bot")throw new ApiError(409,"computer_busy","This conversation no longer owns the shared computer.");
+      }
       if(taskId) {
         const taskResponse=await registry.fetch(`https://workspace/tasks/${taskId}`);
         if(!taskResponse.ok)throw new Error("Task configuration unavailable");
@@ -297,7 +301,7 @@ export class BotDO extends DurableObject<Env> {
       ? {...run,errorCode:'chatgpt_allowance_exhausted',error:MODEL_FAILURES.chatgpt_allowance_exhausted}
       : run;
   }
-  private summary():{lastMessage?:{text:string;createdAt:string};status:RunStatus|"ready";activeRuns:number;activeAgents:number;activeProcesses:number;pendingCancellations:number} {
+  private summary():{lastMessage?:{text:string;createdAt:string};status:RunStatus|"ready";activeRuns:number;activeAgents:number;activeProcesses:number;pendingCancellations:number;executionRuns:number} {
     const active=this.ctx.storage.sql.exec<{status:RunStatus;subagent_id:string|null}>("SELECT json_extract(data,'$.status') AS status,json_extract(data,'$.subagentId') AS subagent_id FROM runs WHERE json_extract(data,'$.status') IN ('queued','running','waiting_approval','waiting_connection')").toArray();
     const roots=active.filter(run=>!run.subagent_id);
     const priority:RunStatus[]=["waiting_approval","waiting_connection","running","queued"];
@@ -305,7 +309,7 @@ export class BotDO extends DurableObject<Env> {
     const latest=message?JSON.parse(message.data) as Message:undefined;
     const preview=latest?.text.trim() ? latest.text : latest?.attachments?.length ? (latest.attachments.length===1 ? "Image" : `${latest.attachments.length} images`) : latest?.text;
     const activeProcesses=this.ctx.storage.sql.exec<{total:number}>("SELECT COUNT(*) AS total FROM run_processes WHERE status='running'").toArray()[0].total;
-    return {status:priority.find(status=>roots.some(run=>run.status===status))??(activeProcesses?"running":"ready"),activeRuns:roots.length,activeAgents:new Set(active.flatMap(run=>run.subagent_id?[run.subagent_id]:[])).size,activeProcesses,pendingCancellations:this.ctx.storage.sql.exec<{n:number}>("SELECT COUNT(*) n FROM pending_run_cancellations").one().n,...(latest?{lastMessage:{text:(preview??"").slice(0,240),createdAt:latest.createdAt}}:{})};
+    return {status:priority.find(status=>roots.some(run=>run.status===status))??(activeProcesses?"running":"ready"),activeRuns:roots.length,activeAgents:new Set(active.flatMap(run=>run.subagent_id?[run.subagent_id]:[])).size,activeProcesses,executionRuns:this.ctx.storage.sql.exec<{n:number}>("SELECT COUNT(*) n FROM runs r WHERE json_extract(r.data,'$.status') IN ('queued','running','waiting_approval','waiting_connection') AND (json_extract(r.data,'$.status')!='queued' OR EXISTS(SELECT 1 FROM submissions s WHERE s.run_id=r.id AND s.admitted=1) OR EXISTS(SELECT 1 FROM execution_claims c WHERE c.run_id=r.id))").one().n,pendingCancellations:this.ctx.storage.sql.exec<{n:number}>("SELECT COUNT(*) n FROM pending_run_cancellations").one().n,...(latest?{lastMessage:{text:(preview??"").slice(0,240),createdAt:latest.createdAt}}:{})};
   }
   private listMessages(url:URL):MessagePage {
     const raw=url.searchParams.get("limit"),limit=raw===null?500:Number(raw);
@@ -581,7 +585,7 @@ export class BotDO extends DurableObject<Env> {
     // A typed configuration failure precedes native admission. Confirm that
     // again before adopting corrected settings for this exact saved input.
     try {if((await this.runtime.operation(id)).status!=="missing") return;} catch {return;}
-    const selection=run.subagentId?await this.subagent(run.subagentId):await this.currentBot();
+    const selection=run.subagentId?await this.subagent(run.subagentId):await this.currentBot(false);
     this.ctx.storage.transactionSync(()=>{
       const latest=this.getRunRow(row.id),current=JSON.parse(latest.data) as Run;
       const submission=this.ctx.storage.sql.exec<Submission>("SELECT * FROM submissions WHERE operation_id=?",id).toArray()[0];
@@ -637,7 +641,7 @@ export class BotDO extends DurableObject<Env> {
     }
     if(this.ctx.storage.sql.exec("SELECT 1 FROM admission_fences WHERE operation_id=?",input.operationId).toArray().length)throw new ApiError(409,"admission_fenced","This input was fenced after its request outcome could not be confirmed.");
     await this.validateMentions(input.mentions??[]);
-    const selection:ModelSettings|RuntimeSubagent=metadata?.subagentId?await this.subagent(metadata.subagentId):await this.currentBot();
+    const selection:ModelSettings|RuntimeSubagent=metadata?.subagentId?await this.subagent(metadata.subagentId):await this.currentBot(false);
     this.active();
     // Registry validation yielded; serialize duplicate submissions by checking
     // the durable receipt again before the transaction.
@@ -733,6 +737,9 @@ export class BotDO extends DurableObject<Env> {
     // Separate input runs keep queued child messages from superseding an
     // in-flight tool or approval. Only approval/connection continuations reuse a run.
     const registry=this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName("owner")),taskId=this.taskId();
+    if(!taskId) {
+      await this.createRun({operationId:op,text},{role:"system",parentRunId:source.id,...(source.subagentId?{subagentId:source.subagentId}:{}),...(source.delegation?{delegation:source.delegation}:{})});return;
+    }
     const reserved=await registry.fetch(`https://workspace/tasks/bot-slot/${this.bot().id}/admissions`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId:op,...(taskId?{taskId}:{})})});
     if(!reserved.ok) {
       const detail=await reserved.json<{error?:{code?:string}}>();
@@ -865,9 +872,9 @@ export class BotDO extends DurableObject<Env> {
     }
   }
 
-  private async waitForCapacity(operationId:string,runId:string):Promise<void> {
+  private async waitForCapacity(operationId:string,runId:string,diagnostic=capacityPending):Promise<void> {
     this.ctx.storage.sql.exec("INSERT OR IGNORE INTO capacity_waits(operation_id,run_id) VALUES(?,?)",operationId,runId);
-    this.updateStatus(runId,"queued",capacityPending);
+    this.updateStatus(runId,"queued",diagnostic);
     await this.runtime.scheduleAdmissionRetry(operationId,1000);
   }
   private async deliverReceipt(operationId:string,runId:string):Promise<void> {
@@ -916,6 +923,18 @@ export class BotDO extends DurableObject<Env> {
     this.admitting.set(nativeOperationId,operation);
     return operation;
   }
+  private async claimExecution(operationId:string,runId:string):Promise<string> {
+    const registry=this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName("owner")),taskId=this.taskId();
+    const response=await registry.fetch(`https://workspace/tasks/bot-slot/${this.bot().id}/admissions`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId,...(taskId?{taskId}:{})})});
+    const data=await response.json<{token?:string;error?:{code?:string;message?:string}}>();
+    if(!response.ok||!data.token)throw new ApiError(response.status,data.error?.code??"computer_busy",data.error?.message??"Waiting for this bot's shared computer.");
+    this.ctx.storage.sql.exec("INSERT OR REPLACE INTO execution_claims(operation_id,run_id) VALUES(?,?)",operationId,runId);
+    return data.token;
+  }
+  private async acknowledgeExecution(token:string):Promise<void> {
+    const response=await this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName("owner")).fetch(`https://workspace/tasks/bot-slot/${this.bot().id}/admissions/${token}`,{method:"DELETE"});
+    await response.arrayBuffer();
+  }
   private async admitOnce(nativeOperationId:string):Promise<void> {
     if(this.deleted) return;
     const submission=this.ctx.storage.sql.exec<Submission>("SELECT * FROM submissions WHERE operation_id=?",nativeOperationId).toArray()[0];
@@ -931,10 +950,13 @@ export class BotDO extends DurableObject<Env> {
     }
     const retry=this.ctx.storage.sql.exec<AdmissionRetry>("SELECT attempts,next_at FROM admission_retries WHERE operation_id=?",nativeOperationId).toArray()[0];
     if(!submission.admitted && retry && (retry.attempts>=maxAdmissionAttempts || retry.next_at>Date.now())) return;
+    let executionToken:string|undefined,confirmed=false;
     try {
       if(!submission.admitted) {
         if(submission.subagent_id) {
           if(!this.canAdmit(nativeOperationId,run.id)) return;
+          executionToken=await this.claimExecution(nativeOperationId,run.id);
+          if(!this.canAdmit(nativeOperationId,run.id)){confirmed=true;return;}
           await this.runtime.sendSubagent(submission.subagent_id,submission.text,{operationId:nativeOperationId});
         } else {
           const message=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM messages WHERE source_key=?",`input:${nativeOperationId}`).toArray()[0];
@@ -961,6 +983,8 @@ export class BotDO extends DurableObject<Env> {
               if(known.status==="missing") return;
             }
             if(!this.canAdmit(nativeOperationId,run.id)) return;
+            executionToken=await this.claimExecution(nativeOperationId,run.id);
+            if(!this.canAdmit(nativeOperationId,run.id)){confirmed=true;return;}
             this.admissionReservations.add(nativeOperationId);
             const receipt=(async()=>{
               try {return await this.runtime.submit(submission.text,{...(run.model?{modelSettings:{model:run.model,reasoningEffort:run.reasoningEffort,fast:run.fast}}:{}),operationId:nativeOperationId,whenBusy:"steer",...(images.length?{images}:{})});}
@@ -979,6 +1003,7 @@ export class BotDO extends DurableObject<Env> {
           }
           await started.receipt;
         }
+        confirmed=true;
         if(this.deleted) return;
         const configurationFailure=this.ctx.storage.sql.exec("SELECT operation_id FROM configuration_admissions WHERE operation_id=?",nativeOperationId).toArray().length>0;
         this.ctx.storage.sql.exec("UPDATE submissions SET admitted=1 WHERE operation_id=?",nativeOperationId);
@@ -986,10 +1011,13 @@ export class BotDO extends DurableObject<Env> {
         this.ctx.storage.sql.exec("DELETE FROM admission_retries WHERE operation_id=?",nativeOperationId);
         this.ctx.storage.sql.exec("DELETE FROM configuration_admissions WHERE operation_id=?",nativeOperationId);
         const current=this.getRunRow(run.id),latest=JSON.parse(current.data) as Run;
-        if(current.native_operation_id===nativeOperationId && latest.status==="queued" && (configurationFailure || [admissionPending,admissionExhausted,capacityPending].includes(latest.error??""))) this.updateStatus(run.id,"queued");
+        if(current.native_operation_id===nativeOperationId && latest.status==="queued" && (configurationFailure || [admissionPending,admissionExhausted,capacityPending,computerPending].includes(latest.error??""))) this.updateStatus(run.id,"queued");
       }
       if(!submission.subagent_id) this.observe(nativeOperationId);
     } catch(error) {
+      if(error instanceof ApiError && error.code==="computer_busy"&&!executionToken) {
+        if(this.canAdmit(nativeOperationId,run.id))await this.waitForCapacity(nativeOperationId,run.id,computerPending);return;
+      }
       // Admission may settle after an approval replaced this native input or the
       // user cancelled it. A stale failure cannot terminate the newer input.
       if(!this.canAdmit(nativeOperationId,run.id)) return;
@@ -997,6 +1025,8 @@ export class BotDO extends DurableObject<Env> {
       // record before retrying the same idempotent input; never restart a tool.
       let known:Awaited<ReturnType<AgentRuntime["operation"]>>|undefined;
       try {if(!submission.subagent_id) known=await this.runtime.operation(nativeOperationId);} catch {/* Keep delivery unconfirmed. */}
+      confirmed=known!==undefined;
+      if(known?.status==="missing")this.ctx.storage.sql.exec("DELETE FROM execution_claims WHERE operation_id=?",nativeOperationId);
       if(!this.canAdmit(nativeOperationId,run.id)) return;
       if(known && known.status!=="missing") {
         this.ctx.storage.sql.exec("UPDATE submissions SET admitted=1 WHERE operation_id=?",nativeOperationId);
@@ -1020,7 +1050,7 @@ export class BotDO extends DurableObject<Env> {
       this.ctx.storage.sql.exec("INSERT INTO admission_retries(operation_id,attempts,next_at) VALUES(?,?,?) ON CONFLICT(operation_id) DO UPDATE SET attempts=excluded.attempts,next_at=excluded.next_at",nativeOperationId,attempts,Date.now()+delayMs);
       this.updateStatus(run.id,"queued",attempts<maxAdmissionAttempts?admissionPending:admissionExhausted);
       if(attempts<maxAdmissionAttempts) await this.runtime.scheduleAdmissionRetry(nativeOperationId,delayMs);
-    }
+    } finally {if(executionToken&&confirmed)await this.acknowledgeExecution(executionToken);}
   }
   private canAdmit(nativeOperationId:string,runId:string):boolean {
     if(this.deleted) return false;
@@ -1200,6 +1230,41 @@ export class BotDO extends DurableObject<Env> {
     })().finally(()=>this.pollingProcesses.delete(id));
     this.pollingProcesses.set(id,pending);return pending;
   }
+  private directDispatching=new Map<string,{action:string;response:Promise<Response>}>();
+  private dispatchDirect(op:string,action:ComputerAction,lease:unknown):Promise<Response> {
+    const existing=this.directDispatching.get(op),fingerprint=JSON.stringify(action);
+    if(existing) {
+      if(existing.action!==fingerprint)throw new ApiError(409,"idempotency_conflict","Computer operation arguments changed.");
+      return existing.response.then(response=>response.clone());
+    }
+    const response=(async()=>{
+      let pin:string|undefined;
+      if(!["readFile","listFiles","screenshot"].includes(action.type)) {
+        const fence=await this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName("owner")).fetch(`https://workspace/tasks/bot-slot/${this.bot().id}/direct-dispatch`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({lease,operationId:op,action})});
+        if(!fence.ok)return fence;
+        pin=(await fence.json<{token:string}>()).token;
+      }
+      try {
+        this.active();
+        if(!["readFile","listFiles","screenshot","execPoll","execCancel"].includes(action.type))this.invalidatePendingGui();
+        const result=await this.dispatchComputer(op,action);
+        this.emit("computer.action",{operationId:op,actionType:action.type,input:computerActivityInput(action),result},undefined,`direct:${op}`);
+        return json({result});
+      } catch(error) {
+        if(error instanceof ApiError&&["idempotency_conflict","process_not_found","process_forbidden"].includes(error.code)||error instanceof ComputerProviderError&&error.code==="computer_upgrade_required") {
+          const response=errorResponse(error),data=await response.json<{error:unknown}>();
+          return json({...data,preEffectRejected:true},response.status);
+        }
+        return errorResponse(error);
+      } finally {
+        // The current lease remains pinned across every await before journaling.
+        // Recovery reuses the same journal identity, never an alternate effect.
+        if(pin)await this.acknowledgeExecution(pin);
+      }
+    })().finally(()=>this.directDispatching.delete(op));
+    this.directDispatching.set(op,{action:fingerprint,response});
+    return response.then(response=>response.clone());
+  }
   private async dispatchComputer(op:string,action:ComputerAction,run?:Run,toolCallId?:string):Promise<ComputerResult> {
     const known=this.ctx.storage.sql.exec<{action:string;run_id:string|null}>("SELECT action,run_id FROM computer_operations WHERE operation_id=?",op).toArray()[0];
     if(known && (known.action!==JSON.stringify(action) || known.run_id!==(run?.id??null))) throw new ApiError(409,"idempotency_conflict","Computer operation arguments or owner changed.");
@@ -1239,7 +1304,12 @@ export class BotDO extends DurableObject<Env> {
       if(this.process(process.process_id)?.cancel_requested) this.ctx.waitUntil(this.cancelProcess(process.process_id));
       return receipt;
     } catch(error) {
-      if(initial && !this.deleted) this.ctx.storage.sql.exec("UPDATE run_processes SET dispatch_state='uncertain' WHERE process_id=? AND result IS NULL",process!.process_id);
+      if(initial&&!this.deleted&&error instanceof ComputerProviderError&&error.code==="computer_upgrade_required") {
+        // Provider rejects these before dispatch/journaling any effect. They
+        // must not invent an active process that prevents upgrade/suspend.
+        this.ctx.storage.sql.exec("DELETE FROM run_processes WHERE process_id=? AND result IS NULL",process!.process_id);
+        this.ctx.storage.sql.exec("DELETE FROM process_observations WHERE process_id=?",process!.process_id);
+      } else if(initial && !this.deleted) this.ctx.storage.sql.exec("UPDATE run_processes SET dispatch_state='uncertain' WHERE process_id=? AND result IS NULL",process!.process_id);
       if(action.type==="execCancel" && process && !this.deleted && !(error instanceof ComputerProviderError && error.code==="computer_idempotency_conflict")) this.ctx.storage.sql.exec("UPDATE run_processes SET cancel_requested=1,next_at=0 WHERE process_id=?",process.process_id);
       if(process && !this.deleted && this.process(process.process_id)?.cancel_requested) this.ctx.waitUntil(this.cancelProcess(process.process_id));
       throw error;
@@ -1739,7 +1809,7 @@ export class BotDO extends DurableObject<Env> {
         // Keep the public compact DTO stable; scheduler-only journals are not
         // conversation activity. The trusted registry needs them for release.
         if(request.headers.get("x-timber-internal")==="scheduler")return json({summary});
-        const {pendingCancellations:_pending,...publicSummary}=summary;return json({summary:publicSummary});
+        const {pendingCancellations:_pending,executionRuns:_execution,...publicSummary}=summary;return json({summary:publicSummary});
       }
       if(path==="/computer/lease-state" && request.method==="GET") {
         if(request.headers.get("x-timber-internal")!=="scheduler")throw new ApiError(403,"internal_only","Computer lease inspection is internal.");
@@ -1835,11 +1905,8 @@ export class BotDO extends DurableObject<Env> {
       if(path==="/computer/actions" && request.method==="POST") {
         if(this.suspending) throw new ApiError(409,"computer_busy","The computer is being suspended. Retry after it stops.");
         const input=await body(request),action=parseAction(input.action),op=operationId(input.operationId);
-        this.active();
-        if(!["readFile","listFiles","screenshot","execPoll","execCancel"].includes(action.type)) this.invalidatePendingGui();
-        const result=await this.dispatchComputer(op,action);
-        this.emit("computer.action",{operationId:op,actionType:action.type,input:computerActivityInput(action),result},undefined,`direct:${op}`);
-        return json({result});
+        let lease:unknown;try {lease=JSON.parse(request.headers.get("x-timber-direct-lease")??"null");} catch {lease=null;}
+        return await this.dispatchDirect(op,action,lease);
       }
       if(path==="/approvals" && request.method==="GET") {
         const approvals=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM approvals ORDER BY rowid DESC LIMIT 100").toArray().map(row=>JSON.parse(row.data));

@@ -124,7 +124,7 @@ export default {
         if(!created.ok) return created;
         return created;
       }
-      const taskRoute=/^\/v1\/tasks\/([0-9a-f-]{36})(?:\/(messages|runs(?:\/[0-9a-f-]{36}(?:\/cancel)?)?|events|start|cancel|approvals(?:\/[0-9a-f-]{36})?|agents(?:\/[^/]+\/(?:messages|cancel))?|connections(?:\/[^/]+\/connect)?))?$/.exec(url.pathname);
+      const taskRoute=/^\/v1\/tasks\/([0-9a-f-]{36})(?:\/(messages|runs(?:\/[0-9a-f-]{36}(?:\/cancel)?)?|events|start|continue|cancel|approvals(?:\/[0-9a-f-]{36})?|agents(?:\/[^/]+\/(?:messages|cancel))?|connections(?:\/[^/]+\/connect)?))?$/.exec(url.pathname);
       if(taskRoute) {
         const [,taskId,endpoint]=taskRoute;
         const taskResponse=await registry.fetch(`https://workspace/tasks/${taskId}`);
@@ -139,6 +139,10 @@ export default {
         headers.set("x-timber-task-id",taskId);
         const contentType=request.headers.get("content-type");if(contentType)headers.set("content-type",contentType);
         const lastEvent=request.headers.get("last-event-id");if(lastEvent)headers.set("last-event-id",lastEvent);
+        if(endpoint==="continue") {
+          if(request.method!=="POST")throw new ApiError(405,"method_not_allowed","Method not allowed.");
+          requestBodyForwarded=true;return registry.fetch(internalRequest(request,`https://workspace/tasks/${taskId}/continue`));
+        }
         if(endpoint==="start") {
           if(request.method!=="POST") throw new ApiError(405,"method_not_allowed","Method not allowed.");
           await discardRequestBody(request);
@@ -199,6 +203,9 @@ export default {
         const contentType=stored.httpMetadata?.contentType??"application/octet-stream";
         return new Response(stored.body,{headers:{"content-type":contentType,"content-disposition":`attachment; filename="${artifact[1]}"`,"cache-control":"private, no-store","x-content-type-options":"nosniff","content-security-policy":"sandbox; default-src 'none'"}});
       }
+      if((tail==="/computer/queued-actions"&&request.method==="GET")||/^\/computer\/queued-actions\/[^/]+\/cancel$/.test(tail)&&request.method==="POST") {
+        await discardRequestBody(request);return registry.fetch(`https://workspace/tasks/bot-slot/${botId}${tail.slice("/computer".length)}`,{method:request.method});
+      }
       const stub=env.BOT.get(env.BOT.idFromName(`${owner}:${botId}`));
       const headers=new Headers();
       headers.set("x-botspace-config",encodeURIComponent(JSON.stringify(bot)));
@@ -207,10 +214,6 @@ export default {
       const lastEvent=request.headers.get("last-event-id");
       if(lastEvent) headers.set("last-event-id",lastEvent);
       let admissionToken:string|undefined;
-      const agentMessage=/^\/agents\/([^/]+)\/messages$/.exec(tail);
-      let decodedAgentId="";try{decodedAgentId=agentMessage?decodeURIComponent(agentMessage[1]):"";}catch{}
-      const isRunAdmission=tail==="/messages"&&request.method==="POST"||!!agentMessage&&!!decodedAgentId&&request.method==="POST";
-      if(isRunAdmission) admissionToken=await beginAdmission(env,botId,await bodyOperationId(request));
       if(tail==="/computer/actions" && request.method==="POST") {
         const raw=await request.text();
         let input:{operationId?:unknown;action?:{type?:unknown;processId?:unknown}};
@@ -223,10 +226,25 @@ export default {
         const key=(action.type==="execPoll"||action.type==="execCancel")?validateOperationId(action.processId):op;
         const reservation=await registry.fetch(new Request(`https://workspace/tasks/bot-slot/${botId}?kind=direct&key=${encodeURIComponent(key)}`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({payload:directInput})}));
         if(!reservation.ok)return reservation;
-        const {token,shared,admissionToken,key:leaseKey}=await reservation.json<{token:string;shared?:boolean;admissionToken?:string;key?:string}>();
+        const reserved=await reservation.json<{token:string;generation:number;shared?:boolean;admissionToken?:string;key?:string;queued?:boolean;operationId?:string;receiptStatus?:number;receipt?:{result?:unknown;error?:{code:string}}}>();
+        if(reserved.receipt)return json(reserved.receipt,reserved.receiptStatus??200);
+        if(reserved.queued)return json({operationId:op,status:"queued",accepted:true},202);
+        const {token,shared,admissionToken,key:leaseKey}=reserved;
+        headers.set("x-timber-direct-lease",JSON.stringify({key:leaseKey??key,token,generation:reserved.generation,...(shared?{admissionToken}:{})}));
         const direct=new Request(`https://bot${tail}${url.search}`,{method:"POST",headers,body:JSON.stringify(directInput),redirect:"manual",signal:request.signal});
         const response=await stub.fetch(direct);
         if(shared&&admissionToken)await completeAdmission(env,botId,admissionToken);
+        if(!shared) {
+          try {
+            const receipt=await response.clone().json<{result?:{status:string;checkpointStatus?:string};preEffectRejected?:boolean}>();
+            const terminal=receipt.preEffectRejected===true||!!receipt.result&&["completed","failed","cancelled","interrupted"].includes(receipt.result.status)&&receipt.result.checkpointStatus!=="pending";
+            await registry.fetch(`https://workspace/tasks/bot-slot/${botId}/receipt?key=${encodeURIComponent(leaseKey??key)}&token=${encodeURIComponent(token)}`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId:op,receipt,terminal,status:response.status})});
+          } catch { /* Unknown receipts do not settle or release a queued intent. */ }
+        }
+        if(!shared&&!response.ok) {
+          const rejected=await response.clone().json<{preEffectRejected?:boolean}>().catch(()=>({preEffectRejected:false}));
+          if(rejected.preEffectRejected)await registry.fetch(`https://workspace/tasks/bot-slot/${botId}/reject?key=${encodeURIComponent(leaseKey??key)}&token=${encodeURIComponent(token)}`,{method:"POST"});
+        }
         if(!shared&&response.ok) {
           try {
             const result=(await response.clone().json<{result:{status:string;processId?:string;checkpointStatus?:string}}>()).result;

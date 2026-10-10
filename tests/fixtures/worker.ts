@@ -34,6 +34,11 @@ export class ComputerDO extends DurableObject {
     }
     if(this.ctx.storage.sql.exec("SELECT id FROM deletion").toArray().length) return Response.json({error:{code:"computer_deleted"}},{status:410});
     if (path === "/status") return Response.json({id: input.botId, provider: "cloudflare", state: "running", capabilities: ["exec", "checkpoint"]});
+    if(path==="/suspend") {
+      const active=this.ctx.storage.sql.exec("SELECT 1 FROM exec_sessions WHERE json_extract(result,'$.status')='running' LIMIT 1").toArray().length;
+      if(active)return Response.json({error:{code:"computer_execution_active"}},{status:409});
+      return Response.json({id:input.botId,provider:"cloudflare",state:"stopped",capabilities:["exec","checkpoint"]});
+    }
     if (path === "/touch") return Response.json({ok: true});
     if(path==="/exec/cancel") return Response.json(this.cancel(input.processId!));
     if (path !== "/actions") return new Response("Not found", {status: 404});

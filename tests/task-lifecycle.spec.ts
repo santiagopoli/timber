@@ -60,18 +60,18 @@ function insertProcess(state:DurableObjectState,run:Run,processId:string,registe
 // All native calls use tests/fixtures/runtime.ts. Computer effects below are
 // deterministic provider mocks; no real command, container or model is invoked.
 describe("internal continuation admission",()=>{
-  it("does not admit an ordinary-bot report while another task owns its computer",async()=>{
+  it("durably queues an ordinary-bot report without native admission while another task owns its computer",async()=>{
     const bot=await setupBot(),task=await setupTask(bot);
     await setTask(task,"running",true);
     await runInDurableObject(botStub(bot),async(instance,state)=>{
-      const target=instance as unknown as Internals,parent=insertRun(state,bot),op=`subagent-report:${crypto.randomUUID()}`,admit=target.admit;
-      let nativeAdmissions=0;
-      target.admit=async()=>{nativeAdmissions++;};
-      try{
-        await expect(target.enqueueAgentContinuation(parent,op,"Delayed child report")).rejects.toMatchObject({code:"computer_busy"});
-        expect(state.storage.sql.exec("SELECT id FROM runs WHERE operation_id=?",op).toArray()).toHaveLength(0);
-        expect(nativeAdmissions).toBe(0);
-      }finally{target.admit=admit;}
+      const target=instance as unknown as Internals,parent=insertRun(state,bot),op=`subagent-report:${crypto.randomUUID()}`;
+      await target.enqueueAgentContinuation(parent,op,"Delayed child report");
+      const saved=state.storage.sql.exec<{data:string}>("SELECT data FROM runs WHERE operation_id=?",op).one();
+      expect(JSON.parse(saved.data)).toMatchObject({status:"queued",parentRunId:parent.id,operationId:op});
+      expect(state.storage.sql.exec<{admitted:number}>("SELECT admitted FROM submissions WHERE operation_id=?",op).one().admitted).toBe(0);
+      expect(await state.storage.get(`fixture-runtime:${op}`)).toBeUndefined();
+      expect(await state.storage.get(`fixture-admission-retry:${op}`)).toMatchObject({operationId:op,delayMs:1000});
+      expect(state.storage.sql.exec("SELECT 1 FROM admission_retries WHERE operation_id=?",op).toArray()).toHaveLength(0);
     });
     await runInDurableObject(registry(),(_instance,state)=>expect(state.storage.sql.exec<{task_id:string}>("SELECT task_id FROM task_slots WHERE bot_id=?",bot.id).one().task_id).toBe(task.id));
   });

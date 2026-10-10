@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import type { Bot, ModelSettings } from "@botspace/contracts";
 import type { Env } from "./env";
 import { ApiError, errorResponse, json } from "./errors";
-import { body, parseBotInput, UUID } from "./validation";
+import { body, parseBotInput, parseAction, operationId, UUID } from "./validation";
 import { AgentCoordinator } from "./agent-coordination";
 import { AvatarCoordinator } from "./avatars";
 
@@ -17,6 +17,9 @@ export class WorkspaceDO extends DurableObject<Env> {
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY,data TEXT NOT NULL)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS task_operations (operation_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,fingerprint TEXT NOT NULL)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS task_slots (bot_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,token TEXT,generation INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0,payload TEXT,direct_process_id TEXT)");
+    ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS direct_intents (bot_id TEXT NOT NULL,operation_id TEXT NOT NULL,lease_key TEXT NOT NULL,payload TEXT NOT NULL,state TEXT NOT NULL,created_at INTEGER NOT NULL,receipt TEXT,receipt_status INTEGER NOT NULL DEFAULT 200,PRIMARY KEY(bot_id,operation_id))");
+    if(!ctx.storage.sql.exec<{name:string}>("PRAGMA table_info(direct_intents)").toArray().some(c=>c.name==="receipt"))ctx.storage.sql.exec("ALTER TABLE direct_intents ADD COLUMN receipt TEXT");
+    if(!ctx.storage.sql.exec<{name:string}>("PRAGMA table_info(direct_intents)").toArray().some(c=>c.name==="receipt_status"))ctx.storage.sql.exec("ALTER TABLE direct_intents ADD COLUMN receipt_status INTEGER NOT NULL DEFAULT 200");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS computer_slot_generations (bot_id TEXT PRIMARY KEY,generation INTEGER NOT NULL)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS computer_admissions (token TEXT PRIMARY KEY,bot_id TEXT NOT NULL,task_id TEXT NOT NULL,operation_id TEXT NOT NULL,slot_token TEXT NOT NULL,created_at INTEGER NOT NULL)");
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS computer_admissions_scope ON computer_admissions(bot_id,task_id)");
@@ -50,7 +53,7 @@ export class WorkspaceDO extends DurableObject<Env> {
   private async rearmDeletion():Promise<void> {
     const next=this.ctx.storage.sql.exec<{next_at:number}>("SELECT next_at FROM bot_deletions WHERE completed=0 ORDER BY next_at LIMIT 1").toArray()[0];
     const agentTime=this.agents.nextAlarm();
-    const schedulerActive=this.ctx.storage.sql.exec("SELECT 1 FROM task_slots LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM computer_admissions LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM tasks WHERE json_extract(data,'$.status')='queued' AND json_extract(data,'$.startImmediately')=1 LIMIT 1").toArray().length>0;
+    const schedulerActive=this.ctx.storage.sql.exec("SELECT 1 FROM direct_intents WHERE state='pending' LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM task_slots LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM computer_admissions LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM tasks WHERE json_extract(data,'$.status')='queued' AND json_extract(data,'$.startImmediately')=1 LIMIT 1").toArray().length>0;
     const now=Date.now(),existingAlarm=await this.ctx.storage.getAlarm();
     const schedulerTime=schedulerActive?Math.min(existingAlarm&&existingAlarm>now?existingAlarm:Infinity,now+5000):Infinity;
     const nextAt=Math.min(next?.next_at??Infinity,agentTime??Infinity,schedulerTime,this.avatars?.nextAlarm()??Infinity);
@@ -132,7 +135,7 @@ export class WorkspaceDO extends DurableObject<Env> {
     const row=this.ctx.storage.sql.exec<{bot_id:string;task_id:string;slot_token:string}>("SELECT bot_id,task_id,slot_token FROM computer_admissions WHERE token=?",token).toArray()[0];
     if(!row)return;
     this.ctx.storage.sql.exec("DELETE FROM computer_admissions WHERE token=?",token);
-    this.ctx.storage.sql.exec("UPDATE task_slots SET updated_at=? WHERE bot_id=? AND task_id=? AND token=?",Date.now(),row.bot_id,row.task_id,row.slot_token);
+    if(!row.task_id.startsWith("@direct:"))this.ctx.storage.sql.exec("UPDATE task_slots SET updated_at=? WHERE bot_id=? AND task_id=? AND token=?",Date.now(),row.bot_id,row.task_id,row.slot_token);
   }
   private hasPendingAdmission(botId:string,taskId:string):boolean {
     return this.ctx.storage.sql.exec("SELECT 1 FROM computer_admissions WHERE bot_id=? AND task_id=? LIMIT 1",botId,taskId).toArray().length>0;
@@ -146,6 +149,7 @@ export class WorkspaceDO extends DurableObject<Env> {
   }
   private slotFor(botId:string):{task_id:string;token:string|null;generation:number;updated_at:number}|undefined {return this.ctx.storage.sql.exec<{task_id:string;token:string|null;generation:number;updated_at:number}>("SELECT task_id,token,generation,updated_at FROM task_slots WHERE bot_id=?",botId).toArray()[0];}
   private releaseSlot(botId:string,taskId:string,token:string|null,updatedAt?:number):void {
+    if(this.hasPendingAdmission(botId,taskId))return;
     if(updatedAt===undefined)this.ctx.storage.sql.exec("DELETE FROM task_slots WHERE bot_id=? AND task_id=? AND token IS ?",botId,taskId,token);
     else this.ctx.storage.sql.exec("DELETE FROM task_slots WHERE bot_id=? AND task_id=? AND token IS ? AND updated_at=?",botId,taskId,token,updatedAt);
   }
@@ -162,8 +166,8 @@ export class WorkspaceDO extends DurableObject<Env> {
     const headers={"x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-internal":"scheduler",...(taskId?{"x-timber-task-id":taskId}:{})};
     const [r,s,c]=await Promise.all([stub.fetch(new Request(`https://${prefix}/runs`,{headers})),stub.fetch(new Request(`https://${prefix}/summary`,{headers})),root.fetch(new Request("https://bot/computer/lease-state",{headers:{"x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-internal":"scheduler"}}))]);
     if(!r.ok||!s.ok||!c.ok) {await Promise.all([r.arrayBuffer(),s.arrayBuffer(),c.arrayBuffer()]);throw new Error("Run reconciliation unavailable");}
-    const page=await r.json<{activeRuns:Array<{status:string;subagentId?:string}>;runs:Array<{status:string;subagentId?:string}>}>(),summary=await s.json<{summary:{activeRuns:number;activeProcesses:number;pendingCancellations?:number}}>(),lease=await c.json<{computerControlled:boolean}>();
-    return {activeRuns:page.activeRuns.length,activeProcesses:summary.summary.activeProcesses,pendingCancellations:summary.summary.pendingCancellations??0,computerControlled:lease.computerControlled,latest:page.runs.find(run=>!run.subagentId)?.status,activeStatus:page.activeRuns.find(run=>!run.subagentId)?.status};
+    const page=await r.json<{activeRuns:Array<{status:string;subagentId?:string}>;runs:Array<{status:string;subagentId?:string}>}>(),summary=await s.json<{summary:{activeRuns:number;activeProcesses:number;pendingCancellations?:number;executionRuns?:number}}>(),lease=await c.json<{computerControlled:boolean}>();
+    return {activeRuns:taskId?page.activeRuns.length:summary.summary.executionRuns??page.activeRuns.length,activeProcesses:summary.summary.activeProcesses,pendingCancellations:summary.summary.pendingCancellations??0,computerControlled:lease.computerControlled,latest:page.runs.find(run=>!run.subagentId)?.status,activeStatus:page.activeRuns.find(run=>!run.subagentId)?.status};
   }
   private hasTaskDelegation(taskId:string):boolean {
     return this.ctx.storage.sql.exec("SELECT 1 FROM agent_deliveries WHERE phase!='done' AND json_extract(data,'$.sourceTaskId')=? LIMIT 1",taskId).toArray().length>0;
@@ -196,10 +200,15 @@ export class WorkspaceDO extends DurableObject<Env> {
     const task=JSON.parse(row.data) as {botId:string},slot=this.slotFor(task.botId);
     if(slot?.task_id===taskId)this.releaseSlot(task.botId,taskId,slot.token,slot.updated_at);
   }
+  private saveDirectReceipt(botId:string,operationId:string,receipt:unknown,terminal=false,status=200):void {
+    this.ctx.storage.sql.exec("UPDATE direct_intents SET receipt=?,receipt_status=?,state=CASE WHEN ?=1 THEN 'settled' ELSE state END WHERE bot_id=? AND operation_id=? AND state!='cancelled'",JSON.stringify(receipt),status,terminal?1:0,botId,operationId);
+  }
   private taskStartOperation(task:{id:string;startOperationId?:string}):string {return task.startOperationId??`task-start:${task.id}`;}
   private async reconcileAdmissions():Promise<void> {
     const rows=this.ctx.storage.sql.exec<{token:string;bot_id:string;task_id:string;operation_id:string;created_at:number}>("SELECT token,bot_id,task_id,operation_id,created_at FROM computer_admissions WHERE created_at<=? ORDER BY created_at LIMIT 32",Date.now()-60_000).toArray();
     for(const row of rows) {
+      // Direct pins recover through the original computer journal, not native input admission.
+      if(row.task_id.startsWith("@direct:"))continue;
       try {
         const botRow=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",row.bot_id).toArray()[0];
         if(!botRow) {this.ctx.storage.sql.exec("DELETE FROM computer_admissions WHERE bot_id=?",row.bot_id);continue;}
@@ -243,18 +252,24 @@ export class WorkspaceDO extends DurableObject<Env> {
         const bot=JSON.parse(botRow.data) as Bot;
         if(slot.task_id.startsWith("@direct:")) {
           if(!slot.payload||!slot.token)continue;
+          if(await this.computerControlled(slot.bot_id,bot))continue;
+          const freshSlot=this.slotFor(slot.bot_id);
+          if(!freshSlot||freshSlot.task_id!==slot.task_id||freshSlot.token!==slot.token||freshSlot.generation!==slot.generation)continue;
           const direct=JSON.parse(slot.payload) as {operationId:string;action:{type:string;processId?:string}};
           const stub=this.env.BOT.get(this.env.BOT.idFromName(`owner:${slot.bot_id}`));
           const operation=slot.direct_process_id&&direct.action.type!=="execCancel"
             ? {operationId:`scheduler-poll:${slot.token}:${Math.floor(Date.now()/5000)}`,action:{type:"execPoll",processId:slot.direct_process_id}}
             : direct;
-          const receipt=await stub.fetch(new Request("https://bot/computer/actions",{method:"POST",headers:{"content-type":"application/json","x-botspace-config":encodeURIComponent(JSON.stringify(bot))},body:JSON.stringify(operation)}));
+          const receipt=await stub.fetch(new Request("https://bot/computer/actions",{method:"POST",headers:{"content-type":"application/json","x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-direct-lease":JSON.stringify({key:slot.task_id.slice("@direct:".length),token:slot.token,generation:slot.generation})},body:JSON.stringify(operation)}));
           if(!receipt.ok) {
-            const failure:{error?:{code?:string}}=await receipt.json<{error?:{code?:string}}>().catch(()=>({error:undefined}));
-            if(["execPoll","execCancel"].includes(direct.action.type)&&failure.error?.code==="process_not_found")this.releaseSlot(slot.bot_id,slot.task_id,slot.token,slot.updated_at);
+            const failure:{preEffectRejected?:boolean;error?:{code?:string}}=await receipt.json<{preEffectRejected?:boolean;error?:{code?:string}}>().catch(()=>({error:undefined}));
+            if(failure.preEffectRejected) {this.saveDirectReceipt(slot.bot_id,direct.operationId,failure,true,receipt.status);const state=await this.schedulerSnapshot(slot.bot_id,bot);if(!state.activeRuns&&!state.activeProcesses&&!state.pendingCancellations&&!state.computerControlled)this.releaseSlot(slot.bot_id,slot.task_id,slot.token,slot.updated_at);}
             continue;
           }
           const result=(await receipt.json<{result:{status:string;processId?:string;checkpointStatus?:string}}>()).result;
+          const settled=["completed","failed","cancelled","interrupted"].includes(result.status)&&result.checkpointStatus!=="pending";
+          this.saveDirectReceipt(slot.bot_id,direct.operationId,{result:{...result,operationId:direct.operationId}},settled);
+          if(slot.direct_process_id&&slot.direct_process_id!==direct.operationId)this.saveDirectReceipt(slot.bot_id,slot.direct_process_id,{result:{...result,operationId:slot.direct_process_id}},settled);
           if(result.status==="running"&&result.processId&&!slot.direct_process_id)this.ctx.storage.sql.exec("UPDATE task_slots SET direct_process_id=? WHERE bot_id=? AND token=?",result.processId,slot.bot_id,slot.token);
           else if(["completed","failed","cancelled"].includes(result.status)&&result.checkpointStatus!=="pending")this.releaseSlot(slot.bot_id,slot.task_id,slot.token,slot.updated_at);
           else if(result.status==="interrupted"&&result.checkpointStatus!=="pending") {const state=await this.schedulerSnapshot(slot.bot_id,bot);if(state.activeProcesses===0&&state.pendingCancellations===0&&!state.computerControlled)this.releaseSlot(slot.bot_id,slot.task_id,slot.token,slot.updated_at);}
@@ -267,7 +282,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         }
         const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",slot.task_id).toArray()[0];
         if(!row){this.releaseSlot(slot.bot_id,slot.task_id,slot.token);continue;}
-        const task=JSON.parse(row.data) as {id:string;botId:string;status:string;title:string;description:string;startOperationId?:string;cancelRequested?:boolean;updatedAt:string};
+        const task=JSON.parse(row.data) as {id:string;botId:string;status:string;title:string;description:string;startText?:string;startOperationId?:string;cancelRequested?:boolean;updatedAt:string};
         const state=await this.schedulerSnapshot(slot.bot_id,bot,task.id);
         const observedSlot=this.slotFor(slot.bot_id);
         if(!observedSlot||observedSlot.task_id!==slot.task_id||observedSlot.token!==slot.token||observedSlot.generation!==slot.generation||observedSlot.updated_at!==slot.updated_at)continue;
@@ -282,7 +297,7 @@ export class WorkspaceDO extends DurableObject<Env> {
           if(mainState.activeRuns||mainState.activeProcesses||mainState.pendingCancellations||mainState.computerControlled)continue;
           const startStub=this.env.BOT.get(this.env.BOT.idFromName(`owner:task:${task.id}`));
           const admission=this.beginComputerAdmission(slot.bot_id,task.id,this.taskStartOperation(task),true);
-          const startResponse=await startStub.fetch(new Request("https://task/messages",{method:"POST",headers:{"content-type":"application/json","x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-task-id":task.id},body:JSON.stringify({operationId:this.taskStartOperation(task),text:task.description||task.title})}));
+          const startResponse=await startStub.fetch(new Request("https://task/messages",{method:"POST",headers:{"content-type":"application/json","x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-task-id":task.id},body:JSON.stringify({operationId:this.taskStartOperation(task),text:task.startText??(task.description||task.title)})}));
           this.ctx.waitUntil(startResponse.arrayBuffer().catch(()=>{}));
           this.completeComputerAdmission(admission);
           if(startResponse.ok)this.markTaskRunning(task.id);
@@ -313,10 +328,25 @@ export class WorkspaceDO extends DurableObject<Env> {
         } else if(state.activeRuns===0&&state.activeProcesses===0&&state.pendingCancellations===0&&!state.computerControlled&&!this.hasPendingAdmission(slot.bot_id,task.id)&&!this.hasTaskDelegation(task.id)&&["completed","failed","cancelled"].includes(task.status)) this.releaseSlot(slot.bot_id,slot.task_id,slot.token,slot.updated_at);
       } catch { /* An uncertain holder stays fenced until a later reconciliation. */ }
     }
+    const directQueue=this.ctx.storage.sql.exec<{bot_id:string;operation_id:string;lease_key:string;payload:string}>("SELECT bot_id,operation_id,lease_key,payload FROM direct_intents WHERE state='pending' ORDER BY created_at,rowid").toArray();
+    for(const intent of directQueue) {
+      if(this.slotFor(intent.bot_id))continue;
+      const botRow=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",intent.bot_id).toArray()[0];
+      if(!botRow)continue;
+      try {const state=await this.schedulerSnapshot(intent.bot_id,JSON.parse(botRow.data) as Bot);if(state.activeRuns||state.activeProcesses||state.pendingCancellations||state.computerControlled)continue;}catch{continue;}
+      this.ctx.storage.transactionSync(()=>{
+        if(this.slotFor(intent.bot_id))return;
+        const pending=this.ctx.storage.sql.exec("SELECT 1 FROM direct_intents WHERE bot_id=? AND operation_id=? AND state='pending'",intent.bot_id,intent.operation_id).toArray().length;
+        if(!pending)return;
+        const token=crypto.randomUUID(),generation=this.nextSlotGeneration(intent.bot_id);
+        this.ctx.storage.sql.exec("INSERT INTO task_slots(bot_id,task_id,token,generation,updated_at,payload) VALUES(?,?,?,?,?,?)",intent.bot_id,`@direct:${intent.lease_key}`,token,generation,Date.now(),intent.payload);
+        this.ctx.storage.sql.exec("UPDATE direct_intents SET state='claimed' WHERE bot_id=? AND operation_id=? AND state='pending'",intent.bot_id,intent.operation_id);
+      });
+    }
     const queued=this.ctx.storage.sql.exec<{id:string;data:string}>("SELECT id,data FROM tasks WHERE json_extract(data,'$.status')='queued' AND json_extract(data,'$.startImmediately')=1 ORDER BY rowid").toArray();
     const bots=new Set<string>();
     for(const row of queued) {
-      const task=JSON.parse(row.data) as {id:string;botId:string;title:string;description:string;status:string;startOperationId?:string};
+      const task=JSON.parse(row.data) as {id:string;botId:string;title:string;description:string;startText?:string;status:string;startOperationId?:string};
       if(bots.has(task.botId)||this.ctx.storage.sql.exec("SELECT 1 FROM task_slots WHERE bot_id=?",task.botId).toArray().length)continue;
       const token=crypto.randomUUID();let reserved=false;
       this.ctx.storage.transactionSync(()=>{if(!this.ctx.storage.sql.exec("SELECT 1 FROM task_slots WHERE bot_id=?",task.botId).toArray().length){const generation=this.nextSlotGeneration(task.botId);this.ctx.storage.sql.exec("INSERT INTO task_slots(bot_id,task_id,token,generation,updated_at) VALUES(?,?,?,?,?)",task.botId,task.id,token,generation,Date.now());reserved=true;}});
@@ -328,7 +358,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         const fresh=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",task.id).toArray()[0];
         const current=fresh?JSON.parse(fresh.data) as typeof task:undefined;if(!current||current.status!=="queued")continue;
         const stub=this.env.BOT.get(this.env.BOT.idFromName(`owner:task:${task.id}`)),admission=this.beginComputerAdmission(task.botId,task.id,this.taskStartOperation(task),true);
-        const response=await stub.fetch(new Request("https://task/messages",{method:"POST",headers:{"content-type":"application/json","x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-task-id":task.id},body:JSON.stringify({operationId:this.taskStartOperation(task),text:task.description||task.title})}));
+        const response=await stub.fetch(new Request("https://task/messages",{method:"POST",headers:{"content-type":"application/json","x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-task-id":task.id},body:JSON.stringify({operationId:this.taskStartOperation(task),text:task.startText??(task.description||task.title)})}));
         this.ctx.waitUntil(response.arrayBuffer().catch(()=>{}));
         this.completeComputerAdmission(admission);
         if(response.ok)this.markTaskRunning(task.id);
@@ -352,6 +382,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         const tasks=this.ctx.storage.sql.exec<{id:string;data:string}>("SELECT id,data FROM tasks WHERE json_extract(data,'$.botId')=?",id).toArray();
         for(const entry of tasks) {this.ctx.storage.sql.exec("INSERT OR IGNORE INTO bot_task_deletions(task_id,bot_id) VALUES(?,?)",entry.id,id);const task=JSON.parse(entry.data);task.status="cancelled";task.deleting=true;task.updatedAt=new Date().toISOString();this.ctx.storage.sql.exec("UPDATE tasks SET data=? WHERE id=?",JSON.stringify(task),entry.id);}
         this.ctx.storage.sql.exec("DELETE FROM bots WHERE id=?",id);
+        this.ctx.storage.sql.exec("DELETE FROM direct_intents WHERE bot_id=?",id);
         this.agents.forgetBot(id);
         this.avatars.forgetBot(id);
       });
@@ -433,9 +464,54 @@ export class WorkspaceDO extends DurableObject<Env> {
         if(typeof operationId!=="string"||!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(operationId))throw new ApiError(400,"invalid_request","A valid admission operationId is required.");
         const taskId=input.taskId===undefined?null:input.taskId;
         if(taskId!==null&&(typeof taskId!=="string"||!UUID.test(taskId)))throw new ApiError(400,"invalid_request","Invalid task admission identity.");
-        return json({token:this.beginComputerAdmission(admissionRoute[1],taskId as string|null,operationId)});
+        const row=taskId?this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",taskId).toArray()[0]:undefined;
+        const task=row?JSON.parse(row.data) as {id:string;status:string;startOperationId?:string}:undefined;
+        const queuedStart=!!task&&task.status==="queued"&&this.taskStartOperation(task)===operationId;
+        return json({token:this.beginComputerAdmission(admissionRoute[1],taskId as string|null,operationId,queuedStart)});
       }
       if(admissionRoute && request.method==="DELETE" && admissionRoute[2]) {this.completeComputerAdmission(admissionRoute[2]);await this.rearmDeletion();return json({released:true});}
+      const directDispatch=/^\/tasks\/bot-slot\/([0-9a-f-]{36})\/direct-dispatch$/.exec(path);
+      if(directDispatch&&request.method==="POST") {
+        const input=await body(request),botId=directDispatch[1],lease=input.lease as {key?:string;token?:string;generation?:number;admissionToken?:string}|null,op=operationId(input.operationId),action=parseAction(input.action);
+        const slot=this.slotFor(botId),holder=lease?.admissionToken?"@bot":`@direct:${lease?.key}`;
+        if(!slot||slot.task_id!==holder||slot.token!==lease?.token||slot.generation!==lease?.generation)throw new ApiError(409,"computer_lease_stale","The computer lease changed before action dispatch.");
+        const intent=this.ctx.storage.sql.exec<{payload:string;state:string}>("SELECT payload,state FROM direct_intents WHERE bot_id=? AND operation_id=?",botId,op).toArray()[0];
+        if(intent?.state==="cancelled")throw new ApiError(409,"action_cancelled","This queued action was cancelled and will not execute.");
+        if(intent&&intent.payload!==JSON.stringify({operationId:op,action}))throw new ApiError(409,"operation_id_conflict","Queued action operationId was already used for different input.");
+        if(lease?.admissionToken) {
+          const admission=this.ctx.storage.sql.exec("SELECT 1 FROM computer_admissions WHERE token=? AND bot_id=? AND task_id='@bot' AND operation_id=? AND slot_token=?",lease.admissionToken,botId,op,slot.token).toArray()[0];
+          if(!admission)throw new ApiError(409,"computer_lease_stale","The direct admission is no longer valid.");
+          return json({token:lease.admissionToken});
+        }
+        const existing=this.ctx.storage.sql.exec<{token:string}>("SELECT token FROM computer_admissions WHERE bot_id=? AND task_id=? AND operation_id=? AND slot_token=?",botId,holder,op,slot.token).toArray()[0];
+        const token=existing?.token??crypto.randomUUID();
+        if(!existing)this.ctx.storage.sql.exec("INSERT INTO computer_admissions(token,bot_id,task_id,operation_id,slot_token,created_at) VALUES(?,?,?,?,?,?)",token,botId,holder,op,slot.token,Date.now());
+        this.ctx.waitUntil(this.rearmDeletion());return json({token});
+      }
+      const directQueueRoute=/^\/tasks\/bot-slot\/([0-9a-f-]{36})\/queued-actions(?:\/([^/]+)\/cancel)?$/.exec(path);
+      if(directQueueRoute&&request.method==="GET"&&!directQueueRoute[2])return json({actions:this.ctx.storage.sql.exec<{operation_id:string;payload:string;state:string;receipt:string|null}>("SELECT operation_id,payload,state,receipt FROM direct_intents WHERE bot_id=? ORDER BY rowid DESC LIMIT 100",directQueueRoute[1]).toArray().map(row=>({...JSON.parse(row.payload),state:row.state,...(row.receipt?{receipt:JSON.parse(row.receipt)}:{})}))});
+      if(directQueueRoute&&request.method==="POST"&&directQueueRoute[2]) {
+        const op=operationId(decodeURIComponent(directQueueRoute[2])),row=this.ctx.storage.sql.exec<{state:string}>("SELECT state FROM direct_intents WHERE bot_id=? AND operation_id=?",directQueueRoute[1],op).toArray()[0];
+        if(!row)throw new ApiError(404,"not_found","Queued action not found.");
+        if(row.state!=="pending"&&row.state!=="cancelled")throw new ApiError(409,"action_already_claimed","The action has begun dispatch; inspect its receipt or cancel its managed process explicitly.");
+        this.ctx.storage.sql.exec("UPDATE direct_intents SET state='cancelled' WHERE bot_id=? AND operation_id=? AND state='pending'",directQueueRoute[1],op);
+        await this.rearmDeletion();return json({operationId:op,cancelled:true});
+      }
+      const directReceipt=/^\/tasks\/bot-slot\/([0-9a-f-]{36})\/receipt$/.exec(path);
+      if(directReceipt&&request.method==="POST") {
+        const input=await body(request),url=new URL(request.url),slot=this.slotFor(directReceipt[1]);
+        if(slot?.task_id===`@direct:${url.searchParams.get("key")}`&&slot.token===url.searchParams.get("token")&&typeof input.operationId==="string")this.saveDirectReceipt(directReceipt[1],input.operationId,input.receipt,input.terminal===true,typeof input.status==="number"&&Number.isInteger(input.status)&&input.status>=200&&input.status<600?input.status:200);
+        return json({recorded:true});
+      }
+      const rejectedDirect=/^\/tasks\/bot-slot\/([0-9a-f-]{36})\/reject$/.exec(path);
+      if(rejectedDirect&&request.method==="POST") {
+        const url=new URL(request.url),slot=this.slotFor(rejectedDirect[1]),key=url.searchParams.get("key"),token=url.searchParams.get("token");
+        if(slot&&slot.task_id===`@direct:${key}`&&slot.token===token) {
+          const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",rejectedDirect[1]).toArray()[0];
+          if(row) {const state=await this.schedulerSnapshot(rejectedDirect[1],JSON.parse(row.data) as Bot);if(!state.activeRuns&&!state.activeProcesses&&!state.pendingCancellations&&!state.computerControlled)this.releaseSlot(rejectedDirect[1],slot.task_id,slot.token,slot.updated_at);}
+        }
+        await this.rearmDeletion();return json({reconciled:true});
+      }
       const directProcess=/^\/tasks\/bot-slot\/([0-9a-f-]{36})\/direct-process$/.exec(path);
       if(directProcess && request.method==="POST") {
         const key=new URL(request.url).searchParams.get("key"),token=new URL(request.url).searchParams.get("token"),input=await body(request);
@@ -449,10 +525,20 @@ export class WorkspaceDO extends DurableObject<Env> {
         if(request.method==="POST") {
           const direct=new URL(request.url).searchParams.get("kind")==="direct";
           const key=new URL(request.url).searchParams.get("key");
-          const current=this.ctx.storage.sql.exec<{task_id:string;token:string|null;generation:number;direct_process_id:string|null}>("SELECT task_id,token,generation,direct_process_id FROM task_slots WHERE bot_id=?",botId).toArray()[0];
+          let current=this.ctx.storage.sql.exec<{task_id:string;token:string|null;generation:number;direct_process_id:string|null}>("SELECT task_id,token,generation,direct_process_id FROM task_slots WHERE bot_id=?",botId).toArray()[0];
           if(direct) {
             if(!key||! /^[A-Za-z0-9:_.-]{1,160}$/.test(key)) throw new ApiError(400,"invalid_request","A stable direct-action key is required.");
-            const input=await body(request),payload=JSON.stringify(input.payload);
+            const input=await body(request);
+            const supplied=input.payload as {operationId?:unknown;action?:unknown};
+            const directOperation=operationId(supplied?.operationId),validatedAction=parseAction(supplied?.action),payload=JSON.stringify({operationId:directOperation,action:validatedAction});
+            const savedIntent=():Response|undefined=>{
+              const intent=this.ctx.storage.sql.exec<{payload:string;state:string;receipt:string|null;receipt_status:number}>("SELECT payload,state,receipt,receipt_status FROM direct_intents WHERE bot_id=? AND operation_id=?",botId,directOperation).toArray()[0];
+              if(intent&&intent.payload!==payload)throw new ApiError(409,"operation_id_conflict","Queued action operationId was already used for different input.");
+              if(intent?.state==="cancelled")throw new ApiError(409,"action_cancelled","This queued action was cancelled and will not execute.");
+              if(intent?.state==="settled"&&intent.receipt)return json({receipt:JSON.parse(intent.receipt),receiptStatus:intent.receipt_status});
+              if(intent?.state==="pending")return json({queued:true,operationId:directOperation},202);
+            };
+            const saved=savedIntent();if(saved)return saved;
             if(!payload||payload==="null") throw new ApiError(400,"invalid_request","The direct action payload is required.");
             let holder=`@direct:${key}`,leaseKey=key;const action=(input.payload as {action?:{type?:string;processId?:string}}).action;
             if(!["execPoll","execCancel"].includes(action?.type??"")) {
@@ -460,24 +546,39 @@ export class WorkspaceDO extends DurableObject<Env> {
               if(!botRow)throw new ApiError(404,"not_found","Bot not found.");
               if(await this.computerControlled(botId,JSON.parse(botRow.data) as Bot))throw new ApiError(409,"computer_busy","Interactive desktop control is active; mutations are paused until control is released.");
             }
+            current=this.ctx.storage.sql.exec<NonNullable<typeof current>>("SELECT task_id,token,generation,direct_process_id FROM task_slots WHERE bot_id=?",botId).toArray()[0];
             if(current?.task_id.startsWith("@direct:")&&["execPoll","execCancel"].includes(action?.type??"")&&current.direct_process_id===action?.processId) {holder=current.task_id;leaseKey=holder.slice("@direct:".length);}
             if(current?.task_id==="@bot"&&["key","click","type","scroll"].includes(action?.type??"")) {
               const botRow=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",botId).toArray()[0];
               if(botRow) {
                 const bot=JSON.parse(botRow.data) as Bot,stub=this.env.BOT.get(this.env.BOT.idFromName(`owner:${botId}`));
                 const runs=await stub.fetch(new Request("https://bot/runs",{headers:{"x-botspace-config":encodeURIComponent(JSON.stringify(bot))}}));
-                if(runs.ok) {const page=await runs.json<{activeRuns:Array<{status:string}>}>();if(page.activeRuns.length&&page.activeRuns.every(run=>run.status==="waiting_approval")) {const op=(input.payload as {operationId?:unknown}).operationId;if(typeof op!=="string")throw new ApiError(400,"invalid_request","A stable action operationId is required.");const admissionToken=this.beginComputerAdmission(botId,null,op);return json({claimed:true,token:current.token??"",generation:current.generation,key,shared:true,admissionToken});}}else this.ctx.waitUntil(runs.arrayBuffer().catch(()=>{}));
+                if(runs.ok) {const page=await runs.json<{activeRuns:Array<{status:string}>}>();if(page.activeRuns.length&&page.activeRuns.every(run=>run.status==="waiting_approval")) {const saved=savedIntent();if(saved)return saved;const latest=this.slotFor(botId);if(!latest||latest.task_id!=="@bot")throw new ApiError(409,"computer_busy","The computer lease changed; retry the same operation ID.");const op=(input.payload as {operationId?:unknown}).operationId;if(typeof op!=="string")throw new ApiError(400,"invalid_request","A stable action operationId is required.");const admissionToken=this.beginComputerAdmission(botId,null,op);return json({claimed:true,token:this.slotFor(botId)?.token??"",generation:this.slotFor(botId)?.generation,key,shared:true,admissionToken});}}else this.ctx.waitUntil(runs.arrayBuffer().catch(()=>{}));
               }
             }
-            if(current && current.task_id!==holder) throw new ApiError(409,"computer_busy","This bot's shared computer is occupied. Retry when the active work finishes.");
+            // Reread immutable arguments and cancellation state after every await.
+            const latestIntent=savedIntent();if(latestIntent)return latestIntent;
+            // All body/control/run awaits precede the authoritative CAS read.
+            current=this.ctx.storage.sql.exec<NonNullable<typeof current>>("SELECT task_id,token,generation,direct_process_id FROM task_slots WHERE bot_id=?",botId).toArray()[0];
+            holder=`@direct:${key}`;leaseKey=key;
+            if(current?.task_id.startsWith("@direct:")&&["execPoll","execCancel"].includes(action?.type??"")&&current.direct_process_id===action?.processId){holder=current.task_id;leaseKey=holder.slice("@direct:".length);}
+            if(current && current.task_id!==holder) {
+              const count=this.ctx.storage.sql.exec<{n:number}>("SELECT COUNT(*) n FROM direct_intents WHERE bot_id=? AND state='pending'",botId).one().n;
+              if(count>=32)throw new ApiError(429,"computer_queue_full","This bot's direct action queue is full.");
+              const inserted=this.ctx.storage.sql.exec<{operation_id:string}>("INSERT INTO direct_intents(bot_id,operation_id,lease_key,payload,state,created_at) VALUES(?,?,?,?,'pending',?) ON CONFLICT(bot_id,operation_id) DO NOTHING RETURNING operation_id",botId,directOperation,key,payload,Date.now()).toArray();
+              if(inserted.length!==1){const saved=savedIntent();if(saved)return saved;throw new ApiError(409,"computer_busy","The queued action changed; retry the same operation ID.");}
+              await this.rearmDeletion();return json({queued:true,operationId:directOperation},202);
+            }
             const token=current?.token??crypto.randomUUID(),generation=current?.generation??this.nextSlotGeneration(botId);
             let nextToken=token,nextGeneration=generation;
             if(!current)this.ctx.storage.sql.exec("INSERT INTO task_slots(bot_id,task_id,token,generation,updated_at,payload,direct_process_id) VALUES(?,?,?,?,?,?,NULL)",botId,holder,token,generation,Date.now(),payload);
             else {
+              if(this.hasPendingAdmission(botId,holder)){await this.rearmDeletion();return json({claimed:true,token:current.token,generation:current.generation,key:leaseKey});}
               const old=this.ctx.storage.sql.exec<{payload:string|null}>("SELECT payload FROM task_slots WHERE bot_id=? AND token=?",botId,token).toArray()[0]?.payload;
               if(action?.type!=="execPoll"&&action?.type!=="execCancel"&&old&&old!==payload) throw new ApiError(409,"operation_id_conflict","A direct-action key is already reserved for different input.");
               nextToken=crypto.randomUUID();nextGeneration=this.nextSlotGeneration(botId);
-              this.ctx.storage.sql.exec("UPDATE task_slots SET token=?,generation=?,updated_at=?,payload=CASE WHEN ?='execCancel' THEN ? ELSE payload END WHERE bot_id=? AND token=?",nextToken,nextGeneration,Date.now(),action?.type??"",payload,botId,token);
+              const changed=this.ctx.storage.sql.exec<{token:string}>("UPDATE task_slots SET token=?,generation=?,updated_at=?,payload=CASE WHEN ?='execCancel' THEN ? ELSE payload END WHERE bot_id=? AND token IS ? AND generation=? RETURNING token",nextToken,nextGeneration,Date.now(),action?.type??"",payload,botId,current.token,current.generation).toArray();
+              if(changed.length!==1)throw new ApiError(409,"computer_busy","The computer lease changed; retry the same operation ID.");
             }
             await this.rearmDeletion();return json({claimed:true,token:nextToken,generation:nextGeneration,key:leaseKey});
           }
@@ -486,7 +587,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         }
         if(request.method==="DELETE") {
           const key=new URL(request.url).searchParams.get("key"),token=new URL(request.url).searchParams.get("token");
-          if(key&&token)this.ctx.storage.sql.exec("DELETE FROM task_slots WHERE bot_id=? AND task_id=? AND token=?",botId,`@direct:${key}`,token);
+          if(key&&token)this.releaseSlot(botId,`@direct:${key}`,token);
           else this.ctx.storage.sql.exec("DELETE FROM task_slots WHERE bot_id=? AND task_id='@bot'",botId);
           await this.rearmDeletion();return json({released:true});
         }
@@ -528,9 +629,25 @@ export class WorkspaceDO extends DurableObject<Env> {
         await this.rearmDeletion();await this.reconcileComputerSlots();
         const latest=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",task.id).toArray()[0];return json({task:JSON.parse(latest.data)},202);
       }
+      const continueRoute=/^\/tasks\/([0-9a-f-]{36})\/continue$/.exec(path);
+      if(continueRoute&&request.method==="POST") {
+        const input=await body(request);
+        if(typeof input.operationId!=="string"||!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.operationId)||typeof input.text!=="string"||!input.text.trim()||input.text.length>32000)throw new ApiError(400,"invalid_request","Continue requires a fresh operationId and explicit instructions.");
+        const id=continueRoute[1],op=`task-continue:${id}:${input.operationId}`,fingerprint=JSON.stringify({taskId:id,text:input.text});
+        const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",id).toArray()[0];if(!row)throw new ApiError(404,"not_found","Task not found.");
+        const task=JSON.parse(row.data) as {id:string;status:string;startImmediately:boolean;updatedAt:string;cancelRequested?:boolean;startOperationId?:string;startText?:string};
+        if(task.cancelRequested||["cancelled","cancelling"].includes(task.status))throw new ApiError(409,"task_cancelled","Cancelled tasks cannot be continued; create a new task.");
+        const previous=this.ctx.storage.sql.exec<{fingerprint:string;task_id:string}>("SELECT fingerprint,task_id FROM task_operations WHERE operation_id=?",op).toArray()[0];
+        if(previous){if(previous.fingerprint!==fingerprint)throw new ApiError(409,"operation_id_conflict","Continue operationId was used with different instructions.");return json({task},202);}
+        if(!["completed","failed"].includes(task.status))throw new ApiError(409,"task_not_terminal","Continue is only available for completed or failed tasks.");
+        task.status="queued";task.startImmediately=true;task.startOperationId=`task-continue:${crypto.randomUUID()}`;task.startText=input.text;task.updatedAt=new Date().toISOString();
+        this.ctx.storage.transactionSync(()=>{this.ctx.storage.sql.exec("INSERT INTO task_operations(operation_id,task_id,fingerprint) VALUES(?,?,?)",op,id,fingerprint);this.ctx.storage.sql.exec("UPDATE tasks SET data=? WHERE id=?",JSON.stringify(task),id);});
+        await this.rearmDeletion();await this.reconcileComputerSlots();
+        return json({task:JSON.parse(this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",id).one().data)},202);
+      }
       const taskMatch=/^\/tasks\/([0-9a-f-]{36})$/.exec(path);
       if(taskMatch && request.method==="GET") {const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",taskMatch[1]).toArray()[0];if(!row) throw new ApiError(404,"not_found","Task not found.");return json({task:JSON.parse(row.data)});}
-      if(taskMatch && request.method==="PATCH") {const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",taskMatch[1]).toArray()[0];if(!row) throw new ApiError(404,"not_found","Task not found.");const task=JSON.parse(row.data) as {id:string;botId:string;status:string;cancelRequested?:boolean;updatedAt?:string};const input=await body(request);if(!["pending","queued","running","waiting_approval","waiting_connection","cancelling","completed","failed","cancelled"].includes(input.status as string)) throw new ApiError(400,"invalid_request","Invalid task status.");if(["completed","failed","cancelled"].includes(task.status)&&input.status!==task.status)throw new ApiError(409,"task_terminal","A terminal task cannot be changed.");if((task.cancelRequested||task.status==="cancelling")&&!['cancelling','cancelled'].includes(input.status as string))throw new ApiError(409,"task_cancelling","A cancellation request cannot be rewound.");const firstStop=(input.status==="cancelling"||input.cancelRequested===true)&&!task.cancelRequested&&task.status!=="cancelling";task.status=input.status as string;if(input.cancelRequested===true) (task as {cancelRequested?:boolean}).cancelRequested=true;task.updatedAt=new Date().toISOString();
+      if(taskMatch && request.method==="PATCH") {const input=await body(request);const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",taskMatch[1]).toArray()[0];if(!row) throw new ApiError(404,"not_found","Task not found.");const task=JSON.parse(row.data) as {id:string;botId:string;status:string;cancelRequested?:boolean;updatedAt?:string};if(!["pending","queued","running","waiting_approval","waiting_connection","cancelling","completed","failed","cancelled"].includes(input.status as string)) throw new ApiError(400,"invalid_request","Invalid task status.");if(["completed","failed","cancelled"].includes(task.status)&&input.status!==task.status)throw new ApiError(409,"task_terminal","A terminal task cannot be changed.");if((task.cancelRequested||task.status==="cancelling")&&!['cancelling','cancelled'].includes(input.status as string))throw new ApiError(409,"task_cancelling","A cancellation request cannot be rewound.");const firstStop=(input.status==="cancelling"||input.cancelRequested===true)&&!task.cancelRequested&&task.status!=="cancelling";task.status=input.status as string;if(input.cancelRequested===true) (task as {cancelRequested?:boolean}).cancelRequested=true;task.updatedAt=new Date().toISOString();
         if(task.status==="cancelling"&&!this.ctx.storage.sql.exec("SELECT 1 FROM task_slots WHERE bot_id=? AND task_id=?",task.botId,task.id).toArray().length) task.status="cancelled";
         this.ctx.storage.transactionSync(()=>{
           this.ctx.storage.sql.exec("UPDATE tasks SET data=? WHERE id=?",JSON.stringify(task),taskMatch[1]);

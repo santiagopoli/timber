@@ -212,6 +212,20 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   Status reads never start a computer, dispatch actions or renew its idle timeout.
 - POST /v1/bots/:id/computer/actions {operationId,action:ComputerAction}
   -> {result:ComputerResult}; authenticated user intentionally invokes tools.
+  When a task/other computer holder prevents execution, mutations return 202
+  `{operationId,status:"queued",accepted:true}` after persisting exact validated
+  arguments in a separate 32-pending-intent queue. This owner authorization does
+  not approve any stored model approval. Alarms claim a fenced lease and dispatch
+  through the existing ComputerDO journal with the original operation ID; unsafe
+  interrupted effects are never blindly replayed. Confirmed pre-effect rejection
+  releases only after authoritative no-activity confirmation; uncertain receipts
+  remain fenced. Read/list/screenshot remain passive immediate actions.
+- GET /v1/bots/:id/computer/queued-actions -> {actions:[{operationId,action,state,receipt?}]}.
+  Lists the latest 100 exact direct intents. State is pending, claimed, settled,
+  or cancelled; a retained receipt describes the confirmed result, not invented success.
+- POST /v1/bots/:id/computer/queued-actions/:operationId/cancel -> {operationId,cancelled:true}.
+  Permanently fences only a still-pending direct intent. Once claimed, returns 409
+  `action_already_claimed`; stop managed execution by its explicit process identity.
 - POST /v1/bots/:id/computer/suspend -> {computer:ComputerStatus}; checkpoint
   then stop. Rejects active runs or executing approvals and invalidates GUI approvals.
 - GET /v1/bots/:id/approvals -> {approvals:Approval[]}
@@ -234,16 +248,13 @@ own transcript and run/event IDs.
 
 `POST /v1/tasks/:id/start` admits the description under stable operation ID
 `task-start:<taskId>`. `POST /v1/tasks/:id/messages`, `GET /messages`, `GET
-/runs`, and `GET /events` expose the task conversation. `POST /cancel` cancels its
-active runs and fences subsequent starts. Task-scoped `/approvals`,
+/runs`, and `GET /events` expose the task conversation. `POST /continue {operationId,text}` explicitly continues a completed or failed task in the same chat with a newly generated native input ID, never by replaying `task-start` or old computer actions. Identical continuation receipts deduplicate; different instructions under the same ID conflict. `POST /cancel` cancels its
+active runs and permanently fences subsequent starts and continuations. Cancelled tasks cannot Continue in this version; create a new task. Task-scoped `/approvals`,
 `/approvals/:approvalId`, `/agents`, `/agents/:agentId/messages`,
 `/agents/:agentId/cancel`, `/runs/:runId`, `/runs/:runId/cancel` and `/connections`
 reuse the isolated conversation’s decision/run APIs; decisions are never applied
 to the assigned bot’s ordinary chat. A per-assigned-bot durable slot blocks
-task starts while the ordinary bot has an active run; it also rejects ordinary bot
-message admissions and owner computer actions while a task holds the slot. These
-blocked requests receive `409 computer_busy`, so task chat is not admitted as
-steering while the shared computer is occupied. Other tasks remain durably `queued` and are admitted FIFO by the WorkspaceDO alarm
+task starts while the ordinary bot has an active run; ordinary bot messages are durably receipted in the existing bounded backlog while a task holds the slot, but cannot enter Pi until their conversation atomically acquires an `@bot` execution lease. Expected contention uses the existing Lifecycle capacity wake without consuming delivery-failure attempts. Unadmitted backlog alone never prevents a future lease. Owner direct mutations retain exact validated queued intentions and return explicit 202 queued receipts; no task chat is admitted as ordinary bot steering while the shared computer is occupied. Other tasks remain durably `queued` and are admitted FIFO by the WorkspaceDO alarm
 once run and managed-process termination is confirmed. No browser polling is
 needed to release an idle lease or start queued tasks. Snapshot-based release is
 fenced by lease token/generation, pending admissions, unacknowledged native
@@ -622,7 +633,7 @@ with a new path. Request and result text
 are bounded to 32,000 characters. Transport delivery has five attempts with
 1/2/4/8-second backoff; this retries input delivery, never completed computer effects.
 Observation polls queued/running work every three seconds and host waits every
-15 seconds. A delegation still active after 24 hours is cancelled with a visible
+15 seconds. A delegation still pending submission or active after 24 hours is cancelled with a visible
 failure. Exhausted result delivery retains an error in the delegation record rather
 than claiming that the source received it.
 Exhausted submission or observation retries request cancellation of the exact

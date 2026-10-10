@@ -71,7 +71,7 @@ export class AgentCoordinator {
     // this WorkspaceDO directly (rather than recursively calling its own
     // fetch handler) so an alarm-driven outbox retry cannot deadlock itself.
     let admission:string|undefined;
-    if(method==="POST"&&(path==="/agent-messages"||path==="/agent-results")) {
+    if(taskId&&method==="POST"&&(path==="/agent-messages"||path==="/agent-results")) {
       const op=input&&typeof input==="object"?(input as {operationId?:unknown}).operationId:undefined;
       if(typeof op!=="string")throw new ApiError(400,"invalid_request","Agent delivery operationId is required.");
       admission=this.reserveComputer(botId,op,taskId);
@@ -226,6 +226,9 @@ export class AgentCoordinator {
         // source task's slot can be released after Stop.
         this.cancel(delivery,"The source task was cancelled.");
         return;
+      }
+      if((row.phase==="submit"||row.phase==="observe")&&Date.now()-Date.parse(d.createdAt)>maxLifetimeMs) {
+        this.cancel(delivery,"The delegation exceeded its 24-hour lifetime. Cancellation was requested; start a new task to continue.");return;
       }
       if(row.phase==="submit" || row.phase==="observe") {
         const {run:sourceRun}=await this.botRequest<{run:Run}>(d.sourceBotId,`/runs/${d.sourceRunId}`,undefined,"GET",delivery.sourceTaskId);

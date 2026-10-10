@@ -37,6 +37,10 @@ async function withTasks(work,width=1440) {
       if(tasks.readGates.has(id))await tasks.readGates.get(id).promise;
       try{return await fulfill(route,payload);}catch(error){if(!request.failure())throw error;}finally{read.finished=true;}
     }
+    if(tail==='/continue'){
+      if(!['completed','failed'].includes(task.status))return fulfill(route,{error:{code:'task_cancelled',message:'This task cannot continue.'}},409);
+      task.status='running';tasks.messages.get(id).push({id:randomUUID(),role:'user',text:body.text});return fulfill(route,{task},202);
+    }
     if(tail==='/messages'){
       if(tasks.sendGate)await tasks.sendGate.promise;
       if(tasks.sendError)return fulfill(route,{error:{code:'unavailable',message:'Send response unavailable.'}},503);
@@ -162,4 +166,18 @@ test('global tasks: assigned bot defaults recover when the catalogue arrives or 
   fixture.state.bots=bots.filter(bot=>bot.id===BOT_B);await page.getByRole('button',{name:'Refresh bots',exact:true}).click();
   await page.waitForFunction(id=>document.querySelector('.timber-tasks-create select')?.value===id,BOT_B);
   assert.equal(await page.getByRole('button',{name:'Create task',exact:true}).isEnabled(),true);
+}));
+
+for(const status of ['completed','failed'])test(`global tasks: ${status} Continue is an explicit new task input, cancelled tasks stay stopped`,async()=>withTasks(async({page,tasks,fixture,login,open,back})=>{
+  await login();await open(`task-${status}`);
+  await page.getByRole('button',{name:'Continue task',exact:true}).waitFor();
+  assert.equal(await page.getByRole('button',{name:'Start task',exact:true}).count(),0);
+  await page.getByLabel('Message this task').fill('New instructions, not an old action retry');
+  await page.getByRole('button',{name:'Continue task',exact:true}).click();
+  await page.getByLabel('Task conversation').getByText('New instructions, not an old action retry',{exact:true}).waitFor();
+  const calls=tasks.calls.filter(call=>call.method==='POST'&&call.path===`/v1/tasks/task-${status}/continue`);
+  assert.equal(calls.length,1);assert.equal(typeof calls[0].body.operationId,'string');assert.equal(calls[0].body.text,'New instructions, not an old action retry');
+  assert.equal(tasks.calls.filter(call=>call.method==='POST'&&call.path===`/v1/tasks/task-${status}/start`).length,0);
+  assert.equal(fixture.state.calls.filter(call=>call.method==='POST'&&call.path===`/v1/bots/${BOT_A}/messages`).length,0);
+  await back();await open('task-cancelled');assert.equal(await page.getByRole('button',{name:'Continue task',exact:true}).count(),0);assert.equal(await page.getByLabel('Message this task').count(),0);assert.equal(await page.getByText('Cancelled tasks stay stopped. Create a new task to work again.',{exact:true}).isVisible(),true);
 }));
