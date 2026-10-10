@@ -118,6 +118,38 @@ async function readCompleted(response: Response, signal?: AbortSignal): Promise<
   }
   const reader = response.body.getReader(), decoder = new TextDecoder('utf-8', {fatal: true, ignoreBOM: false});
   let buffer = '', bytes = 0, data: string[] = [], result: string | undefined;
+  // The Responses protocol also delivers complete items in output_item.done.
+  // Retain those snapshots (not unfinished text deltas) for a terminal summary
+  // with an empty output array. Require response/item identity and every item to be done.
+  let responseId: string | undefined, streamIdentityValid = true;
+  const items = new Map<number, {id: string; type: string; done?: Record<string, unknown>}>();
+  const itemIds = new Set<string>();
+  const id = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 256;
+  const index = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) < 256;
+  function observeItem(event: Record<string, unknown>) {
+    const item = event.item;
+    if (!responseId) streamIdentityValid = false;
+    if (!index(event.output_index) || !object(item) || !id(item.id) || typeof item.type !== 'string') { streamIdentityValid = false; return; }
+    const previous = items.get(event.output_index);
+    if (event.type === 'response.output_item.added') {
+      if (previous || itemIds.has(item.id)) { streamIdentityValid = false; return; }
+      items.set(event.output_index, {id: item.id, type: item.type}); itemIds.add(item.id);
+    } else {
+      if (!previous || previous.done || previous.id !== item.id || previous.type !== item.type) { streamIdentityValid = false; return; }
+      previous.done = item;
+    }
+  }
+  function terminalText(value: unknown): string {
+    if (!object(value) || value.status !== 'completed' || !Array.isArray(value.output) || value.output.length) return completedText(value);
+    if (!streamIdentityValid || !responseId || value.id !== responseId || !items.size) return completedText(value);
+    const output: Record<string, unknown>[] = [];
+    for (let i = 0; i < items.size; i++) {
+      const item = items.get(i)?.done;
+      if (!item || (item.type === 'message' ? item.status !== 'completed' : item.status !== undefined && item.status !== 'completed')) failure('avatar_response_invalid', 'The avatar response was not a completed text response.');
+      output.push(item);
+    }
+    return completedText({...value, output});
+  }
   const abort = () => { void reader.cancel().catch(() => {}); };
   signal?.addEventListener('abort', abort, {once: true});
   function frame() {
@@ -133,9 +165,19 @@ async function readCompleted(response: Response, signal?: AbortSignal): Promise<
       if (reviewed) throw reviewed;
     }
     if (['response.interrupted', 'response.failed', 'response.incomplete', 'error'].includes(event.type)) failure('avatar_generation_interrupted', 'Avatar generation was interrupted or incomplete. No automatic retry was attempted.');
+    if (result !== undefined && event.type.startsWith('response.')) failure('avatar_response_invalid');
+    if (event.type.startsWith('response.refusal.') || event.type.includes('_call')) streamIdentityValid = false;
+    if (event.type === 'response.created') {
+      if (responseId || !object(event.response) || !id(event.response.id)) streamIdentityValid = false;
+      else responseId = event.response.id;
+    }
+    if (event.type === 'response.output_item.added' || event.type === 'response.output_item.done') {
+      if (result !== undefined) failure('avatar_response_invalid');
+      observeItem(event);
+    }
     if (event.type === 'response.completed') {
       if (result !== undefined) failure('avatar_response_invalid');
-      result = completedText(event.response);
+      result = terminalText(event.response);
     }
   }
   function lines(final = false) {
