@@ -6,7 +6,7 @@ import {createConsoleFixture,TEST_TOKEN,BOT_A} from './console-fixture.mjs';
 let browser;
 before(async()=>{browser=await chromium.launch({executablePath:process.env.CONSOLE_CHROMIUM_PATH||'/usr/bin/chromium',args:['--no-sandbox']});});
 after(async()=>{await browser?.close();});
-const popup=page=>page.getByRole('dialog',{name:'Choose model',exact:true});
+const popup=page=>page.locator('.timber-model-picker, .timber-model-popover');
 const search=page=>popup(page).getByRole('combobox',{name:'Search models',exact:true});
 const providerSearch=page=>popup(page).getByRole('combobox',{name:'Search model providers',exact:true});
 const provider=(page,name)=>popup(page).locator(`[data-provider="${name}"]`);
@@ -27,8 +27,9 @@ for(const width of [1440,390])test(`model picker selects providers before models
     if(width<760)await page.locator('.bot-item').first().click();
     await page.locator('#message').fill('A draft that stays intact.');
     const settingsTrigger=page.getByRole('button',{name:/^Model settings:/});await settingsTrigger.click();
-    const settings=page.getByRole('dialog',{name:'Model settings',exact:true}),model=settings.getByRole('combobox',{name:'Model',exact:true});
-    await model.click();await providerSearch(page).and(page.locator(':focus')).waitFor();await bounds(page);
+    const settings=page.getByRole('dialog',{name:'Model settings',exact:true});
+    assert.equal(await page.getByRole('dialog').count(),1,'the chat opens just one panel');
+    assert.equal(await settings.locator('[aria-haspopup]').count(),0,'no settings control opens a nested dropdown');await providerSearch(page).and(page.locator(':focus')).waitFor();await bounds(page);
     assert.equal(await popup(page).getByRole('option').count(),3,'82 models start as just three providers');
     await provider(page,'OpenAI').locator('[aria-label="Current provider"]').waitFor();
     assert.equal(await popup(page).locator('.timber-model-option-id').count(),0,'the first step does not list individual models');
@@ -42,13 +43,13 @@ for(const width of [1440,390])test(`model picker selects providers before models
     await page.keyboard.press('Enter');await settingsTrigger.filter({hasText:'Reviewer 79'}).waitFor();
     assert.equal(fixture.state.bots.find(bot=>bot.id===BOT_A).model,'anthropic/reviewer-79');
     assert.equal(await page.locator('#message').inputValue(),'A draft that stays intact.');
-    await model.click();assert.equal(await providerSearch(page).inputValue(),'','every opening starts with providers and clears the search');
+    await settings.getByRole('button',{name:'Close model settings'}).click();await settingsTrigger.click();assert.equal(await providerSearch(page).inputValue(),'','every opening starts with providers and clears the search');
     await provider(page,'Anthropic').locator('[aria-label="Current provider"]').waitFor();await provider(page,'Anthropic').click();
     await popup(page).locator('[data-current=true] [aria-label="Current model"]').waitFor();
     await search(page).fill('reviewer-12');await popup(page).getByRole('button',{name:'Back to model providers'}).click();
     assert.equal(await providerSearch(page).inputValue(),'');await provider(page,'OpenAI').click();assert.equal(await popup(page).getByRole('option').count(),1,'switching providers excludes the previous provider');
-    await page.keyboard.press('Escape');await popup(page).waitFor({state:'hidden'});await model.and(page.locator(':focus')).waitFor();assert.ok(await settings.isVisible());
-    await settings.getByRole('button',{name:'Close model settings'}).click();
+    assert.equal(await page.getByRole('dialog').count(),1,'provider navigation keeps the same panel');
+    await page.keyboard.press('Escape');await popup(page).waitFor({state:'hidden'});await settingsTrigger.and(page.locator(':focus')).waitFor();
 
     if(!await page.locator('#edit-bot').isVisible())await page.locator('#panel-menu > summary').click();
     await page.locator('#edit-bot').click();const edit=page.locator('#edit-model-picker');await edit.click();await bounds(page);
@@ -80,14 +81,14 @@ test('saved models outside the catalogue remain visible in their provider withou
   try{
     await page.goto(fixture.url);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();
     await page.getByRole('button',{name:'Model settings: retired-model',exact:true}).click();
-    const model=page.getByRole('dialog',{name:'Model settings',exact:true}).getByRole('combobox',{name:'Model',exact:true});
-    await model.click();await provider(page,'Other providers').click();await search(page).fill('retired-model');
+    const settings=page.getByRole('dialog',{name:'Model settings',exact:true});
+    await provider(page,'Other providers').click();await search(page).fill('retired-model');
     const retired=popup(page).getByRole('option');assert.equal(await retired.getAttribute('aria-disabled'),'true');await retired.getByText('Saved model is not in the current catalogue',{exact:true}).waitFor();
     await page.keyboard.press('Enter');assert.equal(fixture.state.calls.filter(call=>call.method==='PATCH').length,0);assert.ok(await popup(page).isVisible());
     await popup(page).getByRole('button',{name:'Back to model providers'}).click();await provider(page,'OpenAI').click();
     await search(page).fill('gpt-6.1-sol');await page.keyboard.press('Enter');await page.getByRole('button',{name:'Model settings: GPT-6.1 Sol',exact:true}).waitFor();
     assert.equal(fixture.state.bots[0].model,'gpt-6.1-sol');assert.equal(fixture.state.calls.filter(call=>call.method==='PATCH').length,1);
-    await model.click();await provider(page,'OpenAI').click();await search(page).fill('gpt-6.1-sol');await page.keyboard.press('Enter');await popup(page).waitFor({state:'hidden'});assert.equal(fixture.state.calls.filter(call=>call.method==='PATCH').length,1,'choosing the current model does not write again');
+    await popup(page).getByRole('button',{name:'Back to model providers'}).click();await provider(page,'OpenAI').click();await search(page).fill('gpt-6.1-sol');await page.keyboard.press('Enter');assert.ok(await settings.isVisible());assert.equal(fixture.state.calls.filter(call=>call.method==='PATCH').length,1,'choosing the current model does not write again');
   }finally{await context.close();await fixture.close();}
 });
 
@@ -98,8 +99,9 @@ test('a publisher prefix from OpenRouter is not repeated in the visible model na
   try{
     await page.goto(fixture.url);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('#app').waitFor();
     await page.getByRole('button',{name:/^Model settings:/}).click();
-    const settings=page.getByRole('dialog',{name:'Model settings',exact:true}),model=settings.getByRole('combobox',{name:'Model',exact:true});
-    await model.click();
+    const settings=page.getByRole('dialog',{name:'Model settings',exact:true});
+    assert.equal(await page.getByRole('dialog').count(),1,'the chat opens just one panel');
+    assert.equal(await settings.locator('[aria-haspopup]').count(),0,'no settings control opens a nested dropdown');
     await provider(page,'Anthropic').click();
     const option=popup(page).locator('[data-value="anthropic/claude-opus-5.5"]');
     await option.waitFor();

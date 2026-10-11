@@ -68,8 +68,11 @@ const signOut = async page => {
 };
 
 const chooseModel = async (page, trigger, id) => {
-  await trigger.click();
-  const picker=page.getByRole('dialog',{name:'Choose model',exact:true});
+  const isPanel=await trigger.getAttribute('role')==='dialog';
+  if(!isPanel)await trigger.click();
+  const picker=isPanel?trigger:page.getByRole('dialog',{name:'Choose model',exact:true});
+  const back=picker.getByRole('button',{name:'Back to model providers'});
+  if(await back.isVisible())await back.click();
   const provider=id.includes('kimi')?'Moonshot AI':'OpenAI';
   await picker.locator('[data-provider]').filter({hasText:provider}).click();
   await picker.getByRole('combobox',{name:'Search models'}).fill(id);
@@ -759,7 +762,7 @@ for (const status of ['failed','queued']) test(`a ${status} model admission fail
     const retry=page.getByRole('button',{name:'Retry sending',exact:true});await retry.waitFor();await page.reload();await retry.waitFor();
     assert.equal(sentMessages(state,BOT_A).length,0,'restoring a configuration failure does not resubmit automatically');assert.equal(await page.getByRole('button',{name:'Continue',exact:true}).count(),0);
     await page.locator('#message').fill('Keep my next draft');await page.getByRole('button',{name:/^Model settings:/}).click();
-    const settings=page.getByRole('dialog',{name:'Model settings',exact:true});await chooseModel(page,settings.getByRole('combobox',{name:'Model',exact:true}),'account-fixed');await page.getByRole('button',{name:'Model settings: Account fixed',exact:true}).waitFor();await settings.getByRole('button',{name:'Close model settings'}).click();
+    const settings=page.getByRole('dialog',{name:'Model settings',exact:true});await chooseModel(page,settings,'account-fixed');await page.getByRole('button',{name:'Model settings: Account fixed',exact:true}).waitFor();await settings.getByRole('button',{name:'Close model settings'}).click();
     await page.route(`**/v1/bots/${BOT_A}/messages`,route=>{if(route.request().method()==='POST'){Object.assign(run,{status:'running',admissionRetryable:false,model:state.bots.find(bot=>bot.id===BOT_A).model,updatedAt:new Date(Date.now()+2000).toISOString()});delete run.error;}return route.continue();});
     await retry.click();await retry.waitFor({state:'hidden'});
     assert.deepEqual(sentMessages(state,BOT_A).map(call=>call.body),[{text,operationId:run.operationId,attachments:[attachment.artifactId],...(mentions.length?{mentions}:{})}]);
@@ -2518,11 +2521,11 @@ for(const viewport of [{width:1440,height:1050},{width:390,height:844}])test(`pr
     await page.locator('input[type=file][accept="image/png,image/jpeg"]').setInputFiles({name:'model-review.png',mimeType:'image/png',buffer:png});
     const color=await page.locator('#selected-avatar').getAttribute('data-agent-color');
     const trigger=page.getByRole('button',{name:/^Model settings:/});await trigger.click();
-    const settings=page.getByRole('dialog',{name:'Model settings',exact:true}),model=settings.getByRole('combobox',{name:'Model',exact:true});
+    const settings=page.getByRole('dialog',{name:'Model settings',exact:true}),model=settings;
     await chooseModel(page,model,'account-reviewer');await trigger.filter({hasText:'Account reviewer'}).waitFor();
-    assert.equal(await settings.getByRole('combobox',{name:'Reasoning effort'}).inputValue(),'high','a new model uses its declared default rather than a hardcoded low setting');
+    assert.equal(await settings.getByRole('group',{name:'Reasoning effort'}).getByRole('button',{name:'High',exact:true}).getAttribute('aria-pressed'),'true','a new model uses its declared default rather than a hardcoded low setting');
     await settings.getByRole('switch',{name:'Fast mode'}).click();await trigger.locator('[aria-label="Fast mode"]').waitFor();assert.equal(await settings.getByRole('switch',{name:'Fast mode'}).isChecked(),true,'Fast is displayed after the server acknowledges the setting');
-    await settings.getByRole('combobox',{name:'Reasoning effort'}).selectOption('xhigh');await trigger.filter({hasText:'Extra high'}).waitFor();
+    await settings.getByRole('group',{name:'Reasoning effort'}).getByRole('button',{name:'Extra high',exact:true}).click();await trigger.filter({hasText:'Extra high'}).waitFor();
     assert.deepEqual(state.calls.filter(call=>call.method==='PATCH').map(call=>Object.keys(call.body).sort()),Array.from({length:3},()=>['fast','model','reasoningEffort']),'model changes never resend unrelated bot fields');
     assert.equal(await page.locator('#selected-avatar').getAttribute('data-agent-color'),color,'model identity does not replace the stable bot color');
     assert.equal(await page.locator('#selected-avatar .timber-model-badge').getAttribute('data-model'),'account-reviewer');
@@ -2530,10 +2533,10 @@ for(const viewport of [{width:1440,height:1050},{width:390,height:844}])test(`pr
     if(process.env.TIMBER_CAPTURE_UI){await page.screenshot({path:`/tmp/timber-model-settings-${viewport.width}.png`,animations:'disabled'});await page.emulateMedia({colorScheme:'dark'});await page.screenshot({path:`/tmp/timber-model-settings-${viewport.width}-dark.png`,animations:'disabled'});await page.emulateMedia({colorScheme:'light'});await settings.getByRole('button',{name:'Close model settings'}).click();await page.screenshot({path:`/tmp/timber-model-controls-${viewport.width}.png`,animations:'disabled'});await trigger.click();}
     state.patchError={code:'settings_unavailable',message:'Model settings could not be saved.'};
     await chooseModel(page,model,'account-basic');await settings.getByRole('alert').filter({hasText:'Model settings could not be saved.'}).waitFor();
-    assert.equal(await model.getAttribute('title'),'account-reviewer');assert.equal(await page.locator('.timber-image-attachments img').count(),1);assert.equal(await page.locator('#message').inputValue(),'Keep this draft and its image.');
+    assert.equal(await trigger.getAttribute('title'),'account-reviewer · Extra high reasoning · Fast');assert.equal(await page.locator('.timber-image-attachments img').count(),1);assert.equal(await page.locator('#message').inputValue(),'Keep this draft and its image.');
     state.patchError=null;let release;state.patchGate=new Promise(resolve=>{release=resolve;});
     try{await chooseModel(page,model,'account-basic');await settings.getByRole('status').filter({hasText:'Saving…'}).waitFor();assert.equal(await page.locator('#message-form [type=submit]').isDisabled(),true,'sending waits for a model change to be acknowledged');}finally{release();state.patchGate=null;}
-    await trigger.filter({hasText:'Account basic'}).waitFor();assert.equal(await settings.getByRole('switch',{name:'Fast mode'}).count(),0);assert.equal(await settings.getByRole('combobox',{name:'Reasoning effort'}).count(),0);
+    await trigger.filter({hasText:'Account basic'}).waitFor();assert.equal(await settings.getByRole('switch',{name:'Fast mode'}).count(),0);assert.equal(await settings.getByRole('group',{name:'Reasoning effort'}).count(),0);
     await settings.getByRole('button',{name:'Close model settings'}).click();await sendMessage(page);await page.locator('#message').filter({hasText:''}).waitFor();
     await page.waitForFunction(()=>document.querySelector('#message').value==='');
     const accepted=state.runs.get(BOT_A).find(run=>run.model==='account-basic');assert.ok(accepted);assert.equal(accepted.fast,false);assert.equal(accepted.reasoningEffort,undefined,'unsupported reasoning is cleared when choosing another model');
@@ -2548,8 +2551,8 @@ test('unavailable model catalogs keep the saved model readable and allow a delib
     state.modelsError={code:'catalog_unavailable',message:'The model catalog is temporarily unavailable.'};await login();
     const trigger=page.getByRole('button',{name:/^Model settings:/});await trigger.click();
     const settings=page.getByRole('dialog',{name:'Model settings',exact:true});await settings.getByRole('alert').filter({hasText:'temporarily unavailable'}).waitFor();
-    const model=settings.getByRole('combobox',{name:'Model',exact:true});assert.equal(await model.isDisabled(),true);assert.equal(await model.getAttribute('title'),'gpt-6.1-sol');assert.equal(await model.textContent(),'gpt-6.1-sol');assert.equal(await settings.getByRole('switch').count(),0);
-    state.modelsError=null;await settings.getByRole('button',{name:'Try again'}).click();await page.waitForFunction(()=>!document.querySelector('.timber-model-popover .timber-model-picker-trigger').disabled);assert.equal(await model.textContent(),'GPT-6.1 Sol');
+    const model=settings.getByRole('combobox',{name:'Search model providers',exact:true});assert.equal(await model.isDisabled(),true);assert.equal(await trigger.textContent(),'gpt-6.1-sol');assert.equal(await settings.getByRole('switch').count(),0);
+    state.modelsError=null;await settings.getByRole('button',{name:'Try again'}).click();await page.waitForFunction(()=>!document.querySelector('.timber-model-popover .timber-model-search input').disabled);assert.equal(await trigger.locator('span').textContent(),'GPT-6.1 Sol');
     await page.keyboard.press('Escape');await settings.waitFor({state:'hidden'});
     // Radix restores focus in a deferred unmount callback, after the panel hides.
     await trigger.and(page.locator(':focus')).waitFor({timeout:3000});
@@ -2562,7 +2565,7 @@ test('disconnecting ChatGPT immediately makes model controls read-only',async()=
     await page.route('**/v1/connections/chatgpt',route=>{if(route.request().method()!=='DELETE')return route.continue();state.modelCatalog={...state.modelCatalog,models:[],connected:false};return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:false,status:'disconnected',revoked:true})});});
     await login();await page.locator('#settings-button').click();await page.locator('#disconnect-chatgpt').click();await page.locator('#chatgpt-status').filter({hasText:'Not connected'}).waitFor();await page.getByRole('button',{name:'Close settings',exact:true}).click();
     await page.getByRole('button',{name:/^Model settings:/}).click();const settings=page.getByRole('dialog',{name:'Model settings',exact:true});await settings.getByText('Connect ChatGPT or configure OpenRouter to choose a model.',{exact:true}).waitFor();
-    assert.equal(await settings.getByRole('combobox',{name:'Model',exact:true}).isDisabled(),true);assert.equal(await settings.getByRole('switch',{name:'Fast mode'}).count(),0);
+    assert.equal(await settings.getByRole('combobox',{name:'Search model providers',exact:true}).isDisabled(),true);assert.equal(await settings.getByRole('switch',{name:'Fast mode'}).count(),0);
   });
 });
 
@@ -2573,13 +2576,12 @@ test('combined model catalogs refresh concrete names and remain selectable after
     state.modelCatalog={connected:true,defaultModel:base.id,sources:[{id:'chatgpt',connected:true},{id:'openrouter',connected:true}],models:[{...base,routes:[{...base,modelId:base.id,source:'chatgpt'},paid]}]};
     await login();
     state.modelCatalog.models.push({id:'moonshotai/kimi-k3',name:'Kimi K3',provider:'openrouter',reasoningEfforts:[],supportsFast:false,routes:[{id:'moonshotai/kimi-k3',modelId:'moonshotai/kimi-k3',source:'openrouter',provider:'openrouter',name:'Kimi K3',reasoningEfforts:[],supportsFast:false}]});
-    const trigger=page.getByRole('button',{name:/^Model settings:/});await trigger.click();const settings=page.getByRole('dialog',{name:'Model settings',exact:true}),select=settings.getByRole('combobox',{name:'Model',exact:true});
+    const trigger=page.getByRole('button',{name:/^Model settings:/});await trigger.click();const settings=page.getByRole('dialog',{name:'Model settings',exact:true}),select=settings;
     await settings.getByText('ChatGPT subscription · OpenRouter fallback uses API credits',{exact:true}).waitFor();
-    await select.click();const picker=page.getByRole('dialog',{name:'Choose model',exact:true});await picker.locator('[data-provider="Moonshot AI"]').waitFor();assert.equal(await picker.getByRole('option').count(),2,'model creators are separate from routing providers');await picker.locator('[data-provider="Moonshot AI"]').click();assert.equal(await picker.getByRole('option').count(),1,'only models from the chosen provider are listed');await page.keyboard.press('Escape');
-    await page.keyboard.press('Escape');
+    const picker=settings;await picker.locator('[data-provider="Moonshot AI"]').waitFor();assert.equal(await picker.getByRole('option').count(),2,'model creators are separate from routing providers');await picker.locator('[data-provider="Moonshot AI"]').click();assert.equal(await picker.getByRole('option').count(),1,'only models from the chosen provider are listed');await page.keyboard.press('Escape');
     await page.route('**/v1/connections/chatgpt',route=>{if(route.request().method()!=='DELETE')return route.continue();state.modelCatalog={...state.modelCatalog,sources:[{id:'chatgpt',connected:false},{id:'openrouter',connected:true}],models:[{...base,provider:'openrouter',routes:[paid]},state.modelCatalog.models[1]]};return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:false,status:'disconnected',revoked:true})});});
     await page.locator('#settings-button').click();await page.locator('#disconnect-chatgpt').click();await page.locator('#chatgpt-status').filter({hasText:'Not connected'}).waitFor();await page.getByRole('button',{name:'Close settings',exact:true}).click();
-    await trigger.click();await settings.getByText('OpenRouter · Uses API credits',{exact:true}).waitFor();await page.waitForFunction(()=>!document.querySelector('.timber-model-popover .timber-model-picker-trigger').disabled);assert.equal(await select.getAttribute('title'),'gpt-6.1-sol','disconnecting a source does not change the selected model');await chooseModel(page,select,'moonshotai/kimi-k3');await trigger.filter({hasText:'Kimi K3'}).waitFor();
+    await trigger.click();await settings.getByText('OpenRouter · Uses API credits',{exact:true}).waitFor();await page.waitForFunction(()=>!document.querySelector('.timber-model-popover .timber-model-search input').disabled);assert.equal(await trigger.getAttribute('title'),'gpt-6.1-sol','disconnecting a source does not change the selected model');await chooseModel(page,select,'moonshotai/kimi-k3');await trigger.filter({hasText:'Kimi K3'}).waitFor();
   });
 });
 
@@ -2615,7 +2617,7 @@ for(const width of [1440,390])test(`model failures show actionable safe diagnost
     assert.equal(await notice.getByRole('button',{name:'Continue',exact:true}).count(),0);assert.equal(await notice.getByRole('button',{name:'Try again',exact:true}).count(),0);assert.equal(await page.getByText('Private provider detail must never be rendered.',{exact:true}).count(),0);assert.equal(sentMessages(state,BOT_A).length,0);
     await page.reload();await notice.getByRole('button',{name:'Review model settings',exact:true}).waitFor();await notice.locator('summary').click();await notice.getByText('model_fast_unsupported',{exact:true}).waitFor();await notice.getByText('gpt-6-astra · high reasoning · Fast',{exact:true}).waitFor();
     if(process.env.TIMBER_CAPTURE_UI)await page.screenshot({path:`/tmp/timber-model-failure-${width}.png`,animations:'disabled'});
-    await page.locator('#message').fill('Preserve this draft');await notice.getByRole('button',{name:'Review model settings',exact:true}).click();const settings=page.getByRole('dialog',{name:'Model settings',exact:true});await settings.waitFor();assert.equal(await settings.getByRole('combobox',{name:'Model',exact:true}).getAttribute('title'),'gpt-6-astra');assert.equal(await settings.getByRole('switch',{name:'Fast mode'}).isChecked(),true);assert.equal(await page.locator('#message').inputValue(),'Preserve this draft');assert.equal(sentMessages(state,BOT_A).length,0,'reviewing settings never retries the failed request');
+    await page.locator('#message').fill('Preserve this draft');await notice.getByRole('button',{name:'Review model settings',exact:true}).click();const settings=page.getByRole('dialog',{name:'Model settings',exact:true});await settings.waitFor();assert.equal(await page.getByRole('button',{name:/^Model settings:/}).getAttribute('title'),'gpt-6-astra · High reasoning · Fast');assert.equal(await settings.getByRole('switch',{name:'Fast mode'}).isChecked(),true);assert.equal(await page.locator('#message').inputValue(),'Preserve this draft');assert.equal(sentMessages(state,BOT_A).length,0,'reviewing settings never retries the failed request');
   },{viewport:{width,height:900},...(width<760?{isMobile:true,hasTouch:true}:{})});
 });
 

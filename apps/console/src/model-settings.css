@@ -8,8 +8,8 @@
 .timber-model-trigger>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .timber-model-trigger>small{flex:none;font-size:10px}
 .timber-model-trigger>svg{width:12px;height:12px;flex:none}
-.timber-model-popover{z-index:80;width:320px;max-width:calc(100vw - 24px);max-height:min(460px,var(--radix-popover-content-available-height));overflow:auto;border:1px solid var(--line);border-radius:15px;padding:14px;background:var(--surface);color:var(--ink);box-shadow:0 10px 40px #0002;outline:none}
-.timber-model-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:13px}
+.timber-model-popover{z-index:80;display:flex;flex-direction:column;width:360px;max-width:calc(100vw - 24px);max-height:var(--radix-popover-content-available-height);overflow:auto;border:1px solid var(--line);border-radius:15px;background:var(--surface);color:var(--ink);box-shadow:0 10px 40px #0002;outline:none}
+.timber-model-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 14px;border-bottom:1px solid var(--line);font-size:13px}
 .timber-model-heading>strong{font-weight:550}
 .timber-model-heading>button{display:flex;align-items:center;justify-content:center;width:30px;min-height:30px;padding:4px;border:0;background:transparent;color:var(--muted);border-radius:7px}
 .timber-model-heading svg{width:15px;height:15px}
@@ -26,4 +26,15 @@
 .timber-model-error{font-size:12px;color:var(--danger);line-height:1.5;margin:10px 0 0}
 .timber-model-error p{margin:0 0 6px}
 .timber-model-error button{background:transparent;border:0;padding:3px 0;min-height:30px;color:var(--ink);text-decoration:underline;font-size:12px}
-@media(max-width:760px){.timber-model-settings{min-height:34px;padding-top:0}.timber-model-trigger{min-height:34px;font-size:11px}.timber-model-heading>button{width:36px;min-height:36px}.timber-model-field>select{font-size:16px;min-height:44px}.timber-model-fast{min-height:44px}}
+.timber-model-popover>.timber-model-picker-content{flex-shrink:0}
+.timber-model-popover .timber-model-list{max-height:200px}
+.timber-model-options{padding:12px 14px;border-top:1px solid var(--line)}
+.timber-model-current{display:flex;flex-direction:column;gap:4px;font-size:13px;overflow-wrap:anywhere}
+.timber-model-current>span{font-size:11px;color:var(--muted)}
+.timber-model-options .timber-model-field{margin:10px 0}
+.timber-model-options .timber-model-help{margin-bottom:8px}
+.timber-model-efforts{display:flex;flex-wrap:wrap;gap:4px}
+.timber-model-efforts>button{flex:1;min-height:36px;padding:6px 8px;border:1px solid var(--line);border-radius:7px;background:transparent;color:var(--muted);font-size:12px;font-weight:400}
+.timber-model-efforts>button[aria-pressed=true]{background:var(--soft);border-color:var(--muted);color:var(--ink)}
+.timber-model-efforts>button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+@media(max-width:760px){.timber-model-settings{min-height:34px;padding-top:0}.timber-model-trigger{min-height:34px;font-size:11px}.timber-model-heading>button{width:36px;min-height:36px}.timber-model-field>select{font-size:16px;min-height:44px}.timber-model-fast{min-height:44px}.timber-model-popover{width:calc(100vw - 24px)}.timber-model-efforts>button{min-height:44px}}

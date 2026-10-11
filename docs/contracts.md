@@ -145,7 +145,9 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   `anthropic`, `google`) independently of `provider`, which selects inference
   transport. OpenRouter discovery retains the publisher namespace from the
   upstream model ID before canonicalization; ChatGPT account models use `openai`.
-  The console first selects this creator, then one of its concrete models.
+  The console first selects this creator, then one of its concrete models inside
+  the same popover. The chat opens this picker directly and keeps reasoning and
+  Fast controls in that panel; model selection never opens a second dropdown.
 - GET /v1/bots -> {bots:Bot[]}
 - POST /v1/bots {name,instructions?,model?,reasoningEffort?,fast?,computerApprovalMode?,allowNamedAgents?,allowTaskCreation?} -> 201 {bot:Bot}
 - GET /v1/bots/:id -> {bot:Bot}
