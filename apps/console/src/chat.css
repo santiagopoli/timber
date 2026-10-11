@@ -96,6 +96,11 @@
 .timber-task-outcome-heading svg{width:16px;height:16px;color:var(--danger);flex-shrink:0}
 .timber-task-outcome p{margin:8px 0 12px;color:var(--muted);overflow-wrap:anywhere}
 .timber-task-outcome button,.timber-task-outcome [data-slot="button"]{min-height:40px}
+/* Delivery and model failures belong to the original user bubble. */
+.timber-message-notice{font-size:12px;line-height:1.6;min-width:0;max-width:100%;padding:10px 0 0;margin:8px 0 0;border-top:1px solid var(--line);border-radius:0;background:transparent;white-space:normal}
+.timber-message-notice .timber-task-outcome-heading{font-size:12px;color:var(--ink)}
+.timber-message-notice p{margin:6px 0 8px;color:var(--muted);overflow-wrap:anywhere}
+.timber-message-notice button,.timber-message-notice [data-slot="button"]{max-width:100%;height:auto;min-height:36px;white-space:normal}
 .timber-failure-details{margin:8px 0 12px;font-size:11px;color:var(--muted);overflow-wrap:anywhere}
 .timber-failure-details summary{cursor:pointer;width:fit-content}
 .timber-failure-details code{display:block;margin-top:7px;font-size:11px}

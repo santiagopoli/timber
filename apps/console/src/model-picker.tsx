@@ -4,20 +4,24 @@ import {Popover} from 'radix-ui';
 import {Command} from 'cmdk';
 import {ArrowLeftIcon, CheckIcon, ChevronDownIcon, ChevronRightIcon, SearchIcon, ZapIcon} from 'lucide-react';
 import './model-picker.css';
+import {modelBillingLines, type ModelUsage} from './model-billing';
+import type {ModelSettings} from '../../../packages/contracts/src/models';
 
 export type PickerChoice = {
   id:string;label:string;available:boolean;unavailableReason?:string;
   providerLabel?:string;sourceLabel?:string;supportsFast?:boolean;
+  usage?:ModelUsage;reasoningEfforts?:string[];defaultReasoningEffort?:string;
   /** Unavailable avatar models can still be saved as theme configuration. */
   selectable?:boolean;
 };
 type PickerProps = {
   id?:string;value:string;choices:PickerChoice[];disabled?:boolean;loading?:boolean;
+  settings?:ModelSettings;
   onChange(value:string):void;
 };
 
 /** Provider and model navigation, embedded in the caller's single popover. */
-export function ModelPickerContent({value,choices,disabled=false,loading=false,onChange}:Omit<PickerProps,'id'>) {
+export function ModelPickerContent({value,choices,disabled=false,loading=false,settings,onChange}:Omit<PickerProps,'id'>) {
   const [query,setQuery]=useState(''),[provider,setProvider]=useState<string|null>(null);
   const input=useRef<HTMLInputElement>(null);
   useEffect(()=>{if(!loading)input.current?.focus();},[loading]);
@@ -49,6 +53,7 @@ export function ModelPickerContent({value,choices,disabled=false,loading=false,o
                 <span className="timber-model-option-copy"><span className="timber-model-option-name">{choice.label}{choice.supportsFast&&<ZapIcon aria-label="Supports Fast mode"/>}</span>
                   {choice.label!==choice.id&&<span className="timber-model-option-id">{choice.id}</span>}
                   {choice.sourceLabel&&<span className="timber-model-option-detail">{choice.sourceLabel}</span>}
+                  {modelBillingLines(choice.usage,{model:choice.id,fast:Boolean(settings?.fast&&choice.supportsFast),reasoningEffort:settings?.reasoningEffort&&choice.reasoningEfforts?.includes(settings.reasoningEffort)?settings.reasoningEffort:choice.defaultReasoningEffort},true).map((line,index)=><span key={index} className="timber-model-option-detail timber-model-price">{line}</span>)}
                   {!choice.available&&<span className="timber-model-option-detail">{choice.unavailableReason||'Unavailable'}{choice.selectable?' · Configuration only':''}</span>}
                 </span>
                 {choice.id===value&&<CheckIcon className="timber-model-check" aria-label="Current model"/>}
@@ -58,7 +63,7 @@ export function ModelPickerContent({value,choices,disabled=false,loading=false,o
   </div>;
 }
 
-export function ModelPicker({id,value,choices,disabled=false,loading=false,onChange}:PickerProps) {
+export function ModelPicker({id,value,choices,disabled=false,loading=false,settings,onChange}:PickerProps) {
   const [open,setOpen]=useState(false);
   const current=choices.find(choice=>choice.id===value);
   return <Popover.Root open={open&&!disabled&&!loading} onOpenChange={setOpen}>
@@ -70,7 +75,7 @@ export function ModelPicker({id,value,choices,disabled=false,loading=false,onCha
     {/* Native modal dialogs live above body portals. Keep their picker in the same top layer. */}
     <Popover.Portal container={(id&&document.getElementById(id)?.closest('dialog'))||document.fullscreenElement||document.body}>
       <Popover.Content className="timber-model-picker" align="start" sideOffset={6} collisionPadding={12} aria-label="Choose model" onCloseAutoFocus={event=>{if(disabled||loading)event.preventDefault();}}>
-        <ModelPickerContent value={value} choices={choices} disabled={disabled} loading={loading} onChange={next=>{if(next!==value)onChange(next);setOpen(false);}}/>
+        <ModelPickerContent value={value} choices={choices} disabled={disabled} loading={loading} settings={settings} onChange={next=>{if(next!==value)onChange(next);setOpen(false);}}/>
       </Popover.Content>
     </Popover.Portal>
   </Popover.Root>;

@@ -24,6 +24,7 @@ function harness() {
     mountToolActivity: () => ({update: value => activityModels.push(value), clear() {}, setActive() {}}),
     mountAgents: () => ({update: value => agentModels.push(value), clear() {}, setActive() {}}),
     mountModelPicker: () => ({update() {}}),
+    modelUsage: () => ({routes: []}), modelBillingLines: () => [],
     createDesktopViewer: () => ({disconnect() {}, setActive() {}}), mountWorkspaceExplorer: () => ({clear() {}}),
     agentColor: () => 'blue', modelBadgeLabel: () => 'M', hasBotMention: () => false, canRetryAdmission: run => run.admissionRetryable,
     requestAnimationFrame: fn => {const id = ++nextId; frames.set(id, fn); return id;}, cancelAnimationFrame: id => frames.delete(id),

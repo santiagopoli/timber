@@ -37,4 +37,7 @@
 .timber-model-efforts>button{flex:1;min-height:36px;padding:6px 8px;border:1px solid var(--line);border-radius:7px;background:transparent;color:var(--muted);font-size:12px;font-weight:400}
 .timber-model-efforts>button[aria-pressed=true]{background:var(--soft);border-color:var(--muted);color:var(--ink)}
 .timber-model-efforts>button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+.timber-model-billing{display:flex;flex-direction:column;gap:4px;margin:8px 0;color:var(--muted);font-size:11px;line-height:1.5;overflow-wrap:anywhere}
+.timber-model-billing>p{margin:0}
+#bot-model-help,#edit-model-help{white-space:pre-line}
 @media(max-width:760px){.timber-model-settings{min-height:34px;padding-top:0}.timber-model-trigger{min-height:34px;font-size:11px}.timber-model-heading>button{width:36px;min-height:36px}.timber-model-field>select{font-size:16px;min-height:44px}.timber-model-fast{min-height:44px}.timber-model-popover{width:calc(100vw - 24px)}.timber-model-efforts>button{min-height:44px}}

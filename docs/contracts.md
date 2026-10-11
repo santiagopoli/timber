@@ -148,6 +148,12 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   The console first selects this creator, then one of its concrete models inside
   the same popover. The chat opens this picker directly and keeps reasoning and
   Fast controls in that panel; model selection never opens a second dropdown.
+  Prices use the admitted source's published USD rates per million input, output
+  and cached-input tokens. ChatGPT entries show subscription allowance separately
+  from conditional paid fallback rates. Missing prices are unknown, never zero;
+  Fast does not inherit standard-tier prices as a Fast quote. The selected model
+  shows the complete ordered billing routes and settings-incompatible fallbacks.
+  Image-avatar API billing stays separate and has no inferred token price.
 - GET /v1/bots -> {bots:Bot[]}
 - POST /v1/bots {name,instructions?,model?,reasoningEffort?,fast?,computerApprovalMode?,allowNamedAgents?,allowTaskCreation?} -> 201 {bot:Bot}
 - GET /v1/bots/:id -> {bot:Bot}
@@ -191,6 +197,14 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   drag/drop, removable previews, and retains attachments after a failed send.
   Blob conversion uses FileReader, without weakening the console CSP.
   Image attachments with bot mentions are currently rejected, not silently omitted.
+
+  The console embeds delivery failures and failed/interrupted model requests
+  inside the originating user-message bubble, including safe diagnostics and
+  existing explicit recovery controls. Accepted pending receipts reconcile with
+  the canonical transcript without duplicating the error. If the original message
+  is not loaded, its run diagnostic remains visible until that message is available.
+  Copying a message preserves only its original text. Moving a diagnostic never
+  resends input or replays tools; delivery retries retain the original operation ID.
 
   The receipt confirms durable storage of the user input. A busy named bot admits
   subsequent inputs as native Pi steering: they join at the next completed tool

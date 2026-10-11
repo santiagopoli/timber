@@ -4,9 +4,11 @@ import {ChevronDownIcon, LoaderCircleIcon, XIcon, ZapIcon} from 'lucide-react';
 import type {ModelSettings as InferenceSettings} from '../../../packages/contracts/src/index';
 import './model-settings.css';
 import {ModelPickerContent} from './model-picker';
+import {modelBillingLines, type ModelUsage} from './model-billing';
 
 export type ModelChoice = {
   id:string;label:string;available:boolean;unavailableReason?:string;sourceLabel?:string;providerLabel?:string;
+  usage?:ModelUsage;
   reasoningEfforts:string[];defaultReasoningEffort?:string;supportsFast:boolean;
 };
 export type ModelSelection = InferenceSettings;
@@ -36,7 +38,7 @@ export function ModelSettings({value,state,onChange,onRefresh,disabled=false}: {
       <Popover.Portal container={document.fullscreenElement||document.body}>
         <Popover.Content className="timber-model-popover" side="top" align="start" sideOffset={8} collisionPadding={12} aria-label="Model settings">
           <div className="timber-model-heading"><strong>Choose a model</strong><Popover.Close aria-label="Close model settings"><XIcon aria-hidden="true"/></Popover.Close></div>
-          <ModelPickerContent value={value.model} choices={state.choices} disabled={disabled||saving||!state.choices.some(choice=>choice.available)} loading={state.loading} onChange={selectModel}/>
+          <ModelPickerContent value={value.model} choices={state.choices} disabled={disabled||saving||!state.choices.some(choice=>choice.available)} loading={state.loading} settings={value} onChange={selectModel}/>
           <div className="timber-model-options">
           <div className="timber-model-current"><strong>{current?.label||value.model}</strong><span>Default for new messages and subagents.</span></div>
           {state.loading&&<p className="timber-model-help" role="status"><LoaderCircleIcon className="timber-spinner"/>Loading available models…</p>}
@@ -44,6 +46,7 @@ export function ModelSettings({value,state,onChange,onRefresh,disabled=false}: {
           {state.error&&<div className="timber-model-error" role="alert"><p>{state.error}</p><button type="button" onClick={onRefresh}>Try again</button></div>}
           {current?.unavailableReason&&<p className="timber-model-help">{current.unavailableReason}</p>}
           {current?.sourceLabel&&<p className="timber-model-help">{current.sourceLabel}</p>}
+          {current?.usage&&<div className="timber-model-billing" aria-label="Model usage and pricing">{modelBillingLines(current.usage,value).map((line,index)=><p key={index}>{line}</p>)}{current.usage.routes.length>1&&<p>Fallback is used only after a quota or billing limit, when the request is compatible.</p>}</div>}
           {Boolean(current?.reasoningEfforts.length)&&<div className="timber-model-field"><span>Reasoning</span><div className="timber-model-efforts" role="group" aria-label="Reasoning effort">
             {current?.reasoningEfforts.map(effort=><button key={effort} type="button" aria-pressed={effort===(value.reasoningEffort||current.defaultReasoningEffort)} disabled={disabled||saving||!current.available} onClick={()=>void update({...value,reasoningEffort:effort})}>{effortLabel(effort)}</button>)}
           </div></div>}
