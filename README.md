@@ -230,6 +230,9 @@ For `npm run dev`, build the console first. The API Worker serves
 required. Component provenance and licenses are in
 `apps/console/THIRD_PARTY_NOTICES.md`.
 
+Browser tests reuse Chromium per file and isolate scenarios in fresh contexts.
+The console test runner limits parallel files to two to bound CPU/memory use.
+
 These use real Chromium with local HTTP API fixtures, with no model or cloud
 charges. They cover bot editing, draft isolation, stale SSE, active-run recovery,
 pagination, approvals, screenshot input, files, session expiry, and mobile layout.
@@ -425,7 +428,9 @@ The BotDO keeps messages, runs, approvals and replayable events in SQLite. R2
 stores private artifacts and immutable workspace archives. A computer stops after
 five idle minutes only after a successful checkpoint; active runs renew its lease.
 Container root filesystems are ephemeral. Checkpoints preserve `/workspace` and
-the Chromium profile, not process RAM or running tasks. Dependency caches are
+the Chromium profile, not process RAM or running tasks. Automatic file saves keep
+Chromium open and reuse its last consistent closed profile; explicit checkpoints
+and idle/suspend saves flush the current profile. Dependency caches are
 excluded. An abrupt failure can lose changes since the last successful checkpoint;
 an interrupted effect is reported instead of automatically repeated.
 

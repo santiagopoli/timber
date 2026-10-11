@@ -11,7 +11,7 @@ const hash=async(bytes:Uint8Array)=>Array.from(new Uint8Array(await crypto.subtl
 afterEach(()=>vi.restoreAllMocks());
 
 function computer() {
-  const state={effects:0,archives:0,uploads:0,heads:0,failUploads:0,bootId:'boot',running:true,destroys:0,restore:0,contents:'saved workspace',commandError:undefined as string|undefined};
+  const state={effects:0,archives:0,uploads:0,heads:0,failUploads:0,bootId:'boot',running:true,destroys:0,restore:0,contents:'saved workspace',commandError:undefined as string|undefined,archiveOptions:[] as {quiesce:boolean;preserveBrowser:boolean}[]};
   const files={async put(key:string,value:ReadableStream,options:R2PutOptions){state.uploads++;if(state.failUploads>0){state.failUploads--;throw new Error('network failure private-detail');}return bindings.FILES.put(key,value,options);},async head(key:string){state.heads++;return bindings.FILES.head(key);},get:(key:string)=>bindings.FILES.get(key)};
   const container={get running(){return state.running;},async setInactivityTimeout(){},async destroy(){state.destroys++;state.running=false;},getTcpPort(){return {async fetch(input:string,init?:RequestInit){
     const path=new URL(input).pathname;
@@ -19,6 +19,7 @@ function computer() {
     if(path==='/actions') {state.effects++;return Response.json({status:state.commandError?'failed':'completed',exitCode:state.commandError?1:0,output:'command output',error:state.commandError});}
     if(path==='/restore') {state.restore++;await new Response(init?.body).arrayBuffer();return Response.json({ok:true});}
     expect(path).toBe('/checkpoint');state.archives++;
+    state.archiveOptions.push(JSON.parse(String(init?.body)));
     const bytes=new TextEncoder().encode(state.contents);
     // Deliberately unknown stream length, even with a valid HTTP length header.
     const body=new ReadableStream<Uint8Array>({start(controller){controller.enqueue(bytes.subarray(0,3));controller.enqueue(bytes.subarray(3));controller.close();}});
@@ -55,6 +56,7 @@ describe('checkpoint upload and durable recovery',()=>{
       await instance.fetch(request(botId,'observe',{type:'execPoll',processId:'read-command',yieldMs:0}));
       await due(state.storage);await instance.alarm!();
       expect(vm.state.archives).toBe(1);expect(vm.state.uploads).toBe(1);expect(vm.state.effects).toBe(3);
+      expect(vm.state.archiveOptions).toEqual([{quiesce:false,preserveBrowser:true}]);
       for(const id of ['first-write','second-write','read-command']) expect(await state.storage.get(`operation:${id}`)).toMatchObject({result:{checkpointStatus:'saved',checkpointId:expect.any(String)}});
     });
   });
@@ -114,6 +116,7 @@ describe('checkpoint upload and durable recovery',()=>{
       const latest=(await state.storage.get<{key:string}>('lastCheckpoint'))!;
       expect(await (await bindings.FILES.get(latest.key))!.text()).toBe(vm.state.contents);
       expect(vm.state.archives).toBe(2);expect(vm.state.destroys).toBe(kind==='suspend'?1:0);
+      expect(vm.state.archiveOptions).toEqual([{quiesce:false,preserveBrowser:true},{quiesce:kind==='suspend',preserveBrowser:false}]);
     });
   });
 

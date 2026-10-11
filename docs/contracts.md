@@ -578,6 +578,14 @@ upload. Later writes have higher revisions and remain pending when an older uplo
 finishes. Explicit checkpoint and suspend wait for an in-flight upload outside
 the gates, then capture fresh files. Deletion drains background uploads before
 acknowledging cleanup. Uploads enforce the declared byte length with a streaming transfer and verify SHA-256.
+Automatic captures leave a managed Chromium process and its live page state
+running. They exclude its actively written profile and include the last consistent
+closed-profile baseline instead. The server refreshes that baseline before each
+browser launch, including after an explicit checkpoint. New cookies, sessions and
+other profile changes become durable through an explicit checkpoint or idle/suspend
+capture, which closes Chromium to flush the current profile. A file checkpoint
+alone does not claim that recent live browser changes were saved. Computers on an
+older image retain their previous capture behavior until their next natural start.
 The upload candidate is recorded before R2 admission; recovery checks its size and
 checksum and atomically publishes its pointer and affected operation receipts.
 A lost pointer write can therefore recover an existing upload without rerunning a

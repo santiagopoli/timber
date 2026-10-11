@@ -95,6 +95,7 @@ class Computer:
             boot_file.write_text(str(uuid.uuid4()))
         self.boot_id = boot_file.read_text()
         self.browser: subprocess.Popen | None = None
+        self.browser_checkpoint_profile = self.state / "browser-checkpoint-profile"
 
     def path(self, relative: str, *, allow_root: bool = False) -> Path:
         if not isinstance(relative, str) or "\x00" in relative:
@@ -522,7 +523,19 @@ class Computer:
             self.activate_browser()
             return
         profile = self.workspace / ".browser-profile"
+        if not profile.resolve().is_relative_to(self.workspace):
+            raise ValueError("Browser profile must remain inside the workspace")
         profile.mkdir(exist_ok=True)
+        # Capture only a closed profile. Automatic file checkpoints reuse this
+        # baseline rather than copying Chromium's live SQLite/session files.
+        stage = Path(tempfile.mkdtemp(prefix="browser-profile-", dir=self.state))
+        try:
+            shutil.copytree(profile, stage, dirs_exist_ok=True, symlinks=True,
+                            ignore=shutil.ignore_patterns("Singleton*", "Cache", "Code Cache", "GPUCache", "ShaderCache", "GrShaderCache", *EXCLUDED))
+            shutil.rmtree(self.browser_checkpoint_profile, ignore_errors=True)
+            os.replace(stage, self.browser_checkpoint_profile)
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
         log = open(self.state / "chromium.log", "ab")
         self.browser = subprocess.Popen([
             "chromium", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-first-run",
@@ -681,50 +694,67 @@ class Computer:
         except (OSError, subprocess.SubprocessError):
             return {"status": "failed", "error": "Git transport failed; inspect repository and remote state before retrying."}
 
-    def checkpoint(self, resume_browser: bool = True) -> Path:
-        """Quiesce Chromium, archive only portable filesystem contents, detect races.
+    def checkpoint(self, resume_browser: bool = True, preserve_browser: bool = False) -> Path:
+        """Archive portable files; automatic saves reuse a closed browser profile.
 
         Managed calls are serialized. External/background writers can still exist;
         metadata checks reject detectable races rather than claim a live disk image.
         """
         with self.workspace_snapshot():
             browser_was_running = self.browser is not None and self.browser.poll() is None
-            self.close_browser()
+            live_browser = preserve_browser and resume_browser and browser_was_running
+            if live_browser:
+                if self.browser_checkpoint_profile.is_symlink() or not self.browser_checkpoint_profile.is_dir():
+                    raise ValueError("A consistent browser profile is unavailable; use an explicit checkpoint")
+            else:
+                self.close_browser()
             fd, name = tempfile.mkstemp(suffix=".tar.gz", dir=self.state)
             os.close(fd)
             target = Path(name)
             total = 0
             root_stat = self.workspace.stat()
-            before = {".": (root_stat.st_size, root_stat.st_mtime_ns)}
+            before = {self.workspace: (root_stat.st_size, root_stat.st_mtime_ns)}
             try:
                 with tarfile.open(target, "w:gz", dereference=False) as archive:
-                    for base, dirs, files in os.walk(self.workspace, followlinks=False):
-                        dirs[:] = sorted(d for d in dirs if d not in EXCLUDED)
-                        if Path(base).relative_to(self.workspace).parts[:1] == (".browser-profile",):
-                            dirs[:] = [d for d in dirs if d not in {"Cache", "Code Cache", "GPUCache", "ShaderCache", "GrShaderCache"}]
-                        for entry in sorted(dirs + files):
-                            path = Path(base) / entry
-                            rel = path.relative_to(self.workspace).as_posix()
-                            if path.is_symlink():
-                                resolved = path.resolve()
-                                if not resolved.is_relative_to(self.workspace):
-                                    # Browser singleton sockets/locks are process-local.
-                                    if rel.startswith(".browser-profile/") and path.name.startswith("Singleton"):
-                                        continue
-                                    raise ValueError(f"Checkpoint contains an escaping symlink: {rel}")
-                            stat = path.lstat()
-                            if not (path.is_file() or path.is_dir() or path.is_symlink()):
-                                raise ValueError(f"Checkpoint contains a nonportable special file: {rel}")
-                            total += stat.st_size
-                            if total > MAX_ARCHIVE or len(before) >= MAX_FILES:
-                                raise ValueError("Workspace exceeds checkpoint limit (256 MiB, 10000 entries)")
-                            before[rel] = (stat.st_size, stat.st_mtime_ns)
-                            # Store hardlinked files as independent regular files;
-                            # the portable restore deliberately rejects hardlinks.
-                            archive.inodes.clear()
-                            archive.add(path, arcname=rel, recursive=False)
-                for rel, stamp in before.items():
-                    stat = (self.workspace / rel).lstat()
+                    sources = [(self.workspace, "")]
+                    if live_browser:
+                        sources.append((self.browser_checkpoint_profile, ".browser-profile"))
+                    for source, prefix in sources:
+                        if prefix:
+                            stamp = source.stat()
+                            before[source] = (stamp.st_size, stamp.st_mtime_ns)
+                            archive.add(source, arcname=prefix, recursive=False)
+                        for base, dirs, files in os.walk(source, followlinks=False):
+                            dirs[:] = sorted(d for d in dirs if d not in EXCLUDED)
+                            if live_browser and Path(base) == self.workspace:
+                                dirs[:] = [d for d in dirs if d != ".browser-profile"]
+                                files[:] = [f for f in files if f != ".browser-profile"]
+                            relative_base = Path(prefix) / Path(base).relative_to(source)
+                            if relative_base.parts[:1] == (".browser-profile",):
+                                dirs[:] = [d for d in dirs if d not in {"Cache", "Code Cache", "GPUCache", "ShaderCache", "GrShaderCache"}]
+                            for entry in sorted(dirs + files):
+                                path = Path(base) / entry
+                                rel = (relative_base / entry).as_posix()
+                                if path.is_symlink():
+                                    resolved = ((self.workspace / rel).parent / os.readlink(path)).resolve()
+                                    if not resolved.is_relative_to(self.workspace):
+                                        # Browser singleton sockets/locks are process-local.
+                                        if rel.startswith(".browser-profile/") and path.name.startswith("Singleton"):
+                                            continue
+                                        raise ValueError(f"Checkpoint contains an escaping symlink: {rel}")
+                                stat = path.lstat()
+                                if not (path.is_file() or path.is_dir() or path.is_symlink()):
+                                    raise ValueError(f"Checkpoint contains a nonportable special file: {rel}")
+                                total += stat.st_size
+                                if total > MAX_ARCHIVE or len(before) >= MAX_FILES:
+                                    raise ValueError("Workspace exceeds checkpoint limit (256 MiB, 10000 entries)")
+                                before[path] = (stat.st_size, stat.st_mtime_ns)
+                                # Store hardlinked files as independent regular files;
+                                # the portable restore deliberately rejects hardlinks.
+                                archive.inodes.clear()
+                                archive.add(path, arcname=rel, recursive=False)
+                for path, stamp in before.items():
+                    stat = path.lstat()
                     if (stat.st_size, stat.st_mtime_ns) != stamp:
                         raise ValueError("Workspace changed during checkpoint; stop background writers and retry")
                 if target.stat().st_size > MAX_ARCHIVE:
@@ -734,7 +764,7 @@ class Computer:
                 target.unlink(missing_ok=True)
                 raise
             finally:
-                if resume_browser and browser_was_running:
+                if resume_browser and browser_was_running and not live_browser:
                     self.ensure_browser()
 
     def close_browser(self):
@@ -863,7 +893,7 @@ def create_handler(computer: Computer, token: str):
                 desktop = all(shutil.which(tool) for tool in ["scrot", "xdotool", "chromium", "xclip"])
                 if desktop:
                     desktop = subprocess.run(["xdotool", "getdisplaygeometry"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2).returncode == 0
-                return self.respond(200, {"ok": True, "bootId": computer.boot_id, "desktop": desktop, "capabilities": ["gitClone", "gitPush", "workspace", "execSessions"] + (["move", "doubleClick", "drag"] if desktop else []) + (["liveDesktop"] if desktop and desktop_ready() else [])})
+                return self.respond(200, {"ok": True, "bootId": computer.boot_id, "desktop": desktop, "capabilities": ["gitClone", "gitPush", "workspace", "execSessions", "preserveBrowserCheckpoint"] + (["move", "doubleClick", "drag"] if desktop else []) + (["liveDesktop"] if desktop and desktop_ready() else [])})
             parsed = urlparse(self.path)
             if parsed.path.startswith("/workspace/"):
                 try:
@@ -919,7 +949,7 @@ def create_handler(computer: Computer, token: str):
                 if self.path == "/actions":
                     return self.respond(200, computer.execute(body["operationId"], body["action"], body.get("gitTransport")))
                 if self.path == "/checkpoint":
-                    path = computer.checkpoint(resume_browser=not body.get("quiesce", False))
+                    path = computer.checkpoint(resume_browser=not body.get("quiesce", False), preserve_browser=body.get("preserveBrowser", False))
                     try:
                         return self.stream(path, "application/gzip")
                     finally:

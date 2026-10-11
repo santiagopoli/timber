@@ -11,8 +11,10 @@ import {readFile, writeFile} from 'node:fs/promises';
 import {createHash} from 'node:crypto';
 import {resolve} from 'node:path';
 import {performance} from 'node:perf_hooks';
-import {chromium} from 'playwright';
+import {createConsoleBrowser} from './console-browser.mjs';
 import {createConsoleFixture, TEST_TOKEN, BOT_A, BOT_B} from './console-fixture.mjs';
+
+const consoleBrowser = createConsoleBrowser();
 
 const MESSAGE_COUNT = 1200, UPDATES_PER_BATCH = 12, BATCHES = 3;
 const BASELINE = process.env.LONG_CONVERSATION_BASELINE === '1';
@@ -114,10 +116,7 @@ async function selectBot(page, botId) {
 
 test('1200 mixed-Markdown messages stay seamless while live updates perform bounded history render work', async () => {
   const fixture = await createConsoleFixture();
-  const browser = await chromium.launch({headless: true,
-    ...(process.env.CONSOLE_CHROMIUM_PATH ? {executablePath: process.env.CONSOLE_CHROMIUM_PATH} : {}),
-    ...(process.env.CONSOLE_CHROMIUM_ARGS ? {args: JSON.parse(process.env.CONSOLE_CHROMIUM_ARGS)} : {}),
-  });
+  const browser = await consoleBrowser();
   const context = await browser.newContext({viewport: {width: 1440, height: 1050}});
   const page = await context.newPage(), errors = [];
   page.setDefaultTimeout(180000); // readiness only, not a performance budget
@@ -275,7 +274,7 @@ test('1200 mixed-Markdown messages stay seamless while live updates perform boun
     console.log(`LONG_HISTORY_INCOMPLETE ${JSON.stringify(metrics)}`);
     if (process.env.LONG_CONVERSATION_RESULT) await writeFile(process.env.LONG_CONVERSATION_RESULT, `${JSON.stringify(metrics, null, 2)}\n`);
     throw error;
-  } finally {await context.close(); await browser.close(); await fixture.close();}
+  } finally {await context.close(); await fixture.close();}
 });
 
 // The realistic backend returns only the newest 500 messages. Verify older
@@ -283,10 +282,7 @@ test('1200 mixed-Markdown messages stay seamless while live updates perform boun
 // control, and prepending a delayed page preserves the reader's existing anchor.
 for (const width of [320, 1440]) test(`archive cursor pages join seamlessly without losing live messages or the reading anchor at ${width}px`, {skip: BASELINE}, async () => {
   const fixture = await createConsoleFixture();
-  const browser = await chromium.launch({headless: true,
-    ...(process.env.CONSOLE_CHROMIUM_PATH ? {executablePath: process.env.CONSOLE_CHROMIUM_PATH} : {}),
-    ...(process.env.CONSOLE_CHROMIUM_ARGS ? {args: JSON.parse(process.env.CONSOLE_CHROMIUM_ARGS)} : {}),
-  });
+  const browser = await consoleBrowser();
   const context = await browser.newContext({viewport: {width, height: width === 320 ? 844 : 1050}, ...(width === 320 ? {isMobile: true, hasTouch: true} : {})});
   const page = await context.newPage(), requests = [], errors = [];
   page.setDefaultTimeout(30000);
@@ -355,5 +351,5 @@ for (const width of [320, 1440]) test(`archive cursor pages join seamlessly with
     assert.deepEqual(errors, []);
     assert.deepEqual(fixture.state.failures, []);
     console.log(`LONG_HISTORY_ARCHIVE ${JSON.stringify({width, requests})}`);
-  } finally {releaseOlder(); await context.close(); await browser.close(); await fixture.close();}
+  } finally {releaseOlder(); await context.close(); await fixture.close();}
 });

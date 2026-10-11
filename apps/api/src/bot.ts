@@ -421,7 +421,7 @@ export class BotDO extends DurableObject<Env> {
     if(row.native_operation_id!==nativeOperationId || terminal.has(run.status)) return;
     if(this.hasPendingConnection(run.id)) {this.updateStatus(run.id,"waiting_connection");return;}
     if(this.hasPendingApproval(run.id)) {this.updateStatus(run.id,"waiting_approval");return;}
-    // The provider checkpoints file mutations before returning their results.
+    // Mutation receipts return before automatic file persistence completes.
     // Read-only/GUI turns must not stop a warm browser just to copy its profile.
     if(status==="done" && (kind==="progress" || !text?.trim())) this.updateStatus(run.id,"failed","The task stopped before a final answer. Its recorded actions remain available.");
     else if(status==="done") this.updateStatus(run.id,"completed");

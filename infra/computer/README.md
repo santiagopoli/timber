@@ -113,10 +113,14 @@ checkpoint. Dependency/cache directories `node_modules`, `.venv`, `.cache` and
 `__pycache__` are excluded. Chromium caches are excluded while its profile is
 included. Rebuild dependencies from package manifests after a cold start.
 
-Chromium is closed to flush its profile during a checkpoint. When the computer
-continues running it is reopened with the previous browser session. Tabs/profile
-data can survive; page JavaScript memory and in-flight interactions do not. Idle
-and explicit suspension leave Chromium closed.
+Automatic file checkpoints keep Chromium and its live pages open. They archive
+the last consistent closed-profile baseline captured before browser launch,
+rather than copy active SQLite/session files. Recent browser changes are saved
+by an explicit checkpoint or idle/suspend capture: those close Chromium to flush
+its current profile. An explicit checkpoint reopens the previous browser session;
+idle and suspension leave it closed. Restoring a saved profile can recover browser
+data, but not page JavaScript memory or in-flight interactions. A file checkpoint
+alone does not promise that recent cookies or session changes are durable.
 
 Managed effects and archive creation are serialized, but a background upload to
 R2 holds neither the effect nor workspace gate. New tools can run during upload;

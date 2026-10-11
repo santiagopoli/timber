@@ -1,20 +1,22 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdir,writeFile} from 'node:fs/promises';
-import {chromium} from 'playwright';
+import {createConsoleBrowser} from './console-browser.mjs';
 import {createConsoleFixture,TEST_TOKEN,BOT_A,BOT_B} from './console-fixture.mjs';
+
+const consoleBrowser = createConsoleBrowser();
 
 // Local-only UI review. No billing, provider requests or deployment.
 const evidence=process.env.AVATAR_UI_EVIDENCE||'/tmp/avatar-ui-evidence';
 for(const [name,viewport] of [['desktop',{width:1280,height:900}],['mobile',{width:390,height:844}]])test(`avatar review ${name}: shared theme, stale retention, single bot and image unavailable`,async()=>{
  await mkdir(evidence,{recursive:true});const fixture=await createConsoleFixture();
- const browser=await chromium.launch({executablePath:process.env.CONSOLE_CHROMIUM_PATH||'/usr/bin/chromium',args:['--no-sandbox']});
+ const browser=await consoleBrowser();let context;
  const themes=[{id:'paper',name:'Paper characters',kind:'vector',prompt:'Transparent paper geometry, no circular frame',model:'gpt-6.1-sol'},{id:'angular',name:'Angular characters',kind:'vector',prompt:'Shared angular geometry',model:'gpt-6.1-sol'},{id:'image',name:'Saved image theme (unavailable)',kind:'image',prompt:'Shared portrait',model:'gpt-image-2.5-sunburst'}];
  let selection={themeId:'paper',revision:1},jobs=[],fail=true;
  const avatars=[BOT_A,BOT_B].map((botId,i)=>({botId,themeId:'paper',revision:1,status:'ready',artifactId:`prior-${i}`,mimeType:'image/svg+xml',updatedAt:'2026-10-01T00:00:00.000Z'}));
  const calls=[],headers=[],external=[],errors=[],screenshots=[];const settings=()=>({themes,selection:{...selection},avatars:structuredClone(avatars),jobs:structuredClone(jobs)});
  try{
-  const page=await browser.newPage({viewport,isMobile:name==='mobile',hasTouch:name==='mobile'});page.setDefaultTimeout(15000);page.on('pageerror',e=>errors.push(e.message));
+  context=await browser.newContext({viewport,isMobile:name==='mobile',hasTouch:name==='mobile'});const page=await context.newPage();page.setDefaultTimeout(15000);page.on('pageerror',e=>errors.push(e.message));
   await page.route('**/*',async route=>{const url=new URL(route.request().url());if(!['127.0.0.1','localhost'].includes(url.hostname)){external.push(url.origin);await route.abort();}else await route.continue();});
   await page.route('**/v1/avatar-settings',async route=>{if(route.request().method()==='PUT'){selection={themeId:route.request().postDataJSON().themeId,revision:selection.revision+1};avatars.forEach(a=>a.status='obsolete');}await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(settings())});});
   await page.route('**/v1/avatar-models',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:true,vectorModels:[{id:'gpt-6.1-sol',name:'Connected text model'}],imageModels:[],imageAvailable:false,unavailableImageModels:['sunburst','flare'].map(id=>({id:`gpt-image-2.5-${id}`,name:`GPT Image 2.5 ${id}`,available:false,reason:'Server image API is not configured.'})),imageBilling:{provider:'openai-api',separateFromChatGPT:true,costKnown:false,message:'OpenAI API billing is separate from ChatGPT/SIWC.'}})}));
@@ -36,5 +38,5 @@ for(const [name,viewport] of [['desktop',{width:1280,height:900}],['mobile',{wid
   await writeFile(`${evidence}/${name}-checks.json`,JSON.stringify({viewport,initialGeometry,expandedGeometry,calls,imageRequestCount:headers.length,external,errors,screenshots},null,2));
   for(const g of [initialGeometry,expandedGeometry]){assert.ok(g.documentWidth<=viewport.width+1,`page horizontal overflow: ${JSON.stringify(g)}`);assert.ok(g.dialogScrollWidth<=g.dialogWidth+1,`modal horizontal overflow: ${JSON.stringify(g)}`);assert.ok(g.left>=0&&g.right<=viewport.width+1,'modal inside viewport');}
   assert.deepEqual(errors,[]);assert.deepEqual(external,[]);assert.ok(headers.length>=2);for(const h of headers){assert.equal(h.authorization,undefined);assert.equal(h['x-timber-client'],'console');assert.match(h.cookie||'',/timber_fixture_session=/);}await page.close();
- }finally{await browser.close();await fixture.close();}
+ }finally{await context?.close();await fixture.close();}
 });

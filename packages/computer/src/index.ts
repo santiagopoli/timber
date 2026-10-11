@@ -1069,7 +1069,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
           if(background && ((await this.ctx.storage.get<number>('checkpointQuietUntil')??0)>Date.now() || await this.hasActiveExecutions())) return;
           if(await this.hasActiveExecutions()) throw new ComputerProviderError('computer_execution_active');
           const current=(await this.ctx.storage.get<CheckpointRetry>('checkpointRetry'))!;
-          const response=await stage('computer_checkpoint_failed',()=>this.call('/checkpoint',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({quiesce})}));
+          const response=await stage('computer_checkpoint_failed',()=>this.call('/checkpoint',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({quiesce,preserveBrowser:background})}));
           if(!response.ok) throw await checkpointResponseError(response);
           if(!response.body) throw new ComputerProviderError('computer_checkpoint_failed');
           const size=Number(response.headers.get('Content-Length')),checksum=response.headers.get('X-Content-SHA256')??'';

@@ -1,14 +1,16 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {mkdir} from 'node:fs/promises';
-import {chromium} from 'playwright';
+import {createConsoleBrowser} from './console-browser.mjs';
 import {createConsoleFixture, TEST_TOKEN} from './console-fixture.mjs';
+
+const consoleBrowser = createConsoleBrowser();
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64');
 const image = n => ({name:`mobile-${n}.png`,mimeType:'image/png',buffer:png});
 const output=process.env.MOBILE_VISUAL_OUTPUT || '/tmp/mobile-visual-captures';
 for(const width of [390,320]) test(`mobile image composer geometry and accessible controls at ${width}px`,async()=>{
  const fixture=await createConsoleFixture();
- const browser=await chromium.launch({headless:true,...(process.env.CONSOLE_CHROMIUM_PATH?{executablePath:process.env.CONSOLE_CHROMIUM_PATH}:{}),...(process.env.CONSOLE_CHROMIUM_ARGS?{args:JSON.parse(process.env.CONSOLE_CHROMIUM_ARGS)}:{})});
+ const browser=await consoleBrowser();
  const context=await browser.newContext({viewport:{width,height:844},colorScheme:'light'}),page=await context.newPage(),errors=[];
  page.on('pageerror',e=>errors.push(e.message));page.setDefaultTimeout(8000);await mkdir(output,{recursive:true});
  const capture=name=>page.screenshot({path:`${output}/${width}-${name}.png`});
@@ -45,5 +47,5 @@ for(const width of [390,320]) test(`mobile image composer geometry and accessibl
   const alert=await page.locator('.timber-attachment-error').boundingBox();assert.ok(alert.x>=0&&alert.x+alert.width<=width&&alert.y+alert.height<=844,'error readable within viewport');
   await page.getByRole('button',{name:/^Remove mobile-/}).first().focus();await page.keyboard.press('Enter');await page.waitForFunction(()=>document.querySelectorAll('.timber-image-attachments img').length===3);await geometry(3);
   assert.deepEqual(errors,[],'no browser errors');assert.deepEqual(fixture.state.failures,[],'fixture requests complete');
- }finally{await context.close();await browser.close();await fixture.close();}
+ }finally{await context.close();await fixture.close();}
 });

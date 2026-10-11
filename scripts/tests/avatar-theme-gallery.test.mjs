@@ -1,18 +1,20 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdir,writeFile} from 'node:fs/promises';
-import {chromium} from 'playwright';
+import {createConsoleBrowser} from './console-browser.mjs';
 import {builtinAvatarThemes} from '../../packages/contracts/src/avatar-presets.ts';
 import {createConsoleFixture,TEST_TOKEN,BOT_A} from './console-fixture.mjs';
 
+const consoleBrowser = createConsoleBrowser();
+
 for(const [name,viewport] of [['desktop',{width:1280,height:1000}],['mobile',{width:390,height:844}]])test(`built-in theme gallery: ${name}`,async()=>{
   const fixture=await createConsoleFixture();
-  const browser=await chromium.launch({executablePath:process.env.CONSOLE_CHROMIUM_PATH||'/usr/bin/chromium',args:['--no-sandbox']});
+  const browser=await consoleBrowser();let context;
   const themes=builtinAvatarThemes();let selection={themeId:themes[0].id,revision:1};
   const calls=[],errors=[],assetFailures=[];let rejectReasoningOnce=false;
   const settings=()=>({themes,selection,avatars:[{botId:BOT_A,themeId:themes[0].id,revision:1,status:'ready',artifactId:'gallery-owl',mimeType:'image/svg+xml',updatedAt:'2026-10-10T00:00:00Z'}],jobs:[]});
   try{
-    const page=await browser.newPage({viewport,deviceScaleFactor:2,colorScheme:name==='desktop'?'dark':'light',isMobile:name==='mobile',hasTouch:name==='mobile'});
+    context=await browser.newContext({viewport,deviceScaleFactor:2,colorScheme:name==='desktop'?'dark':'light',isMobile:name==='mobile',hasTouch:name==='mobile'});const page=await context.newPage();
     page.setDefaultTimeout(15000);page.on('pageerror',e=>errors.push(e.message));
     page.on('response',response=>{if(response.url().includes('/avatar-themes/')&&!response.ok())assetFailures.push(response.url());});
     await page.route('**/v1/avatar-settings',async route=>{
@@ -114,5 +116,5 @@ for(const [name,viewport] of [['desktop',{width:1280,height:1000}],['mobile',{wi
         }
       }
     }
-  }finally{await browser.close();await fixture.close();}
+  }finally{await context?.close();await fixture.close();}
 });

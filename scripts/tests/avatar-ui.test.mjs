@@ -1,7 +1,9 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {chromium} from 'playwright';
+import {createConsoleBrowser} from './console-browser.mjs';
 import {createConsoleFixture,TEST_TOKEN,BOT_A,BOT_B} from './console-fixture.mjs';
+
+const consoleBrowser = createConsoleBrowser();
 
 // Keep the mutation response pending so these regressions exercise the loading
 // render deterministically, rather than depending on CI/network timing.
@@ -17,12 +19,12 @@ async function waitForGlobalSelection(page,themeId,revision){
 
 test('image API catalogue is independent of SIWC and batch generation requires exact billing confirmation',async()=>{
  const fixture=await createConsoleFixture();
- const browser=await chromium.launch({executablePath:process.env.CONSOLE_CHROMIUM_PATH||'/usr/bin/chromium',args:['--no-sandbox']});
+ const browser=await consoleBrowser();let context;
  const themes=[{id:'theme-vector',name:'Paper sculpture',kind:'vector',prompt:'Paper character',model:'gpt-6.1-sol',createdAt:'2026-10-01T00:00:00.000Z'}];
  let selection={themeId:'theme-vector',revision:1};const calls=[],applyResponse=responseGate();
  const settings=()=>({themes:structuredClone(themes),selection:{...selection},avatars:[],jobs:[]});
  try{
-  const page=await browser.newPage({viewport:{width:1280,height:900}});await page.addInitScript(()=>{window.confirm=message=>{window.__avatarConfirmation=message;return true;};});
+  context=await browser.newContext({viewport:{width:1280,height:900}});const page=await context.newPage();await page.addInitScript(()=>{window.confirm=message=>{window.__avatarConfirmation=message;return true;};});
   await page.route('**/v1/avatar-settings',async route=>{if(route.request().method()==='PUT'){selection={themeId:route.request().postDataJSON().themeId,revision:selection.revision+1};await applyResponse.hold();}await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(settings())});});
   await page.route('**/v1/avatar-models',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:false,vectorModels:[],imageModels:[
    {id:'gpt-image-2.5-sunburst',name:'GPT Image 2.5 Sunburst',provider:'openai',billing:'openai-api'},
@@ -46,19 +48,19 @@ test('image API catalogue is independent of SIWC and batch generation requires e
   assert.match(await page.evaluate(()=>window.__avatarConfirmation),/exactly 2 images for 2 bots/i);assert.match(await page.evaluate(()=>window.__avatarConfirmation),/COST UNKNOWN/i);
   const batch=calls.find(call=>call.path==='/v1/avatar-generations').body;assert.equal(batch.expectedThemeId,'theme-image');assert.equal(batch.expectedRevision,2);assert.equal(batch.confirmedCount,2);assert.equal(batch.acknowledgeApiBilling,true);assert.equal(typeof batch.operationId,'string');
   await page.close();
- }finally{applyResponse.release();await browser.close();await fixture.close();}
+ }finally{applyResponse.release();await context?.close();await fixture.close();}
 });
 
 test('vector avatars use authenticated Blob images, preserve stale revisions and keep uncertain admission IDs', async () => {
  const fixture=await createConsoleFixture();
- const browser=await chromium.launch({executablePath:process.env.CONSOLE_CHROMIUM_PATH||'/usr/bin/chromium',args:['--no-sandbox']});
+ const browser=await consoleBrowser();let context;
  const themes=['paper','angular'].map(id=>({id,name:id,kind:'vector',prompt:'Transparent geometric character, no circular frame',model:'gpt-6.1-sol',createdAt:'2026-10-01T00:00:00.000Z'}));
  let selection={themeId:'paper',revision:1},jobs=[];
  const avatars=[{botId:BOT_A,themeId:'paper',revision:1,status:'ready',artifactId:'one',mimeType:'image/svg+xml',updatedAt:'2026-10-01T00:00:00.000Z'}];
  const calls=[],images=[],applyResponse=responseGate();
  const settings=()=>({themes,selection,avatars,jobs});
  try {
-  const page=await browser.newPage({viewport:{width:1280,height:900}});page.setDefaultTimeout(10000);
+  context=await browser.newContext({viewport:{width:1280,height:900}});const page=await context.newPage();page.setDefaultTimeout(10000);
   await page.route('**/v1/avatar-settings',async route=>{
    const req=route.request();if(req.method()==='PUT'){selection={themeId:req.postDataJSON().themeId,revision:2};avatars[0].status='obsolete';await applyResponse.hold();}
    await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(settings())});
@@ -98,15 +100,15 @@ test('vector avatars use authenticated Blob images, preserve stale revisions and
   assert.equal(await page.locator(`.bot-item[data-bot-id="${BOT_A}"] .timber-avatar-image`).getAttribute('src'),prior,'sidebar retains the same validated Blob');
   assert.equal(await page.locator(`.bot-item[data-bot-id="${BOT_A}"] .avatar-stale`).count(),1);
   await page.close();
- } finally {applyResponse.release();await browser.close();await fixture.close();}
+ } finally {applyResponse.release();await context?.close();await fixture.close();}
 });
 
 test('PNG avatar display caches a 96px client thumbnail from authenticated image bytes',async()=>{
  const fixture=await createConsoleFixture();
- const browser=await chromium.launch({executablePath:process.env.CONSOLE_CHROMIUM_PATH||'/usr/bin/chromium',args:['--no-sandbox']});
+ const browser=await consoleBrowser();let context;
  const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==','base64');
  try{
-  const page=await browser.newPage({viewport:{width:1280,height:900}});page.setDefaultTimeout(10000);
+  context=await browser.newContext({viewport:{width:1280,height:900}});const page=await context.newPage();page.setDefaultTimeout(10000);
   await page.addInitScript(()=>{window.__avatarBlobs=[];const create=URL.createObjectURL.bind(URL);URL.createObjectURL=blob=>{window.__avatarBlobs.push(blob);return create(blob);};});
   await page.route('**/v1/avatar-settings',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({themes:[{id:'png-theme',name:'PNG',kind:'image',prompt:'A small character',model:'gpt-image-2.5-sunburst'}],selection:{themeId:'png-theme',revision:1},avatars:[{botId:BOT_A,themeId:'png-theme',revision:1,status:'ready',artifactId:'png-one',mimeType:'image/png',updatedAt:'2026-10-01T00:00:00.000Z'}],jobs:[]})}));
   await page.route('**/v1/avatar-models',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:false,vectorModels:[],imageModels:[],imageAvailable:false,imageBilling:{provider:'openai-api',separateFromChatGPT:true,costKnown:false,message:'Cost unknown'}})}));
@@ -116,16 +118,16 @@ test('PNG avatar display caches a 96px client thumbnail from authenticated image
   const dimensions=await page.evaluate(async()=>{const blob=window.__avatarBlobs.at(-1);const bitmap=await createImageBitmap(blob);const value={width:bitmap.width,height:bitmap.height,type:blob.type};bitmap.close();return value;});
   assert.deepEqual(dimensions,{width:96,height:96,type:'image/png'});
   await page.close();
- }finally{await browser.close();await fixture.close();}
+ }finally{await context?.close();await fixture.close();}
 });
 
 test('replacement failures retain decoded avatars across Settings renders and superseded URLs are bounded',async()=>{
  const fixture=await createConsoleFixture();
- const browser=await chromium.launch({executablePath:process.env.CONSOLE_CHROMIUM_PATH||'/usr/bin/chromium',args:['--no-sandbox']});
+ const browser=await consoleBrowser();let context;
  let artifact='one',fail=false;
  const settings=()=>({themes:[{id:'paper',name:'Paper',kind:'vector',model:'gpt-6.1-sol',prompt:'Geometry'}],selection:{themeId:'paper',revision:1},avatars:[{botId:BOT_A,themeId:'paper',revision:1,status:'ready',artifactId:artifact,mimeType:'image/svg+xml',updatedAt:'2026-10-01T00:00:00.000Z'}],jobs:[]});
  try{
-  const page=await browser.newPage({viewport:{width:1280,height:900}});page.setDefaultTimeout(10000);
+  context=await browser.newContext({viewport:{width:1280,height:900}});const page=await context.newPage();page.setDefaultTimeout(10000);
   await page.addInitScript(()=>{window.__avatarCreated=[];window.__avatarRevoked=[];const create=URL.createObjectURL.bind(URL),revoke=URL.revokeObjectURL.bind(URL);URL.createObjectURL=blob=>{const url=create(blob);window.__avatarCreated.push(url);return url;};URL.revokeObjectURL=url=>{window.__avatarRevoked.push(url);revoke(url);};});
   await page.route('**/v1/avatar-settings',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(settings())}));
   await page.route('**/v1/avatar-models',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:true,vectorModels:[{id:'gpt-6.1-sol',name:'Text'}],imageModels:[],imageAvailable:false})}));
@@ -150,12 +152,12 @@ test('replacement failures retain decoded avatars across Settings renders and su
   assert.equal(await page.locator('.timber-avatar-image').count(),0);
   assert.equal(await page.evaluate(()=>window.__avatarCreated.filter(url=>!window.__avatarRevoked.includes(url)).length),0);
   await page.close();
- }finally{await browser.close();await fixture.close();}
+ }finally{await context?.close();await fixture.close();}
 });
 
 for(const timing of ['before POST','before uncertain resend'])test(`image consent snapshot survives a switch ${timing} and requires fresh confirmation`,async()=>{
  const fixture=await createConsoleFixture();
- const browser=await chromium.launch({executablePath:process.env.CONSOLE_CHROMIUM_PATH||'/usr/bin/chromium',args:['--no-sandbox']});
+ const browser=await consoleBrowser();let context;
  const themes=[
   {id:'sunburst-theme',name:'Sunburst shared',kind:'image',prompt:'Shared style',model:'gpt-image-2.5-sunburst',createdAt:'2026-10-01T00:00:00.000Z'},
   {id:'flare-theme',name:'Flare shared',kind:'image',prompt:'Shared style',model:'gpt-image-2.5-flare',createdAt:'2026-10-01T00:00:00.000Z'},
@@ -163,7 +165,7 @@ for(const timing of ['before POST','before uncertain resend'])test(`image consen
  let selection={themeId:'sunburst-theme',revision:1};const calls=[],accepted=[];
  const settings=()=>({themes,selection:{...selection},avatars:[],jobs:[]});
  try{
-  const page=await browser.newPage({viewport:{width:1280,height:900}});page.setDefaultTimeout(10000);
+  context=await browser.newContext({viewport:{width:1280,height:900}});const page=await context.newPage();page.setDefaultTimeout(10000);
   await page.addInitScript(()=>{window.__avatarConfirmations=[];window.confirm=message=>{window.__avatarConfirmations.push(message);return true;};});
   await page.route('**/v1/avatar-settings',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(settings())}));
   await page.route('**/v1/avatar-models',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:false,vectorModels:[],imageModels:themes.map(theme=>({id:theme.model,name:theme.name,provider:'openai',billing:'openai-api'})),imageAvailable:true,imageBilling:{provider:'openai-api',separateFromChatGPT:true,costKnown:false,message:'Separately billed OpenAI API access, not ChatGPT.'}})}));
@@ -199,7 +201,7 @@ for(const timing of ['before POST','before uncertain resend'])test(`image consen
   assert.equal(accepted.length,1);const fresh=accepted[0];assert.equal(fresh.expectedThemeId,'flare-theme');assert.equal(fresh.expectedRevision,2);
   assert.notEqual(fresh.operationId,calls[0].operationId);assert.equal(fresh.confirmedCount,2);assert.equal(fresh.acknowledgeApiBilling,true);
   const confirmations=await page.evaluate(()=>window.__avatarConfirmations);assert.match(confirmations[0],/gpt-image-2.5-sunburst/);assert.match(confirmations[1],/gpt-image-2.5-flare/);
- }finally{await browser.close();await fixture.close();}
+ }finally{await context?.close();await fixture.close();}
 });
 
 // Avatar current-status and retained attempt history regressions.
@@ -214,11 +216,11 @@ async function openSettings(page,fixture,mobile){
  await page.locator('#settings-button').click();await page.waitForFunction(()=>document.querySelector('#avatar-status').textContent==='Global selection · revision 1');
 }
 for(const mobile of [false,true])test(`avatar status bounds repeated attempts with separate accessible history (${mobile?'mobile':'desktop'})`,async()=>{
- const fixture=await createConsoleFixture(),browser=await chromium.launch({executablePath:process.env.CONSOLE_CHROMIUM_PATH||'/usr/bin/chromium',args:['--no-sandbox']});
+ const fixture=await createConsoleFixture(),browser=await consoleBrowser();let context;
  let jobs=Array.from({length:72},(_,i)=>job(`earlier-${i}`,i%2?BOT_A:BOT_B,i%3?'completed':'failed',i,{error:i%3?undefined:{message:'Historical avatar response did not contain completed text'}})).reverse();
  const calls=[],errors=[];
  try{
-  const page=await browser.newPage({viewport:mobile?{width:390,height:844}:{width:1280,height:900},isMobile:mobile,hasTouch:mobile});page.setDefaultTimeout(10000);page.on('pageerror',error=>errors.push(error.message));
+  context=await browser.newContext({viewport:mobile?{width:390,height:844}:{width:1280,height:900},isMobile:mobile,hasTouch:mobile});const page=await context.newPage();page.setDefaultTimeout(10000);page.on('pageerror',error=>errors.push(error.message));
   await page.route('**/v1/avatar-settings',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({themes:[theme],selection:{themeId:'paper',revision:1},avatars:[],jobs})}));
   await page.route('**/v1/avatar-models',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:true,vectorModels:[{id:theme.model}],imageModels:[],imageAvailable:false})}));
   await page.route('**/v1/avatar-generations',async route=>{
@@ -251,14 +253,14 @@ for(const mobile of [false,true])test(`avatar status bounds repeated attempts wi
   assert.equal(await page.locator('.avatar-active-attempts .avatar-job').count(),0,'closed active details do not mount hidden attempt rows');await current.getByText('Inspect all 2 active attempts',{exact:true}).click();await page.locator('.avatar-active-attempts [data-job-status="running"]').waitFor({state:'visible'});assert.equal(await page.locator('.avatar-active-attempts [data-job-status="running"]').isVisible(),true);assert.equal(await page.locator('.avatar-active-attempts [data-job-status="queued"]').isVisible(),true);assert.match(await page.locator('.avatar-active-attempts').textContent(),/attempt active-one/);
   await history.locator('summary').click();assert.equal(await history.getByRole('button',{name:/Retry|Regenerate/}).count(),0);
   const geometry=await page.evaluate(()=>{const modal=document.querySelector('#settings-dialog');return {documentWidth:document.documentElement.scrollWidth,viewport:innerWidth,width:modal.clientWidth,scrollWidth:modal.scrollWidth};});assert.ok(geometry.documentWidth<=geometry.viewport);assert.ok(geometry.scrollWidth<=geometry.width);assert.deepEqual(errors,[]);
- }finally{await browser.close();await fixture.close();}
+ }finally{await context?.close();await fixture.close();}
 });
 
 test('Retry rechecks exact failed job and revision, suppressing stale failures without inference',async()=>{
- const fixture=await createConsoleFixture(),browser=await chromium.launch({executablePath:process.env.CONSOLE_CHROMIUM_PATH||'/usr/bin/chromium',args:['--no-sandbox']});
+ const fixture=await createConsoleFixture(),browser=await consoleBrowser();let context;
  let jobs=[job('failed-current',BOT_A,'failed',1)],selection={themeId:'paper',revision:1},getError=false,imageMode=false;const calls=[];
  try{
-  const page=await browser.newPage({viewport:{width:1280,height:900}});page.setDefaultTimeout(10000);
+  context=await browser.newContext({viewport:{width:1280,height:900}});const page=await context.newPage();page.setDefaultTimeout(10000);
   await page.route('**/v1/avatar-settings',route=>route.fulfill({status:getError?503:200,contentType:'application/json',body:JSON.stringify(getError?{error:{message:'Status refresh unavailable'}}:{themes:[imageMode?{...theme,id:'image-paper',kind:'image',model:'gpt-image-2.5-sunburst'}:theme],selection,avatars:[],jobs})}));
   await page.route('**/v1/avatar-models',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:true,vectorModels:[{id:theme.model}],imageModels:imageMode?[{id:'gpt-image-2.5-sunburst'}]:[],imageAvailable:imageMode,imageBilling:{costKnown:false,message:'Separately billed OpenAI API access, not ChatGPT.'}})}));
   await page.route('**/v1/avatar-generations',route=>{calls.push(route.request().postDataJSON());return route.fulfill({status:202,contentType:'application/json',body:JSON.stringify({jobs:[]})});});
@@ -274,5 +276,5 @@ test('Retry rechecks exact failed job and revision, suppressing stale failures w
   imageMode=true;selection={themeId:'image-paper',revision:4};jobs=[job('image-failure',BOT_A,'failed',4,{themeId:'image-paper',revision:4})];await page.locator('#avatar-refresh').click();const imageRetry=page.getByRole('button',{name:'Retry avatar for Ada, revision 4',exact:true});await imageRetry.waitFor();
   await page.evaluate(()=>{window.__avatarRetryConfirmations=[];window.confirm=message=>{window.__avatarRetryConfirmations.push(message);return false;};});await imageRetry.click();await page.waitForFunction(()=>window.__avatarRetryConfirmations.length===1);assert.equal(calls.length,0,'declined image consent admits no generation');
   await page.evaluate(()=>{window.confirm=message=>{window.__avatarRetryConfirmations.push(message);return true;};});const admitted=page.waitForResponse(response=>response.url().endsWith('/v1/avatar-generations')&&response.status()===202);await imageRetry.click();await admitted;assert.equal(calls.length,1);assert.equal(calls[0].expectedThemeId,'image-paper');assert.equal(calls[0].expectedRevision,4);assert.equal(calls[0].confirmedCount,1);assert.equal(calls[0].acknowledgeApiBilling,true);assert.equal(calls[0].botId,BOT_A);assert.match(await page.evaluate(()=>window.__avatarRetryConfirmations.at(-1)),/exactly 1 image.*1 bot/);
- }finally{await browser.close();await fixture.close();}
+ }finally{await context?.close();await fixture.close();}
 });
