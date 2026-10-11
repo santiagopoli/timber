@@ -10,7 +10,6 @@ import type { PiHarness, PiHarnessContext } from 'agents/harness/pi';
 import { classifyFailure, normalizeEntries, textContent, toolCompletion } from './normalize.js';
 import { computerToolOperationId } from './tools.js';
 import { archivedEntries } from './maintenance.js';
-import { AGENT_MESSAGE_FORMAT_INSTRUCTION } from './agent-message-format.js';
 import type { RuntimeEvent, RuntimePause, RuntimeReceipt, RuntimeSubagent } from './types.js';
 
 type Context = PiHarnessContext['context'];
@@ -367,7 +366,7 @@ export function createSubagents(host: SubagentHost) {
     };
     const id = Type.String({ minLength: 1, maxLength: 160 });
     return [
-      defineTool({ name: 'spawn_subagent', description: 'Create a temporary native Pi subagent with its own context. It shares this bot’s computer and approval policy. Give a concrete, self-contained, clearly formatted task with normal spacing and short paragraphs or lists when useful. Work runs concurrently; inspect or wait for its result. Optionally choose model, reasoningEffort or fast from list_models; omit them to inherit your current model configuration. At most 8 active agents and 3 levels.', replay: 'safe',
+      defineTool({ name: 'spawn_subagent', description: 'Create a temporary native Pi subagent with its own context. It shares this bot’s computer and approval policy. Give a concrete self-contained task. Work runs concurrently; inspect or wait for its result. Optionally choose model, reasoningEffort or fast from list_models; omit them to inherit your current model configuration. At most 8 active agents and 3 levels.', replay: 'safe',
         parameters: Type.Object({ name: Type.String({ minLength: 1, maxLength: 80 }), task: Type.String({ minLength: 1, maxLength: 20_000 }), model:Type.Optional(Type.String({maxLength:128})), reasoningEffort:Type.Optional(Type.String({maxLength:40})), fast:Type.Optional(Type.Boolean()) }),
         execute: (input, api, context) => guarded(api, context, async (parentOperationId, operationId) => {
           await host.scheduleWake();
@@ -386,7 +385,7 @@ export function createSubagents(host: SubagentHost) {
             if (depth > MAX_DEPTH) throw new Error('Subagents may be nested at most 3 levels');
             const anchor = await tx.createTask(Anchor, null, { ownership: { kind: 'conversation' }, conversationId: api.conversationId, background: true });
             const child = await tx.createConversation({ ownership: { kind: 'task', taskId: anchor } });
-            await configure(tx, child.id, { model:{provider:selected!.model.provider,modelId:selected!.model.id}, thinkingLevel:null, instructions: `You are temporary subagent ${input.name}. Complete your assigned task. ${AGENT_MESSAGE_FORMAT_INSTRUCTION} Coordinate with other temporary agents using send_subagent_message; use targetId "parent" to contact your parent. Share only public findings, never private reasoning. You share the parent bot’s computer and must coordinate file edits.` });
+            await configure(tx, child.id, { model:{provider:selected!.model.provider,modelId:selected!.model.id}, thinkingLevel:null, instructions: `You are temporary subagent ${input.name}. Complete your assigned task. Coordinate with other temporary agents using send_subagent_message; use targetId "parent" to contact your parent. Share only public findings, never private reasoning. You share the parent bot’s computer and must coordinate file edits.` });
             const now = new Date().toISOString();
             const record: StoredAgent = { ...selected!.settings, id: crypto.randomUUID(), name: input.name, task: input.task,
               parentOperationId, ...(parent ? { parentSubagentId: parent.id } : {}),
@@ -402,7 +401,7 @@ export function createSubagents(host: SubagentHost) {
         }) }),
       defineTool({ name: 'list_subagents', description: 'List temporary subagents, their status and public final results.', replay: 'safe', parameters: Type.Object({}),
         execute: (_input, api, context) => guarded(api, context, async () => content({ subagents: Object.values((await state()).agents).map(publicAgent) })) }),
-      defineTool({ name: 'send_subagent_message', description: 'Send a durable, clearly formatted message with normal spacing and short paragraphs or lists when useful to another temporary agent by its ID. A child may use targetId "parent". Messages start a new turn or queue behind active work.', replay: 'safe',
+      defineTool({ name: 'send_subagent_message', description: 'Send a durable message to another temporary agent by its ID. A child may use targetId "parent". Messages start a new turn or queue behind active work.', replay: 'safe',
         parameters: Type.Object({ targetId: id, text: Type.String({ minLength: 1, maxLength: 20_000 }) }),
         execute: (input, api, context) => guarded(api, context, async (parentOperationId, operationId) => {
           const sender = await forConversation(api.conversationId);

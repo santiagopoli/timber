@@ -17,7 +17,6 @@ import {createOpenAIProvider} from './openai-api.js';
 import { createBudget } from './budget.js';
 import { createStopGate } from './stop-gate.js';
 import { createSubagents } from './subagents.js';
-import { AGENT_MESSAGE_FORMAT_INSTRUCTION } from './agent-message-format.js';
 import { archivedEntries, createMaintenance } from './maintenance.js';
 import type { AgentRuntime, RuntimePause, PiRuntimeOptions, RuntimeApprovalSummary, RuntimeEvent, RuntimeMessage, RuntimeOperation, RuntimeOperationResult, RuntimeReceipt } from './types.js';
 
@@ -274,7 +273,6 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
           }
           return [
             child ? `You are ${child.name}, a temporary subagent of ${bot.name}. Complete your assigned task and coordinate with your parent.` : `You are ${bot.name}, a persistent named bot in Botspace.`,
-            AGENT_MESSAGE_FORMAT_INSTRUCTION,
             bot.instructions,
             'You own one ongoing conversation. Preserve useful context across tasks.',
             'Use list_models to inspect the connected account’s available models and supported reasoning/speed. spawn_subagent may select model, reasoningEffort and fast; omitted settings inherit your current configuration. Use spawn_subagent to delegate concrete tasks to temporary agents with separate contexts. They share your computer; assign separate files and coordinate edits. Use list_subagents, send_subagent_message, wait_subagent and cancel_subagent to coordinate. Temporary agents are visible to the user. Named persistent bots are separate host capabilities discoverable through list_tools.',

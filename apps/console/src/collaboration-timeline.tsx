@@ -82,7 +82,7 @@ export function AgentCreationCard({creation,callbacks,context='timeline'}: {crea
     {expanded && <div id={bodyId} className="timber-agent-created-details">
       <span className="timber-agent-created-caption">Created {kind}{creation.creator?` · by ${creation.creator.name}`:''}</span>
       {creation.agent.model&&<span className="timber-agent-created-caption">Model: {creation.agent.model}</span>}
-      {creation.task && <MessageResponse className="timber-markdown timber-agent-created-task" mode="static" skipHtml plugins={{}} components={{img:()=>null}} linkSafety={{enabled:false}} controls={false}>{creation.task}</MessageResponse>}
+      {creation.task && <p className="timber-agent-created-task">{creation.task}</p>}
       <button type="button" className="timber-agent-created-open" aria-label={`Open ${creation.agent.name} conversation`} onClick={()=>openAgent(creation.agent,callbacks)}>Open conversation<ChevronRightIcon aria-hidden="true"/></button>
     </div>}
   </article>;

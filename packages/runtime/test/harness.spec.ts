@@ -7,7 +7,6 @@ import { createStopGate } from '../src/stop-gate.js';
 import { PiHarness } from 'agents/harness/pi';
 import {configure,ROOT_CONVERSATION_ID} from '@earendil-works/pi-durable';
 import {SHARED_ALLOWANCE_MESSAGE} from './responses-fixture.js';
-import { AGENT_MESSAGE_FORMAT_INSTRUCTION } from '../src/agent-message-format.js';
 let probeId: string;
 beforeEach(() => { probeId = crypto.randomUUID(); });
 const request = (path: string, input?: unknown) => exports.default.fetch(`https://test${path}`, { headers: { 'content-type': 'application/json', 'x-probe-id': probeId }, ...(input ? { method: 'POST', body: JSON.stringify(input) } : {}) });
@@ -42,9 +41,6 @@ it('runs a visible temporary Pi conversation, attributes its tools and keeps its
     const agents = await instance.runtime.subagents();
     expect(agents).toHaveLength(1);
     expect(agents[0]).toMatchObject({ name: 'Reader', parentOperationId: 'parent-with-child', status: 'completed', result: 'Hello from the real Pi harness.' });
-    const prompts = state.storage.sql.exec<{ input: string }>('SELECT input FROM calls').toArray().map(row => row.input);
-    expect(prompts.some(prompt => prompt.includes('You are Ada, a persistent named bot') && prompt.includes(AGENT_MESSAGE_FORMAT_INSTRUCTION))).toBe(true);
-    expect(prompts.some(prompt => prompt.includes('You are Reader, a temporary subagent') && prompt.includes(AGENT_MESSAGE_FORMAT_INSTRUCTION))).toBe(true);
     const tools = state.storage.sql.exec<{ input: string }>('SELECT input FROM tool_calls').toArray().map(row => JSON.parse(row.input));
     expect(tools).toHaveLength(1);
     expect(tools[0]).toMatchObject({ runOperationId: 'parent-with-child', subagentId: agents[0]!.id, subagentOperationId: agents[0]!.operationId, action: { type: 'readFile' } });
