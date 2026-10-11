@@ -152,7 +152,12 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   and cached-input tokens. ChatGPT entries show subscription allowance separately
   from conditional paid fallback rates. Missing prices are unknown, never zero;
   Fast does not inherit standard-tier prices as a Fast quote. The selected model
-  shows the complete ordered billing routes and settings-incompatible fallbacks.
+  uses compact model rows with aligned input/output prices and one unit legend.
+  IDs are available as row titles rather than repeated beneath the name. Reasoning
+  and Fast stay in the selected-model footer; a collapsed inline “Usage & prices”
+  table exposes cached-input rates, ordered billing routes and incompatible
+  fallbacks without opening another popover. Only the model list scrolls during
+  comparison, leaving the settings in view.
   Image-avatar API billing stays separate and has no inferred token price.
 - GET /v1/bots -> {bots:Bot[]}
 - POST /v1/bots {name,instructions?,model?,reasoningEffort?,fast?,computerApprovalMode?,allowNamedAgents?,allowTaskCreation?} -> 201 {bot:Bot}
