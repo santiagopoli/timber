@@ -90,3 +90,21 @@ test('saved models outside the catalogue remain visible in their provider withou
     await model.click();await provider(page,'OpenAI').click();await search(page).fill('gpt-6.1-sol');await page.keyboard.press('Enter');await popup(page).waitFor({state:'hidden'});assert.equal(fixture.state.calls.filter(call=>call.method==='PATCH').length,1,'choosing the current model does not write again');
   }finally{await context.close();await fixture.close();}
 });
+
+test('a publisher prefix from OpenRouter is not repeated in the visible model name',async()=>{
+  const fixture=await createConsoleFixture(),context=await browser.newContext({viewport:{width:1440,height:900}}),page=await context.newPage();
+  page.setDefaultTimeout(6000);const errors=[];page.on('pageerror',error=>errors.push(error.message));
+  fixture.state.modelCatalog.models.push({id:'anthropic/claude-opus-5.5',name:'Anthropic: Claude Opus 5.5',provider:'openrouter',reasoningEfforts:['high'],defaultReasoningEffort:'high',supportsFast:false});
+  try{
+    await page.goto(fixture.url);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('#app').waitFor();
+    await page.getByRole('button',{name:/^Model settings:/}).click();
+    const settings=page.getByRole('dialog',{name:'Model settings',exact:true}),model=settings.getByRole('combobox',{name:'Model',exact:true});
+    await model.click();
+    await provider(page,'Anthropic').click();
+    const option=popup(page).locator('[data-value="anthropic/claude-opus-5.5"]');
+    await option.waitFor();
+    assert.match(await option.innerText(),/^Claude Opus 5\.5/,'visible name drops the repeated publisher prefix');
+    assert.doesNotMatch(await option.innerText(),/Anthropic: /);
+    assert.deepEqual(errors,[]);
+  }finally{await context.close();await fixture.close();}
+});
