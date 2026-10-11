@@ -2,6 +2,7 @@ import {createElement, useCallback, useEffect, useRef, useState, type FormEvent}
 import {createRoot} from 'react-dom/client';
 import {ArrowLeftIcon, ArrowUpIcon, LoaderCircleIcon, PlusIcon, RefreshCwIcon, SquareIcon} from 'lucide-react';
 import {MessageResponse} from './components/ai-elements/message';
+import {modelPublisherLabel} from './model-publisher';
 import './tasks.css';
 
 type RequestOptions = {method?: string; body?: unknown; signal?: AbortSignal};
@@ -10,11 +11,16 @@ export type TasksBot = {id: string; name: string};
 export type TasksProps = {
   request: TasksRequest;
   bots: TasksBot[];
+  initialTaskId?: string|null;
+  initialTaskVersion?: number;
   onClose?: () => void;
   onOpenBot?: (botId: string) => void;
+  onBotCreated?: (bot: TasksBot) => void;
 };
 type TaskStatus = 'pending'|'queued'|'running'|'waiting_approval'|'waiting_connection'|'cancelling'|'completed'|'failed'|'cancelled'|string;
-type Task = {id:string;title:string;description?:string;botId:string;botName?:string;status:TaskStatus;createdAt?:string;updatedAt?:string;lastActivity?:string};
+type Task = {id:string;title:string;description?:string;botId:string;botName?:string;dedicatedBot?:boolean;status:TaskStatus;createdAt?:string;updatedAt?:string;lastActivity?:string};
+type ModelChoice = {id:string;label:string};
+const NEW_BOT='__new_bot__';
 type TaskFilter = 'all'|'active'|'pending'|'completed';
 type TaskApproval = {id:string;status:string;action:Record<string,unknown>;expiresAt:string};
 type TaskMessage = {id?:string;role?:string;text?:string;content?:string;createdAt?:string};
@@ -26,7 +32,7 @@ const activeStatuses = new Set(['queued','running','waiting_approval','waiting_c
 const statusName = (status: string) => (({pending:'Pending',queued:'Queued',running:'Running',waiting_approval:'Needs approval',waiting_connection:'Needs connection',cancelling:'Cancelling',completed:'Completed',failed:'Failed',cancelled:'Cancelled'} as Record<string,string>)[status] || label(status));
 function taskList(value: unknown): Task[] {
   const source = Array.isArray(value) ? value : isRecord(value) && Array.isArray(value.tasks) ? value.tasks : [];
-  return source.filter(isRecord).map(item => ({id:text(item.id),title:text(item.title)||'Untitled task',description:text(item.description),botId:text(item.botId),botName:text(item.botName),status:text(item.status)||'pending',createdAt:text(item.createdAt),updatedAt:text(item.updatedAt),lastActivity:text(item.lastActivity)})).filter(item=>item.id);
+  return source.filter(isRecord).map(item => ({id:text(item.id),title:text(item.title)||'Untitled task',description:text(item.description),botId:text(item.botId),botName:text(item.botName),dedicatedBot:item.dedicatedBot===true,status:text(item.status)||'pending',createdAt:text(item.createdAt),updatedAt:text(item.updatedAt),lastActivity:text(item.lastActivity)})).filter(item=>item.id);
 }
 function taskDetail(value: unknown): Task | undefined {
   const candidate = isRecord(value) && isRecord(value.task) ? value.task : value;
@@ -41,30 +47,62 @@ function approvalList(value: unknown): TaskApproval[] {
   return source.filter(isRecord).map(item=>({id:text(item.id),status:text(item.status),action:isRecord(item.action)?item.action:{},expiresAt:text(item.expiresAt)})).filter(item=>item.id);
 }
 const approvalExpired = (approval:TaskApproval) => Boolean(approval.expiresAt && Date.parse(approval.expiresAt)<=Date.now());
+function modelChoice(value:Record<string,unknown>):ModelChoice|undefined {
+  const id=text(value.id);if(!id)return undefined;
+  const routes=Array.isArray(value.routes)?value.routes.filter(isRecord).map(route=>({modelId:text(route.modelId),publisher:text(route.publisher)||undefined})).filter(route=>route.modelId):undefined;
+  const publisher=modelPublisherLabel({id,publisher:text(value.publisher)||undefined,provider:text(value.provider)||undefined,routes});
+  let name=text(value.name)||text(value.label)||id;
+  const repeatedPrefix=`${publisher}: `;
+  while(name.toLocaleLowerCase().startsWith(repeatedPrefix.toLocaleLowerCase()))name=name.slice(repeatedPrefix.length).trimStart();
+  return {id,label:name||id};
+}
 
 function TaskView({props}:{props:TasksProps}) {
-  const [tasks,setTasks]=useState<Task[]>([]),[selected,setSelected]=useState<string|null>(null),[detail,setDetail]=useState<Task|null>(null),[messages,setMessages]=useState<TaskMessage[]>([]);
+  const [tasks,setTasks]=useState<Task[]>([]),[selected,setSelected]=useState<string|null>(props.initialTaskId??null),[detail,setDetail]=useState<Task|null>(null),[messages,setMessages]=useState<TaskMessage[]>([]);
   const [loading,setLoading]=useState(true),[loadingMessages,setLoadingMessages]=useState(false),[creating,setCreating]=useState(false),[busy,setBusy]=useState(false);
   const [error,setError]=useState(''),[loadError,setLoadError]=useState(''),[showCreate,setShowCreate]=useState(false),[filter,setFilter]=useState<TaskFilter>('all');
   const [approvals,setApprovals]=useState<TaskApproval[]>([]),[approvalError,setApprovalError]=useState('');
-  const [title,setTitle]=useState(''),[description,setDescription]=useState(''),[botId,setBotId]=useState(props.bots[0]?.id||''),[startImmediately,setStartImmediately]=useState(true),[draft,setDraft]=useState('');
+  const [title,setTitle]=useState(''),[description,setDescription]=useState(''),[botId,setBotId]=useState(props.bots[0]?.id||NEW_BOT),[startImmediately,setStartImmediately]=useState(true),[draft,setDraft]=useState('');
+  const [newBotName,setNewBotName]=useState(''),[newBotNameCustomized,setNewBotNameCustomized]=useState(false),[newBotInstructions,setNewBotInstructions]=useState(''),[newBotModel,setNewBotModel]=useState('');
+  const [modelChoices,setModelChoices]=useState<ModelChoice[]>([]),[modelsLoading,setModelsLoading]=useState(false),[modelsError,setModelsError]=useState('');
+  const modelRead=useRef<AbortController|null>(null),botCallbackOperations=useRef(new Set<string>());
+  const requestRef=useRef(props.request),initialTaskIdRef=useRef(props.initialTaskId??null),initialTaskVersionRef=useRef(props.initialTaskVersion??0);requestRef.current=props.request;
   const createOperation=useRef<{key:string;id:string}|null>(null),sendOperation=useRef<{key:string;id:string}|null>(null),mounted=useRef(true);
-  const selectedRef=useRef<string|null>(null),viewVersion=useRef(0),tasksRef=useRef(tasks);
+  const selectedRef=useRef<string|null>(props.initialTaskId??null),viewVersion=useRef(0),tasksRef=useRef(tasks);
   const listRead=useRef<AbortController|null>(null),detailRead=useRef<AbortController|null>(null);
   tasksRef.current=tasks;
   useEffect(()=>{
     // The task island can mount before the bot catalogue arrives, or outlive a bot.
-    if(!props.bots.some(bot=>bot.id===botId))setBotId(props.bots[0]?.id||'');
+    if(botId===NEW_BOT)return;
+    if(!props.bots.some(bot=>bot.id===botId))setBotId(props.bots[0]?.id||NEW_BOT);
   },[props.bots,botId]);
   useEffect(()=>{
+    if(!showCreate||botId!==NEW_BOT)return;
+    modelRead.current?.abort();const controller=new AbortController();modelRead.current=controller;setModelsLoading(true);setModelsError('');
+    void requestRef.current('/v1/models',{signal:controller.signal}).then(value=>{
+      if(controller.signal.aborted||modelRead.current!==controller)return;
+      const source=isRecord(value)&&Array.isArray(value.models)?value.models:[];
+      const choices=source.filter(isRecord).map(modelChoice).filter((item):item is ModelChoice=>Boolean(item));
+      setModelChoices(choices);setNewBotModel(current=>choices.some(choice=>choice.id===current)?current:'');
+      if(isRecord(value)&&text(value.error))setModelsError(text(value.error));
+    }).catch(reason=>{if(!controller.signal.aborted&&modelRead.current===controller){setModelChoices([]);setNewBotModel('');setModelsError(reason instanceof Error?reason.message:'Could not load models. You can use the backend default.');}}).finally(()=>{if(!controller.signal.aborted&&modelRead.current===controller)setModelsLoading(false);});
+    return()=>{controller.abort();if(modelRead.current===controller)modelRead.current=null;};
+  },[showCreate,botId]);
+  useEffect(()=>{
     mounted.current=true;
-    return()=>{mounted.current=false;listRead.current?.abort();detailRead.current?.abort()};
+    return()=>{mounted.current=false;listRead.current?.abort();detailRead.current?.abort();modelRead.current?.abort()};
   },[]);
   const selectTask=(id:string|null)=>{
     // Fence the old view synchronously, including switching away and back to the same task.
     viewVersion.current++;selectedRef.current=id;listRead.current?.abort();detailRead.current?.abort();setSelected(id);
     setDetail(null);setMessages([]);setApprovals([]);setDraft('');setBusy(false);setError('');setLoadError('');setApprovalError('');
   };
+  useEffect(()=>{
+    const next=props.initialTaskId??null;
+    const version=props.initialTaskVersion??0;
+    if(initialTaskIdRef.current===next&&initialTaskVersionRef.current===version)return;
+    initialTaskIdRef.current=next;initialTaskVersionRef.current=version;selectTask(next);
+  },[props.initialTaskId,props.initialTaskVersion]);
   const loadTasks=useCallback(async()=>{
     if(!mounted.current)return;
     listRead.current?.abort();const controller=new AbortController();listRead.current=controller;
@@ -103,15 +141,23 @@ function TaskView({props}:{props:TasksProps}) {
   },[selected,loadDetail]);
   const refresh=()=>{void loadTasks();if(selected)void loadDetail(selected)};
   const create=async(event:FormEvent)=>{
-    event.preventDefault();const trimmed=title.trim(),trimmedDescription=description.trim();if(!trimmed||!botId||creating)return;
-    const key=JSON.stringify([trimmed,trimmedDescription,botId,startImmediately]);
+    event.preventDefault();const trimmed=title.trim(),trimmedDescription=description.trim(),dedicated=botId===NEW_BOT;
+    const botName=newBotName.trim(),botInstructions=newBotInstructions.trim();
+    if(!trimmed||(!dedicated&&!botId)||dedicated&&(!botName||botName.length>80)||botInstructions.length>16000||creating)return;
+    modelRead.current?.abort();modelRead.current=null;setModelsLoading(false);
+    const key=JSON.stringify([trimmed,trimmedDescription,botId,startImmediately,dedicated?botName:null,dedicated?botInstructions:null,dedicated?newBotModel:null]);
     const operation=createOperation.current?.key===key?createOperation.current:{key,id:crypto.randomUUID()};createOperation.current=operation;
     const version=viewVersion.current;
     setCreating(true);setError('');
     try {
-      const result=await props.request('/v1/tasks',{method:'POST',body:{operationId:operation.id,title:trimmed,description:trimmedDescription,botId,startImmediately}});
+      const body={operationId:operation.id,title:trimmed,description:trimmedDescription,startImmediately,...(dedicated?{newBot:{name:botName,...(botInstructions?{instructions:botInstructions}:{}),...(newBotModel?{model:newBotModel}:{})}}:{botId})};
+      const result=await props.request('/v1/tasks',{method:'POST',body});
       if(!mounted.current)return;
-      const created=taskDetail(result);createOperation.current=null;setTitle('');setDescription('');setShowCreate(false);setStartImmediately(true);await loadTasks();
+      const created=taskDetail(result);const responseBot=isRecord(result)&&isRecord(result.bot)&&text(result.bot.id)?{id:text(result.bot.id),name:text(result.bot.name)||botName}:undefined;
+      if(viewVersion.current===version)createOperation.current=null;
+      if(responseBot&&!botCallbackOperations.current.has(operation.id)){botCallbackOperations.current.add(operation.id);props.onBotCreated?.(responseBot);}
+      if(viewVersion.current===version){setTitle('');setDescription('');setNewBotName('');setNewBotNameCustomized(false);setNewBotInstructions('');setNewBotModel('');setShowCreate(false);setStartImmediately(true);}
+      await loadTasks();
       if(mounted.current&&viewVersion.current===version&&created?.id)selectTask(created.id);
     } catch(reason){if(mounted.current&&viewVersion.current===version)setError(reason instanceof Error?reason.message:'Could not create task.');}
     finally{if(mounted.current)setCreating(false);}
@@ -153,7 +199,7 @@ function TaskView({props}:{props:TasksProps}) {
   const canDecideApproval=Boolean(detail&&['running','waiting_approval','waiting_connection'].includes(detail.status));
   const waitingApprovals=approvals.filter(approval=>['pending','approved','executing'].includes(approval.status));
   const content=selected ? <section className="timber-tasks-detail" data-task-id={selected}>
-    <header className="timber-tasks-detail-heading"><button type="button" className="timber-tasks-icon-button" aria-label="Back to tasks" onClick={()=>selectTask(null)}><ArrowLeftIcon/></button><div className="timber-tasks-title-block"><h2>{detail?.title||'Task'}</h2><span className="timber-tasks-subtitle">{detail?.botName||botNames.get(detail?.botId||'')||'Assigned bot'}{detail?.status&&<> · <span className="timber-task-status" data-status={detail.status}>{statusName(detail.status)}</span></>}</span></div><button type="button" className="timber-tasks-quiet" onClick={refresh} aria-label="Refresh task"><RefreshCwIcon/></button>{detail?.botId&&props.onOpenBot&&<button type="button" className="timber-tasks-quiet" onClick={()=>props.onOpenBot?.(detail.botId)}>Open bot</button>}</header>
+    <header className="timber-tasks-detail-heading"><button type="button" className="timber-tasks-icon-button" aria-label="Back to tasks" onClick={()=>selectTask(null)}><ArrowLeftIcon/></button><div className="timber-tasks-title-block"><h2>{detail?.title||'Task'}</h2><span className="timber-tasks-subtitle">{detail?.botName||botNames.get(detail?.botId||'')||'Assigned bot'}{detail?.dedicatedBot&&<> · Dedicated bot</>}{detail?.status&&<> · <span className="timber-task-status" data-status={detail.status}>{statusName(detail.status)}</span></>}</span></div><button type="button" className="timber-tasks-quiet" onClick={refresh} aria-label="Refresh task"><RefreshCwIcon/></button>{detail?.botId&&props.onOpenBot&&<button type="button" className="timber-tasks-quiet" aria-label="Open bot" onClick={()=>props.onOpenBot?.(detail.botId)}>Open bot</button>}</header>
     {detail?.description&&<p className="timber-tasks-description">{detail.description}</p>}
     {loadError&&<p className="timber-tasks-error" role="alert">{loadError}</p>}
     {approvalError&&<p className="timber-tasks-error" role="alert">{approvalError}</p>}
@@ -185,15 +231,15 @@ function TaskView({props}:{props:TasksProps}) {
     {detail?.status==='cancelled'&&<p className="timber-tasks-hint">Cancelled tasks stay stopped. Create a new task to work again.</p>}
     {detail&&['running','waiting_approval','waiting_connection','completed','failed'].includes(detail.status)&&<form className="timber-tasks-composer" onSubmit={event=>void send(event)}><label className="timber-tasks-sr-only" htmlFor="timber-task-draft">Message this task</label><textarea id="timber-task-draft" rows={2} value={draft} onChange={event=>setDraft(event.currentTarget.value)} placeholder={['completed','failed'].includes(detail.status)?'New instructions to continue this task…':'Message this task…'}/><button type="submit" aria-label={['completed','failed'].includes(detail.status)?'Continue task':'Send task message'} disabled={busy||!draft.trim()}>{busy?<LoaderCircleIcon className="timber-tasks-spinner"/>:['completed','failed'].includes(detail.status)?'Continue':<ArrowUpIcon/>}</button></form>}
   </section> : <section className="timber-tasks-overview">
-    <header className="timber-tasks-overview-heading"><div><h2>Tasks</h2><p>Independent work and conversations across your bots.</p></div><button type="button" className="timber-tasks-action" onClick={()=>{setShowCreate(value=>!value);setError('')}}><PlusIcon/>{showCreate?'Close':'New task'}</button></header>
-    {showCreate&&<form className="timber-tasks-create" onSubmit={event=>void create(event)}><h3>Create a task</h3><label>Title<input autoFocus required maxLength={160} value={title} onChange={event=>setTitle(event.currentTarget.value)} placeholder="What needs to be done?"/></label><label>Description<textarea rows={3} maxLength={32000} value={description} onChange={event=>setDescription(event.currentTarget.value)} placeholder="Add context or instructions (optional)"/></label><label>Assigned bot<select required value={botId} onChange={event=>setBotId(event.currentTarget.value)}><option value="" disabled>Select a bot</option>{props.bots.map(bot=><option value={bot.id} key={bot.id}>{bot.name}</option>)}</select></label><label className="timber-tasks-checkbox"><input type="checkbox" checked={startImmediately} onChange={event=>setStartImmediately(event.currentTarget.checked)}/>Start immediately</label>{error&&<p className="timber-tasks-error" role="alert">{error}</p>}<div className="timber-tasks-form-actions"><button type="button" className="timber-tasks-quiet" onClick={()=>setShowCreate(false)}>Cancel</button><button type="submit" className="timber-tasks-action" disabled={creating||!props.bots.length||!title.trim()}>{creating&&<LoaderCircleIcon className="timber-tasks-spinner"/>}{creating?'Creating…':'Create task'}</button></div>{!props.bots.length&&<p className="timber-tasks-hint">Create a bot before assigning a task.</p>}</form>}
+    <header className="timber-tasks-overview-heading"><div><h2>Tasks</h2><p>Independent work and conversations across your bots.</p></div><button type="button" className="timber-tasks-action" disabled={creating} onClick={()=>{if(showCreate){modelRead.current?.abort();modelRead.current=null;setModelsLoading(false);}setShowCreate(value=>!value);setError('')}}><PlusIcon/>{showCreate?'Close':'New task'}</button></header>
+    {showCreate&&<form className="timber-tasks-create" onSubmit={event=>void create(event)}><fieldset disabled={creating}><legend>Create a task</legend><label htmlFor="timber-task-title">Title</label><input id="timber-task-title" autoFocus required maxLength={160} value={title} onChange={event=>{const next=event.currentTarget.value;setTitle(next);if(!newBotNameCustomized)setNewBotName(next.trim().slice(0,80));}} placeholder="What needs to be done?"/><label htmlFor="timber-task-description">Description</label><textarea id="timber-task-description" rows={3} maxLength={32000} value={description} onChange={event=>setDescription(event.currentTarget.value)} placeholder="Add context for this task (optional)"/><label htmlFor="timber-task-assignee">Assigned bot</label><select id="timber-task-assignee" required value={botId} onChange={event=>{const next=event.currentTarget.value;setBotId(next);if(next===NEW_BOT){setNewBotNameCustomized(false);setNewBotName(title.trim().slice(0,80));}}}><option value={NEW_BOT}>Create a dedicated bot</option>{props.bots.map(bot=><option value={bot.id} key={bot.id}>{bot.name}</option>)}</select>{botId===NEW_BOT&&<div className="timber-tasks-new-bot"><h4>Dedicated bot</h4><label htmlFor="timber-task-bot-name">Bot name</label><input id="timber-task-bot-name" required maxLength={80} value={newBotName} onChange={event=>{setNewBotNameCustomized(true);setNewBotName(event.currentTarget.value);}} placeholder="Name this bot"/><label htmlFor="timber-task-bot-instructions">Bot instructions</label><textarea id="timber-task-bot-instructions" rows={3} maxLength={16000} value={newBotInstructions} onChange={event=>setNewBotInstructions(event.currentTarget.value)} placeholder="Optional guidance for this bot"/><label htmlFor="timber-task-model">Model (optional)</label><select id="timber-task-model" value={newBotModel} onChange={event=>setNewBotModel(event.currentTarget.value)}><option value="">Use backend default</option>{modelChoices.map(choice=><option value={choice.id} key={choice.id}>{choice.label}</option>)}</select>{modelsLoading&&<p className="timber-tasks-hint">Loading available models…</p>}{modelsError&&<p className="timber-tasks-hint" role="status">{modelsError} You can leave Model as backend default.</p>}{!modelsLoading&&!modelChoices.length&&<p className="timber-tasks-hint">No models are currently listed. The backend default remains available.</p>}<p className="timber-tasks-hint">This bot gets its own computer and workspace. Computer actions ask for permission by default.</p></div>}<label className="timber-tasks-checkbox"><input type="checkbox" checked={startImmediately} onChange={event=>setStartImmediately(event.currentTarget.checked)}/>Start immediately</label>{error&&<p className="timber-tasks-error" role="alert">{error}</p>}<div className="timber-tasks-form-actions"><button type="button" className="timber-tasks-quiet" disabled={creating} onClick={()=>{modelRead.current?.abort();modelRead.current=null;setModelsLoading(false);setShowCreate(false)}}>Cancel</button><button type="submit" className="timber-tasks-action" disabled={creating||!title.trim()||botId===NEW_BOT&&(!newBotName.trim()||newBotName.trim().length>80||newBotInstructions.length>16000)||botId!==NEW_BOT&&!props.bots.some(bot=>bot.id===botId)}>{creating&&<LoaderCircleIcon className="timber-tasks-spinner"/>}{creating?'Creating…':'Create task'}</button></div></fieldset></form>}
     <div className="timber-tasks-filters" role="group" aria-label="Filter tasks by status">{(['all','active','pending','completed'] as TaskFilter[]).map(value=><button type="button" key={value} aria-pressed={filter===value} onClick={()=>setFilter(value)}>{value==='all'?'All':value==='active'?'Active':statusName(value)}</button>)}</div>
     {loadError&&<p className="timber-tasks-error" role="alert">{loadError} <button type="button" className="timber-tasks-link" onClick={refresh}>Retry</button></p>}
     {!tasks.length&&<div className="timber-tasks-empty">{loading?<><LoaderCircleIcon className="timber-tasks-spinner"/><span>Loading tasks…</span></>:<><strong>No tasks yet</strong><span>Create a global task and assign it to a bot. Its conversation stays separate from bot chat.</span></>}</div>}
     {!!tasks.length&&!visibleTasks.length&&<div className="timber-tasks-empty"><strong>No {filter} tasks</strong><span>Choose another filter to see other tasks.</span></div>}
-    {!!visibleTasks.length&&<div className="timber-tasks-list">{visibleTasks.map(task=><button type="button" className="timber-tasks-card" key={task.id} data-task-id={task.id} onClick={()=>selectTask(task.id)}><span className="timber-tasks-card-heading"><strong>{task.title}</strong><span className="timber-task-status" data-status={task.status}>{statusName(task.status)}</span></span><span className="timber-tasks-card-description">{task.description||'No description'}</span><span className="timber-tasks-card-footer"><span>{task.botName||botNames.get(task.botId)||'Assigned bot'}</span><time>{date(task.lastActivity||task.updatedAt||task.createdAt)}</time></span></button>)}</div>}
+    {!!visibleTasks.length&&<div className="timber-tasks-list">{visibleTasks.map(task=><button type="button" className="timber-tasks-card" key={task.id} data-task-id={task.id} disabled={creating} onClick={()=>selectTask(task.id)}><span className="timber-tasks-card-heading"><strong>{task.title}</strong><span className="timber-task-status" data-status={task.status}>{statusName(task.status)}</span></span><span className="timber-tasks-card-description">{task.description||'No description'}</span><span className="timber-tasks-card-footer"><span>{task.botName||botNames.get(task.botId)||'Assigned bot'}{task.dedicatedBot&&<span className="timber-tasks-dedicated-badge">Dedicated bot</span>}</span><time>{date(task.lastActivity||task.updatedAt||task.createdAt)}</time></span></button>)}</div>}
   </section>;
-  return <div className="timber-tasks" role="region" aria-label="Global tasks"><div className="timber-tasks-topbar">{props.onClose&&<button type="button" className="timber-tasks-quiet" onClick={props.onClose}>Close</button>}</div>{content}</div>;
+  return <div className="timber-tasks" role="region" aria-label="Global tasks"><div className="timber-tasks-topbar">{props.onClose&&<button type="button" className="timber-tasks-quiet" disabled={creating} onClick={props.onClose}>Close</button>}</div>{content}</div>;
 }
 
 export function mountTasks(container:HTMLElement,props:TasksProps) {

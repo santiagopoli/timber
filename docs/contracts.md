@@ -368,14 +368,31 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
 ## Global tasks
 
 Tasks are owner-scoped records in WorkspaceDO. `GET /v1/tasks` is passive;
-`POST /v1/tasks` accepts `{operationId,title,description,botId,startImmediately?}`
-and returns `{task}` (201 for a new task; an identical idempotent replay returns
-200). `startImmediately` defaults to true; false leaves the task pending.
+`POST /v1/tasks` accepts `{operationId,title,description,startImmediately?,botId}`
+for an existing bot, or the same fields with `newBot` instead of `botId`. Exactly
+one of `botId` and `newBot` is required. `newBot` accepts the owner bot-creation
+settings `{name,instructions?,model?,reasoningEffort?,fast?,computerApprovalMode?,allowNamedAgents?,allowTaskCreation?}`;
+its safe defaults match owner bot creation (`ask`, false permissions, and the
+configured default model). Dedicated creation returns `{task,bot}` while the
+existing-bot path remains `{task}` (201 for a new task; an identical replay returns
+200). The normalized complete `newBot` input participates in idempotency, including
+omitted-vs-explicit settings; changing settings under a receipt returns 409.
+Task, dedicated bot, and operation receipt are inserted atomically after model
+validation. Replays return the stored pair without consulting mutable model
+catalogue defaults. Dedicated receipts retain only a versioned SHA-256 digest of
+normalized creation input. Explicit bot deletion erases the bot and task records;
+only operation ID, task ID and that opaque digest remain so an identical replay
+returns 404 and changed arguments return 409 without resurrection. Deleted task
+metadata is absent from task listing and detail routes.
+A dedicated task carries `dedicatedBot:true`; its Bot carries `taskId`, an
+informational pointer to its initial associated task only. The bot can receive
+future tasks, and completing or cancelling the initial task does not delete it.
+`startImmediately` defaults to true; false leaves the task pending.
 `GET /v1/tasks/:id` returns task metadata. Task conversation data lives in a
 separate durable BotDO identity keyed by owner and task ID, initialized from the
-assigned bot's current configuration; the BotDO retains the assigned bot's
-computer/workspace identity, so no second computer is created. The task has its
-own transcript and run/event IDs.
+assigned bot's current configuration. Existing-bot tasks share that bot's
+computer; a dedicated bot has its own bot UUID/computer, shared only by its own
+task and ordinary bot conversation. The task has its own transcript and run/event IDs.
 
 `POST /v1/tasks/:id/start` admits the description under stable operation ID
 `task-start:<taskId>`. `POST /v1/tasks/:id/messages`, `GET /messages`, `GET

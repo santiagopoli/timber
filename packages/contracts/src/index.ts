@@ -3,7 +3,7 @@ export * from './model-catalog.js';
 export * from './model-errors.js';
 export type RunStatus = "queued" | "running" | "waiting_approval" | "waiting_connection" | "completed" | "failed" | "cancelled" | "interrupted";
 export type ComputerApprovalMode = "ask" | "automatic";
-export interface Bot { id: string; name: string; instructions: string; runtime: "pi"; model: string; reasoningEffort?: string; fast?: boolean; computerApprovalMode?: ComputerApprovalMode; allowNamedAgents?: boolean; allowTaskCreation?: boolean; createdByBotId?: string; createdAt: string; updatedAt: string; }
+export interface Bot { id: string; name: string; instructions: string; runtime: "pi"; model: string; reasoningEffort?: string; fast?: boolean; computerApprovalMode?: ComputerApprovalMode; allowNamedAgents?: boolean; allowTaskCreation?: boolean; taskId?: string; createdByBotId?: string; createdAt: string; updatedAt: string; }
 export interface MessageProvenance { kind: "bot" | "mention" | "delegation_result"; sourceBotId: string; sourceBotName: string; sourceRunId?: string; delegationId?: string; }
 export interface RunDelegation { id: string; sourceBotId: string; sourceRunId: string; path: string[]; }
 export interface AgentDelegation extends RunDelegation { sourceBotName: string; targetBotId: string; targetBotName: string; targetRunId?: string; status: RunStatus; createdAt: string; updatedAt: string; error?: string; }
@@ -51,7 +51,7 @@ export interface CompactionReceipt {id:string;reason:"manual"|"threshold"|"overf
 export interface BotContextStatus {automatic:true;estimatedTokens:number;activeEntries:number;contextWindow:number;compactions:CompactionReceipt[];historyRetained:true;}
 
 export type TaskStatus = "pending" | "queued" | "running" | "waiting_approval" | "waiting_connection" | "cancelling" | "completed" | "failed" | "cancelled";
-export interface Task { id:string; title:string; description:string; botId:string; botName:string; creator:"owner"|"bot"; createdByBotId?:string; sourceRunId?:string; status:TaskStatus; startImmediately:boolean; createdAt:string; updatedAt:string; lastActivity?:string; }
+export interface Task { id:string; title:string; description:string; botId:string; botName:string; creator:"owner"|"bot"; createdByBotId?:string; sourceRunId?:string; status:TaskStatus; startImmediately:boolean; createdAt:string; updatedAt:string; lastActivity?:string; dedicatedBot?:boolean; }
 export interface TaskPage { tasks:Task[]; }
 export * from "./avatars";
 export * from "./avatar-presets";
