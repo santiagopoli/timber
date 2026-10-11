@@ -115,16 +115,16 @@ function MessageRunStatus({ run, botId, sending, callbacks }: { run?: ChatModel[
   if (!run || run.status !== 'queued') return null;
   return <div className="timber-message-run" data-message-run-status={run.status}>
     <span className="timber-delivery-status"><ClockIcon />Queued</span>
-    {run.error && <div className="timber-delivery-error"><p>{run.error}</p>{canRetryAdmission(run) && <Button variant="outline" size="sm" disabled={sending} onClick={() => callbacks.onRetry(botId, run.operationId)}>Retry sending</Button>}</div>}
+    {run.error && <div className="timber-delivery-error timber-message-notice" role="status"><div className="timber-task-outcome-heading"><CircleAlertIcon aria-hidden="true"/><span>Message not started</span></div><p>{run.error}</p>{canRetryAdmission(run) && <Button variant="outline" size="sm" disabled={sending} onClick={() => callbacks.onRetry(botId, run.operationId)}>Retry sending</Button>}</div>}
   </div>;
 }
 
-const TaskOutcome = memo(function TaskOutcome({botId, run, request, failure, sending, active, callbacks, kind, cancellationId}: {botId:string;run:ChatModel['runs'][number];request?:ChatModel['messages'][number];failure:ReturnType<typeof failureRecovery>;sending:boolean;active:boolean;callbacks:ChatCallbacks;kind:'stopped'|'failure';cancellationId?:string}) {
+const TaskOutcome = memo(function TaskOutcome({botId, run, request, failure, sending, active, callbacks, kind, cancellationId, inline=false}: {botId:string;run:ChatModel['runs'][number];request?:Pick<ChatModel['messages'][number],'text'>;failure:ReturnType<typeof failureRecovery>;sending:boolean;active:boolean;callbacks:ChatCallbacks;kind:'stopped'|'failure';cancellationId?:string;inline?:boolean}) {
   if (kind === 'stopped') return <article className="timber-work-status" data-run-outcome={run.id} data-cancellation-id={cancellationId} data-task-outcome-kind="stopped" role="status"><SquareIcon aria-hidden="true"/><span>Task stopped</span></article>;
   const allowanceExhausted=failure.code==='chatgpt_allowance_exhausted',retryable=canRetryAdmission(run)&&!allowanceExhausted;
   const canContinue=Boolean(request)&&!retryable&&['continue','retry'].includes(failure.action);
   const recoveryTarget=['model','connection','context'].includes(failure.action)?failure.action as 'model'|'connection'|'context':undefined;
-  return <article className="timber-task-outcome" data-run-outcome={run.id} role="status">
+  return <article className={`timber-task-outcome${inline?' timber-message-notice':''}`} data-run-outcome={run.id} role="status">
     <div className="timber-task-outcome-heading"><CircleAlertIcon aria-hidden="true"/><span>{allowanceExhausted?'ChatGPT usage limit reached':retryable?'Message not started':run.status==='failed'?'Request failed':'Response interrupted'}</span></div>
     {failure.message && <p>{failure.message}</p>}
     {failure.code&&<details className="timber-failure-details"><summary>Details</summary><code>{failure.code}</code>{run.model&&<p>{run.model}{run.reasoningEffort?` · ${run.reasoningEffort} reasoning`:''}{run.fast?' · Fast':''}</p>}</details>}
@@ -149,16 +149,17 @@ const ConnectionEntry = memo(function ConnectionEntry({ connection, callbacks }:
   </article>;
 });
 
-const DeliveryEntry = memo(function DeliveryEntry({ delivery, busy, callbacks }: { delivery: MessageDelivery; busy: boolean; callbacks: ChatCallbacks }) {
+const DeliveryEntry = memo(function DeliveryEntry({ delivery, busy, callbacks, outcome }: { delivery: MessageDelivery; busy: boolean; callbacks: ChatCallbacks; outcome?:ReactNode }) {
   const state = delivery.state === 'sending' ? 'Sending' : delivery.state === 'unknown' ? 'Delivery unknown' : delivery.state === 'rejected' ? 'Not accepted' : delivery.runStatus === 'queued' ? 'Queued' : label(delivery.runStatus || 'queued').replace(/^./, character => character.toUpperCase());
   return <Message from="user" data-operation-id={delivery.operationId} className="timber-message timber-delivery">
-    <MessageContent className="timber-message-content"><Response text={delivery.text} /></MessageContent>
-    <CopyMessage text={delivery.text} kind="pending" />
-    <div className="timber-delivery-status" role="status">
+    <MessageContent className="timber-message-content"><Response text={delivery.text} />
+      {outcome || (delivery.error && <div className="timber-delivery-error timber-message-notice" role="status"><div className="timber-task-outcome-heading"><CircleAlertIcon aria-hidden="true"/><span>{state}</span></div><p>{delivery.error}</p>{delivery.canRetry && <Button variant="outline" size="sm" disabled={busy} onClick={() => callbacks.onRetry(delivery.botId, delivery.operationId)}>Retry sending</Button>}</div>)}
+    </MessageContent>
+    <CopyMessage text={delivery.text} kind="pending" createdAt={delivery.createdAt} />
+    {!delivery.error && !outcome && <div className="timber-delivery-status" role="status">
       {delivery.state === 'sending' ? <LoaderCircleIcon className="timber-spinner" /> : delivery.state === 'accepted' ? <CheckIcon /> : <CircleAlertIcon />}
-      <span>{state}</span><time>{time(delivery.createdAt)}</time>
-    </div>
-    {delivery.error && <div className="timber-delivery-error"><p>{delivery.error}</p>{delivery.canRetry && <Button variant="outline" size="sm" disabled={busy} onClick={() => callbacks.onRetry(delivery.botId, delivery.operationId)}>Retry sending</Button>}</div>}
+      <span>{state}</span>
+    </div>}
   </Message>;
 });
 
@@ -370,13 +371,12 @@ function sameValue(left: unknown, right: unknown): boolean {
   return a.length === b.length && a.every(key => Object.prototype.hasOwnProperty.call(right, key) && sameValue((left as Record<string, unknown>)[key], (right as Record<string, unknown>)[key]));
 }
 
-const HistoryMessage = memo(function HistoryMessage({message, botId, botName, run, sending, sourceModel, callbacks}: {message:ChatModel['messages'][number];botId:string;botName:string;run?:ChatModel['runs'][number];sending:boolean;sourceModel?:string;callbacks:ChatCallbacks}) {
+const HistoryMessage = memo(function HistoryMessage({message, botId, botName, run, sending, sourceModel, callbacks, outcome}: {message:ChatModel['messages'][number];botId:string;botName:string;run?:ChatModel['runs'][number];sending:boolean;sourceModel?:string;callbacks:ChatCallbacks;outcome?:ReactNode}) {
   if (message.provenance) return <AgentMessageNotice notice={{direction:'from',agent:{id:message.provenance.sourceBotId,name:message.provenance.sourceBotName,kind:'bot',model:sourceModel},text:message.text,messageId:message.id,status:run?.status}} callbacks={callbacks} eventKey={`message:${message.id}`}/>;
   return <Message from={message.role === 'user' ? 'user' : 'assistant'} data-message-id={message.id} data-message-kind={message.kind} data-progress-message-id={message.kind === 'progress' ? message.id : undefined} data-run-id={message.runId} className={`timber-message timber-message-${message.role}`}>
     {message.role !== 'user' && <div className="timber-message-meta"><span>{message.role === 'assistant' ? botName : label(message.role)}</span></div>}
-    <MessageContent className="timber-message-content"><Response text={message.text} />{message.attachments?.map(image=><ArtifactPreview key={image.artifactId} botId={botId} artifactId={image.artifactId} compact />)}</MessageContent>
+    <MessageContent className="timber-message-content"><Response text={message.text} />{message.attachments?.map(image=><ArtifactPreview key={image.artifactId} botId={botId} artifactId={image.artifactId} compact />)}{outcome}{message.role === 'user' && <MessageRunStatus run={run} botId={botId} sending={sending} callbacks={callbacks} />}</MessageContent>
     {['user', 'assistant'].includes(message.role) && <CopyMessage text={message.text} createdAt={message.createdAt} />}
-    {message.role === 'user' && <MessageRunStatus run={run} botId={botId} sending={sending} callbacks={callbacks} />}
   </Message>;
 });
 
@@ -440,10 +440,19 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks, secureRequests:Sec
       : request && request.at === at ? request.order + 1 : (messages.length + deliveries.length) * 2 + 1;
     return {at, order};
   };
+  const active = model.runs.some(run => !run.subagentId && !terminal.has(run.status));
+  const outcomes = runOutcomes(model.runs, model.events, model.runFilter);
+  const failures = new Map(outcomes.filter(outcome=>outcome.kind==='failure').map(outcome=>[outcome.run.id,outcome]));
+  const integratedFailures = new Set<string>();
+  const inlineFailure = (runId:string|undefined, request:Pick<ChatModel['messages'][number],'text'>) => {
+    const outcome=runId?failures.get(runId):undefined;if(!outcome)return undefined;
+    const {run}=outcome;integratedFailures.add(run.id);
+    return <TaskOutcome inline botId={model.bot.id} run={run} request={request} failure={failureRecovery(run,indexes.eventsByRun.get(run.id)||[])} sending={model.sending} active={active} kind="failure" callbacks={callbacks}/>;
+  };
   const entries: TimelineEntry[] = [];
   messages.forEach((message, index) => {
     const run = indexes.runs.get(message.runId || '');
-    entries.push({key: `message:${message.id}`, ...messagePosition(message,index), node: <HistoryMessage message={message} botId={model.bot.id} botName={model.bot.name} run={(message.role === 'user' && run?.status === 'queued') || message.provenance ? run : undefined} sending={message.role === 'user' && run?.status === 'queued' && Boolean(run.error) ? model.sending : false} sourceModel={message.provenance ? indexes.bots.get(message.provenance.sourceBotId)?.model : undefined} callbacks={callbacks}/>});
+    entries.push({key: `message:${message.id}`, ...messagePosition(message,index), node: <HistoryMessage message={message} botId={model.bot.id} botName={model.bot.name} run={(message.role === 'user' && run?.status === 'queued') || message.provenance ? run : undefined} sending={message.role === 'user' && run?.status === 'queued' && Boolean(run.error) ? model.sending : false} sourceModel={message.provenance ? indexes.bots.get(message.provenance.sourceBotId)?.model : undefined} outcome={message.role==='user'&&!message.provenance&&indexes.requests.get(message.runId||'')?.id===message.id?inlineFailure(message.runId,message):undefined} callbacks={callbacks}/>});
   });
   for (const approval of approvals) entries.push({key: `approval:${approval.id}`, ...afterRequest(approval.runId, timestamp(approval.createdAt)), node: <ApprovalEntry approval={approval} process={indexes.processes.get(approval.result?.processId || approval.operationId)} agentName={indexes.agents.get(indexes.runs.get(approval.runId)?.subagentId || '')?.name} current={approval.id === current?.id} automatic={model.bot.computerApprovalMode === 'automatic'} callbacks={callbacks} />});
   for (const connection of model.connections.filter(item => !model.runFilter || item.runId === model.runFilter)) {
@@ -451,7 +460,7 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks, secureRequests:Sec
   }
   for(const item of secureRequests.filter(item=>!model.runFilter||item.runId===model.runFilter))entries.push({key:`secure:${item.id}`,...afterRequest(item.runId,timestamp(item.createdAt)),node:<SecureRequestCard item={item} onStop={()=>callbacks.onStop(model.bot.id,item.runId)}/>});
   for(const event of model.events.filter(event=>event.type==='keychain.updated'&&!event.data.request&&Array.isArray(event.data.entries)&&(!model.runFilter||event.runId===model.runFilter)))entries.push({key:`secure-saved:${event.id}`,at:timestamp(event.createdAt),order:1,node:<SecureSavedPill names={(event.data.entries as {name:string}[]).map(item=>item.name)}/>});
-  deliveries.forEach((delivery, index) => entries.push({key: `delivery:${delivery.operationId}`, at: timestamp(delivery.createdAt), order: (messages.length + index) * 2, node: <DeliveryEntry delivery={delivery} busy={model.sending} callbacks={callbacks} />}));
+  deliveries.forEach((delivery, index) => entries.push({key: `delivery:${delivery.operationId}`, at: timestamp(delivery.createdAt), order: (messages.length + index) * 2, node: <DeliveryEntry delivery={delivery} busy={model.sending} callbacks={callbacks} outcome={inlineFailure(delivery.runId,delivery)} />}));
   for(const item of collaboration.items)entries.push({key:`collaboration:${item.key}`,...afterRequest(item.runId,timestamp(item.createdAt)),node:<TimelineCollaboration item={item} callbacks={callbacks}/>});
   const compactions = collectCompactions(model), unpositionedCompactions = compactions.filter(item => item.unpositioned);
   for (const item of compactions) if (!item.unpositioned) entries.push({key:item.key,...afterRequest(item.runId,timestamp(item.createdAt)),node:<TimelineCompaction item={item}/>});
@@ -460,9 +469,9 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks, secureRequests:Sec
   for (const tool of tools) {
     entries.push({key:`activity:${tool.key}`, ...afterRequest(tool.runId,tool.at), node:null, tool});
   }
-  const active = model.runs.some(run => !run.subagentId && !terminal.has(run.status));
-  for (const outcome of runOutcomes(model.runs, model.events, model.runFilter)) {
+  for (const outcome of outcomes) {
     const {run} = outcome;
+    if(outcome.kind==='failure'&&integratedFailures.has(run.id))continue;
     const at = Math.max(requests.get(run.id)?.at || 0, timestamp(run.updatedAt), timestamp(outcome.createdAt), indexes.latestAt.get(run.id) || 0);
     entries.push({key:`outcome:${outcome.key}`,at,order:(messages.length + deliveries.length)*2+4,node:<TaskOutcome botId={model.bot.id} run={run} request={indexes.requests.get(run.id)} failure={failureRecovery(run, indexes.eventsByRun.get(run.id) || [])} sending={model.sending} active={active} kind={outcome.kind} cancellationId={outcome.cancellationId} callbacks={callbacks}/>});
   }
@@ -649,7 +658,7 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
         if(securePrompt && selectedMentions.length){setAttachmentError('Send private inputs to one bot at a time; grant other bots access from your keychain.');throw new Error('Unsupported recipients');}
         if(files.length && selectedMentions.length) {setAttachmentError('Image messages cannot mention other bots yet.');throw new Error('Unsupported recipients');}
         setAttachmentError('');
-        setSecuring(true);try {const secured=await secrets.flush(text);await callbacks.onSend(model.bot.id,secured,selectedMentions.map(bot=>bot.id),files);} catch(reason) {setAttachmentError(reason instanceof Error?reason.message:'The message was not delivered. Retry sending.');throw new Error('Not delivered');}finally{setSecuring(false);}
+        setSecuring(true);try {const secured=await secrets.flush(text);await callbacks.onSend(model.bot.id,secured,selectedMentions.map(bot=>bot.id),files);} catch(reason) {if(typeof record(reason).deliveryOperationId!=='string')setAttachmentError(reason instanceof Error?reason.message:'The message was not delivered. Retry sending.');throw new Error('Not delivered');}finally{setSecuring(false);}
       }}>
         <PromptInputBody><ImageControls onSecureInput={()=>addSecure()} sending={model.sending||securing} hasText={!!model.draft.trim()} acceptedIds={model.acceptedImageIds}><>{securePrompt?<SecurePrompt value={model.draft} name={`Message ${model.bot.name}`} disabled={model.sending||securing} caret={caret} onCaret={setCaret} onRange={trackSelection} onKeyDown={mentionKeyDown} renderDraft={secrets.render} onChange={text=>{setMentionIndex(0);setDismissed(false);callbacks.onDraft(model.bot.id,text);}}/>:<PromptInputTextarea ref={textarea} id="message" rows={1} aria-label={`Message ${model.bot.name}`} placeholder={`Message ${model.bot.name}`} value={model.draft}
           aria-autocomplete="list" aria-controls={choices.length ? 'bot-mentions' : undefined} aria-expanded={choices.length > 0} aria-activedescendant={choices.length ? `mention-${choices[Math.min(mentionIndex, choices.length - 1)].id}` : undefined}

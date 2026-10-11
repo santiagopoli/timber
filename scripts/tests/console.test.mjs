@@ -224,7 +224,7 @@ test('response recovery is visible and exhausted failure belongs to its task ins
     assert.equal(await page.locator('#run-status').isVisible(),false);
     assert.equal(await page.locator('#run-error').isVisible(),false);
     assert.equal(await page.locator('#messages').getByText(error,{exact:true}).count(),1);
-    assert.equal(await notice.evaluate(node=>Boolean(document.querySelector('[data-run-activity="recover-ui-run"]').compareDocumentPosition(node)&Node.DOCUMENT_POSITION_FOLLOWING)),true,'the outcome follows the task activity');
+    assert.equal(await notice.evaluate(node=>node.closest('[data-message-id="recover-ui-message"] .timber-message-content')!==null),true,'the failure belongs to its original user bubble');
     assert.equal(await activity.locator('[data-tool-operation-id="recover-ui-exec"]').getAttribute('data-tool-status'),'completed','a model failure does not rewrite the command outcome');
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
     if(process.env.CONSOLE_SCREENSHOT_DIR){await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});await notice.scrollIntoViewIfNeeded();await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/task-outcome-${width}.png`,animations:'disabled'});}
@@ -1977,7 +1977,8 @@ test('an uncertain image send retains previews and retries the same message and 
     });
     await login();await page.locator('input[type=file][accept="image/png,image/jpeg"]').setInputFiles({name:'retry.png',mimeType:'image/png',buffer:png});
     await page.locator('#message').fill('Inspect this image');await sendMessage(page);
-    await page.locator('#message-form [role=alert]').waitFor();
+    await page.locator('.timber-delivery .timber-message-content .timber-delivery-error').waitFor();
+    assert.equal(await page.locator('#message-form [role=alert]').count(),0,'delivery errors appear only in the original message');
     assert.equal(await page.locator('.timber-image-attachments img').count(),1);
     await sendMessage(page);
     await page.waitForFunction(()=>document.querySelectorAll('.timber-image-attachments img').length===0);
@@ -1999,7 +2000,8 @@ test('Retry sending clears only accepted image previews after a failed delivery'
     });
     await login();await page.locator('input[type=file][accept="image/png,image/jpeg"]').setInputFiles({name:'retry.png',mimeType:'image/png',buffer:png});
     await page.locator('#message').fill('Inspect this image');await sendMessage(page);
-    await page.locator('#message-form [role=alert]').waitFor();
+    await page.locator('.timber-delivery .timber-message-content .timber-delivery-error').waitFor();
+    assert.equal(await page.locator('#message-form [role=alert]').count(),0,'delivery errors appear only in the original message');
     assert.equal(await page.locator('.timber-image-attachments img').count(),1);
     await page.getByRole('button',{name:'Retry sending',exact:true}).click();
     await page.waitForFunction(()=>document.querySelectorAll('.timber-image-attachments img').length===0);
@@ -2622,6 +2624,79 @@ for(const width of [1440,390])test(`model failures show actionable safe diagnost
     if(process.env.TIMBER_CAPTURE_UI)await page.screenshot({path:`/tmp/timber-model-failure-${width}.png`,animations:'disabled'});
     await page.locator('#message').fill('Preserve this draft');await notice.getByRole('button',{name:'Review model settings',exact:true}).click();const settings=page.getByRole('dialog',{name:'Model settings',exact:true});await settings.waitFor();assert.equal(await page.getByRole('button',{name:/^Model settings:/}).getAttribute('title'),'gpt-6-astra · High reasoning · Fast');assert.equal(await settings.getByRole('switch',{name:'Fast mode'}).isChecked(),true);assert.equal(await page.locator('#message').inputValue(),'Preserve this draft');assert.equal(sentMessages(state,BOT_A).length,0,'reviewing settings never retries the failed request');
   },{viewport:{width,height:900},...(width<760?{isMobile:true,hasTouch:true}:{})});
+});
+
+for(const {width,colorScheme} of [{width:320,colorScheme:'dark'},{width:390,colorScheme:'dark'},{width:1440,colorScheme:'light'}])test(`billing failures stay inside the correct message after live updates and reload at ${width}px`,async()=>{
+  await withPage(async({page,state,login})=>{
+    await page.addInitScript(()=>{window.__copied=[];Object.defineProperty(navigator,'clipboard',{value:{writeText:async text=>window.__copied.push(text)}});});
+    const stamp=new Date().toISOString(),text='Planea y luego delega en agentes. Para implementación usa Sonnet 5.5.';
+    const failed={id:'inline-billing',botId:BOT_A,operationId:'inline-billing-op',status:'running',model:'anthropic/claude-sonnet-5.5',createdAt:stamp,updatedAt:stamp};
+    const later={...failed,id:'later-success',operationId:'later-success-op',status:'completed'};
+    state.runs.set(BOT_A,[later,failed]);state.messages.set(BOT_A,[{id:'billing-message',botId:BOT_A,runId:failed.id,role:'user',text,createdAt:stamp},{id:'later-message',botId:BOT_A,runId:later.id,role:'user',text:'Another independent request.',createdAt:stamp},{id:'later-answer',botId:BOT_A,runId:later.id,role:'assistant',text:'The later request completed.',createdAt:stamp}]);
+    await login();Object.assign(failed,{status:'failed',errorCode:'model_billing_required',error:'The model request failed before an answer completed.'});state.emit(BOT_A,'run.failed',{errorCode:failed.errorCode,publicMessage:'Private provider detail must never be rendered.'},failed.id);state.emit(BOT_A,'run.updated',{run:failed},failed.id);
+    const message=page.locator('[data-message-id="billing-message"]'),bubble=message.locator('.timber-message-content'),notice=bubble.locator('[data-run-outcome="inline-billing"]');
+    await notice.getByText(MODEL_FAILURES.model_billing_required,{exact:true}).waitFor();
+    assert.equal(await page.locator('[data-run-outcome="inline-billing"]').count(),1,'one diagnostic for the captured request');
+    assert.equal(await page.locator('[data-timeline-key^="outcome:"]').count(),0,'no detached error card remains');
+    assert.equal(await page.locator('[data-message-id="later-message"] [data-run-outcome]').count(),0,'later messages never inherit an earlier error');
+    assert.equal(await notice.getByRole('button',{name:/^(Continue|Try again|Retry sending)$/}).count(),0,'billing errors cannot resend automatically');
+    await message.getByRole('button',{name:'Copy message',exact:true}).click();assert.deepEqual(await page.evaluate(()=>window.__copied),[text],'copying excludes the diagnostic');
+    await page.reload();await notice.getByText(MODEL_FAILURES.model_billing_required,{exact:true}).waitFor();
+    await notice.locator('summary').click();await notice.getByText('model_billing_required',{exact:true}).waitFor();
+    assert.equal(await page.getByText('Private provider detail must never be rendered.',{exact:true}).count(),0);
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+    const boxes=await Promise.all([bubble.boundingBox(),notice.boundingBox()]);assert.ok(boxes[1].x>=boxes[0].x&&boxes[1].x+boxes[1].width<=boxes[0].x+boxes[0].width+1,'error details fit the user bubble');
+    if(process.env.CONSOLE_SCREENSHOT_DIR){await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});await message.scrollIntoViewIfNeeded();await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/inline-billing-${width}.png`,animations:'disabled'});}
+    assert.equal(sentMessages(state,BOT_A).length,0);assert.equal(state.actions.length,0);
+  },{viewport:{width,height:900},colorScheme,...(width<760?{isMobile:true,hasTouch:true}:{})});
+});
+
+test('a failed accepted receipt reconciles into the same canonical bubble without duplicating its error',async()=>{
+  await withPage(async({page,state,login})=>{
+    await login();let release;state.readsGate=new Promise(resolve=>{release=resolve;});
+    try{
+      await page.locator('#message').fill('Accepted message waiting for its transcript');await sendMessage(page);
+      await page.locator('.timber-delivery-status').filter({hasText:'Queued'}).waitFor();
+      const run=state.runs.get(BOT_A).at(-1);Object.assign(run,{status:'failed',errorCode:'model_billing_required',error:MODEL_FAILURES.model_billing_required});state.emit(BOT_A,'run.updated',{run},run.id);
+      await page.locator(`.timber-delivery .timber-message-content [data-run-outcome="${run.id}"]`).waitFor();
+      assert.equal(await page.locator(`[data-run-outcome="${run.id}"]`).count(),1);
+      state.readsGate=null;release();
+      const message=page.locator('[data-message-id]').filter({hasText:'Accepted message waiting for its transcript'});
+      await message.locator(`.timber-message-content [data-run-outcome="${run.id}"]`).waitFor();
+      assert.equal(await page.locator(`[data-run-outcome="${run.id}"]`).count(),1);assert.equal(await page.locator('.timber-delivery').count(),0);
+      assert.equal(sentMessages(state,BOT_A).length,1);
+    }finally{state.readsGate=null;release();}
+  });
+});
+
+test('a run error stays visible until its original transcript message loads',async()=>{
+  await withPage(async({page,state,login})=>{
+    const stamp=new Date().toISOString(),run={id:'missing-request',botId:BOT_A,operationId:'missing-request-op',status:'failed',errorCode:'model_billing_required',error:MODEL_FAILURES.model_billing_required,createdAt:stamp,updatedAt:stamp};
+    state.runs.set(BOT_A,[run]);state.messages.set(BOT_A,[]);await login();
+    const notice=page.locator('[data-run-outcome="missing-request"]');await notice.waitFor();assert.equal(await page.locator('[data-timeline-key="outcome:missing-request"]').count(),1);
+    const message={id:'late-request',botId:BOT_A,runId:run.id,role:'user',text:'A request whose history arrived late.',createdAt:stamp};
+    state.messages.get(BOT_A).push(message);state.emit(BOT_A,'message.created',{message},run.id);
+    await page.locator('[data-message-id="late-request"] .timber-message-content [data-run-outcome="missing-request"]').waitFor();
+    assert.equal(await notice.count(),1);assert.equal(await page.locator('[data-timeline-key="outcome:missing-request"]').count(),0);
+  });
+});
+
+for(const status of [429,503])test(`failed sends remain inside their captured message and preserve retry identity for HTTP ${status}`,async()=>{
+  await withPage(async({page,state,login})=>{
+    await login();let original;
+    await page.route(`**/v1/bots/${BOT_A}/messages`,async route=>{
+      if(route.request().method()!=='POST'||original)return route.continue();original=route.request().postDataJSON();
+      return route.fulfill({status,contentType:'application/json',body:JSON.stringify({error:{code:'temporarily_unavailable',message:'The message could not be accepted yet.'}})});
+    });
+    await page.locator('#message').fill('Keep this original message');await sendMessage(page);
+    const receipt=page.locator('.timber-delivery'),notice=receipt.locator('.timber-message-content .timber-delivery-error');
+    await notice.getByText('The message could not be accepted yet.',{exact:true}).waitFor();
+    assert.equal(await page.locator('#messages').getByText('The message could not be accepted yet.',{exact:true}).count(),1);
+    await page.locator('#message').fill('Keep this newer draft');await notice.getByRole('button',{name:'Retry sending',exact:true}).click();
+    await page.locator('[data-message-id]').filter({hasText:'Keep this original message'}).waitFor();
+    assert.deepEqual(sentMessages(state,BOT_A)[0].body,original,'retry uses the same operation and text');
+    assert.equal(await page.locator('#message').inputValue(),'Keep this newer draft');assert.equal(await page.locator('.timber-delivery-error').count(),0,'accepted receipt reconciles without stale errors');
+  },{viewport:{width:390,height:844},isMobile:true,hasTouch:true,colorScheme:'dark'});
 });
 
 test('permanent model failures route to connection or context and do not offer unchanged continuation',async()=>{

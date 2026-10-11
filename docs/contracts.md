@@ -198,6 +198,14 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   Blob conversion uses FileReader, without weakening the console CSP.
   Image attachments with bot mentions are currently rejected, not silently omitted.
 
+  The console embeds delivery failures and failed/interrupted model requests
+  inside the originating user-message bubble, including safe diagnostics and
+  existing explicit recovery controls. Accepted pending receipts reconcile with
+  the canonical transcript without duplicating the error. If the original message
+  is not loaded, its run diagnostic remains visible until that message is available.
+  Copying a message preserves only its original text. Moving a diagnostic never
+  resends input or replays tools; delivery retries retain the original operation ID.
+
   The receipt confirms durable storage of the user input. A busy named bot admits
   subsequent inputs as native Pi steering: they join at the next completed tool
   round, or start a new run after the current final answer. An in-flight model

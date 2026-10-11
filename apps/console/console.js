@@ -806,7 +806,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     } catch (error) {
       if (session !== authSession || error.name === 'AbortError' || delivery.runId) return;
       delivery.state = !error.status || error.status >= 500 ? 'unknown' : 'rejected'; delivery.error = errorText(error); delivery.canRetry = !error.status || error.status >= 500 || error.status === 429;
-      if (files.length) throw error;
+      if (files.length) {error.deliveryOperationId=delivery.operationId;throw error;}
     } finally { if (session === authSession) { sendBusy.delete(botId); if (selected?.id === botId) renderMessages(); } }
   }
   async function retryAdmission(botId, run, text, mentions) {
