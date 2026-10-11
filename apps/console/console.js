@@ -7,6 +7,7 @@ import {agentColor} from './src/agent-colors.ts';
 import {modelBadgeLabel} from './src/model-identity.tsx';
 import {mountModelPicker} from './src/model-picker.tsx';
 import {modelPublisherLabel} from './src/model-publisher.ts';
+import {modelUsage,modelBillingLines} from './src/model-billing.ts';
 import {canRetryAdmission} from './src/run-recovery.ts';
 import './src/agent-colors.css';
 import { createDesktopViewer } from './src/desktop.ts';
@@ -433,7 +434,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     $('avatar-create-submit').disabled=avatarLoading||!select.options.length;
     modelPickers.get(select.id).update({choices:[...select.options].map(entry=>{
       const model=options.find(option=>option.id===entry.value),value=model?avatarModelOption(model):{id:entry.value,label:entry.value};
-      return {...value,available:entry.dataset.available!=='false',selectable:true,providerLabel:modelPublisherLabel(model||value),unavailableReason:model?.reason||'Not currently available'};
+      return {...value,available:entry.dataset.available!=='false',selectable:true,providerLabel:modelPublisherLabel(model||value),unavailableReason:model?.reason||'Not currently available',usage:kind==='image'?{routes:[],imageApi:true}:model?modelUsage(model):undefined};
     }),disabled:avatarLoading||!select.options.length});
     renderAvatarCreateReasoning();
   }
@@ -649,7 +650,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   function updateBotHeader() { $('selected-name').textContent = selected.name; $('selected-avatar').textContent = selected.name.slice(0, 1).toUpperCase();$('selected-avatar').dataset.agentColor=agentColor(selected.id);decorateModelAvatar($('selected-avatar'),selected);decorateGlobalAvatar($('selected-avatar'),selected.id); $('selected-model').textContent = `${selected.runtime} · ${modelDescription(selected)}`; $('selected-computer-mode').textContent = selected.computerApprovalMode === 'automatic' ? 'Computer · Use authorized' : 'Computer · Ask for each action'; }
   function modelDisplayName(item){const name=String(item.name||item.id||'');const publisher=modelPublisherLabel(item);return publisher&&name.toLowerCase().startsWith(publisher.toLowerCase()+': ')?name.slice(publisher.length+2):name;}
   function modelSourceLabel(item){const source=item.routes?.[0]?.source;const paidFallback=item.routes?.slice(1).some(route=>route.source==='openai-api'||route.source==='openrouter');return source==='chatgpt'?`ChatGPT subscription${paidFallback?' · Fallback uses API credits':''}`:source==='openai-api'?'OpenAI API · Uses API credits':source==='openrouter'?'OpenRouter · Uses API credits':undefined;}
-  function modelSettingsState(){const error=modelCatalogError||modelCatalog.error;const warnings=(modelCatalog.sources||[]).filter(source=>source.error).map(source=>source.error).join(' ');return {choices:(error?[]:modelCatalog.models).map(item=>({id:item.id,label:modelDisplayName(item),providerLabel:modelPublisherLabel(item),available:modelCatalog.connected,reasoningEfforts:item.reasoningEfforts||[],defaultReasoningEffort:item.defaultReasoningEffort,supportsFast:item.supportsFast===true,sourceLabel:modelSourceLabel(item)})),loading:modelCatalogLoading,error,message:warnings||(!modelCatalogLoading&&!modelCatalog.connected&&!error?'Connect ChatGPT or configure OpenAI API or OpenRouter to choose a model.':undefined)};}
+  function modelSettingsState(){const error=modelCatalogError||modelCatalog.error;const warnings=(modelCatalog.sources||[]).filter(source=>source.error).map(source=>source.error).join(' ');return {choices:(error?[]:modelCatalog.models).map(item=>({id:item.id,label:modelDisplayName(item),providerLabel:modelPublisherLabel(item),available:modelCatalog.connected,reasoningEfforts:item.reasoningEfforts||[],defaultReasoningEffort:item.defaultReasoningEffort,supportsFast:item.supportsFast===true,sourceLabel:modelSourceLabel(item),usage:modelUsage(item,modelCatalog)})),loading:modelCatalogLoading,error,message:warnings||(!modelCatalogLoading&&!modelCatalog.connected&&!error?'Connect ChatGPT or configure OpenAI API or OpenRouter to choose a model.':undefined)};}
   async function loadModelCatalog(){
     if(!authenticated)return;
     const session=authSession,sequence=++modelCatalogRequest;modelCatalogLoading=true;modelCatalogError='';renderMessages();
@@ -670,14 +671,15 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     if(!choice){const option=el('option','',current||'Provider default');option.value=current;select.append(option);}
     for(const item of state.choices){const option=el('option','',item.label);option.value=item.id;option.disabled=!item.available;select.append(option);}
     select.value=current;select.disabled=modelCatalogLoading||!state.choices.some(item=>item.available);
-    modelPickers.get(select.id).update({choices:state.choices,disabled:select.disabled,loading:state.loading});
     reasoning.replaceChildren();
     if(!choice?.defaultReasoningEffort){const option=el('option','','Provider default');option.value='';reasoning.append(option);}
     for(const effort of choice?.reasoningEfforts||[]){const option=el('option','',effort==='xhigh'?'Extra high':effort.replace(/^./,letter=>letter.toUpperCase()));option.value=effort;reasoning.append(option);}
     reasoning.value=choice?.reasoningEfforts.includes(settings.reasoningEffort)?settings.reasoningEffort:choice?.defaultReasoningEffort||'';
     reasoning.disabled=select.disabled;$(`${prefix}-reasoning-field`).hidden=!choice?.reasoningEfforts.length;
     fast.checked=Boolean(settings.fast&&choice?.supportsFast);fast.disabled=select.disabled;$(`${prefix}-fast-field`).hidden=!choice?.supportsFast;
-    $(`${prefix}-model-help`).textContent=state.loading?'Loading available models…':state.error||state.message||'Subagents inherit these settings unless another model is chosen.';
+    const effective={model:current,reasoningEffort:reasoning.value||undefined,fast:fast.checked};
+    modelPickers.get(select.id).update({choices:state.choices,disabled:select.disabled,loading:state.loading,settings:effective});
+    $(`${prefix}-model-help`).textContent=[state.loading?'Loading available models…':state.error||state.message||'Subagents inherit these settings unless another model is chosen.',...(!state.loading?modelBillingLines(choice?.usage,effective):[])].join('\n');
   }
   function readModelForm(prefix){const model=$(`${prefix}-model`),reasoning=$(`${prefix}-reasoning`);return model.disabled||!model.value?{}:{model:model.value,...(!reasoning.disabled&&reasoning.value?{reasoningEffort:reasoning.value}:{}),fast:!$(`${prefix}-fast-field`).hidden&&$(`${prefix}-fast`).checked};}
   function refreshModelForms(){for(const [prefix,dialog]of [['bot','bot-dialog'],['edit','edit-dialog']])if($(dialog).open)renderModelForm(prefix,{model:$(`${prefix}-model`).value,reasoningEffort:$(`${prefix}-reasoning`).value,fast:$(`${prefix}-fast`).checked});}
@@ -1486,7 +1488,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     catch (error) { if (authenticated) $('create-error').textContent = errorText(error); } finally { button.disabled = false; }
   });
   $('edit-bot').addEventListener('click', () => { if (!selected) return; if ($('panel-menu')) $('panel-menu').open = false; editBotId = selected.id; $('edit-name').value = selected.name; $('edit-instructions').value = selected.instructions; $('edit-computer-approval-mode').value = selected.computerApprovalMode === 'automatic' ? 'automatic' : 'ask'; $('edit-allow-named-agents').checked = selected.allowNamedAgents === true; $('edit-allow-task-creation').checked = selected.allowTaskCreation === true; $('edit-error').textContent = '';renderModelForm('edit',selected); $('edit-dialog').showModal(); $('edit-name').focus(); });
-  for(const prefix of ['bot','edit'])$(`${prefix}-model`).addEventListener('change',()=>renderModelForm(prefix,{model:$(`${prefix}-model`).value,reasoningEffort:$(`${prefix}-reasoning`).value,fast:$(`${prefix}-fast`).checked}));
+  for(const prefix of ['bot','edit'])for(const field of ['model','reasoning','fast'])$(`${prefix}-${field}`).addEventListener('change',()=>renderModelForm(prefix,{model:$(`${prefix}-model`).value,reasoningEffort:$(`${prefix}-reasoning`).value,fast:$(`${prefix}-fast`).checked}));
   $('edit-form').addEventListener('submit', async (event) => {
     event.preventDefault(); const button = event.submitter || event.currentTarget.querySelector('[type=submit]'), id = editBotId; if (!id) return; button.disabled = true; $('edit-error').textContent = '';
     try { const { bot } = await request(botPath(id), { method: 'PATCH', body: { name: $('edit-name').value.trim(), instructions: $('edit-instructions').value.trim(), ...readModelForm('edit'), computerApprovalMode: $('edit-computer-approval-mode').value, allowNamedAgents: $('edit-allow-named-agents').checked, allowTaskCreation: $('edit-allow-task-creation').checked } }); bots = bots.map((item) => item.id === bot.id ? bot : item); if (selected?.id === bot.id) { selected = bot; updateBotHeader(); renderMessages(); renderApprovals(); } renderBots(); $('edit-dialog').close(); }

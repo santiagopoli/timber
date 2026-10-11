@@ -69,6 +69,7 @@ for(const width of [1440,390])test(`model picker selects providers before models
     else await page.locator('#settings-button').click();
     await page.locator('#avatar-create-details > summary').click();await page.locator('#avatar-theme-kind').selectOption('image');await page.locator('#avatar-theme-model-picker').click();await bounds(page);await provider(page,'OpenAI').click();
     await popup(page).getByText('Image API is not configured · Configuration only',{exact:true}).waitFor();
+    await popup(page).getByText('OpenAI Image API · Separately billed',{exact:true}).waitFor();await popup(page).getByText('Token pricing unavailable',{exact:true}).waitFor();assert.doesNotMatch(await popup(page).getByRole('option').innerText(),/Uses ChatGPT allowance/);
     assert.equal(await popup(page).getByRole('option').getAttribute('aria-disabled'),'false','unavailable image models remain selectable for saved theme configuration');
     await page.keyboard.press('Escape');assert.ok(await page.locator('#settings-dialog').isVisible());
     assert.deepEqual(errors,[]);assert.deepEqual(fixture.state.failures,[]);
@@ -109,4 +110,48 @@ test('a publisher prefix from OpenRouter is not repeated in the visible model na
     assert.doesNotMatch(await option.innerText(),/Anthropic: /);
     assert.deepEqual(errors,[]);
   }finally{await context.close();await fixture.close();}
+});
+
+for(const width of [1440,390])test(`model prices follow subscription, paid fallback and source disconnection at ${width}px`,async()=>{
+  const fixture=await createConsoleFixture(),context=await browser.newContext({viewport:{width,height:900},...(width<760?{isMobile:true,hasTouch:true}:{})}),page=await context.newPage();page.setDefaultTimeout(6000);
+  const base=fixture.state.modelCatalog.models[0];
+  const subscription={...base,source:'chatgpt',modelId:base.id,contextWindow:128000};
+  const api={...base,source:'openai-api',provider:'openai-api',modelId:base.id,contextWindow:128000,pricing:{input:2,output:10,cachedInput:.1}};
+  const router={...base,id:`openai/${base.id}`,source:'openrouter',provider:'openrouter',modelId:`openai/${base.id}`,supportsFast:false,contextWindow:128000,pricing:{input:3,output:15,cachedInput:.3}};
+  const claude={id:'anthropic/claude-reviewer',name:'Claude reviewer',provider:'openrouter',reasoningEfforts:[],supportsFast:false};
+  fixture.state.modelCatalog={...fixture.state.modelCatalog,sources:[{id:'chatgpt',connected:true},{id:'openai-api',connected:true},{id:'openrouter',connected:true}],models:[{...base,routes:[subscription,api,router]},{...claude,routes:[{...claude,source:'openrouter',modelId:claude.id,pricing:{input:3,output:15},contextWindow:128000}]}]};
+  try{
+    await page.goto(fixture.url);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('#app').waitFor();
+    if(width<760)await page.locator('.bot-item').first().click();
+    const trigger=page.getByRole('button',{name:/^Model settings:/});await trigger.click();
+    const settings=page.getByRole('dialog',{name:'Model settings',exact:true}),billing=settings.locator('.timber-model-billing');
+    await billing.getByText('Uses ChatGPT allowance · No per-token API charge',{exact:true}).waitFor();
+    await billing.getByText('OpenAI API fallback · USD / 1M tokens',{exact:true}).waitFor();await billing.getByText('Input $2 · Output $10 · Cached input $0.1',{exact:true}).waitFor();
+    await billing.getByText('OpenRouter fallback · USD / 1M tokens',{exact:true}).waitFor();await billing.getByText('Input $3 · Output $15 · Cached input $0.3',{exact:true}).waitFor();
+    await provider(page,'OpenAI').click();const option=settings.getByRole('option');await option.getByText('Uses ChatGPT allowance · No per-token API charge',{exact:true}).waitFor();assert.ok((await option.innerText()).includes('OpenAI API fallback'));
+    await bounds(page);assert.equal(await page.getByRole('dialog').count(),1,'pricing does not introduce another popup');
+    await settings.getByRole('switch',{name:'Fast mode'}).click();await trigger.locator('[aria-label="Fast mode"]').waitFor();
+    await billing.getByText('OpenRouter fallback unavailable with these settings',{exact:true}).waitFor();
+    assert.equal(await billing.getByText('Input $3 · Output $15 · Cached input $0.3',{exact:true}).count(),0,'an incompatible fallback is not quoted as active');
+    await billing.getByText('Input $2 · Output $10 · Cached input $0.1 · Standard rates; Fast pricing unavailable',{exact:true}).waitFor();
+    await settings.getByRole('switch',{name:'Fast mode'}).click();await trigger.locator('[aria-label="Fast mode"]').waitFor({state:'hidden'});
+    await settings.getByRole('button',{name:'Close model settings'}).click();
+    await page.route('**/v1/connections/chatgpt',route=>{
+      if(route.request().method()!=='DELETE')return route.continue();
+      fixture.state.modelCatalog.models[0]={...base,provider:'openai-api',routes:[api,router]};fixture.state.modelCatalog.sources[0].connected=false;
+      return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:false,status:'disconnected',revoked:true})});
+    });
+    if(!await page.locator('#settings-button').isVisible()){await page.locator('#panel-menu > summary').click();await page.locator('#mobile-account').click();}else await page.locator('#settings-button').click();
+    await page.locator('#disconnect-chatgpt').click();await page.locator('#chatgpt-status').filter({hasText:'Not connected'}).waitFor();await page.getByRole('button',{name:'Close settings',exact:true}).click();
+    await trigger.click();await settings.getByText('OpenAI API · Uses API credits',{exact:true}).waitFor();
+    await billing.getByText('OpenAI API · USD / 1M tokens',{exact:true}).waitFor();assert.equal(await billing.getByText(/Uses ChatGPT allowance/).count(),0);
+    await billing.getByText('OpenRouter fallback · USD / 1M tokens',{exact:true}).waitFor();await settings.getByRole('button',{name:'Close model settings'}).click();
+    if(!await page.locator('#edit-bot').isVisible())await page.locator('#panel-menu > summary').click();await page.locator('#edit-bot').click();
+    await page.locator('#edit-model-help').filter({hasText:'Input $2 · Output $10 · Cached input $0.1'}).waitFor();
+    await page.locator('#edit-fast').check();await page.locator('#edit-model-help').filter({hasText:'OpenRouter fallback unavailable with these settings'}).waitFor();await page.getByRole('button',{name:'Close edit bot'}).click();
+    if(width<760)await page.locator('#mobile-back').click();await page.locator('#new-bot').click();await page.locator('#bot-model-picker').click();await provider(page,'Anthropic').click();
+    await popup(page).getByRole('option').getByText('Input $3 · Output $15 / 1M tokens (USD)',{exact:true}).waitFor();await popup(page).getByRole('option').click();
+    await page.locator('#bot-model-help').filter({hasText:'OpenRouter · USD / 1M tokens'}).waitFor();assert.doesNotMatch(await page.locator('#bot-model-help').innerText(),/ChatGPT/);
+    assert.deepEqual(fixture.state.failures,[]);
+  }finally{await page.unrouteAll({behavior:'wait'});await context.close();await fixture.close();}
 });

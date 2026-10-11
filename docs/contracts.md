@@ -148,6 +148,12 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   The console first selects this creator, then one of its concrete models inside
   the same popover. The chat opens this picker directly and keeps reasoning and
   Fast controls in that panel; model selection never opens a second dropdown.
+  Prices use the admitted source's published USD rates per million input, output
+  and cached-input tokens. ChatGPT entries show subscription allowance separately
+  from conditional paid fallback rates. Missing prices are unknown, never zero;
+  Fast does not inherit standard-tier prices as a Fast quote. The selected model
+  shows the complete ordered billing routes and settings-incompatible fallbacks.
+  Image-avatar API billing stays separate and has no inferred token price.
 - GET /v1/bots -> {bots:Bot[]}
 - POST /v1/bots {name,instructions?,model?,reasoningEffort?,fast?,computerApprovalMode?,allowNamedAgents?,allowTaskCreation?} -> 201 {bot:Bot}
 - GET /v1/bots/:id -> {bot:Bot}
