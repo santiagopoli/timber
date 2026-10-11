@@ -12,8 +12,8 @@
 
 .timber-private-inline{min-width:45px;flex:1}.timber-private-edit svg{fill:currentColor}
 
-.timber-private-chip{height:1.3em;line-height:1;align-items:center;position:relative}.timber-private-chip svg.timber-private-dots{width:30px;height:11px;opacity:1}
-.timber-composer .timber-private-edit{min-height:0;height:1.3em;padding:0 3px;gap:3px;border:1px solid color-mix(in srgb,var(--ink) 30%,var(--line));background:color-mix(in srgb,var(--ink) 17%,var(--bg));line-height:1;white-space:nowrap;vertical-align:baseline}
+.timber-private-chip{height:1.3em;min-height:22px;line-height:1;align-items:center;position:relative}.timber-private-chip svg.timber-private-dots{width:30px;height:11px;opacity:1}
+.timber-composer .timber-private-edit{min-height:22px;height:1.3em;padding:0 3px;gap:3px;border:1px solid color-mix(in srgb,var(--ink) 30%,var(--line));background:color-mix(in srgb,var(--ink) 17%,var(--bg));line-height:1;white-space:nowrap;vertical-align:baseline}
 .timber-private-edit:focus-within{outline:1px solid var(--muted);outline-offset:2px}.timber-private-edit[aria-busy=true]{opacity:.6}
 .timber-private-field{display:inline-flex;position:relative;align-items:center;justify-content:center;width:30px;height:11px;flex:0 1 auto;min-width:0}
 .timber-private-field>svg{pointer-events:none}
