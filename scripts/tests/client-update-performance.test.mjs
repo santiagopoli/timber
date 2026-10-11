@@ -23,6 +23,7 @@ function harness() {
     mountChat: () => ({update: value => models.push(value), clear() {}, setDock() {}}),
     mountToolActivity: () => ({update: value => activityModels.push(value), clear() {}, setActive() {}}),
     mountAgents: () => ({update: value => agentModels.push(value), clear() {}, setActive() {}}),
+    mountModelPicker: () => ({update() {}}),
     createDesktopViewer: () => ({disconnect() {}, setActive() {}}), mountWorkspaceExplorer: () => ({clear() {}}),
     agentColor: () => 'blue', modelBadgeLabel: () => 'M', hasBotMention: () => false, canRetryAdmission: run => run.admissionRetryable,
     requestAnimationFrame: fn => {const id = ++nextId; frames.set(id, fn); return id;}, cancelAnimationFrame: id => frames.delete(id),
