@@ -54,6 +54,7 @@ export function computerActivityInput(action: ComputerAction): DisplayInput {
 }
 
 const hostFields: Record<string, readonly string[]> = {
+  name_secret: ['name'],
   load_skill: ['name'],
   github_connect: ['repository', 'permission'],
   github_list_repositories: ['page'],

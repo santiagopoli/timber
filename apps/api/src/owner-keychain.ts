@@ -2,7 +2,7 @@ import type {Bot,SecretMetadata,SecureInputRequest} from '@botspace/contracts';
 import type {Env} from './env';
 import {OwnerKeychain} from './keychain';
 import {ApiError,json} from './errors';
-import {body,object,string,UUID} from './validation';
+import {body,object,string,operationId,UUID} from './validation';
 
 /** Owner-owned values and permissions. Bots receive references and sanitized
  * results. Durable delivery receipts bridge the owner store and bot runtimes. */
@@ -61,6 +61,10 @@ export class OwnerKeychainCoordinator {
     }
     await this.assertRun({botId,runId,nativeOperationId} as SecureInputRequest);
     if(name==='list_secrets')return json({secrets:await this.store.permitted(botId)});
+    if(name==='name_secret'){
+      const entry=await this.store.rename(op,string(args.secretId,'secretId',36),args,async()=>{await this.assertRun({botId,runId,nativeOperationId} as SecureInputRequest);signal.throwIfAborted();},botId);
+      return json({secret:entry});
+    }
     if(name==='request_secret'||name==='configure_secret'){
       if(name==='configure_secret')await this.store.requireAccess(string(args.secretId,'secretId',36),botId);
       return json({request:this.store.requestInput(`${botId}:${op}`,args,runId,nativeOperationId,botId)});
@@ -103,6 +107,11 @@ export class OwnerKeychainCoordinator {
       await this.store.grantAccess(permission[1],target,input.allowed,()=>{this.bot(target);});return json({entries:this.store.list()});
     }
     const secret=/^\/keychain\/([^/]+)$/.exec(path);
+    if(secret&&request.method==='PATCH'){
+      const input=await body(request);if(Object.keys(input).some(key=>!['name','expectedRevision','operationId'].includes(key)))throw new ApiError(400,'invalid_secure_input','Only the name can be changed here.');
+      const entry=await this.store.rename(operationId(input.operationId),secret[1],input,()=>{if(botId)this.bot(botId);});
+      return json({entries:this.store.list().filter(item=>item.id===entry.id)});
+    }
     if(secret&&request.method==='DELETE'){this.store.revoke(secret[1]);return json({revoked:true});}
     throw new ApiError(404,'not_found','Keychain endpoint not found.');
   }

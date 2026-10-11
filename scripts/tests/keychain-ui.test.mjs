@@ -19,6 +19,11 @@ async function scenario(width,work){
     if(req.method()==='DELETE'){data.entries=data.entries.filter(item=>item.id!==parts[5]);return json({revoked:true});}
     const body=req.postDataJSON();posts.push({botId:id,...body});
     if(failSave)return json({error:{code:'unavailable',message:'private provider error must never be rendered'}},503);
+    if(req.method()==='PATCH'){
+      const existing=data.entries.find(item=>item.id===parts[5]);
+      if(existing?.revision!==body.expectedRevision)return json({error:{code:'credential_changed',message:'Input changed'}},409);
+      data.entries=data.entries.map(item=>item.id===parts[5]?{...item,name:body.name,revision:item.revision+1}:item);return json({entries:data.entries.filter(item=>item.id===parts[5])});
+    }
     if(parts.at(-1)==='authorize'){data.requests=data.requests.map(item=>item.id===parts[6]?{...item,status:'saved'}:item);return json({entries:data.entries});}
     if(parts.at(-1)==='permissions'){data.entries=data.entries.map(item=>item.id===parts[5]?{...item,botIds:body.allowed?[...new Set([...item.botIds,body.botId])]:item.botIds.filter(id=>id!==body.botId)}:item);return json({entries:data.entries});}
     const entries=body.entries.map(({value,expectedRevision,...item})=>entry({...item,id:item.id||crypto.randomUUID(),revision:(expectedRevision??0)+1,botIds:item.id?data.entries.find(old=>old.id===item.id).botIds:[id]}));
@@ -61,6 +66,26 @@ test('bot-prepared access shows a simple destination confirmation without techni
 test('replacement checks revision and removal stays explicit',()=>scenario(1440,async({page,login,keychains,posts})=>{
   keychains.get(BOT_A).entries=[entry()];await login();await page.getByRole('button',{name:'Your keychain',exact:true}).waitFor();await page.getByRole('button',{name:'Your keychain',exact:true}).click();await page.getByRole('button',{name:'Replace',exact:true}).click();await page.getByLabel('Private input',{exact:true}).fill('replacement-fixture-value');await page.getByLabel('Private input',{exact:true}).press('Enter');await page.getByLabel('Private input',{exact:true}).waitFor({state:'hidden'});assert.equal(posts[0].entries[0].expectedRevision,1);
   await page.getByRole('button',{name:'Your keychain',exact:true}).waitFor();await page.getByRole('button',{name:'Your keychain',exact:true}).click();await page.getByRole('button',{name:'Remove',exact:true}).click();assert.equal(keychains.get(BOT_A).entries.length,1);await page.getByRole('button',{name:'Confirm removal',exact:true}).click();await page.getByText('No private inputs saved.',{exact:true}).waitFor();assert.equal(keychains.get(BOT_A).entries.length,0);
+}));
+for(const width of [390,1440])test(`keychain names can be edited without the value and persist across reload at ${width}px`,()=>scenario(width,async({page,login,keychains,posts})=>{
+  keychains.get(BOT_A).entries=[entry()];await login();await page.getByRole('button',{name:'Your keychain',exact:true}).click();
+  await page.getByRole('button',{name:'Rename Private input',exact:true}).click();await page.getByRole('textbox',{name:'Name',exact:true}).fill('Cloudflare · Production');
+  assert.equal(await page.locator('[data-secure-value]').count(),0);await page.getByRole('button',{name:'Save name',exact:true}).click();await page.getByRole('button',{name:'Rename Cloudflare · Production',exact:true}).waitFor();
+  assert.equal(posts.length,1);assert.deepEqual(Object.keys(posts[0]).sort(),['botId','expectedRevision','name','operationId'].sort());assert.equal(posts[0].expectedRevision,1);assert.equal(posts[0].name,'Cloudflare · Production');assert.deepEqual(keychains.get(BOT_A).entries[0].botIds,[BOT_A]);
+  const layout=await page.locator('.timber-keychain-entry').evaluate(row=>{const name=row.querySelector('.timber-keychain-name').getBoundingClientRect(),date=row.querySelector('small').getBoundingClientRect();return {separate:date.top>=name.bottom,overflow:document.documentElement.scrollWidth>innerWidth};});assert.equal(layout.separate,true);assert.equal(layout.overflow,false);
+  if(process.env.CONSOLE_SCREENSHOT_DIR){await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/keychain-names-${width}.png`});}
+  await page.reload();await page.getByRole('button',{name:'Your keychain',exact:true}).click();await page.getByRole('button',{name:'Rename Cloudflare · Production',exact:true}).waitFor();
+  await page.getByRole('button',{name:'Rename Cloudflare · Production',exact:true}).click();await page.getByRole('textbox',{name:'Name',exact:true}).fill('Cancelled name');await page.getByRole('button',{name:'Cancel',exact:true}).click();assert.equal(posts.length,1);
+  await page.getByRole('button',{name:'Insert',exact:true}).click();await page.locator('#message .timber-private-chip').waitFor();assert.ok((await page.locator('#message-form input[name=message]').inputValue()).includes(entry().id));
+}));
+test('failed naming retains the label and retries the same operation without exposing server errors',()=>scenario(390,async({page,login,keychains,posts,setFailSave})=>{
+  keychains.get(BOT_A).entries=[entry()];await login();await page.getByRole('button',{name:'Your keychain',exact:true}).click();await page.getByRole('button',{name:'Rename Private input',exact:true}).click();await page.getByRole('textbox',{name:'Name',exact:true}).fill('Cloudflare');setFailSave(true);
+  await page.getByRole('button',{name:'Save name',exact:true}).click();await page.getByText('The name could not be saved. Try again.',{exact:true}).waitFor();assert.equal(await page.getByRole('textbox',{name:'Name',exact:true}).inputValue(),'Cloudflare');assert.ok(!(await page.locator('body').innerText()).includes('private provider error'));
+  setFailSave(false);await page.getByRole('button',{name:'Save name',exact:true}).click();await page.getByRole('button',{name:'Rename Cloudflare',exact:true}).waitFor();assert.equal(posts[0].operationId,posts[1].operationId);
+}));
+test('stale name editing preserves a newer name and refreshes the keychain',()=>scenario(390,async({page,login,keychains})=>{
+  keychains.get(BOT_A).entries=[entry()];await login();await page.getByRole('button',{name:'Your keychain',exact:true}).click();await page.getByRole('button',{name:'Rename Private input',exact:true}).click();await page.getByRole('textbox',{name:'Name',exact:true}).fill('Old edit');keychains.get(BOT_A).entries=[entry({name:'Newer name',revision:2})];
+  await page.getByRole('button',{name:'Save name',exact:true}).click();await page.getByText('This input changed. Cancel and rename its latest version.',{exact:true}).waitFor();await page.getByRole('button',{name:'Cancel',exact:true}).click();await page.getByRole('button',{name:'Rename Newer name',exact:true}).waitFor();assert.equal(keychains.get(BOT_A).entries[0].name,'Newer name');
 }));
 test('failed secure saves clear private text and never expose server diagnostics or insert a reference',()=>scenario(1440,async({page,login,add,setFailSave})=>{
   await login();setFailSave(true);await add();await page.getByLabel('Private input',{exact:true}).fill('ui-fixture-private-value');await page.getByLabel('Private input',{exact:true}).press('Enter');await page.getByText('Save could not be confirmed.',{exact:false}).waitFor();assert.equal(await page.getByLabel('Private input',{exact:true}).inputValue(),'');assert.equal(await page.locator('.timber-private-chip:not(.timber-private-edit)').count(),0);assert.ok(!await page.locator('body').innerText().then(text=>text.includes('private provider error')));

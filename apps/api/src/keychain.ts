@@ -17,8 +17,11 @@ export function secretDestination(value:unknown):string {
   if(url.protocol!=='https:' || url.username || url.password || url.search || url.hash || url.pathname!=='/' || url.port || !/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}$/.test(url.hostname) || /(?:^|\.)(?:localhost|local|internal|test|invalid|onion)$/.test(url.hostname)) return invalid('Use a public HTTPS origin without a path, credentials or port.');
   return url.origin;
 }
+function secretName(value:unknown):string {
+  const name=string(value,'name',80).trim();if(!name||/[\x00-\x1f\x7f]/.test(name))invalid('Use a short, single-line name.');return name;
+}
 function metadata(value:Record<string,unknown>,unbound=false) {
-  const name=string(value.name??'Private input','name',80).trim();if(!name)invalid('Give the private input a name.');
+  const name=secretName(value.name??'Private input');
   if(unbound&&!value.origin)return {name,origin:'',header:'',prefix:''};
   const origin=secretDestination(value.origin),header=string(value.header??'Authorization','header',80);
   if(!/^[A-Za-z][A-Za-z0-9-]{0,79}$/.test(header)||/^(?:accept|host|cookie|set-cookie|content-.+|connection|transfer-encoding|proxy-.+|sec-.+|cf-.+|x-forwarded-.+)$/i.test(header))invalid('Use an authentication header such as Authorization or X-API-Key.');
@@ -34,6 +37,7 @@ export class OwnerKeychain {
   constructor(private storage:DurableObjectStorage,private ownerId:string,private master:string|undefined,private active:()=>void) {
     storage.sql.exec(`CREATE TABLE IF NOT EXISTS keychain_entries(id TEXT PRIMARY KEY,data TEXT NOT NULL,envelope TEXT);
       CREATE TABLE IF NOT EXISTS keychain_writes(operation_id TEXT PRIMARY KEY,digest TEXT NOT NULL,data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS keychain_names(operation_id TEXT PRIMARY KEY,digest TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS secure_input_requests(id TEXT PRIMARY KEY,operation_id TEXT UNIQUE NOT NULL,data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS keychain_grants(secret_id TEXT NOT NULL,bot_id TEXT NOT NULL,data TEXT NOT NULL,signature TEXT NOT NULL,PRIMARY KEY(secret_id,bot_id));
       CREATE TABLE IF NOT EXISTS keychain_calls(operation_id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,result TEXT);`);
@@ -88,7 +92,7 @@ export class OwnerKeychain {
     this.root();
     const details={...metadata(args,true),purpose:string(args.purpose,'purpose',500),...(args.secretId?{secretId:string(args.secretId,'secretId',36)}:{})};
     const secret=details.secretId?this.row(details.secretId):undefined;
-    if(secret&&!args.name)details.name=(JSON.parse(secret.data) as SecretMetadata).name;
+    if(secret){const existingName=(JSON.parse(secret.data) as SecretMetadata).name;if(existingName!=='Private input'||!args.name)details.name=existingName;}
     if(details.secretId&&!secret?.envelope)throw new ApiError(404,'credential_unavailable','Private input is unavailable or revoked.');
     if(details.secretId&&!details.origin)invalid('The agent must configure an HTTPS destination before requesting access.');
     const prior=this.storage.sql.exec<{data:string}>('SELECT data FROM secure_input_requests WHERE operation_id=?',op).toArray()[0];
@@ -128,6 +132,34 @@ export class OwnerKeychain {
       for(const {entry,envelope} of prepared)this.storage.sql.exec('INSERT INTO keychain_entries(id,data,envelope) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,envelope=excluded.envelope',entry.id,JSON.stringify(entry),JSON.stringify(envelope));
       for(const item of prepared)if(item.grant&&grantBotId)this.writeGrant(item.entry.id,grantBotId,item.grant);
       this.storage.sql.exec('INSERT INTO keychain_writes(operation_id,digest,data) VALUES(?,?,?)',op,digest,JSON.stringify(result));
+      return result;
+    });
+  }
+  async rename(op:string,id:string,input:Record<string,unknown>,check:()=>void|Promise<void>=()=>{},botId?:string):Promise<SecretMetadata> {
+    const name=secretName(input.name),revision=input.expectedRevision;
+    if(!UUID.test(id)||!Number.isInteger(revision)||Number(revision)<1)invalid('Renaming requires the input ID and current revision.');
+    const permission=botId?await this.requireAccess(id,botId):undefined;
+    const key=`${botId??'owner'}:${op}`,digest=await this.digest(['rename',id,name,revision]);this.active();
+    const replay=()=>{const prior=this.storage.sql.exec<{digest:string}>('SELECT digest FROM keychain_names WHERE operation_id=?',key).toArray()[0];if(prior&&prior.digest!==digest)throw new ApiError(409,'idempotency_conflict','This rename operation has already been used with different data.');return !!prior;};
+    const stored=this.row(id);if(!stored?.envelope)throw new ApiError(404,'credential_unavailable','Private input is unavailable or revoked.');
+    const entry:SecretMetadata=JSON.parse(stored.data);
+    if(replay())return entry;
+    if(entry.revision!==revision)throw new ApiError(409,'credential_changed','Private input changed. Refresh the keychain.');
+    if(botId&&entry.name!=='Private input')return entry;
+    if(botId&&name==='Private input')invalid('Choose a descriptive name from the conversation.');
+    const envelope:Envelope=JSON.parse(stored.envelope),updated={...entry,name,revision:entry.revision+1,updatedAt:now()};
+    const clear=new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:decode(envelope.iv),additionalData:this.aad(entry)},await this.encryptionKey(),decode(envelope.ciphertext)));
+    const iv=crypto.getRandomValues(new Uint8Array(12));let encrypted:ArrayBuffer;
+    try{encrypted=await crypto.subtle.encrypt({name:'AES-GCM',iv,additionalData:this.aad(updated)},await this.encryptionKey(),clear);}finally{clear.fill(0);}
+    await check();this.active();
+    return this.storage.transactionSync(()=>{
+      const latest=this.row(id);
+      if(botId&&this.permissionEpoch(id,botId)!==permission)throw new ApiError(409,'credential_changed','Permission changed.');
+      if(replay()&&latest?.envelope)return JSON.parse(latest.data) as SecretMetadata;
+      if(!latest?.envelope||latest.envelope!==stored.envelope)throw new ApiError(409,'credential_changed','Private input changed or was removed.');
+      const result={...updated,...((JSON.parse(latest.data) as SecretMetadata).lastUsedAt?{lastUsedAt:(JSON.parse(latest.data) as SecretMetadata).lastUsedAt}:{})};
+      this.storage.sql.exec('UPDATE keychain_entries SET data=?,envelope=? WHERE id=?',JSON.stringify(result),JSON.stringify({iv:encode(iv),ciphertext:encode(new Uint8Array(encrypted))}),id);
+      this.storage.sql.exec('INSERT INTO keychain_names(operation_id,digest) VALUES(?,?)',key,digest);
       return result;
     });
   }
