@@ -541,6 +541,22 @@ BotDO also observes confirmed running processes through a durable ten-second
 read-only job, including after their task's final answer. `process.updated` keeps
 the conversation and sidebar current without additional model calls. Transport
 retries reuse the same observation identity; fully settled terminal states end observation.
+Terminal exec receipts may include `workspaceChanged:boolean`. The Linux image
+uses a recursive filesystem event watch, indexed once at startup and extended
+for newly created or moved directories. Commands without events verify metadata
+of the bounded file index to cover mmap writes and external hardlink aliases.
+They do not read file contents, hash files or rediscover workspace directories.
+A command with no observed persistent-file changes returns `workspaceChanged:false`
+and creates no automatic checkpoint or pending-save label. Concurrent writers
+can conservatively mark more than one command changed. Watch failure, overflow,
+remaining background children, interrupted receipts and older images remain
+conservative. Excluded dependency/cache directories and the live browser profile
+do not trigger file checkpoints; explicit/idle/suspend capture still flushes the
+current browser profile. The durable running session is the recovery intent;
+confirmed or uncertain terminal writes create checkpoint intent before their
+terminal result is stored. The console labels pending durability `Save pending`,
+which does not imply an archive/upload is already running.
+
 Terminal commands with `checkpointStatus:"pending"` remain under observation
 until their files are saved or checkpointing fails. Unchanged snapshots do not
 emit duplicate output. A durable dispatch marker also recovers an exec whose

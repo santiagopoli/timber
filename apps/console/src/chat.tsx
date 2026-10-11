@@ -92,7 +92,7 @@ const ApprovalEntry = memo(function ApprovalEntry({ approval, current, automatic
         {!automatic && <p className="timber-approval-help">“Approve and allow” includes future commands, file changes and desktop actions for this bot.</p>}
       </Confirmation>}
       {executing && <p className="timber-approval-help"><LoaderCircleIcon className="timber-spinner" aria-hidden="true" /> {process?.data.cancellationRequested ? 'Stopping command…' : 'Approved action is executing'}</p>}
-      {current && saving && <p className="timber-approval-help" data-checkpoint-status="pending">Saving files…</p>}
+      {current && saving && <p className="timber-approval-help" data-checkpoint-status="pending">Save pending</p>}
       {approval.status === 'expired' && <p className="timber-approval-help">This request expired.</p>}
       {approval.result?.error && <p className={approval.result.status === "completed" ? "timber-save-warning" : "timber-inline-error"}>{approval.result.error}</p>}
       {['failed', 'interrupted'].includes(approval.status) && <p className="timber-approval-help">Inspect its effects before retrying. This action will not be replayed automatically.</p>}
@@ -103,7 +103,7 @@ const ApprovalEntry = memo(function ApprovalEntry({ approval, current, automatic
   const attributes = {'data-approval-id': approval.id, 'data-approval-status': approval.status, 'data-process-status': processStatus};
   return <article className="timber-approval-entry" data-timeline-approval={approval.id} data-run-id={approval.runId}>
     {current ? <div id="current-approval" {...attributes}>{content}</div> : <details className="timber-approval-history" data-approval-history-id={approval.id}>
-      <summary><WrenchIcon aria-hidden="true" /><span>{title}</span>{saving && <span className="timber-tool-parameters" data-checkpoint-status="pending">Saving files…</span>}<time>{time(approval.createdAt)}</time></summary>
+      <summary><WrenchIcon aria-hidden="true" /><span>{title}</span>{saving && <span className="timber-tool-parameters" data-checkpoint-status="pending">Save pending</span>}<time>{time(approval.createdAt)}</time></summary>
       <div {...attributes}>{content}</div>
     </details>}
   </article>;
@@ -324,7 +324,7 @@ const ToolActivityRow = memo(function ToolActivityRow({tool, run, botId, panel =
       <span className="timber-tool-kind" title={identity.label} aria-label={identity.label}><Icon aria-hidden="true"/></span>
       <div className="timber-tool-overview">
         <div className={`timber-tool-command${presentation.command ? ' is-command' : ''}`}>{command ? <ActivityCode code={command} language="bash" compact/> : presentation.title}</div>
-        <div className="timber-tool-meta"><span className={state.pending || state.cancelled || state.unknown ? 'timber-tool-parameters' : 'timber-sr-only'}>{statusLabel}</span>{tool.result?.exitCode !== undefined && tool.result.exitCode !== 0 && !state.cancelled && <span className="timber-tool-exit">exit {tool.result.exitCode}</span>}{presentation.parameters && <span className="timber-tool-parameters">{presentation.parameters}</span>}{tool.result?.checkpointStatus==='pending' && <span className="timber-tool-parameters" data-checkpoint-status="pending">Saving files…</span>}</div>
+        <div className="timber-tool-meta"><span className={state.pending || state.cancelled || state.unknown ? 'timber-tool-parameters' : 'timber-sr-only'}>{statusLabel}</span>{tool.result?.exitCode !== undefined && tool.result.exitCode !== 0 && !state.cancelled && <span className="timber-tool-exit">exit {tool.result.exitCode}</span>}{presentation.parameters && <span className="timber-tool-parameters">{presentation.parameters}</span>}{tool.result?.checkpointStatus==='pending' && <span className="timber-tool-parameters" data-checkpoint-status="pending">Save pending</span>}</div>
         {(preview || showOutput) && <div className="timber-tool-preview" data-tool-result-preview>{preview && <div className={`timber-tool-preview${error && diagnosticClass ? ` ${diagnosticClass}` : ''}`}>{bounded(preview,420)}</div>}{showOutput && <ActivityOutput format={format} compact/>}</div>}
         {tool.result?.artifactId && <ArtifactPreview key={`${botId}:${tool.result.artifactId}`} botId={botId} artifactId={tool.result.artifactId}/>}
       </div>

@@ -2362,7 +2362,7 @@ for(const approved of [false,true]) test(`checkpoint recovery replaces stale war
     const row=approved?page.locator('[data-timeline-approval="checkpoint-approval"]'):page.locator(`#messages [data-tool-operation-id="${processId}"]`);
     if(approved)await row.locator('.timber-approval-history > summary').click();
     await row.locator('.timber-save-warning').filter({hasText:oldResult.error}).waitFor();
-    await row.locator('[data-checkpoint-status="pending"]').filter({hasText:'Saving files…'}).waitFor();
+    await row.locator('[data-checkpoint-status="pending"]').filter({hasText:'Save pending'}).waitFor();
     assert.equal(await row.locator('.timber-inline-error').count(),0,'a checkpoint warning does not turn a successful command into a failed command');
     const pending={operationId:'checkpoint-observation',processId,status:'completed',checkpointStatus:'pending',output:oldResult.output,exitCode:0};
     update(pending);await row.locator('.timber-save-warning').waitFor({state:'hidden'});

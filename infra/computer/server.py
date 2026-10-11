@@ -6,6 +6,7 @@ prevents an HTTP retry from repeating an effect after a connection is lost.
 from __future__ import annotations
 
 import hashlib
+import ctypes
 import hmac
 import io
 import json
@@ -17,6 +18,7 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import struct
 import tarfile
 import tempfile
 import threading
@@ -37,6 +39,176 @@ MAX_FILES = 10000
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 DEFAULT_EXEC_YIELD_MS = 1000
 EXCLUDED = {"node_modules", ".cache", "__pycache__", ".venv"}
+
+
+class WorkspaceChanges:
+    """One recursive Linux watch and a bounded index of persistent file metadata.
+
+    A missing watch or lost event makes the answer conservative for this boot.
+    New/moved directories are indexed only when their parent reports a change.
+    Commands without events check indexed metadata, covering mmap/hardlink writes
+    that inotify can miss, without reading content or rediscovering directories.
+    The live browser profile is not part of automatic file checkpoints.
+    """
+    MODIFY, ATTRIB = 0x2, 0x4
+    MOVED_FROM, MOVED_TO, CREATE, DELETE = 0x40, 0x80, 0x100, 0x200
+    DELETE_SELF, MOVE_SELF = 0x400, 0x800
+    OVERFLOW, IGNORED, ISDIR = 0x4000, 0x8000, 0x40000000
+    MASK = MODIFY | ATTRIB | MOVED_FROM | MOVED_TO | CREATE | DELETE | DELETE_SELF | MOVE_SELF
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.lock = threading.Lock()
+        self.fd = -1
+        self.watches: dict[int, Path] = {}
+        self.files: dict[Path, tuple] = {}
+        self.revision = 0
+        self.healthy = False
+        try:
+            self.libc = ctypes.CDLL(None, use_errno=True)
+            self.libc.inotify_init1.argtypes = [ctypes.c_int]
+            self.libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+            self.fd = self.libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+            if self.fd < 0:
+                raise OSError("Workspace watch unavailable")
+            self.healthy = True
+            self.add_tree(root)
+            self.drain()
+        except (OSError, AttributeError):
+            self.healthy = False
+
+    def included(self, path: Path, *, directory: bool = False) -> bool:
+        parts = path.relative_to(self.root).parts
+        parents = parts if directory else parts[:-1]
+        return not any(part in EXCLUDED for part in parents) and (not parts or parts[0] != ".browser-profile")
+
+    def add_tree(self, root: Path):
+        if root.is_symlink() or not self.included(root, directory=True):
+            return
+        def failed(_error):
+            self.healthy = False
+        for directory, dirs, files in os.walk(root, onerror=failed, followlinks=False):
+            path = Path(directory)
+            link_dirs = [name for name in dirs if (path / name).is_symlink() and self.included(path / name, directory=True)]
+            dirs[:] = [name for name in dirs if self.included(path / name, directory=True) and not (path / name).is_symlink()]
+            # Directory links are stored by the checkpoint without following them.
+            for name in files + link_dirs:
+                target = path / name
+                if self.included(target):
+                    self.refresh_file(target)
+                    if not self.healthy:
+                        return
+            # Match the archive entry budget; never let watch setup run unbounded.
+            if len(self.watches) >= MAX_FILES:
+                self.healthy = False
+                return
+            wd = self.libc.inotify_add_watch(self.fd, os.fsencode(path), self.MASK | 0x02000000 | 0x01000000)  # DONT_FOLLOW | ONLYDIR
+            if wd < 0:
+                self.healthy = False
+                return
+            self.watches[wd] = path
+
+    @staticmethod
+    def stamp(path: Path) -> tuple:
+        stat = path.lstat()
+        return (stat.st_ino, stat.st_mode, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+    def refresh_file(self, path: Path):
+        try:
+            if path not in self.files and len(self.files) >= MAX_FILES:
+                self.healthy = False
+                return
+            self.files[path] = self.stamp(path)
+        except FileNotFoundError:
+            self.files.pop(path, None)
+        except OSError:
+            self.healthy = False
+
+    def audit_files(self):
+        for path, previous in list(self.files.items()):
+            try:
+                current = self.stamp(path)
+            except FileNotFoundError:
+                self.files.pop(path, None)
+                self.revision += 1
+                continue
+            except OSError:
+                self.healthy = False
+                return
+            if current != previous:
+                self.files[path] = current
+                self.revision += 1
+
+    def drain(self):
+        if not self.healthy:
+            return
+        consumed = 0
+        while True:
+            try:
+                events = os.read(self.fd, 65536)
+            except BlockingIOError:
+                return
+            except OSError:
+                self.healthy = False
+                return
+            if not events:
+                self.healthy = False
+                return
+            consumed += len(events)
+            if consumed > MAX_JSON:
+                self.healthy = False
+                return
+            offset = 0
+            while offset < len(events):
+                wd, mask, _cookie, length = struct.unpack_from("iIII", events, offset)
+                name = os.fsdecode(events[offset + 16:offset + 16 + length].split(b"\0", 1)[0])
+                offset += 16 + length
+                if mask & self.OVERFLOW:
+                    self.healthy = False
+                    return
+                directory = self.watches.get(wd)
+                if directory is None:
+                    self.healthy = False
+                    return
+                path = directory / name if name else directory
+                if mask & self.IGNORED:
+                    self.watches.pop(wd, None)
+                    if directory == self.root:
+                        self.healthy = False
+                    continue
+                if directory == self.root and mask & (self.DELETE_SELF | self.MOVE_SELF):
+                    self.healthy = False
+                    return
+                if not self.included(path, directory=bool(mask & self.ISDIR) or not name):
+                    continue
+                self.revision += 1
+                if mask & self.ISDIR:
+                    if mask & (self.DELETE | self.MOVED_FROM):
+                        self.files = {file: stamp for file, stamp in self.files.items() if not file.is_relative_to(path)}
+                    if mask & (self.CREATE | self.MOVED_TO) and path.is_dir():
+                        self.add_tree(path)
+                elif name:
+                    self.refresh_file(path)
+                if not self.healthy:
+                    return
+
+    def snapshot(self) -> int | None:
+        with self.lock:
+            self.drain()
+            return self.revision if self.healthy else None
+
+    def changed_since(self, revision: int | None) -> bool:
+        with self.lock:
+            self.drain()
+            if revision is not None and self.healthy and self.revision == revision:
+                self.audit_files()
+                self.drain()
+            return revision is None or not self.healthy or self.revision != revision
+
+    def close(self):
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
 
 
 class IdempotencyConflict(ValueError):
@@ -63,6 +235,8 @@ class ExecutionSession:
         self.cancelled = threading.Event()
         self.done = threading.Event()
         self.thread: threading.Thread | None = None
+        self.workspace_revision: int | None = None
+        self.background_writers = False
 
 
 class Computer:
@@ -96,6 +270,7 @@ class Computer:
         self.boot_id = boot_file.read_text()
         self.browser: subprocess.Popen | None = None
         self.browser_checkpoint_profile = self.state / "browser-checkpoint-profile"
+        self.workspace_changes = WorkspaceChanges(self.workspace)
 
     def path(self, relative: str, *, allow_root: bool = False) -> Path:
         if not isinstance(relative, str) or "\x00" in relative:
@@ -253,6 +428,8 @@ class Computer:
 
     def persist_session(self, session: ExecutionSession, status: str, *, exit_code: int | None = None, error: str | None = None):
         result = {"processId": session.id, "status": status, "output": self.execution_output(session)}
+        if status != "running":
+            result["workspaceChanged"] = session.background_writers or self.workspace_changes.changed_since(session.workspace_revision)
         if exit_code is not None:
             result["exitCode"] = exit_code
         if error:
@@ -269,6 +446,7 @@ class Computer:
         selector = selectors.DefaultSelector()
         proc = None
         try:
+            session.workspace_revision = self.workspace_changes.snapshot()
             if session.cancelled.is_set():
                 self.persist_session(session, "cancelled")
                 return
@@ -332,6 +510,13 @@ class Computer:
                     last_publish = now
                     dirty = False
             code = proc.wait()
+            # A background child can write after its parent shell has exited.
+            # Such commands remain conservative even with no event yet.
+            try:
+                os.killpg(proc.pid, 0)
+                session.background_writers = True
+            except ProcessLookupError:
+                pass
             status = "cancelled" if session.cancelled.is_set() else "failed" if code or timed_out else "completed"
             error = "Command timed out; its process group was terminated. External effects may have occurred." if timed_out else None
             self.persist_session(session, status, exit_code=code, error=error)
@@ -372,6 +557,7 @@ class Computer:
         for session in sessions:
             session.done.wait(5)
         self.close_browser()
+        self.workspace_changes.close()
         with self.journal_lock:
             self.db.close()
 
@@ -893,7 +1079,7 @@ def create_handler(computer: Computer, token: str):
                 desktop = all(shutil.which(tool) for tool in ["scrot", "xdotool", "chromium", "xclip"])
                 if desktop:
                     desktop = subprocess.run(["xdotool", "getdisplaygeometry"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2).returncode == 0
-                return self.respond(200, {"ok": True, "bootId": computer.boot_id, "desktop": desktop, "capabilities": ["gitClone", "gitPush", "workspace", "execSessions", "preserveBrowserCheckpoint"] + (["move", "doubleClick", "drag"] if desktop else []) + (["liveDesktop"] if desktop and desktop_ready() else [])})
+                return self.respond(200, {"ok": True, "bootId": computer.boot_id, "desktop": desktop, "capabilities": ["gitClone", "gitPush", "workspace", "execSessions", "preserveBrowserCheckpoint", "workspaceChangeTracking"] + (["move", "doubleClick", "drag"] if desktop else []) + (["liveDesktop"] if desktop and desktop_ready() else [])})
             parsed = urlparse(self.path)
             if parsed.path.startswith("/workspace/"):
                 try:

@@ -41,6 +41,65 @@ function machine() {
 }
 
 describe('durable execution sessions',()=>{
+  it('settles read-only commands without checkpoint intent, uploads or a pending-save status',async()=>{
+    const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId)),vm=machine();
+    await runInDurableObject(stub,async(instance,state)=>{
+      vm.attach(instance);
+      const port=vm.container.getTcpPort();
+      vm.container.getTcpPort=()=>({async fetch(input:string,init?:RequestInit){
+        if(new URL(input).pathname==='/actions' && JSON.parse(String(init?.body)).action.type==='exec') {
+          expect(await state.storage.getAlarm()).toBeGreaterThan(Date.now());
+          expect(await state.storage.get('exec-session:read-only')).toMatchObject({result:{status:'running'}});
+        }
+        return port.fetch(input,init);
+      }});
+      const action={type:'exec',command:'cd . && grep label report.txt',yieldMs:0};
+      await instance.fetch(request(botId,'read-only',action));
+      expect(await state.storage.get('checkpointRetry')).toBeUndefined();
+      vm.sessions.set('read-only',{operationId:'read-only',processId:'read-only',status:'completed',exitCode:0,output:'label',workspaceChanged:false});
+      const result=await (await instance.fetch(request(botId,'observe',{type:'execPoll',processId:'read-only',yieldMs:0}))).json<ComputerResult>();
+      expect(result).toMatchObject({status:'completed',workspaceChanged:false});expect(result.checkpointStatus).toBeUndefined();
+      expect(await (await instance.fetch(request(botId,'read-only',action))).json()).toEqual({...result,operationId:'read-only'});
+      await flush(instance,state.storage);
+      expect(await state.storage.get('checkpointRetry')).toBeUndefined();expect(vm.checkpoints).toBe(0);
+      expect(vm.actions.filter(value=>value.action.type==='exec')).toHaveLength(1);
+    });
+    await evictDurableObject(stub);
+    await runInDurableObject(stub,async(instance,state)=>{
+      vm.attach(instance);
+      const result=await (await instance.fetch(request(botId,'after-recovery',{type:'execPoll',processId:'read-only',yieldMs:0}))).json<ComputerResult>();
+      expect(result).toMatchObject({status:'completed',workspaceChanged:false});expect(result.checkpointStatus).toBeUndefined();
+      expect(await state.storage.get('checkpointRetry')).toBeUndefined();expect(vm.checkpoints).toBe(0);
+    });
+  });
+
+  it.each([true,undefined])('persists changed or unknown commands before exposing a terminal result (%s)',async workspaceChanged=>{
+    const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId)),vm=machine();
+    await runInDurableObject(stub,async(instance,state)=>{
+      vm.attach(instance);await instance.fetch(request(botId,'writer',{type:'exec',command:'printf x > report.txt',yieldMs:0}));
+      vm.sessions.set('writer',{operationId:'writer',processId:'writer',status:'failed',exitCode:1,workspaceChanged,output:'wrote before failure'});
+      expect(await (await instance.fetch(request(botId,'observe',{type:'execPoll',processId:'writer',yieldMs:0}))).json()).toMatchObject({status:'failed',checkpointStatus:'pending'});
+      expect(await state.storage.get('operation:writer')).toMatchObject({checkpoint:{bootId:'same-boot'},result:{status:'failed',checkpointStatus:'pending'}});
+      await flush(instance,state.storage);expect(vm.checkpoints).toBe(1);
+    });
+  });
+
+  it('a read-only command does not clear pending changes from an earlier write',async()=>{
+    const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId)),vm=machine();
+    await runInDurableObject(stub,async(instance,state)=>{
+      vm.attach(instance);await instance.fetch(request(botId,'write',{type:'writeFile',path:'report.txt',content:'label'}));
+      const retry=await state.storage.get('checkpointRetry');expect(retry).toBeTruthy();
+      await instance.fetch(request(botId,'read',{type:'exec',command:'cat report.txt',yieldMs:0}));
+      vm.sessions.set('read',{operationId:'read',processId:'read',status:'completed',workspaceChanged:false,output:'label'});
+      const result=await (await instance.fetch(request(botId,'observe',{type:'execPoll',processId:'read',yieldMs:0}))).json<ComputerResult>();
+      expect(result.checkpointStatus).toBeUndefined();expect(await state.storage.get('checkpointRetry')).toEqual(retry);
+      await flush(instance,state.storage);expect(vm.checkpoints).toBe(1);
+      expect(await state.storage.get('operation:write')).toMatchObject({result:{checkpointStatus:'saved'}});
+      expect(await state.storage.get('operation:read')).toMatchObject({result:{workspaceChanged:false}});
+      expect((await state.storage.get<{result:ComputerResult}>('operation:read'))!.result.checkpointStatus).toBeUndefined();
+    });
+  });
+
   it('omits the execution deadline, excludes yield from deduplication, and accepts explicit deadlines above 120 seconds',async()=>{
     const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId)),vm=machine();
     await runInDurableObject(stub,async(instance,state)=>{

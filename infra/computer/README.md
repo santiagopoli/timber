@@ -93,6 +93,14 @@ the normal idle lease; an idle open tab alone does not keep a computer running f
 ## Persistence and limits
 
 Shell/file tools return their journaled outcome without waiting for persistence.
+Terminal shell receipts report observed workspace changes. Pure reads such as
+`cd && grep` omit checkpoint status and do not schedule an archive/upload. Linux
+events maintain a bounded directory/file index; a metadata audit of indexed files
+covers mmap and hardlink writes without hashing content or walking directories
+again. Lost events or unavailable watches retain conservative saving. Running
+execution intent and its observation alarm are durable before dispatch; terminal
+write intent is durable before returning its result.
+
 Their filesystem changes have `checkpointStatus:pending` until a durable alarm
 coalesces them after 90 seconds without agent tool/runtime activity and without
 active managed commands. Passive process observations and viewer renewals do not

@@ -491,8 +491,14 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
           output:(value.output?.length??0)<(session.result.output?.length??0)?session.result.output:value.output};
         if(lost) session.checkpoint='done';
         else if(session.result.status!=='running') {
+          // The durable running receipt is the recovery intent until the image
+          // reports actual filesystem changes. Unknown/older images still save.
+          const record=await this.ctx.storage.get<OperationRecord>(`operation:${processId}`);
+          if(value.workspaceChanged!==false || record?.checkpoint) {
+            await this.markCheckpointDirty(processId,session.bootId);
+            session.result.checkpointStatus='pending';
+          }
           session.checkpoint='done';
-          session.result.checkpointStatus='pending';
         }
         await this.storeExecution(processId,session);
       }
@@ -542,11 +548,13 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         await this.ctx.storage.transaction(async txn=>{
           if(await txn.get(`operation:${processId}`)) throw new ComputerProviderError('computer_idempotency_conflict');
           await txn.put({[`exec-session:${processId}`]:session,[`operation:${processId}`]:{digest,processId,result:session.result} satisfies OperationRecord});
+          // A crash immediately after dispatch must still wake observation,
+          // even though no filesystem change has been reported yet.
+          await txn.setAlarm(Date.now()+EXEC_POLL_MS);
         });
         return true;
       });
       if(!dispatch) return {operationId:processId,processId,status:'cancelled' as const,output:''};
-      await this.markCheckpointDirty(processId,health.bootId);
       // Admission is short. The process owns its lifetime, not this request.
       try { await this.updateExecution(processId,await this.executionRequest(processId,{...action,yieldMs:0},0)); }
       catch(error) {

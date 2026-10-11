@@ -36,6 +36,8 @@ assert.equal((await action({type:'readFile',path:'image-smoke.txt'})).output,'Ti
 const operationId = randomUUID();
 const command = {type:'exec',command:'printf x >> effect-count.txt; cat effect-count.txt',timeoutMs:10000};
 const result = await action(command,operationId);assert.equal(result.exitCode,0);assert.equal(result.output,'x');
+assert.equal(result.workspaceChanged,true,'real shell writes report persistent file changes');
+assert.equal((await action({type:'exec',command:'cd /workspace && grep -n Timber image-smoke.txt',timeoutMs:10000})).workspaceChanged,false,'cd and grep do not report file changes');
 assert.deepEqual(await action(command,operationId),result,'effect deduplicated');
 assert.equal((await action({type:'readFile',path:'effect-count.txt'})).output,'x','duplicate action did not append again');
 const cancellableId = randomUUID();
