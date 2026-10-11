@@ -18,7 +18,7 @@ export const MODEL_FAILURES = {
   model_request_failed: 'The model request failed before an answer completed. Your conversation and recorded tool results are preserved.',
   model_output_limit: 'The model response exceeded this bot’s output limit. Your recorded tool results are preserved.',
   model_response_filtered: 'The model provider could not return a response to this request.',
-  model_billing_required: 'The selected Workers AI model requires paid access or available billing credits.',
+  model_billing_required: 'The selected model provider requires paid access or available billing credits.',
   model_empty_response: 'The model returned no answer after automatic retries. Your recorded tool results are preserved.',
 } as const;
 export type ModelErrorCode = keyof typeof MODEL_FAILURES;

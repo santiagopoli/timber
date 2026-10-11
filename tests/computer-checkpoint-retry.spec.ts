@@ -11,7 +11,7 @@ const hash=async(bytes:Uint8Array)=>Array.from(new Uint8Array(await crypto.subtl
 afterEach(()=>vi.restoreAllMocks());
 
 function computer() {
-  const state={effects:0,archives:0,uploads:0,heads:0,failUploads:0,bootId:'boot',running:true,destroys:0,restore:0,contents:'saved workspace',commandError:undefined as string|undefined};
+  const state={effects:0,archives:0,uploads:0,heads:0,failUploads:0,bootId:'boot',running:true,destroys:0,restore:0,contents:'saved workspace',commandError:undefined as string|undefined,archiveOptions:[] as {quiesce:boolean;preserveBrowser:boolean}[]};
   const files={async put(key:string,value:ReadableStream,options:R2PutOptions){state.uploads++;if(state.failUploads>0){state.failUploads--;throw new Error('network failure private-detail');}return bindings.FILES.put(key,value,options);},async head(key:string){state.heads++;return bindings.FILES.head(key);},get:(key:string)=>bindings.FILES.get(key)};
   const container={get running(){return state.running;},async setInactivityTimeout(){},async destroy(){state.destroys++;state.running=false;},getTcpPort(){return {async fetch(input:string,init?:RequestInit){
     const path=new URL(input).pathname;
@@ -19,6 +19,7 @@ function computer() {
     if(path==='/actions') {state.effects++;return Response.json({status:state.commandError?'failed':'completed',exitCode:state.commandError?1:0,output:'command output',error:state.commandError});}
     if(path==='/restore') {state.restore++;await new Response(init?.body).arrayBuffer();return Response.json({ok:true});}
     expect(path).toBe('/checkpoint');state.archives++;
+    state.archiveOptions.push(JSON.parse(String(init?.body)));
     const bytes=new TextEncoder().encode(state.contents);
     // Deliberately unknown stream length, even with a valid HTTP length header.
     const body=new ReadableStream<Uint8Array>({start(controller){controller.enqueue(bytes.subarray(0,3));controller.enqueue(bytes.subarray(3));controller.close();}});
@@ -27,7 +28,7 @@ function computer() {
   return {state,files,container,attach(instance:object){Object.defineProperty(instance,'container',{configurable:true,get:()=>container});Object.defineProperty(instance,'env',{configurable:true,value:{FILES:files}});}};
 }
 
-async function due(storage:DurableObjectStorage){const retry=await storage.get<Record<string,unknown>>('checkpointRetry');expect(retry).toBeTruthy();await storage.put('checkpointRetry',{...retry,nextAttemptAt:Date.now()-1});}
+async function due(storage:DurableObjectStorage){const retry=await storage.get<Record<string,unknown>>('checkpointRetry');expect(retry).toBeTruthy();await storage.put({checkpointQuietUntil:0,checkpointRetry:{...retry,nextAttemptAt:Date.now()-1}});}
 
 function failPointer(storage:DurableObjectStorage,enabled:()=>boolean) {
   const original=storage.transaction.bind(storage);
@@ -41,6 +42,84 @@ function failPointer(storage:DurableObjectStorage,enabled:()=>boolean) {
 }
 
 describe('checkpoint upload and durable recovery',()=>{
+  it('returns tool results before any archive and coalesces writes after runtime activity settles',async()=>{
+    const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId)),vm=computer();
+    await runInDurableObject(stub,async(instance,state)=>{
+      vm.attach(instance);
+      for(const id of ['first-write','second-write']) {
+        expect(await (await instance.fetch(request(botId,id,{type:'writeFile',path:id,content:'hello'}))).json()).toMatchObject({status:'completed',checkpointStatus:'pending'});
+      }
+      expect(await (await instance.fetch(request(botId,'read-command',{type:'exec',command:'cat first-write',yieldMs:0}))).json()).toMatchObject({status:'completed',checkpointStatus:'pending'});
+      await instance.alarm!();expect(vm.state.archives).toBe(0);expect(vm.state.uploads).toBe(0);
+      await instance.fetch(post(botId,'/touch'));await instance.alarm!();expect(vm.state.archives).toBe(0);
+      // Automatic observations of pending files do not postpone saving forever.
+      await instance.fetch(request(botId,'observe',{type:'execPoll',processId:'read-command',yieldMs:0}));
+      await due(state.storage);await instance.alarm!();
+      expect(vm.state.archives).toBe(1);expect(vm.state.uploads).toBe(1);expect(vm.state.effects).toBe(3);
+      expect(vm.state.archiveOptions).toEqual([{quiesce:false,preserveBrowser:true}]);
+      for(const id of ['first-write','second-write','read-command']) expect(await state.storage.get(`operation:${id}`)).toMatchObject({result:{checkpointStatus:'saved',checkpointId:expect.any(String)}});
+    });
+  });
+
+  it('allows new tools during a blocked R2 upload without marking later writes as saved',async()=>{
+    const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId)),vm=computer();
+    await runInDurableObject(stub,async(instance,state)=>{
+      vm.attach(instance);
+      const write=(id:string)=>request(botId,id,{type:'writeFile',path:id,content:id});
+      await instance.fetch(write('before-upload'));await due(state.storage);
+      const entered=deferred(),release=deferred(),put=vm.files.put;
+      vm.files.put=async(...args:Parameters<typeof put>)=>{entered.resolve();await release.promise;return put(...args);};
+      const saving=instance.alarm!();await entered.promise;
+      try {
+        expect(await (await instance.fetch(write('during-upload'))).json()).toMatchObject({status:'completed',checkpointStatus:'pending'});
+        expect((await instance.fetch(request(botId,'files-during-upload',{type:'listFiles'}))).status).toBe(200);
+        expect(await state.storage.get('lastCheckpoint')).toBeUndefined();
+      } finally {release.resolve();await saving;}
+      expect(await state.storage.get('operation:before-upload')).toMatchObject({result:{checkpointStatus:'saved'}});
+      expect(await state.storage.get('operation:during-upload')).toMatchObject({result:{checkpointStatus:'pending'}});
+      expect(await state.storage.get('checkpointRetry')).toBeTruthy();
+      await due(state.storage);await instance.alarm!();
+      expect(await state.storage.get('operation:during-upload')).toMatchObject({result:{checkpointStatus:'saved'}});
+      expect(vm.state.archives).toBe(2);expect(vm.state.effects).toBe(3);
+    });
+  });
+
+  it('waits for a background upload before acknowledging permanent deletion',async()=>{
+    vi.spyOn(console,'error').mockImplementation(()=>{});
+    const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId)),vm=computer();
+    await runInDurableObject(stub,async(instance,state)=>{
+      vm.attach(instance);await instance.fetch(request(botId,'before-delete',{type:'writeFile',path:'notes',content:'hello'}));await due(state.storage);
+      const entered=deferred(),release=deferred(),put=vm.files.put;let deleted=false;
+      vm.files.put=async(...args:Parameters<typeof put>)=>{entered.resolve();await release.promise;return put(...args);};
+      const saving=Promise.resolve(instance.alarm!()).catch(()=>{});await entered.promise;
+      const deletion=Promise.resolve(instance.fetch(post(botId,'/delete'))).then(response=>{deleted=true;return response;});
+      await new Promise(resolve=>setTimeout(resolve,10));expect(deleted).toBe(false);
+      release.resolve();expect((await deletion).status).toBe(200);await saving;
+      expect(await state.storage.list()).toEqual(new Map([['deleted',botId]]));
+    });
+  });
+
+  it.each(['checkpoint','suspend'])('waits outside the tool gate then captures fresh files for explicit %s',async kind=>{
+    const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId)),vm=computer();
+    await runInDurableObject(stub,async(instance,state)=>{
+      vm.attach(instance);await instance.fetch(request(botId,'old-files',{type:'writeFile',path:'notes',content:'old'}));await due(state.storage);
+      const entered=deferred(),release=deferred(),put=vm.files.put;let finished=false;
+      vm.files.put=async(...args:Parameters<typeof put>)=>{entered.resolve();await release.promise;return put(...args);};
+      const saving=instance.alarm!();await entered.promise;
+      vm.state.contents='new desktop files after the earlier capture';
+      const explicit=Promise.resolve(instance.fetch(kind==='suspend'?post(botId,'/suspend'):request(botId,'fresh-checkpoint',{type:'checkpoint'}))).then(response=>{finished=true;return response;});
+      try {
+        expect((await instance.fetch(request(botId,'inspect-during-save',{type:'listFiles'}))).status).toBe(200);
+        expect(finished).toBe(false);expect(vm.state.archives).toBe(1);
+      } finally {release.resolve();await saving;}
+      expect((await explicit).status).toBe(200);
+      const latest=(await state.storage.get<{key:string}>('lastCheckpoint'))!;
+      expect(await (await bindings.FILES.get(latest.key))!.text()).toBe(vm.state.contents);
+      expect(vm.state.archives).toBe(2);expect(vm.state.destroys).toBe(kind==='suspend'?1:0);
+      expect(vm.state.archiveOptions).toEqual([{quiesce:false,preserveBrowser:true},{quiesce:kind==='suspend',preserveBrowser:false}]);
+    });
+  });
+
   it('uploads an unknown-length response stream through real R2 with byte and SHA verification',async()=>{
     const bytes=new TextEncoder().encode('native stream'),body=new ReadableStream<Uint8Array>({start(controller){controller.enqueue(bytes);controller.close();}});
     await expect(bindings.FILES.put(`repro/${crypto.randomUUID()}`,body)).rejects.toThrow('known length');
@@ -58,10 +137,12 @@ describe('checkpoint upload and durable recovery',()=>{
   it('recovers one transient upload failure without a warning or repeating the command',async()=>{
     const log=vi.spyOn(console,'error').mockImplementation(()=>{});
     const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId)),vm=computer();vm.state.failUploads=1;
-    await runInDurableObject(stub,async instance=>{
+    await runInDurableObject(stub,async(instance,state)=>{
       vm.attach(instance);
       const result=await (await instance.fetch(request(botId,'one-command',{type:'exec',command:'create files',yieldMs:0}))).json<ComputerResult>();
-      expect(result).toMatchObject({status:'completed',checkpointStatus:'saved',checkpointId:expect.any(String)});expect(result.error).toBeUndefined();
+      expect(result).toMatchObject({status:'completed',checkpointStatus:'pending'});expect(result.error).toBeUndefined();
+      expect(vm.state.archives).toBe(0);await due(state.storage);await instance.alarm!();
+      expect(await state.storage.get('operation:one-command')).toMatchObject({result:{status:'completed',checkpointStatus:'saved',checkpointId:expect.any(String)}});
       expect(vm.state.effects).toBe(1);expect(vm.state.archives).toBe(2);expect(vm.state.uploads).toBe(2);
       expect(log).toHaveBeenCalledWith('computer.checkpoint_failure',{phase:'archive_upload',cause:'transport'});
       expect(JSON.stringify(log.mock.calls)).not.toContain('private-detail');
@@ -75,9 +156,9 @@ describe('checkpoint upload and durable recovery',()=>{
       vm.attach(instance);
       const result=await (await instance.fetch(request(botId,'failed-command',{type:'exec',command:'write then fail',yieldMs:0}))).json<ComputerResult>();
       expect(result).toMatchObject({status:'failed',checkpointStatus:'pending',error:vm.state.commandError});
-      const retry=await state.storage.get<{nextAttemptAt:number}>('checkpointRetry');
       await instance.fetch(post(botId,'/touch'));
-      expect(await state.storage.getAlarm()).toBeLessThanOrEqual(retry!.nextAttemptAt);
+      expect(await state.storage.getAlarm()).toBeGreaterThan(Date.now()+80_000);
+      await due(state.storage);await instance.alarm!();
       await due(state.storage);await instance.alarm!();
       const escalated=await (await instance.fetch(request(botId,'observe-failure',{type:'execPoll',processId:'failed-command',yieldMs:0}))).json<ComputerResult>();
       expect(escalated.checkpointStatus).toBe('pending');expect(escalated.error).toContain('could not be saved durably');expect(escalated.error).toContain(vm.state.commandError!);
@@ -100,6 +181,7 @@ describe('checkpoint upload and durable recovery',()=>{
       vm.attach(instance);const fault=failPointer(state.storage,()=>true);
       const result=await (await instance.fetch(request(botId,'pointer-window',{type:'exec',command:'one effect',yieldMs:0}))).json<ComputerResult>();
       expect(result).toMatchObject({status:'completed',checkpointStatus:'pending'});expect(result.error).toBeUndefined();
+      await due(state.storage);await instance.alarm!();
       const retry=(await state.storage.get<{candidate:{id:string};nextAttemptAt:number}>('checkpointRetry'))!;
       candidateId=retry.candidate.id;
       // Keep recovery pending until the post-eviction step explicitly makes it
@@ -140,7 +222,8 @@ describe('checkpoint upload and durable recovery',()=>{
     const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId)),vm=computer();
     await runInDurableObject(stub,async(instance,state)=>{
       vm.attach(instance);const fault=failPointer(state.storage,()=>true);
-      await instance.fetch(request(botId,'old-snapshot',{type:'writeFile',path:'file',content:'old'}));fault.mockRestore();
+      await instance.fetch(request(botId,'old-snapshot',{type:'writeFile',path:'file',content:'old'}));
+      await due(state.storage);await instance.alarm!();fault.mockRestore();
       const old=(await state.storage.get<{candidate:{id:string}}>('checkpointRetry'))!.candidate.id;
       vm.state.contents='new desktop data without any tool revision';
       expect((await instance.fetch(post(botId,'/suspend'))).status).toBe(200);
@@ -159,7 +242,7 @@ describe('checkpoint upload and durable recovery',()=>{
       await due(state.storage);await instance.alarm!();
       const result=await (await instance.fetch(request(botId,'observe-loss',{type:'execPoll',processId:'lost-work',yieldMs:0}))).json<ComputerResult>();
       expect(result).toMatchObject({status:'completed',checkpointStatus:'failed',error:expect.stringContaining('restarted before')});expect(result.checkpointId).toBeUndefined();
-      expect(vm.state.effects).toBe(1);expect(vm.state.restore).toBe(0);expect(vm.state.uploads).toBe(2);
+      expect(vm.state.effects).toBe(1);expect(vm.state.restore).toBe(0);expect(vm.state.uploads).toBe(0);
     });
   });
 

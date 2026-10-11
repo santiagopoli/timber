@@ -1,4 +1,5 @@
 export * from './models.js';
+export * from './model-catalog.js';
 export * from './model-errors.js';
 export type RunStatus = "queued" | "running" | "waiting_approval" | "waiting_connection" | "completed" | "failed" | "cancelled" | "interrupted";
 export type ComputerApprovalMode = "ask" | "automatic";
@@ -54,3 +55,4 @@ export interface Task { id:string; title:string; description:string; botId:strin
 export interface TaskPage { tasks:Task[]; }
 export * from "./avatars";
 export * from "./avatar-presets";
+export type {SecretMetadata,SecureInputRequest} from './keychain';

@@ -7,6 +7,21 @@ import { DIAGNOSTIC_CODES, timeframe } from './prod-diagnostics.mjs';
 // neither SQL nor object names can be supplied by workflow dispatch inputs.
 // https://github.com/cloudflare/cf/blob/7d7a6d9f6c32ff7d5d72fe56fe2d84fa78e7355f/packages/cli/src/sdk/sdk/api/resources/durableObjects/resources/namespaces/client/Client.ts#L112
 export const BOT_LOOKUP = "SELECT id FROM bots WHERE lower(json_extract(data,'$.name'))='polibot' LIMIT 2";
+export const AVATAR_QUERY = `SELECT json_extract(j.data,'$.createdAt') AS created_at,
+ json_extract(j.data,'$.updatedAt') AS updated_at,json_extract(j.data,'$.status') AS status,
+ json_extract(j.data,'$.error.code') AS error_code,
+ json_extract(t.data,'$.kind') AS kind
+ FROM avatar_jobs j LEFT JOIN avatar_themes t ON t.id=json_extract(j.data,'$.themeId')
+ ORDER BY j.rowid DESC LIMIT 100`;
+const AVATAR_ERRORS=new Set(['avatar_image_unavailable','avatar_image_access_denied','avatar_image_rate_limited','avatar_image_generation_failed','avatar_image_invalid','avatar_image_limit','avatar_response_limit','avatar_generation_interrupted','avatar_generation_failed','avatar_storage_failed','avatar_response_invalid','avatar_model_unavailable','avatar_reasoning_unavailable','avatar_svg_invalid','avatar_svg_limit']);
+export function summarizeAvatars(records,window){
+  const jobs=records.slice(0,100).flatMap(row=>{
+    const createdAt=iso(row.created_at),updatedAt=iso(row.updated_at),at=Date.parse(updatedAt??createdAt??'');
+    if(!Number.isFinite(at)||at<window.from||at>window.to)return [];
+    return [{createdAt,updatedAt,status:['queued','running','completed','failed','interrupted','obsolete'].includes(row.status)?row.status:'unknown',kind:['vector','image'].includes(row.kind)?row.kind:'unknown',errorCode:row.error_code==null?null:AVATAR_ERRORS.has(row.error_code)?row.error_code:'unknown'}];
+  });
+  return {worker:'timber-api',source:'durable_avatar_sql_fixed_select',window:{from:new Date(window.from).toISOString(),to:new Date(window.to).toISOString()},jobs,limitation:'Latest 100 avatar jobs within the window; no prompts, bot identifiers, artwork, credentials or provider error text.'};
+}
 export const SCHEMA = "SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('pi_submissions','pi_tasks','runs','submissions','botspace_runtime_generations') ORDER BY name";
 export const FAILURE_QUERY = `WITH recent AS (
  SELECT id,json_extract(record,'$.requestId') AS request_id,record FROM pi_submissions
@@ -193,7 +208,9 @@ export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now
     return matches[0].id;
   }
   async function query(namespaceId,name,sql){return rows(await request(`${base}/${namespaceId}/query/v2`,{durable_object_name:name,jurisdiction:'none',queries:[{sql}]}));}
-  const workspace=namespace('WorkspaceDO'),bot=namespace('BotDO');
+  const workspace=namespace('WorkspaceDO');
+  if(env.DIAGNOSTIC_SCOPE==='avatars')return summarizeAvatars(await query(workspace,'owner',AVATAR_QUERY),window);
+  const bot=namespace('BotDO');
   const selected=await query(workspace,'owner',BOT_LOOKUP);
   if(selected.length!==1||!uuid(selected[0]?.id))throw new Error('durable_diagnostics_bot_not_unique');
   const name=`owner:${selected[0].id}`;

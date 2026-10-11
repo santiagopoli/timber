@@ -3,6 +3,7 @@ import { ApiError, errorResponse, json } from "./errors";
 import type { Env } from "./env";
 import { UUID, operationId as validateOperationId, parseAction } from "./validation";
 import type { Bot } from "@botspace/contracts";
+import {modelCatalog} from './model-catalog';
 export { WorkspaceDO } from "./workspace";
 export { BotDO } from "./bot";
 export { GitHubAuthDO } from "./github";
@@ -96,8 +97,7 @@ export default {
       if(!url.pathname.startsWith("/v1/")) throw new ApiError(404,"not_found","Endpoint not found.");
       if(url.pathname==="/v1/models") {
         if(request.method!=="GET")throw new ApiError(405,"method_not_allowed","Method not allowed.");
-        if(!env.CHATGPT)return json({models:[],connected:false,defaultModel:env.BOTSPACE_DEFAULT_MODEL??"gpt-6.1-sol",error:"ChatGPT connections are not configured on this server."});
-        return env.CHATGPT.get(env.CHATGPT.idFromName(owner)).fetch("https://chatgpt/models");
+        return json(await modelCatalog(env,owner));
       }
       if(url.pathname==="/v1/connections/chatgpt" || url.pathname==="/v1/connections/chatgpt/verify") {
         const verification=url.pathname.endsWith("/verify");
@@ -117,6 +117,7 @@ export default {
         requestBodyForwarded=true;return env.GITHUB.get(env.GITHUB.idFromName(owner)).fetch(internalRequest(request,"https://github/status"));
       }
       const registry=env.WORKSPACE.get(env.WORKSPACE.idFromName(owner));
+      if(url.pathname==='/v1/keychain'||url.pathname.startsWith('/v1/keychain/'))return registry.fetch(internalRequest(request,`https://workspace${url.pathname.slice(3)}`));
       if(url.pathname==="/v1/tasks") {
         if(request.method==="GET") return registry.fetch(new Request("https://workspace/tasks"));
         if(request.method!=="POST") throw new ApiError(405,"method_not_allowed","Method not allowed.");
@@ -188,12 +189,14 @@ export default {
       if(!match || !UUID.test(match[1])) throw new ApiError(404,"not_found","Bot not found.");
       const botId=match[1];
       const tail=match[2]??"";
+      if(tail.startsWith('/_keychain'))throw new ApiError(404,'not_found','Endpoint not found.');
       if(["/agent-messages","/agent-results","/agent-cancel"].includes(tail)) throw new ApiError(404,"not_found","Endpoint not found.");
       if(tail==="" && ["PATCH","DELETE"].includes(request.method)) {requestBodyForwarded=true;return registry.fetch(internalRequest(request,`https://workspace/${botId}`));}
       const record=await registry.fetch(`https://workspace/${botId}`);
       if(!record.ok) return record;
       const {bot}=await record.json<{bot:Bot}>();
       if(!tail && request.method==="GET") return json({bot});
+      if(tail==='/keychain'||tail.startsWith('/keychain/')){const forwarded=internalRequest(request,`https://workspace${tail}`);forwarded.headers.set('x-keychain-bot',botId);return registry.fetch(forwarded);}
       if(tail==="/avatar") return registry.fetch(internalRequest(request,`https://workspace/avatar/${botId}`,true));
       const artifact=/^\/artifacts\/([^/]+)$/.exec(tail);
       if(artifact && request.method==="GET") {

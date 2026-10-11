@@ -29,14 +29,17 @@ describe("checkpoint failures preserve known computer outcomes",()=>{
         return recovered?new Response("x",{headers:{"content-length":"1","x-content-sha256":"0".repeat(64)}}):Response.json({error:message},{status:400});
       }};}})});
       const action={type:"exec",command:"create source files"};
-      const result=await (await instance.fetch(request(botId,"write-once",action))).json<ComputerResult>();
+      const pending=await (await instance.fetch(request(botId,"write-once",action))).json<ComputerResult>();
+      expect(pending).toMatchObject({status:'completed',checkpointStatus:'pending'});expect(checkpoints).toBe(0);
+      await state.storage.put('checkpointQuietUntil',0);await instance.alarm!();
+      const result=await (await instance.fetch(request(botId,"observe-checkpoint-error",{type:'execPoll',processId:'write-once',yieldMs:0}))).json<ComputerResult>();
       expect(result).toMatchObject({status:"completed",exitCode:0,output:"Source files created",error:expect.stringContaining(detail!)});
       expect(result.checkpointId).toBeUndefined();expect(result.error).not.toContain("private-secret-path");
-      expect(log).toHaveBeenCalledWith("computer.failure",{stage:"checkpoint",code});
+      expect(log).toHaveBeenCalledWith("computer.failure",{stage:"checkpoint_retry",code});
       expect(JSON.stringify(log.mock.calls)).not.toContain("private-secret-path");
       expect(await state.storage.get("lastCheckpoint")).toBeUndefined();expect(uploads).toBe(0);
       // Re-requesting the original operation returns its actual result, never its effect.
-      expect(await (await instance.fetch(request(botId,"write-once",action))).json()).toEqual(result);
+      expect(await (await instance.fetch(request(botId,"write-once",action))).json()).toEqual({...result,operationId:'write-once'});
       expect(effects).toBe(1);expect(checkpoints).toBe(1);
       recovered=true;
       const saved=await (await instance.fetch(request(botId,"save-existing-files",{type:"checkpoint"}))).json<ComputerResult>();
@@ -49,7 +52,7 @@ describe("checkpoint failures preserve known computer outcomes",()=>{
   it("returns the actionable checkpoint failure instead of claiming an unknown command outcome",async()=>{
     vi.spyOn(console,"error").mockImplementation(()=>{});
     const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
-    await runInDurableObject(stub,async instance=>{
+    await runInDurableObject(stub,async(instance,state)=>{
       Object.defineProperty(instance,"container",{get:()=>({running:true,async setInactivityTimeout(){},getTcpPort(){return {async fetch(input:string){
         if(new URL(input).pathname==="/health")return Response.json({ok:true,bootId:"known",desktop:true,capabilities:["execSessions"]});
         return Response.json({error:"Workspace changed during checkpoint; stop background writers and retry"},{status:400});
@@ -63,14 +66,17 @@ describe("checkpoint failures preserve known computer outcomes",()=>{
   it("retains a timeout exit and partial output when checkpoint also fails",async()=>{
     vi.spyOn(console,"error").mockImplementation(()=>{});
     const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
-    await runInDurableObject(stub,async instance=>{
+    await runInDurableObject(stub,async(instance,state)=>{
       Object.defineProperty(instance,"container",{get:()=>({running:true,async setInactivityTimeout(){},getTcpPort(){return {async fetch(input:string){
         const path=new URL(input).pathname;
         if(path==="/health")return Response.json({ok:true,bootId:"known",desktop:true,capabilities:["execSessions"]});
         if(path==="/actions")return Response.json({status:"failed",exitCode:-9,output:"partial install",error:"Command timed out; its process group was terminated. External effects may have occurred."});
         return Response.json({error:"Workspace changed during checkpoint; stop background writers and retry"},{status:400});
       }};}})});
-      const result=await (await instance.fetch(request(botId,"timed-out-install",{type:"exec",command:"install dependencies"}))).json<ComputerResult>();
+      const pending=await (await instance.fetch(request(botId,"timed-out-install",{type:"exec",command:"install dependencies"}))).json<ComputerResult>();
+      expect(pending.error).toContain('Command timed out');expect(pending.checkpointStatus).toBe('pending');
+      await state.storage.put('checkpointQuietUntil',0);await instance.alarm!();
+      const result=await (await instance.fetch(request(botId,"observe-timeout",{type:'execPoll',processId:'timed-out-install',yieldMs:0}))).json<ComputerResult>();
       expect(result).toMatchObject({status:"failed",exitCode:-9,output:"partial install"});
       expect(result.error).toContain("Command timed out");expect(result.error).toContain("Background processes changed");
     });

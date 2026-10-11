@@ -37,7 +37,9 @@ other engines can implement these boundaries without changing bot identity.
   Chromium, screenshots, mouse, keyboard and scrolling.
 - Persisted approvals for model-initiated effects, optional task budgets and operation IDs
   that prevent a repeated request from executing a completed action twice.
-- Workspace checkpoints in R2, restore on cold start, explicit suspend and idle stop.
+- Coalesced workspace checkpoints in R2 without waiting in tool results, restore
+  on cold start, explicit suspend and idle stop. Pending files can be lost if the
+  container fails before saving; effect receipts remain durable.
 - Protected API, developer console and CLI smoke tests.
 
 The admin console provides bot search, creation and configuration dialogs, a
@@ -228,6 +230,9 @@ For `npm run dev`, build the console first. The API Worker serves
 required. Component provenance and licenses are in
 `apps/console/THIRD_PARTY_NOTICES.md`.
 
+Browser tests reuse Chromium per file and isolate scenarios in fresh contexts.
+The console test runner limits parallel files to two to bound CPU/memory use.
+
 These use real Chromium with local HTTP API fixtures, with no model or cloud
 charges. They cover bot editing, draft isolation, stale SSE, active-run recovery,
 pagination, approvals, screenshot input, files, session expiry, and mobile layout.
@@ -348,14 +353,33 @@ console shows the account and verification status, and can disconnect it. If
 remote revocation cannot be confirmed, local credentials are still removed and
 the console tells you to revoke access in ChatGPT settings.
 
-The subscription allowance is shared and limited. Exhaustion, unsupported access
-or a revoked session stops the run with an explicit error; Timber does not switch
-to API billing or another model. Existing bots retain their model selection;
-new bots use the configured default (`gpt-6.1-sol` unless changed). The model
-picker lists the connected account’s actual available models. Fast uses the
+The subscription allowance is shared and limited. Existing bots retain their
+concrete model selection; new bots use the configured default (`gpt-6.1-sol`
+unless changed). The picker combines configured catalogs and shows one entry per
+exact model identity, preferring the ChatGPT subscription over OpenRouter. Fast uses the
 provider’s Fast/Priority tier and may consume allowance faster; reasoning levels
 are model-specific. Explicit `@cf/...` model IDs remain available
 through the API and smoke command for deliberate Workers AI usage.
+
+To enable OpenRouter discovery and inference, set the server-only Worker secret:
+
+```sh
+npx wrangler secret put OPENROUTER_API_KEY --config apps/api/wrangler.production.jsonc
+```
+
+For local development, use the same secret in the ignored `.dev.vars` file.
+Never put it in Worker `vars`, browser settings, or bot instructions. The catalog
+refreshes from OpenRouter's authenticated model API with a five-minute cache;
+model names and versions are discovered, not maintained in a static allowlist.
+Latest aliases and models without agent tool support are excluded.
+
+Configuring OpenRouter also enables **paid fallback for the same concrete model**
+when ChatGPT exhausts its subscription allowance before producing content.
+Fallback preserves recorded tool history and requires compatible selected
+settings and context capacity. Fast selections are not silently downgraded.
+Authentication failures, ordinary rate limits and partial responses still stop
+or follow normal retry policy; they do not trigger paid fallback. Without this
+secret and an exact alternate model route, quota exhaustion remains an error.
 
 This is a personal, self-hosted integration using the documented
 [Sign in with ChatGPT flow](https://developers.openai.com/siwc/token-sharing-open-source).
@@ -404,7 +428,9 @@ The BotDO keeps messages, runs, approvals and replayable events in SQLite. R2
 stores private artifacts and immutable workspace archives. A computer stops after
 five idle minutes only after a successful checkpoint; active runs renew its lease.
 Container root filesystems are ephemeral. Checkpoints preserve `/workspace` and
-the Chromium profile, not process RAM or running tasks. Dependency caches are
+the Chromium profile, not process RAM or running tasks. Automatic file saves keep
+Chromium open and reuse its last consistent closed profile; explicit checkpoints
+and idle/suspend saves flush the current profile. Dependency caches are
 excluded. An abrupt failure can lose changes since the last successful checkpoint;
 an interrupted effect is reported instead of automatically repeated.
 

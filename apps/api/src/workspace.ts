@@ -5,11 +5,14 @@ import { ApiError, errorResponse, json } from "./errors";
 import { body, parseBotInput, parseAction, operationId, UUID } from "./validation";
 import { AgentCoordinator } from "./agent-coordination";
 import { AvatarCoordinator } from "./avatars";
+import {OwnerKeychainCoordinator} from './owner-keychain';
+import {validateModelSettings} from './model-catalog';
 
 export class WorkspaceDO extends DurableObject<Env> {
   private deleting=new Map<string,Promise<void>>();
   private agents:AgentCoordinator;
   private avatars:AvatarCoordinator;
+  private keychain:OwnerKeychainCoordinator;
   private configuring:Promise<unknown>=Promise.resolve();
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx,env);
@@ -32,6 +35,7 @@ export class WorkspaceDO extends DurableObject<Env> {
     if(!columns.includes("direct_process_id")) ctx.storage.sql.exec("ALTER TABLE task_slots ADD COLUMN direct_process_id TEXT");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS bot_task_deletions (task_id TEXT PRIMARY KEY,bot_id TEXT NOT NULL,completed INTEGER NOT NULL DEFAULT 0)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS bot_deletions (id TEXT PRIMARY KEY,completed INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL)");
+    this.keychain=new OwnerKeychainCoordinator(ctx,env,()=>this.rearmDeletion());
     this.agents=new AgentCoordinator(ctx,env,()=>this.rearmDeletion(),(botId,operationId,taskId)=>this.beginComputerAdmission(botId,taskId??null,operationId),token=>this.completeComputerAdmission(token));
     this.avatars=new AvatarCoordinator(ctx,env,()=>this.rearmDeletion());
     ctx.blockConcurrencyWhile(()=>this.rearmDeletion());
@@ -44,12 +48,7 @@ export class WorkspaceDO extends DurableObject<Env> {
       if(input.reasoningEffort!==undefined || input.fast) throw new ApiError(400,"invalid_model_settings","ChatGPT reasoning and Fast mode options require a model from the connected ChatGPT account.");
       return {model:input.model,fast:false};
     }
-    if(!this.env.CHATGPT) throw new ApiError(503,"chatgpt_not_configured","Connect ChatGPT before selecting model settings.");
-    const response=await this.env.CHATGPT.get(this.env.CHATGPT.idFromName("owner")).fetch("https://chatgpt/validate-model",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(input)});
-    const result=await response.json<{settings?:ModelSettings;error?:{code:string;message:string}}>();
-    if(!response.ok) throw new ApiError(response.status,result.error?.code??"invalid_model_settings",result.error?.message??"The model settings could not be validated.");
-    if(!result.settings || result.settings.model!==input.model) throw new ApiError(502,"invalid_model_settings","The model settings could not be validated.");
-    return result.settings;
+    return validateModelSettings(this.env,input);
   }
   private async rearmDeletion():Promise<void> {
     const next=this.ctx.storage.sql.exec<{next_at:number}>("SELECT next_at FROM bot_deletions WHERE completed=0 ORDER BY next_at LIMIT 1").toArray()[0];
@@ -57,7 +56,7 @@ export class WorkspaceDO extends DurableObject<Env> {
     const schedulerActive=this.ctx.storage.sql.exec("SELECT 1 FROM direct_intents WHERE state='pending' LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM task_slots LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM computer_admissions LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM tasks WHERE json_extract(data,'$.status')='queued' AND json_extract(data,'$.startImmediately')=1 LIMIT 1").toArray().length>0;
     const now=Date.now(),existingAlarm=await this.ctx.storage.getAlarm();
     const schedulerTime=schedulerActive?Math.min(existingAlarm&&existingAlarm>now?existingAlarm:Infinity,now+5000):Infinity;
-    const nextAt=Math.min(next?.next_at??Infinity,agentTime??Infinity,schedulerTime,this.avatars?.nextAlarm()??Infinity);
+    const nextAt=Math.min(next?.next_at??Infinity,agentTime??Infinity,schedulerTime,this.avatars?.nextAlarm()??Infinity,this.keychain?.nextAlarm()??Infinity);
     if(Number.isFinite(nextAt)) await this.ctx.storage.setAlarm(Math.max(Date.now(),nextAt));
     else await this.ctx.storage.deleteAlarm();
   }
@@ -384,7 +383,7 @@ export class WorkspaceDO extends DurableObject<Env> {
   }
   async alarm():Promise<void> {
     const due=this.ctx.storage.sql.exec<{id:string}>("SELECT id FROM bot_deletions WHERE completed=0 AND next_at<=? ORDER BY next_at LIMIT 8",Date.now()).toArray();
-    await Promise.allSettled([...due.map(row=>this.cleanup(row.id)),this.agents.alarm(),this.avatars.alarm()]);
+    await Promise.allSettled([...due.map(row=>this.cleanup(row.id)),this.agents.alarm(),this.avatars.alarm(),this.keychain.alarm()]);
     await this.reconcileComputerSlots();
     await this.rearmDeletion();
   }
@@ -399,6 +398,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         for(const entry of tasks) {this.ctx.storage.sql.exec("INSERT OR IGNORE INTO bot_task_deletions(task_id,bot_id) VALUES(?,?)",entry.id,id);const task=JSON.parse(entry.data);task.status="cancelled";task.deleting=true;task.updatedAt=new Date().toISOString();this.ctx.storage.sql.exec("UPDATE tasks SET data=? WHERE id=?",JSON.stringify(task),entry.id);}
         this.ctx.storage.sql.exec("DELETE FROM bots WHERE id=?",id);
         this.ctx.storage.sql.exec("DELETE FROM direct_intents WHERE bot_id=?",id);
+        this.keychain.forgetBot(id);
         this.agents.forgetBot(id);
         this.avatars.forgetBot(id);
       });
@@ -414,6 +414,8 @@ export class WorkspaceDO extends DurableObject<Env> {
   async fetch(request:Request):Promise<Response> {
     try {
       const path=new URL(request.url).pathname;
+      if(path==='/keychain-tools')return await this.keychain.tool(await body(request),request.signal);
+      if(path==='/keychain'||path.startsWith('/keychain/'))return await this.keychain.fetch(request);
       if(path.startsWith("/avatar")) return await this.avatars.fetch(request);
       if(path.startsWith("/agents/")) return await this.agents.fetch(request);
       if(path==="/tasks" && request.method==="GET") {

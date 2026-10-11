@@ -1,7 +1,8 @@
 import type {Api, Model} from '@earendil-works/pi-ai';
-import {resolveModelSettings, type ModelCatalog, type ModelOption, type ModelSettings} from '@botspace/contracts';
+import {resolveModelSettings,subscriptionDiscoveryBlocked, type ModelCatalog, type ModelSettings} from '@botspace/contracts';
 import {chatgptModel, type ConfiguredModel} from './chatgpt.js';
 import type {PiRuntimeOptions} from './types.js';
+import {routeModel} from './model-routing.js';
 
 const configurationFailures = {
   chatgpt_not_connected: {message:'Connect ChatGPT, then retry this message.',retryable:false},
@@ -22,7 +23,7 @@ export class ModelConfigurationError extends Error {
 
 /** Native model references include immutable settings, so recovery and concurrent
  * compaction cannot accidentally use another request's reasoning or speed. */
-export function createModelSettings(storage:DurableObjectStorage,transport:PiRuntimeOptions<object>['chatgpt'],cloud:(id:string)=>Model<Api>) {
+export function createModelSettings(storage:DurableObjectStorage,transport:PiRuntimeOptions<object>['chatgpt'],cloud:(id:string)=>Model<Api>,catalogLoader?:()=>Promise<ModelCatalog>) {
   storage.sql.exec('CREATE TABLE IF NOT EXISTS timber_model_configs (id TEXT PRIMARY KEY, data TEXT NOT NULL)');
   const known=new Map<string,ConfiguredModel>([[chatgptModel.id,chatgptModel]]);
   for(const row of storage.sql.exec<{id:string;data:string}>('SELECT id,data FROM timber_model_configs').toArray())known.set(row.id,JSON.parse(row.data));
@@ -32,6 +33,7 @@ export function createModelSettings(storage:DurableObjectStorage,transport:PiRun
     const value=known.get(id);if(!value)throw new Error('Model configuration unavailable. Select an available model.');return value;
   };
   const catalog=async():Promise<ModelCatalog>=>{
+    if(catalogLoader)return catalogLoader();
     if(transport?.models)return transport.models();
     // Non-production embedders may supply an inference-only adapter. Production
     // always supplies the authenticated account catalogue; this is never its UI.
@@ -45,14 +47,20 @@ export function createModelSettings(storage:DurableObjectStorage,transport:PiRun
     if(account.error)throw new ModelConfigurationError('model_catalog_unavailable');
     const capability=account.models.find(item=>item.id===input.model);
     if(!capability)throw new ModelConfigurationError('model_unavailable');
+    if(subscriptionDiscoveryBlocked(account,capability))throw new ModelConfigurationError('model_catalog_unavailable');
     if(input.reasoningEffort!==undefined&&!capability.reasoningEfforts.includes(input.reasoningEffort))throw new ModelConfigurationError('reasoning_unsupported');
     if(input.fast&&!capability.supportsFast)throw new ModelConfigurationError('fast_unsupported');
     const settings=resolveModelSettings(input,account.models);
-    const id=`${settings.model}~timber~${btoa(JSON.stringify(settings))}`;
-    const value:ConfiguredModel={...chatgptModel,id,name:capability.name,
+    // A catalog refresh can change routes/capabilities without changing the user's
+    // model selection. Never overwrite a reference already admitted by another run.
+    const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(JSON.stringify({settings,capability})));
+    const id=`${settings.model}~timber~${Array.from(new Uint8Array(digest),byte=>byte.toString(16).padStart(2,'0')).join('')}`;
+    const primary=capability.routes?.[0];
+    const base=primary?routeModel(primary,settings):chatgptModel;
+    const value:ConfiguredModel={...base,id,name:capability.name,
       contextWindow:capability.contextWindow??128_000,maxTokens:capability.maxOutputTokens??32_768,
       input:capability.inputModalities??['text'],reasoning:capability.reasoningEfforts.length>0,
-      timberSettings:settings,timberCapability:capability};
+      timberSettings:settings,timberCapability:capability,...(capability.routes?{timberRoutes:capability.routes}:{})};
     storage.sql.exec('INSERT OR REPLACE INTO timber_model_configs(id,data) VALUES(?,?)',id,JSON.stringify(value));known.set(id,value);
     return {settings,model:value};
   };

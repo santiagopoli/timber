@@ -5,6 +5,8 @@ import { mountTasks } from './src/tasks.tsx';
 import { hasBotMention } from './src/mentions.ts';
 import {agentColor} from './src/agent-colors.ts';
 import {modelBadgeLabel} from './src/model-identity.tsx';
+import {mountModelPicker} from './src/model-picker.tsx';
+import {modelPublisherLabel} from './src/model-publisher.ts';
 import {canRetryAdmission} from './src/run-recovery.ts';
 import './src/agent-colors.css';
 import { createDesktopViewer } from './src/desktop.ts';
@@ -16,6 +18,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
 (() => {
   'use strict';
   const $ = (id) => document.getElementById(id);
+  const modelPickers=new Map(['bot-model','edit-model','avatar-theme-model'].map(id=>[id,mountModelPicker($(id))]));
   const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
   const activeAgentStatuses = new Set(['queued', 'running', 'waiting_approval', 'waiting_connection']);
   const guiActions = new Set(['navigate', 'click', 'move', 'doubleClick', 'drag', 'type', 'key', 'scroll']);
@@ -428,6 +431,10 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     $('avatar-image-capability').textContent=kind==='image'?imageInfo:disconnected?'No connected text-model catalogue. Connect the text-model account before generating SVG avatars.':avatarModels.error||'';
     $('avatar-image-capability').hidden=kind!=='image'&&!disconnected&&!avatarModels.error;
     $('avatar-create-submit').disabled=avatarLoading||!select.options.length;
+    modelPickers.get(select.id).update({choices:[...select.options].map(entry=>{
+      const model=options.find(option=>option.id===entry.value),value=model?avatarModelOption(model):{id:entry.value,label:entry.value};
+      return {...value,available:entry.dataset.available!=='false',selectable:true,providerLabel:modelPublisherLabel(model||value),unavailableReason:model?.reason||'Not currently available'};
+    }),disabled:avatarLoading||!select.options.length});
     renderAvatarCreateReasoning();
   }
   function renderAvatarCollection(){
@@ -588,20 +595,22 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
       const latest=isSelected?latestConversationMessage:undefined;
       const activeAgents=isSelected&&!chatLoading?subagents.filter(agent=>!terminal.has(agent.status)).length:saved?.activeAgents||0;
       const latestText=latest?.text?.trim()||(latest?.attachments?.length?(latest.attachments.length===1?'Image':`${latest.attachments.length} images`):'');
-      return {bot,activity,activeAgents,preview:(latestText||saved?.lastMessage?.text||bot.instructions||'Start a conversation').trim().replace(/\s+/g,' ').slice(0,180)};
+      return {bot,activity,activeAgents,modelName:modelCatalog.models.find(model=>model.id===bot.model)?.name||bot.model,preview:(latestText||saved?.lastMessage?.text||bot.instructions||'Start a conversation').trim().replace(/\[private:[a-f0-9-]{36}\]/gi,'🔒 ••••••').replace(/\s+/g,' ').slice(0,180)};
     });
     const renderKey=JSON.stringify([bots.length,selected?.id,rows,[...deletionPending.values()]]);if(renderKey===botRenderKey)return;botRenderKey=renderKey;
     $('bot-count').textContent = String(bots.length); $('bot-list').replaceChildren();
     if (!matching.length) $('bot-list').append(emptyState(bots.length ? 'No matching bots' : 'No bots yet', bots.length ? 'Try another name or keyword.' : 'Create your first bot.'));
-    for (const {bot,activity,activeAgents,preview} of rows) {
+    for (const {bot,activity,activeAgents,modelName,preview} of rows) {
       const button = el('button', `bot-item${bot.id === selected?.id ? ' selected' : ''}`); button.type = 'button'; button.dataset.botId = bot.id;
-      const avatar=el('span','avatar timber-model-avatar',bot.name.slice(0,1).toUpperCase());avatar.dataset.agentColor=agentColor(bot.id);decorateModelAvatar(avatar,bot);
+      const avatar=el('span','avatar timber-model-avatar',bot.name.slice(0,1).toUpperCase());avatar.dataset.agentColor=agentColor(bot.id);decorateModelAvatar(avatar,bot,false);
       button.title=`${bot.name} · ${modelDescription(bot)}`;
       button.setAttribute('aria-pressed', String(bot.id === selected?.id)); button.append(avatar);
       const info=el('span','bot-info'),name=el('span','bot-name-line');name.append(el('span','bot-name',bot.name));
-      if(activity && activity!=='ready') {const status=el('span','bot-activity-status',statusLabel(activity));status.dataset.status=activity;name.append(status);}
-      else if(activeAgents){const status=el('span','bot-activity-status',`${activeAgents} ${activeAgents===1?'agent':'agents'} active`);status.dataset.status='running';name.append(status);}
-      const snippet=el('small','bot-preview',preview);snippet.title=preview;info.append(name,snippet);
+      if(modelName){const badge=el('span','bot-model-badge',modelName);badge.dataset.model=bot.model;badge.title=modelDescription(bot);name.append(badge);}
+      const detail=el('span','bot-preview-line'),snippet=el('small','bot-preview',preview);snippet.title=preview;detail.append(snippet);
+      if(activity && activity!=='ready') {const status=el('span','bot-activity-status',statusLabel(activity));status.dataset.status=activity;detail.append(status);}
+      else if(activeAgents){const status=el('span','bot-activity-status',`${activeAgents} ${activeAgents===1?'agent':'agents'} active`);status.dataset.status='running';detail.append(status);}
+      info.append(name,detail);
       button.append(info); button.addEventListener('click', () => guarded(() => selectBot(bot))); $('bot-list').append(button);
     }
     renderGlobalAvatars();
@@ -632,19 +641,19 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   window.addEventListener('focus',()=>void refreshBotSummaries());
   async function loadBots() { const session = authSession, result = await request('/v1/bots'); if (session !== authSession) return; const prior=new Map(bots.map(bot=>[bot.id,bot]));bots = result.bots.filter(bot => !removedBots.has(bot.id)).map(bot=>prior.get(bot.id)?.updatedAt>bot.updatedAt?prior.get(bot.id):bot); const refreshed=selected&&bots.find(bot=>bot.id===selected.id);if(refreshed&&refreshed.updatedAt>=selected.updatedAt&&!modelSettingsWork.has(selected.id)){selected=refreshed;updateBotHeader();}renderBots(); renderMessages();renderAgents();if(tasksView)setupTasksView();void refreshBotSummaries(); }
   const modelDescription=bot=>`${bot.model||'Model not recorded'}${bot.reasoningEffort?` · ${bot.reasoningEffort} reasoning`:''}${bot.fast?' · Fast mode':''}`;
-  function decorateModelAvatar(avatar,bot){
+  function decorateModelAvatar(avatar,bot,showBadge=true){
     avatar.classList.add('timber-model-avatar');avatar.title=modelDescription(bot);avatar.dataset.model=bot.model||'';
     avatar.querySelector('.timber-model-badge')?.remove();
-    if(bot.model){const badge=el('span','timber-model-badge',modelBadgeLabel(bot.model));badge.dataset.model=bot.model;badge.setAttribute('aria-hidden','true');avatar.append(badge);}
+    if(showBadge&&bot.model){const badge=el('span','timber-model-badge',modelBadgeLabel(bot.model));badge.dataset.model=bot.model;badge.setAttribute('aria-hidden','true');avatar.append(badge);}
   }
   function updateBotHeader() { $('selected-name').textContent = selected.name; $('selected-avatar').textContent = selected.name.slice(0, 1).toUpperCase();$('selected-avatar').dataset.agentColor=agentColor(selected.id);decorateModelAvatar($('selected-avatar'),selected);decorateGlobalAvatar($('selected-avatar'),selected.id); $('selected-model').textContent = `${selected.runtime} · ${modelDescription(selected)}`; $('selected-computer-mode').textContent = selected.computerApprovalMode === 'automatic' ? 'Computer · Use authorized' : 'Computer · Ask for each action'; }
-  function modelSettingsState(){const error=modelCatalogError||modelCatalog.error;return {choices:(error?[]:modelCatalog.models).map(item=>({id:item.id,label:item.name,available:modelCatalog.connected,reasoningEfforts:item.reasoningEfforts||[],defaultReasoningEffort:item.defaultReasoningEffort,supportsFast:item.supportsFast===true})),loading:modelCatalogLoading,error,message:!modelCatalogLoading&&!modelCatalog.connected&&!error?'Connect ChatGPT in Settings to choose a model.':undefined};}
+  function modelSettingsState(){const error=modelCatalogError||modelCatalog.error;const warnings=(modelCatalog.sources||[]).filter(source=>source.error).map(source=>source.error).join(' ');return {choices:(error?[]:modelCatalog.models).map(item=>({id:item.id,label:item.name,providerLabel:modelPublisherLabel(item),available:modelCatalog.connected,reasoningEfforts:item.reasoningEfforts||[],defaultReasoningEffort:item.defaultReasoningEffort,supportsFast:item.supportsFast===true,sourceLabel:item.routes?.[0]?.source==='chatgpt'?`ChatGPT subscription${item.routes.some(route=>route.source==='openrouter')?' · OpenRouter fallback uses API credits':''}`:item.routes?.[0]?.source==='openrouter'?'OpenRouter · Uses API credits':undefined})),loading:modelCatalogLoading,error,message:warnings||(!modelCatalogLoading&&!modelCatalog.connected&&!error?'Connect ChatGPT or configure OpenRouter to choose a model.':undefined)};}
   async function loadModelCatalog(){
     if(!authenticated)return;
     const session=authSession,sequence=++modelCatalogRequest;modelCatalogLoading=true;modelCatalogError='';renderMessages();
     try{const result=await request('/v1/models');if(session!==authSession||sequence!==modelCatalogRequest)return;if(!Array.isArray(result.models))throw new Error('The available models could not be loaded.');modelCatalog=result;}
     catch(error){if(session!==authSession||sequence!==modelCatalogRequest)return;modelCatalogError=errorText(error);}
-    finally{if(session===authSession&&sequence===modelCatalogRequest){modelCatalogLoading=false;refreshModelForms();renderMessages();}}
+    finally{if(session===authSession&&sequence===modelCatalogRequest){modelCatalogLoading=false;refreshModelForms();renderBots();renderMessages();}}
   }
   async function updateModelSettings(botId,settings){
     if(!authenticated||selected?.id!==botId||modelSettingsWork.has(botId)||sendBusy.has(botId))throw new Error('Wait for the current request to finish.');
@@ -659,6 +668,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     if(!choice){const option=el('option','',current||'Provider default');option.value=current;select.append(option);}
     for(const item of state.choices){const option=el('option','',item.label);option.value=item.id;option.disabled=!item.available;select.append(option);}
     select.value=current;select.disabled=modelCatalogLoading||!state.choices.some(item=>item.available);
+    modelPickers.get(select.id).update({choices:state.choices,disabled:select.disabled,loading:state.loading});
     reasoning.replaceChildren();
     if(!choice?.defaultReasoningEffort){const option=el('option','','Provider default');option.value='';reasoning.append(option);}
     for(const effort of choice?.reasoningEfforts||[]){const option=el('option','',effort==='xhigh'?'Extra high':effort.replace(/^./,letter=>letter.toUpperCase()));option.value=effort;reasoning.append(option);}
@@ -1263,7 +1273,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   }
   function renderChatGPT(status) {
     chatGPTConnected = status.connected === true; const account = status.account ? `${status.account.clientId}:${status.account.subject}` : null;
-    if(!chatGPTConnected){modelCatalogRequest++;modelCatalogLoading=false;modelCatalog={models:[],connected:false,defaultModel:modelCatalog.defaultModel};modelCatalogError='';refreshModelForms();renderMessages();}
+    if(!chatGPTConnected){modelCatalogRequest++;modelCatalogLoading=false;const models=modelCatalog.models.flatMap(item=>{if(!item.routes)return item.provider==='openrouter'?[item]:[];const routes=item.routes.filter(route=>route.source!=='chatgpt');if(!routes.length)return [];const {source,modelId,id,...capabilities}=routes[0];return [{...capabilities,id:item.id,canonicalId:item.canonicalId,routes}];});modelCatalog={...modelCatalog,models,connected:models.length>0,sources:modelCatalog.sources?.map(source=>source.id==='chatgpt'?{id:source.id,connected:false}:source)};modelCatalogError='';refreshModelForms();renderMessages();}
     if (account !== chatGPTAccount || !chatGPTConnected) $('chatgpt-verification').textContent = 'Not verified'; chatGPTAccount = account;
     if (chatGPTConnected && status.status === 'verified' && Number.isFinite(Date.parse(status.verifiedAt))) $('chatgpt-verification').textContent = `Verified ${new Date(status.verifiedAt).toLocaleDateString()}`;
     $('chatgpt-status').textContent = chatGPTConnected ? 'Connected' : 'Not connected'; $('chatgpt-account').textContent = status.account?.email || ''; $('chatgpt-account').hidden = !status.account?.email;
@@ -1517,7 +1527,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   $('avatar-create-form').addEventListener('submit', event => void createAvatarTheme(event));
   $('copy-chatgpt-login').addEventListener('click', async () => { try { await navigator.clipboard.writeText('npm run chatgpt:login'); $('chatgpt-verification').textContent = 'Login command copied. Run it in your local Timber checkout.'; } catch { $('chatgpt-error').textContent = 'Copy the command above and run it in your local Timber checkout.'; } });
   $('verify-chatgpt').addEventListener('click', () => chatGPTTask(async (session) => { $('chatgpt-verification').textContent = 'Testing model access with one small real request…'; try { const result = await request('/v1/connections/chatgpt/verify', { method: 'POST', body: {} }); if (session !== authSession) return; if (result.ok !== true || typeof result.model !== 'string' || !result.model.trim() || result.model.length > 200) throw new Error('The backend did not confirm model access.'); $('chatgpt-verification').textContent = `Verified: ${result.model} completed a real request.`; } catch (error) { if (session === authSession) $('chatgpt-verification').textContent = 'Model access was not verified.'; throw error; } }));
-  $('disconnect-chatgpt').addEventListener('click', () => chatGPTTask(async (session) => { const status = await request('/v1/connections/chatgpt', { method: 'DELETE' }); if (session !== authSession) return; renderChatGPT(status); $('chatgpt-verification').textContent = status.revoked === true ? 'ChatGPT disconnected and its renewable session revoked.' : 'Cloud credentials removed. Remote revocation was not confirmed; disconnect Timber in ChatGPT Settings.'; }));
+  $('disconnect-chatgpt').addEventListener('click', () => chatGPTTask(async (session) => { const status = await request('/v1/connections/chatgpt', { method: 'DELETE' }); if (session !== authSession) return; renderChatGPT(status); void loadModelCatalog(); $('chatgpt-verification').textContent = status.revoked === true ? 'ChatGPT disconnected and its renewable session revoked.' : 'Cloud credentials removed. Remote revocation was not confirmed; disconnect Timber in ChatGPT Settings.'; }));
   $('refresh-apps').addEventListener('click', () => guarded(refreshApps));
   $('apps-prompt').addEventListener('click', () => {if (!selected) return; showPanel('conversation'); $('message').focus();});
   $('connect-github').addEventListener('click', () => {void connectAccountGitHub();});

@@ -47,10 +47,10 @@ describe('strict bounded PNG avatar validation', () => {
       await expect(decodeAvatarPng(bad)).rejects.toMatchObject({code: 'avatar_image_invalid'});
     }
   });
-  it('rejects oversized input with a clear durable-storage limit before PNG decoding', async () => {
-    expect(AVATAR_PNG_MAX_BYTES).toBe(1024 * 1024);
+  it('rejects oversized input with a bounded image limit before PNG decoding', async () => {
+    expect(AVATAR_PNG_MAX_BYTES).toBe(8 * 1024 * 1024);
     for (const value of ['A'.repeat(AVATAR_PNG_MAX_BASE64 + 4), b64(new Uint8Array(AVATAR_PNG_MAX_BYTES + 1))]) {
-      await expect(decodeAvatarPng(value)).rejects.toMatchObject({code: 'avatar_image_limit', message: expect.stringContaining('1 MiB')});
+      await expect(decodeAvatarPng(value)).rejects.toMatchObject({code: 'avatar_image_limit', message: expect.stringContaining('8 MiB')});
     }
     await expect(validateAvatarPngBytes(new Uint8Array(AVATAR_PNG_MAX_BYTES + 1))).rejects.toMatchObject({code: 'avatar_image_limit'});
   });

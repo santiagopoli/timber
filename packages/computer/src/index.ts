@@ -33,6 +33,9 @@ interface GitTransport { id:string; url:string; token:string; }
 const IDLE_MS = 5 * 60_000;
 const SAFETY_TIMEOUT_MS = 15 * 60_000;
 const EXEC_POLL_MS = 10_000;
+// Runtime activity renews every minute. Capture only after a quiet interval,
+// rather than closing Chromium and archiving between every pair of tools.
+const CHECKPOINT_QUIET_MS = 90_000;
 const PORT = 8080;
 const BASE_CAPABILITIES = ["exec", "readFile", "writeFile", "listFiles", "checkpoint"];
 const DESKTOP_CAPABILITIES = ["screenshot", "click", "type", "key", "scroll", "navigate"];
@@ -137,7 +140,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   private deleting?:Promise<void>;
   private shutdown=new AbortController();
   private execUpdates=new Map<string,Promise<unknown>>();
-  private finalizingExecutions?:Promise<void>;
+  private backgroundCheckpoint?:Promise<void>;
 
   constructor(ctx: DurableObjectState, env: ComputerEnv) {
     super(ctx, env);
@@ -163,6 +166,11 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         else if(retry) session.result.checkpointStatus='pending';
         else session.result.error=`${session.result.error?session.result.error+' ':''}The checkpoint outcome could not be confirmed after recovery. Retry checkpoint; do not repeat the command.`;
         session.checkpoint='done';
+        await this.storeExecution(key.slice('exec-session:'.length),session);
+      }
+      for(const [key,session] of sessions) if(session.checkpoint==='pending' && session.result.status!=='running') {
+        session.checkpoint='done';
+        session.result.checkpointStatus=retry?'pending':'failed';
         await this.storeExecution(key.slice('exec-session:'.length),session);
       }
       if([...sessions.values()].some(session=>session.result.status==='running' || session.checkpoint==='pending') || (retry && !retry.blocked)) await ctx.storage.setAlarm(Date.now()+1_000);
@@ -200,7 +208,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       await this.tail;
       await this.workspaceTail;
       await Promise.all([...this.execUpdates.values()].map(work=>work.catch(()=>{})));
-      await this.finalizingExecutions?.catch(()=>{});
+      await this.backgroundCheckpoint?.catch(()=>{});
       if(this.starting) await this.starting.catch(()=>{});
       while(true) {
         const values=await this.ctx.storage.list({limit:128});
@@ -229,12 +237,13 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       if (!savedBotId) await this.ctx.storage.put("botId", body.botId);
       this.active();
       if (path === "/status") return Response.json(await this.status(body.botId));
-      if (path === "/touch") { await this.touch(); return Response.json({ok:true}); }
+      if (path === "/touch") { await this.noteToolActivity();await this.touch(); return Response.json({ok:true}); }
       if(path==='/exec/cancel') {
         if(!body.processId || !/^[A-Za-z0-9:_.-]{1,160}$/.test(body.processId)) throw new ComputerProviderError('computer_invalid_request');
         return Response.json(await this.cancelExecution(body.botId,body.processId,body.processId,false));
       }
       if (path === "/suspend") {
+        await this.backgroundCheckpoint?.catch(()=>{});
         return Response.json(await this.serialize(() => this.withWorkspace(async () => {
           this.active();
           if(await this.hasActiveExecutions()) throw new ComputerProviderError('computer_execution_active');
@@ -252,6 +261,8 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       if (path !== "/actions" || !body.action || !body.operationId || !/^[A-Za-z0-9:_.-]{1,160}$/.test(body.operationId)) {
         throw new ComputerProviderError("computer_invalid_request");
       }
+      // Passive process observations must not keep postponing their own save.
+      if(!['execPoll','execCancel','checkpoint'].includes(body.action.type)) await this.noteToolActivity();
       return Response.json(await this.execute(body.botId, body.operationId, body.action));
     } catch (error) {
       if(error instanceof DesktopError) return Response.json({error:{code:error.code,message:error.message}},{status:error.status});
@@ -348,6 +359,9 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   }
 
   private execute(botId: string, operationId: string, action: ComputerAction): Promise<ComputerResult> {
+    // An explicit capture includes changes made during an earlier upload.
+    // Wait outside the effect gate, which the background capture may still need.
+    if(action.type==='checkpoint' && this.backgroundCheckpoint) return this.backgroundCheckpoint.catch(()=>{}).then(()=>this.execute(botId,operationId,action));
     this.active();
     if(action.type==='exec') return this.startExecution(botId,operationId,action);
     if(action.type==='execPoll') return this.pollExecution(botId,operationId,action.processId,action.yieldMs===undefined?1000:action.yieldMs);
@@ -407,16 +421,9 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
             result.artifactId = artifactId;
             result.mimeType = "image/png";
           }
-          // Terminal commands can mutate files even on nonzero exit. Confirm a
-          // portable checkpoint before acknowledging these filesystem operations.
+          // Persist the effect receipt now; the durable alarm saves files later.
           if (action.type === "writeFile" || action.type === "gitClone") {
-            operationStage = "checkpoint";
-            try { result.checkpointId = (await this.withWorkspace(() => this.saveCheckpoint(botId))).id;result.checkpointStatus='saved'; }
-            catch(error) {
-              const failure=safeError(error);
-              console.error("computer.failure",{stage:"checkpoint",code:failure.code});
-              result=await this.recordCheckpointFailure(operationId,result,failure);
-            }
+            result.checkpointStatus='pending';
           }
         }
       } catch (error) {
@@ -483,6 +490,10 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         session.result={...value,operationId:processId,processId,
           output:(value.output?.length??0)<(session.result.output?.length??0)?session.result.output:value.output};
         if(lost) session.checkpoint='done';
+        else if(session.result.status!=='running') {
+          session.checkpoint='done';
+          session.result.checkpointStatus='pending';
+        }
         await this.storeExecution(processId,session);
       }
       return session;
@@ -553,7 +564,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     return this.pollExecution(botId,processId,processId,yieldMs);
   }
 
-  private async pollExecution(botId:string,operationId:string,processId:string,yieldMs:number,finalize=true):Promise<ComputerResult> {
+  private async pollExecution(_botId:string,operationId:string,processId:string,yieldMs:number):Promise<ComputerResult> {
     this.validExecution(processId,yieldMs);
     this.active();
     let session=await this.ctx.storage.get<ExecSession>(`exec-session:${processId}`);
@@ -572,10 +583,6 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
           session=await this.updateExecution(processId,await this.executionRequest(operationId,{type:'execPoll',processId,yieldMs},yieldMs));
         }
       }
-    }
-    if(finalize && session.result.status!=='running' && session.checkpoint==='pending') {
-      await this.finalizeExecutions(botId);
-      session=(await this.ctx.storage.get<ExecSession>(`exec-session:${processId}`))??session;
     }
     return this.executionResult(session,operationId);
   }
@@ -601,10 +608,10 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     let result:ComputerResult;
     if(!session || !session.dispatched) result={operationId,processId,status:'cancelled',output:''};
     else if(session.result.status!=='running') result=this.executionResult(session,operationId);
-    else if(!this.container?.running) result=await this.pollExecution(botId,operationId,processId,0,false);
+    else if(!this.container?.running) result=await this.pollExecution(botId,operationId,processId,0);
     else {
       const health=await this.health();
-      if(health.bootId!==session.bootId || !health.capabilities?.includes('execSessions')) result=await this.pollExecution(botId,operationId,processId,0,false);
+      if(health.bootId!==session.bootId || !health.capabilities?.includes('execSessions')) result=await this.pollExecution(botId,operationId,processId,0);
       else {
         const controlId=journal?operationId:`exec-cancel:${await sha256(processId)}`;
         try {result=this.executionResult(await this.updateExecution(processId,await this.executionRequest(controlId,{type:'execCancel',processId},0)),operationId);}
@@ -624,31 +631,6 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     // Stop never queues behind a checkpoint upload. The alarm owns finalization.
     if(await this.needsExecutionMaintenance()) await this.ctx.storage.setAlarm(Date.now()+1_000);
     return result;
-  }
-
-  private finalizeExecutions(botId:string):Promise<void> {
-    this.finalizingExecutions??=this.serialize(()=>this.withWorkspace(async()=>{
-      if(await this.hasActiveExecutions()) return;
-      const pending=[...(await this.ctx.storage.list<ExecSession>({prefix:'exec-session:'}))].filter(([,session])=>session.checkpoint==='pending');
-      if(!pending.length) return;
-      const attemptId=crypto.randomUUID();
-      for(const [key,session] of pending) {session.checkpoint='attempting';session.checkpointAttemptId=attemptId;await this.storeExecution(key.slice('exec-session:'.length),session);}
-      let checkpoint:Checkpoint|undefined,failure:ComputerProviderError|undefined;
-      try {
-        if(!this.container?.running) throw new ComputerProviderError('computer_checkpoint_failed');
-        const health=await this.health();
-        if(pending.some(([,session])=>session.bootId!==health.bootId)) throw new ComputerProviderError('computer_checkpoint_failed');
-        checkpoint=await this.saveCheckpoint(botId,false,attemptId);
-      } catch(error) {failure=safeError(error);console.error('computer.failure',{stage:'checkpoint',code:failure.code});}
-      for(const [key,session] of pending) {
-        session.checkpoint='done';
-        if(checkpoint) {session.result.checkpointId=checkpoint.id;session.result.checkpointStatus='saved';}
-        else session.result=await this.recordCheckpointFailure(key.slice('exec-session:'.length),session.result,failure!);
-        await this.storeExecution(key.slice('exec-session:'.length),session);
-      }
-      try {await this.touch();} catch(error) {this.active();console.error('computer.failure',{stage:'post_result_touch',code:safeError(error).code});}
-    })).finally(()=>{this.finalizingExecutions=undefined;});
-    return this.finalizingExecutions;
   }
 
   private async markCheckpointDirty(operationId:string,bootId:string):Promise<void> {
@@ -682,7 +664,8 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     const retry=await this.ctx.storage.get<CheckpointRetry>('checkpointRetry');
     const active=await this.hasActiveExecutions();
     const execution=active || await this.needsExecutionMaintenance();
-    const deadline=retry && !retry.blocked && !active?Math.max(Date.now()+100,retry.nextAttemptAt):Infinity;
+    const quietUntil=await this.ctx.storage.get<number>('checkpointQuietUntil')??0;
+    const deadline=retry && !retry.blocked && !active?Math.max(Date.now()+100,retry.nextAttemptAt,quietUntil):Infinity;
     this.active();
     await this.ctx.storage.setAlarm(Math.min(fallback,execution?Date.now()+EXEC_POLL_MS:Infinity,deadline));
   }
@@ -788,20 +771,27 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     }
   }
 
-  private async retryCheckpoint(botId:string):Promise<void> {
-    await this.serialize(()=>this.withWorkspace(async()=>{
+  private retryCheckpoint(botId:string):Promise<void> {
+    this.backgroundCheckpoint??=(async()=>{
       const retry=await this.ctx.storage.get<CheckpointRetry>('checkpointRetry');
       if(!retry || retry.blocked || retry.nextAttemptAt>Date.now() || await this.hasActiveExecutions()) return;
       try {
         await this.recoverCheckpointCandidate();
         if(!await this.ctx.storage.get('checkpointRetry')) return;
         if(!this.container?.running || (await this.health()).bootId!==retry.bootId) {await this.abandonCheckpoint();return;}
-        await this.saveCheckpoint(botId);
+        if((await this.ctx.storage.get<number>('checkpointQuietUntil')??0)>Date.now()) return;
+        await this.saveCheckpoint(botId,false,undefined,true);
       } catch(error) {
         this.active();console.error('computer.failure',{stage:'checkpoint_retry',code:safeError(error).code});
         await this.deferCheckpoint(safeError(error));
       }
-    }));
+    })().finally(()=>{this.backgroundCheckpoint=undefined;});
+    return this.backgroundCheckpoint;
+  }
+
+  private async noteToolActivity():Promise<void> {
+    this.active();
+    await this.ctx.storage.put('checkpointQuietUntil',Date.now()+CHECKPOINT_QUIET_MS);
   }
 
   private async touch(): Promise<void> {
@@ -879,10 +869,9 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
             const processId=key.slice('exec-session:'.length);
             const intent=await this.ctx.storage.get<ExecCancellation|true>(`exec-cancelled:${processId}`);
             if(intent) await this.cancelExecution(botId,intent===true?processId:intent.operationId,processId,intent===true?false:intent.journal);
-            await this.pollExecution(botId,processId,processId,0,false);
+            await this.pollExecution(botId,processId,processId,0);
           }
         }
-        await this.finalizeExecutions(botId);
       } catch { /* Keep a durable wake for unavailable process status or checkpointing. */ }
       if(!this.deleted && await this.needsExecutionMaintenance()) { await this.scheduleComputerAlarm(Date.now()+EXEC_POLL_MS);return; }
     }
@@ -1043,9 +1032,14 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     });
   }
 
-  private async saveCheckpoint(botId: string, quiesce = false, checkpointId?:string): Promise<Checkpoint> {
+  private saveCheckpoint(botId:string,quiesce?:boolean,checkpointId?:string):Promise<Checkpoint>;
+  private saveCheckpoint(botId:string,quiesce:boolean,checkpointId:undefined,background:true):Promise<Checkpoint|undefined>;
+  private async saveCheckpoint(botId: string, quiesce = false, checkpointId?:string,background=false): Promise<Checkpoint|undefined> {
     this.active();
-    if(await this.hasActiveExecutions()) throw new ComputerProviderError('computer_execution_active');
+    if(await this.hasActiveExecutions()) {
+      if(background) return;
+      throw new ComputerProviderError('computer_execution_active');
+    }
     const bootId=await this.ctx.storage.get<string>('restoredBoot');
     if(!bootId) throw new ComputerProviderError('computer_checkpoint_failed');
     let retry!:CheckpointRetry;
@@ -1070,21 +1064,32 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
           if(saved?.bootId===bootId && (saved.revision??-1)>=retry.revision) return saved;
           throw new ComputerProviderError('computer_checkpoint_persist_failed');
         }
-        const response=await stage('computer_checkpoint_failed',()=>this.call('/checkpoint',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({quiesce})}));
-        if(!response.ok) throw await checkpointResponseError(response);
-        if(!response.body) throw new ComputerProviderError('computer_checkpoint_failed');
-        const size=Number(response.headers.get('Content-Length')),checksum=response.headers.get('X-Content-SHA256')??'';
-        if(!Number.isSafeInteger(size) || size<=0 || size>256*1024*1024 || !/^[a-f0-9]{64}$/.test(checksum)) throw new ComputerProviderError('computer_checkpoint_integrity_failed');
-        const id=attempt===0 && checkpointId?checkpointId:crypto.randomUUID();
-        const checkpoint:Checkpoint={id,key:`bots/${botId}/checkpoints/${id}.tar.gz`,size,sha256:checksum,createdAt:new Date().toISOString(),bootId,revision:current.revision};
-        current.candidate=checkpoint;
-        try {this.active();await this.ctx.storage.put('checkpointRetry',current);}
-        catch(error) {this.checkpointDiagnostic('retry_intent',error);await response.body.cancel().catch(()=>{});throw new ComputerProviderError('computer_checkpoint_persist_failed');}
+        const capture=async()=>{
+          // Recheck after queued effects: a new task can arrive while an alarm
+          // awaits the gate. Only archive creation holds it, never the R2 upload.
+          if(background && ((await this.ctx.storage.get<number>('checkpointQuietUntil')??0)>Date.now() || await this.hasActiveExecutions())) return;
+          if(await this.hasActiveExecutions()) throw new ComputerProviderError('computer_execution_active');
+          const current=(await this.ctx.storage.get<CheckpointRetry>('checkpointRetry'))!;
+          const response=await stage('computer_checkpoint_failed',()=>this.call('/checkpoint',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({quiesce,preserveBrowser:background})}));
+          if(!response.ok) throw await checkpointResponseError(response);
+          if(!response.body) throw new ComputerProviderError('computer_checkpoint_failed');
+          const size=Number(response.headers.get('Content-Length')),checksum=response.headers.get('X-Content-SHA256')??'';
+          if(!Number.isSafeInteger(size) || size<=0 || size>256*1024*1024 || !/^[a-f0-9]{64}$/.test(checksum)) {await response.body.cancel().catch(()=>{});throw new ComputerProviderError('computer_checkpoint_integrity_failed');}
+          const id=attempt===0 && checkpointId?checkpointId:crypto.randomUUID();
+          const checkpoint:Checkpoint={id,key:`bots/${botId}/checkpoints/${id}.tar.gz`,size,sha256:checksum,createdAt:new Date().toISOString(),bootId,revision:current.revision};
+          current.candidate=checkpoint;
+          try {this.active();await this.ctx.storage.put('checkpointRetry',current);}
+          catch(error) {this.checkpointDiagnostic('retry_intent',error);await response.body.cancel().catch(()=>{});throw new ComputerProviderError('computer_checkpoint_persist_failed');}
+          return {response,checkpoint,size,checksum};
+        };
+        const captured=background?await this.serialize(()=>this.withWorkspace(capture)):await capture();
+        if(!captured) return;
+        const {response,checkpoint,size,checksum}=captured;
         // A Content-Length header is not sufficient to give a JS/tunnel stream
         // a known length. Preserve streaming and enforce the byte count for R2.
         const transfer=new FixedLengthStream(size),abort=new AbortController();
         const upload=Promise.resolve().then(()=>this.env.FILES.put(checkpoint.key,transfer.readable,{httpMetadata:{contentType:'application/gzip'},sha256:checksum})).catch(error=>{abort.abort();throw error;});
-        const pump=response.body.pipeTo(transfer.writable,{signal:abort.signal});
+        const pump=response.body!.pipeTo(transfer.writable,{signal:abort.signal});
         let object:R2Object;
         try {
           [object]=await Promise.all([upload,pump]);

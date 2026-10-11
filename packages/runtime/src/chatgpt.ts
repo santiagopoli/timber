@@ -1,7 +1,7 @@
-import {createAssistantMessageEventStream,type AssistantMessage,type Model,type SimpleStreamOptions,type TranscriptContext} from '@earendil-works/pi-ai';
+import {createAssistantMessageEventStream,type Api,type AssistantMessage,type Model,type SimpleStreamOptions,type TranscriptContext} from '@earendil-works/pi-ai';
 import { streamSimple } from '@earendil-works/pi-ai/api/openai-responses';
 import { createProvider } from '@earendil-works/pi-ai/models';
-import {classifyModelFailure,type ModelOption,type ModelSettings} from '@botspace/contracts';
+import {classifyModelFailure,type ModelOption,type ModelRoute,type ModelSettings} from '@botspace/contracts';
 import type { PiRuntimeOptions } from './types.js';
 
 export const CHATGPT_MODEL = 'gpt-6.1-sol';
@@ -90,7 +90,7 @@ export function chatgptPayload(value: unknown, settings: ModelSettings = {model:
 /** The SDK needs a nonempty credential locally. This public sentinel never leaves this adapter. */
 const SDK_SENTINEL = 'timber-host-owned-oauth-transport';
 
-export type ConfiguredModel = Model<'openai-responses'> & {timberSettings?:ModelSettings; timberCapability?:ModelOption};
+export type ConfiguredModel = Model<Api> & {timberSettings?:ModelSettings; timberCapability?:ModelOption;timberRoutes?:ModelRoute[]};
 
 export function createChatGPTProvider(transport: PiRuntimeOptions<object>['chatgpt'], available:()=>readonly ConfiguredModel[]=()=>[chatgptModel]) {
   const run = (model: Model<'openai-responses'>, context: TranscriptContext, options?: SimpleStreamOptions) => {
@@ -211,5 +211,6 @@ export function createChatGPTProvider(transport: PiRuntimeOptions<object>['chatg
       streamSimple: (model, context, options) => run(model as Model<'openai-responses'>, context, options),
     },
   });
-  return {...provider,getModels:available,getAllModels:available};
+  const models=()=>available().filter((model):model is ConfiguredModel & Model<'openai-responses'>=>model.api==='openai-responses');
+  return {...provider,getModels:models,getAllModels:models};
 }

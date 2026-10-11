@@ -40,6 +40,7 @@ export function operationId(value:unknown):string {
 export function parseMessage(value:unknown):{text:string;operationId:string;mentions?:string[];attachments?:string[]} {
   const data=object(value);
     const text=string(data.text,"text",32_000,0);
+  if(/\[private-draft:[a-f0-9-]{36}\]/i.test(text))invalid("Complete the private input before sending.");
   const attachments=data.attachments;
   if(attachments!==undefined && (!Array.isArray(attachments) || attachments.length>4 || attachments.some(id=>typeof id!=="string" || !UUID.test(id)) || new Set(attachments).size!==attachments.length)) invalid("attachments must contain up to four distinct image IDs.");
   const ids=attachments as string[]|undefined;
@@ -60,7 +61,7 @@ export function parseBotInput(value:unknown,patch=false):{name?:string;instructi
   if(data.instructions!==undefined) output.instructions=string(data.instructions,"instructions",16_000,0);
   if(data.model!==undefined) {
     output.model=string(data.model,"model",180);
-    if(!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(output.model) && !/^@cf\/[A-Za-z0-9._/-]+$/.test(output.model)) invalid("model must be an account model identifier or an explicit Workers AI @cf/ model identifier.");
+    if(!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(output.model) && !/^(?:@cf\/)?[A-Za-z0-9][A-Za-z0-9._:-]*(?:\/[A-Za-z0-9][A-Za-z0-9._:-]*)+$/.test(output.model)) invalid("model must be a concrete catalog model identifier or an explicit Workers AI @cf/ model identifier.");
   }
   if(data.reasoningEffort!==undefined) {
     output.reasoningEffort=string(data.reasoningEffort,"reasoningEffort",128);

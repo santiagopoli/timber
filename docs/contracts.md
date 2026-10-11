@@ -11,7 +11,8 @@ the assigned bot’s computer, never its ordinary chat transcript. v1 is cloud-o
 - SQLite-backed DOs; R2 bucket FILES for immutable checkpoints and artifacts.
 - First engine Pi through official PiHarness. Default model gpt-6.1-sol via
   the user's explicitly authorized ChatGPT plan. Explicit @cf/ models retain
-  Workers AI. No automatic fallback to separately billed inference.
+  Workers AI. When OPENROUTER_API_KEY is configured, the same concrete model can
+  use separately billed OpenRouter inference after subscription quota exhaustion.
 - ComputerDO owns one reusable Linux desktop container, lazily started.
 - Private single-owner MVP. BOTSPACE_API_TOKEN is a Worker secret; every /v1
   data API request requires Authorization: Bearer token or a valid same-origin
@@ -32,6 +33,96 @@ the assigned bot’s computer, never its ordinary chat transcript. v1 is cloud-o
 
 ## HTTP surface
 JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
+- GET /v1/keychain -> {entries:SecretMetadata[],requests:SecureInputRequest[]}.
+  The keychain belongs to the authenticated owner, independently of bots. Metadata
+  includes names, approved destinations, revisions, timestamps and permitted
+  botIds. There is no endpoint for reading a private value. The bot-context alias
+  /v1/bots/:id/keychain returns the same owner entries and that bot's requests.
+- POST /v1/keychain {operationId,entries:[{value,name?,origin?,header?,prefix?,id?,expectedRevision?}],requestId?}
+  -> {entries:SecretMetadata[]}. Accepts one to four opaque private text values,
+  each up to 16,000 characters, in a separate authenticated request. Normal UI
+  submissions supply only text. No service, URL or credential format is required.
+  Unconfigured values have blank origin/header/prefix and cannot be used for
+  network access. Names default to "Private input". Existing IDs require
+  expectedRevision; replacements preserve approved format when omitted. Revoked
+  or stale revisions cannot be overwritten. At most 100 active inputs per owner.
+  Batches commit atomically with keyed fingerprints and durable receipts.
+  The bot-context alias grants that bot access when a new entry is inserted.
+  Root writes without a requestId grant no bot access automatically.
+  A requestId fulfills a bot-requested input using its server-stored metadata;
+  client destination overrides are ignored. An encrypted save and an outbox
+  continuation receipt commit together in WorkspaceDO. Alarms retry only delivery
+  of the continuation, never the prior authenticated action. BotDO deduplicates
+  admission and checks the original run/native-operation fence. A stopped request
+  cannot resume. If Stop races an already committed save, the owner's saved input
+  remains but the bot stays stopped. Continuations contain references only.
+- POST /v1/keychain/:secretId/permissions {botId,allowed:boolean}
+  -> {entries:SecretMetadata[]}. Only the authenticated owner can grant or revoke
+  bot access. The target must be a live registered bot. Grants are signed and
+  bound to the owner, entry ID, bot ID, approved HTTP format and permission epoch.
+  Revocation followed by a new grant cannot revive an old pending authorization.
+  Bots cannot grant themselves access. Bot-context aliases require membership.
+- POST /v1/keychain/requests/:requestId/authorize -> {entries:SecretMetadata[]}.
+  configure_secret prepares a permitted reference with a descriptive name, exact
+  public HTTPS origin and authentication header/prefix. The owner sees only an
+  Allow use confirmation naming the destination. Approval re-encrypts the unchanged
+  private value with authenticated metadata and queues the waiting task. Revision,
+  permission and Stop checks reject stale approval. Duplicate approval cannot
+  create another continuation or revive stopped work. Changing the approved
+  destination/format invalidates grants for the previous format; other bots must
+  be explicitly allowed again. Saving or authorizing does not perform an external
+  action. Default format is Authorization with prefix `Bearer `; a raw API key
+  uses an empty prefix. Origins exclude ports, paths, URL credentials, IP literals
+  and local/internal names. These options belong to the agent API, not setup UI.
+- DELETE /v1/keychain/:secretId -> {revoked:true}. Removes ciphertext and all
+  grants; future use and stale replacements fail. Repeated removal is idempotent.
+  Already dispatched requests cannot be recalled. Deleting a bot removes only its
+  grants and pending continuations, never the owner's saved credentials.
+  The authorize and delete routes also have /v1/bots/:id/keychain aliases.
+
+  Private values are stored only in WorkspaceDO, encrypted with AES-256-GCM and
+  a fresh random 96-bit IV per write. HKDF-SHA-256 derives an owner key from the
+  server-only CHATGPT_CREDENTIAL_KEY with purpose timber.owner-keychain.v1 and
+  owner identity. Authenticated data binds owner, entry ID, revision, name,
+  origin, header and prefix. Copying ciphertext or changing its destination fails
+  authentication. This is server-side encryption, not end-to-end encryption:
+  the host decrypts briefly to authenticate a request. Master key rotation requires
+  migration before replacing the key, as with existing connection stores.
+  No plaintext is written to messages, events, Pi history, memory, computer files,
+  R2 checkpoints, API responses or operation journals. BotDO stores only request
+  metadata; the host's internal check/resume routes are blocked at the gateway.
+
+  Host tools request_secret, configure_secret, list_secrets and secret_request
+  work with public references only. request_secret is a durable pending_connection
+  wait with provider keychain. list_secrets returns only permitted entries;
+  temporary subagents must ask their parent to perform authenticated work.
+  secret_request accepts single-line ASCII header values up to 8192 characters,
+  injects one header at the approved origin, accepts bounded public API headers
+  that cannot override authentication, disallows redirects and journals dispatch
+  before network I/O. A recovered or uncertain call is never sent again
+  automatically. The host checks task liveness, permission and revocation before
+  dispatch. Only bounded response text is returned; exact, URL/base64/JSON-encoded
+  echoes and common JSON credential fields are redacted. Provider exceptions and
+  redirect bodies are hidden. This filter is defense in depth, not a guarantee
+  against a malicious authorized service encoding data in an arbitrary form.
+  This API supports header credentials, not browser-password filling, generated
+  .env files, shell injection or app-wide provider billing configuration.
+
+  The console offers Add → Secure input and Secure input in the @ dropdown.
+  The masked field appears as the same compact locked pill inside the composer.
+  Enter, leaving the field or sending saves it; six centered dots remain, there is no reveal control. Selected existing text
+  can be converted directly with Make selection secure (or Add → Secure input).
+  Owners write around pills, insert multiple inputs and reuse entries from their
+  shared Keychain. The keychain lets them grant/revoke bots, replace a value or
+  explicitly remove it for all bots. Internal [private:UUID] references are rendered
+  as locked dots in composer and transcript. Unsaved placeholders cannot be sent
+  to the backend. The agent prepares credential format from surrounding text.
+  Removing a pill or discarding a draft does not revoke an already saved entry.
+  Private fields clear on save, removal, bot switch and logout. Their values stay
+  in masked DOM fields and the dedicated encrypted-write request, not React state,
+  browser storage or message-delivery retries. Converting ordinary selected text
+  immediately replaces it in the chat draft. An uncertain save reloads metadata
+  and asks the owner to inspect the keychain before submitting another value.
 - GET /health -> {ok:true,service:"botspace"}
 - POST /v1/session with Authorization: Bearer token -> {authenticated:true,expiresAt}.
 - GET /v1/session with session cookie -> {authenticated:true,expiresAt}; invalid or
@@ -45,9 +136,15 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   with revoked:boolean. A failed remote revocation is explicit.
 - POST /v1/connections/chatgpt/verify performs one small real inference and only
   returns {ok:true,model} after response.completed.
-- GET /v1/models -> {models:ModelOption[],connected,defaultModel,error?}. Returns
-  the connected account's selectable models and supported reasoning/Fast options.
+- GET /v1/models -> {models:ModelOption[],connected,defaultModel,error?,sources?}. Returns
+  the combined connected catalogs, deduplicated by exact model identity, with
+  ordered public routes and supported reasoning/Fast options of the preferred route.
   A disconnected or unavailable catalogue has no invented model entries.
+  `ModelOption.publisher` identifies the model creator (for example `openai`,
+  `anthropic`, `google`) independently of `provider`, which selects inference
+  transport. OpenRouter discovery retains the publisher namespace from the
+  upstream model ID before canonicalization; ChatGPT account models use `openai`.
+  The console first selects this creator, then one of its concrete models.
 - GET /v1/bots -> {bots:Bot[]}
 - POST /v1/bots {name,instructions?,model?,reasoningEffort?,fast?,computerApprovalMode?,allowNamedAgents?,allowTaskCreation?} -> 201 {bot:Bot}
 - GET /v1/bots/:id -> {bot:Bot}
@@ -299,7 +396,41 @@ in requests to api.openai.com. It exposes no token-read route. Pi receives a fet
 transport port, never OAuth credentials. OAuth is completed on the user's local
 loopback callback and imported over the authenticated HTTPS API. No iOS app.
 
-### Account model settings
+### Combined model catalogs and routing
+Sources implement independent discovery and normalize into `ModelOption` entries.
+The shared merge accepts source IDs and numeric priorities. ChatGPT has priority
+0; OpenRouter has priority 10 and is enabled only by the server secret
+`OPENROUTER_API_KEY`. OpenRouter discovery uses its authenticated `/models/user`
+endpoint, with concurrent reads coalesced and a five-minute, credential-scoped
+cache. Only concrete text models supporting tools are selectable; `latest`
+aliases, batch-only variants, classifiers and image generators are excluded.
+
+Public model IDs represent exact identities, independent of transport. The
+explicit `openai/` prefix is removed for OpenAI models so existing bot IDs remain
+valid and `openai/gpt-6.1-sol` can share one entry with subscription `gpt-6.1-sol`.
+Dates, version suffixes and variants remain distinct. Other sources can provide
+an explicit `canonicalId`; display names are never used for deduplication.
+`routes` retains each source's concrete ID, capabilities and optional per-million
+token prices. The preferred route supplies the selectable settings; capabilities
+are not unioned across providers. Partial discovery errors appear in `sources`
+and do not hide healthy catalogs. If all configured sources fail, `error` is set.
+
+Every admission snapshots the concrete model, selected settings and ordered routes
+in its immutable native model reference. Subscription inference is tried first.
+If it terminates with a quota error before emitting any content or tool call,
+the same generation can try OpenRouter for that exact model using API credits.
+The bot's model never changes. Recorded tool results are forwarded, not executed
+again. Fallback requires compatible reasoning/Fast and image capabilities and
+enough advertised context/output capacity. Authentication failures, throttling,
+server errors, Stop and partially streamed responses never trigger paid fallback.
+If the connected ChatGPT catalog is temporarily unavailable, OpenAI-model
+admission waits for discovery instead of starting paid inference; other families
+from healthy sources remain usable.
+No fallback exists without an independently configured OpenRouter credential and
+an exact alternate route. The native assistant record retains the actual provider
+and upstream model ID. Later generations try the subscription first again.
+
+### ChatGPT account model settings
 ChatGPT model discovery calls `GET https://api.openai.com/v1/models` using the
 same OAuth connection as inference. Only entries with `visibility:"list"` appear,
 in provider order. Public options contain the model ID/name, supported reasoning
@@ -311,11 +442,12 @@ The catalogue cache lasts five minutes and belongs to a connection revision.
 Import and disconnect invalidate it. Network discovery runs outside the token
 refresh lock; a delayed response from an old connection cannot populate the new
 cache or authorize inference under a replacement account. Catalogue failures are
-explicit and never trigger another provider or separately billed API access.
+explicit. A healthy alternate catalog remains usable if one source fails;
+source errors remain visible without inventing models or capabilities.
 
 `Bot.model`, `Bot.reasoningEffort?` and `Bot.fast?` are persisted configuration.
-Explicit selections on creation or PATCH must be available to the connected
-account. Changing the model clears omitted reasoning/Fast settings before applying
+Explicit selections on creation or PATCH must be available in a connected
+catalog. Changing the model clears omitted reasoning/Fast settings before applying
 that model's default reasoning effort and `fast:false`. Legacy bots without an
 explicit effort use the provider's advertised default; Timber does not force
 `low`. Creation without explicit model settings remains possible before connecting
@@ -334,7 +466,7 @@ Run records retain their admitted model settings. Temporary subagents inherit
 their parent's selection by default and may choose another supported model,
 reasoning effort or Fast setting at spawn; existing child selections remain
 independent of later bot configuration edits. `list_models` exposes the same
-account options to the model.
+combined catalog options to the model.
 
 Shared types live in @botspace/contracts. Runtime implementer owns its concrete
 types and exports createPiRuntime({owner,ai,model,instructions,tools,...}) or agrees
@@ -484,24 +616,44 @@ explicit workspace reads, live-desktop lease renewals and successful app request
 renew it. A managed running process is active work: a durable ten-second maintenance
 alarm observes it and renews the computer lifetime without model inference.
 Explicit checkpoint, suspend and human desktop control reject while managed
-commands are active. Terminal command checkpoints are deferred until the active
-batch finishes; one checkpoint can cover the completed batch. Passive status
+commands are active. Tool results and effect receipts do not wait for workspace
+checkpoints. Writes, clones and terminal commands report `checkpointStatus:"pending"`;
+the action outcome is durable, while its filesystem changes are not yet saved.
+An alarm coalesces changes after 90 seconds without agent tool/runtime activity and
+without running managed commands. Passive process observations and desktop-viewer
+renewals do not postpone this capture. Runtime lease renewals defer it while a turn
+is active. One checkpoint can cover many completed actions. Passive status
 polling and an open chat do not keep the machine awake. A detached server outside
 managed execution alone does not keep it awake. Idle shutdown first checkpoints, then destroys
 the container; checkpoint failures defer shutdown and retry after one minute.
 Checkpoint persistence has its own durable retry intent, separate from execution.
-Uploads enforce the declared byte length with a streaming transfer and verify SHA-256.
+Archive creation holds the effect/workspace gates to capture consistent files;
+the background R2 transfer releases both gates, so new tools can execute during
+upload. Later writes have higher revisions and remain pending when an older upload
+finishes. Explicit checkpoint and suspend wait for an in-flight upload outside
+the gates, then capture fresh files. Deletion drains background uploads before
+acknowledging cleanup. Uploads enforce the declared byte length with a streaming transfer and verify SHA-256.
+Automatic captures leave a managed Chromium process and its live page state
+running. They exclude its actively written profile and include the last consistent
+closed-profile baseline instead. The server refreshes that baseline before each
+browser launch, including after an explicit checkpoint. New cookies, sessions and
+other profile changes become durable through an explicit checkpoint or idle/suspend
+capture, which closes Chromium to flush the current profile. A file checkpoint
+alone does not claim that recent live browser changes were saved. Computers on an
+older image retain their previous capture behavior until their next natural start.
 The upload candidate is recorded before R2 admission; recovery checks its size and
 checksum and atomically publishes its pointer and affected operation receipts.
 A lost pointer write can therefore recover an existing upload without rerunning a
 command. A fresh explicit checkpoint or suspend always captures current files,
 including desktop changes made after any recovered upload.
 Transient persistence failures get one immediate retry, then durable retries with
-exponential delay capped at one minute. User activity cannot postpone this deadline.
+exponential delay capped at one minute. New activity defers filesystem capture to
+the quiet interval; recovery of an already committed R2 candidate needs no capture.
 `checkpointStatus` is `pending`, `saved`, or `failed`; routine saving is not an action
 error. Continued persistence failure becomes visible after three failed attempts;
 successful publication removes only the checkpoint warning and preserves command
-errors. Snapshot validation failures remain actionable immediately. If the original
+errors. Snapshot validation failures become actionable when the background capture
+is attempted. If the original
 computer was lost before upload, recovery reports unsaved files instead of starting
 a new computer or claiming that the old effects were saved.
 A separate fifteen-minute infrastructure inactivity timeout is the fallback.
@@ -962,7 +1114,7 @@ regeneration on selection.
   pending. It is fenced by bot membership and current stored pointer after awaits.
   No public R2 URLs are returned. SVG is restricted and revalidated on read; PNG
   validation is also enforced; generated PNGs are bounded to 1024px per dimension
-  and 1 MiB encoded bytes by the current validator. Responses use attachment/nosniff security headers
+  and 8 MiB encoded bytes by the current validator. Responses use attachment/nosniff security headers
   and a private ETag cache validator; authenticated external avatar GET forwards only
   `If-None-Match` internally and returns 304 on a match. The response declares `original` (there is no
   server-generated thumbnail). Clients fetch authenticated bytes into safe `img`
@@ -990,7 +1142,14 @@ unless the provider reports a known amount (currently it does not).
 Image API dispatch uses the server-only `OPENAI_API_KEY` Worker secret with one
 `POST /v1/images/generations`, PNG `1024x1024`, `background:"transparent"` for
 structured head themes, and a 30-minute transport deadline.
-The 1 MiB PNG limit keeps base64 output plus snapshots below SQLite row limits.
+The 8 MiB PNG bound accommodates detailed 1024px RGBA images without reducing
+resolution or discarding transparency. JSON transport allows the corresponding
+base64 expansion plus 64 KiB of response metadata. Validated output larger than
+512 KiB is journaled in ordered 512 KiB SQL chunks, atomically with a length
+manifest in the job row; no row contains the whole large image. Recovery checks
+the manifest and chunks, then revalidates PNG bytes before publishing, without
+redispatching inference. Existing inline journals remain readable. Completion,
+failure, obsolescence and bot deletion erase the private output chunks.
 Chunk CRC/order, exact decoded scanlines and filter values are checked; only
 non-interlaced 8-bit RGB/RGBA is accepted, ancillary metadata is removed and APNG
 is rejected. Candidate identities precede PUT; pointer replacement and old-object

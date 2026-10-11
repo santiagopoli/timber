@@ -17,6 +17,7 @@ for (let attempt = 0; attempt < 40; attempt++) {
 assert.equal(health?.ok,true,'computer starts');
 assert.equal(health?.desktop,true,'real X11 desktop is available');
 assert.ok(health?.capabilities?.includes('execSessions'),'queryable execution is available');
+assert.ok(health?.capabilities?.includes('preserveBrowserCheckpoint'),'file checkpoints can preserve Chromium');
 assert.equal((await fetch(origin+'/health')).status,401,'unauthenticated container request rejected');
 async function action(action, operationId = randomUUID()) {
   const response = await request('/actions',{method:'POST',body:JSON.stringify({operationId,action})});
@@ -62,6 +63,20 @@ const image = await action({type:'screenshot'});assert.ok(image.artifactName);
 const artifact = await request(`/artifacts/${image.artifactName}`);assert.equal(artifact.status,200);
 const pixels = new Uint8Array(await artifact.arrayBuffer());
 assert.deepEqual([...pixels.slice(0,8)],[137,80,78,71,13,10,26,10]);
+const browserWindow = (await action({type:'exec',command:'xdotool search --onlyvisible --class chromium'})).output;
+const browserPidCommand='xdotool search --onlyvisible --class chromium | xargs -r -n 1 xdotool getwindowpid';
+const browserPid=(await action({type:'exec',command:browserPidCommand})).output;
+assert.match(browserPid,/^\d+\s*$/,'real Chromium has a process identity');
+for (let attempt=0;attempt<2;attempt++) {
+  const saved=await request('/checkpoint',{method:'POST',body:JSON.stringify({preserveBrowser:true})});
+  assert.equal(saved.status,200,'automatic checkpoint succeeds with Chromium running');
+  await saved.arrayBuffer();
+  assert.equal((await action({type:'exec',command:'xdotool search --onlyvisible --class chromium'})).output,browserWindow,'automatic checkpoints preserve the real Chromium window');
+  assert.equal((await action({type:'exec',command:browserPidCommand})).output,browserPid,'automatic checkpoints preserve the real Chromium process');
+}
+await action({type:'key',key:'ctrl+a'});
+await action({type:'key',key:'ctrl+c'});
+assert.equal((await action({type:'exec',command:'xclip -o -selection clipboard'})).output,unicodeText,'automatic checkpoints preserve live textarea state');
 await action({type:'exec',command:'kill "$(cat /state/smoke-http.pid)"',timeoutMs:10000});
 const checkpoint = await request('/checkpoint',{method:'POST',body:JSON.stringify({quiesce:true})});
 assert.equal(checkpoint.status,200);
@@ -72,4 +87,4 @@ await action({type:'writeFile',path:'image-smoke.txt',content:'changed after che
 const restore = await request('/restore',{method:'POST',body:archive,headers:{'Content-Type':'application/gzip','X-Content-SHA256':checksum}});
 assert.equal(restore.status,200,'checkpoint restores');
 assert.equal((await action({type:'readFile',path:'image-smoke.txt'})).output,'Timber image smoke\n','restore recovers original file');
-console.log('PASS Docker desktop: auth, files, queryable shell sessions, cancellation, side-effect deduplication, Chromium, keyboard, verified Unicode paste, PNG screenshot, checksum and checkpoint restore.');
+console.log('PASS Docker desktop: auth, files, queryable shell sessions, cancellation, side-effect deduplication, Chromium reuse during checkpoints, keyboard, verified Unicode paste, PNG screenshot, checksum and checkpoint restore.');

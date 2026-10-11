@@ -203,6 +203,7 @@ export async function createConsoleFixture({port = 0} = {}) {
         return json({accepted:true},202);
       }
       if (/^\/agents\/[^/]+\/cancel$/.test(tail)) {const agent=(state.agents.get(id)||[]).find(item=>item.id===tail.split('/')[2]);if(agent)agent.status='cancelled';return json({agent});}
+      if (tail === '/keychain' && request.method === 'GET') return json({entries: [], requests: []});
       if (tail === '/connections') return json({connections: state.connections.get(id)});
       if (/^\/connections\/[^/]+\/connect$/.test(tail)) {if (state.connectionGate) await state.connectionGate; return json({url: `http://127.0.0.1:${server.address().port}/github-connect`});}
       if (tail === '/apps') return json({apps: state.apps.get(id)});

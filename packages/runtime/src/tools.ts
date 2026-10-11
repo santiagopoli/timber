@@ -153,7 +153,7 @@ export function computerTools(bridge: ToolBridge) {
     defineTool({ name: 'desktop_scroll', description: 'Scroll the desktop. Host approval policy applies.', replay: 'unsafe', executionMode: 'sequential',
       parameters: Type.Object({ direction: Type.Union([Type.Literal('up'), Type.Literal('down')]), amount: Type.Optional(Type.Integer({ minimum: 1, maximum: 30 })) }),
       execute: ({ direction, amount }, api, context) => executeComputerTool(bridge, { type: 'scroll', direction, ...(amount ? { amount } : {}) }, api, context) }),
-    defineTool({ name: 'checkpoint', description: 'Persist a consistent workspace checkpoint to durable storage.', replay: 'unsafe', executionMode: 'sequential',
+    defineTool({ name: 'checkpoint', description: 'Explicitly persist the current workspace and browser profile to durable storage. This can restart active browser pages. Files save automatically after activity settles; use an explicit checkpoint at a task boundary when a confirmed fresh save is required, rather than after every edit or command.', replay: 'unsafe', executionMode: 'sequential',
       parameters: Type.Object({}), execute: (_args, api, context) => executeComputerTool(bridge, { type: 'checkpoint' }, api, context) }),
   ];
 }

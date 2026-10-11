@@ -1,25 +1,27 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdir,writeFile} from 'node:fs/promises';
-import {chromium} from 'playwright';
+import {createConsoleBrowser} from './console-browser.mjs';
 import {builtinAvatarThemes} from '../../packages/contracts/src/avatar-presets.ts';
 import {createConsoleFixture,TEST_TOKEN,BOT_A} from './console-fixture.mjs';
 
+const consoleBrowser = createConsoleBrowser();
+
 for(const [name,viewport] of [['desktop',{width:1280,height:1000}],['mobile',{width:390,height:844}]])test(`built-in theme gallery: ${name}`,async()=>{
   const fixture=await createConsoleFixture();
-  const browser=await chromium.launch({executablePath:process.env.CONSOLE_CHROMIUM_PATH||'/usr/bin/chromium',args:['--no-sandbox']});
+  const browser=await consoleBrowser();let context;
   const themes=builtinAvatarThemes();let selection={themeId:themes[0].id,revision:1};
   const calls=[],errors=[],assetFailures=[];let rejectReasoningOnce=false;
   const settings=()=>({themes,selection,avatars:[{botId:BOT_A,themeId:themes[0].id,revision:1,status:'ready',artifactId:'gallery-owl',mimeType:'image/svg+xml',updatedAt:'2026-10-10T00:00:00Z'}],jobs:[]});
   try{
-    const page=await browser.newPage({viewport,deviceScaleFactor:2,colorScheme:name==='desktop'?'dark':'light',isMobile:name==='mobile',hasTouch:name==='mobile'});
+    context=await browser.newContext({viewport,deviceScaleFactor:2,colorScheme:name==='desktop'?'dark':'light',isMobile:name==='mobile',hasTouch:name==='mobile'});const page=await context.newPage();
     page.setDefaultTimeout(15000);page.on('pageerror',e=>errors.push(e.message));
     page.on('response',response=>{if(response.url().includes('/avatar-themes/')&&!response.ok())assetFailures.push(response.url());});
     await page.route('**/v1/avatar-settings',async route=>{
       if(route.request().method()==='PUT'){const body=route.request().postDataJSON();calls.push({path:'selection',body});selection={themeId:body.themeId,revision:selection.revision+1};}
       await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(settings())});
     });
-    await page.route('**/v1/avatar-models',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:true,vectorModels:[{id:'gpt-6.1-sol',name:'GPT-6.1',reasoningEfforts:['medium','high'],defaultReasoningEffort:'medium'},{id:'fixed-model',name:'No reasoning options',reasoningEfforts:[]}],imageModels:[],imageAvailable:false})}));
+    await page.route('**/v1/avatar-models',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:true,vectorModels:[{id:'gpt-6.1-sol',name:'GPT-6.1',provider:'openai',reasoningEfforts:['medium','high'],defaultReasoningEffort:'medium'},{id:'fixed-model',name:'No reasoning options',provider:'openai',reasoningEfforts:[]}],imageModels:[],imageAvailable:false})}));
     await page.route('**/v1/bots/*/avatar',route=>route.fulfill({status:200,contentType:'image/svg+xml',body:'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><path d="M32 32L64 44L96 32L96 80L64 108L32 80Z" fill="#ad794d"/></svg>'}));
     await page.route('**/v1/avatar-generations',async route=>{calls.push({path:'generation'});await route.fulfill({status:202,contentType:'application/json',body:'{"jobs":[]}'});});
     await page.route('**/v1/avatar-themes',async route=>{
@@ -93,7 +95,7 @@ for(const [name,viewport] of [['desktop',{width:1280,height:1000}],['mobile',{wi
     assert.equal(calls.filter(call=>call.path==='generation').length,0);
     await page.locator('#avatar-theme-name').fill('Careful SVG');await page.locator('#avatar-theme-prompt').fill('Paperfold');await page.locator('#avatar-theme-reasoning').selectOption('high');await page.locator('#avatar-create-submit').click();
     await page.waitForFunction(()=>document.getElementById('avatar-theme-name').value==='');assert.equal(calls.at(-1).body.reasoningEffort,'high');
-    await page.locator('#avatar-theme-reasoning').selectOption('high');await page.locator('#avatar-theme-model').selectOption('fixed-model');assert.equal(await page.locator('#avatar-theme-reasoning').inputValue(),'');assert.equal(await page.locator('#avatar-theme-reasoning option').count(),1);
+    await page.locator('#avatar-theme-reasoning').selectOption('high');await page.locator('#avatar-theme-model-picker').click();await page.getByRole('dialog',{name:'Choose model',exact:true}).locator('[data-provider="OpenAI"]').click();await page.getByRole('dialog',{name:'Choose model',exact:true}).getByRole('option').filter({hasText:'fixed-model'}).click();assert.equal(await page.locator('#avatar-theme-reasoning').inputValue(),'');assert.equal(await page.locator('#avatar-theme-reasoning option').count(),1);
     await page.locator('#avatar-theme-kind').selectOption('image');assert.equal(await page.locator('#avatar-theme-reasoning-field').isVisible(),false);
     assert.equal(calls.filter(call=>call.path==='generation').length,0);assert.deepEqual(errors,[]);assert.deepEqual(assetFailures,[]);
     if(evidence){
@@ -114,5 +116,5 @@ for(const [name,viewport] of [['desktop',{width:1280,height:1000}],['mobile',{wi
         }
       }
     }
-  }finally{await browser.close();await fixture.close();}
+  }finally{await context?.close();await fixture.close();}
 });

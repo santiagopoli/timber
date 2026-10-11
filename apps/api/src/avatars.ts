@@ -5,7 +5,7 @@ import { ApiError, json } from './errors';
 import { body, operationId, string, UUID } from './validation';
 import { avatarModelCatalog, generateImageAvatar, generateVectorAvatar } from './avatar-provider';
 import { sanitizeAvatarSvg } from './avatar-svg';
-import { decodeAvatarPng, validateAvatarPng, validateAvatarPngBytes, AVATAR_PNG_MAX_BYTES } from './avatar-png';
+import { decodeAvatarPng, validateAvatarPng, validateAvatarPngBytes, AVATAR_PNG_MAX_BYTES, AVATAR_PNG_MAX_BASE64 } from './avatar-png';
 
 interface StoredJob extends Record<string, SqlStorageValue> {
   data: string;
@@ -17,6 +17,10 @@ interface StoredJob extends Record<string, SqlStorageValue> {
   next_at: number;
 }
 const now = () => new Date().toISOString();
+// Keep every SQLite value/row comfortably below its 2 MB limit, independently
+// of the total image size. Legacy inline outputs remain readable on upgrade.
+const OUTPUT_CHUNK_SIZE = 512 * 1024;
+const OUTPUT_CHUNK_PREFIX = '@avatar-chunks:1:';
 const imageUnavailable = () => new ApiError(422, 'avatar_image_unavailable', 'Image avatar generation is unavailable. Configure the server OPENAI_API_KEY Worker secret and choose an image model from the configured catalogue. Images use separately billed OpenAI API access, not the ChatGPT plan. Do not enter API keys in chat. No alternative provider or billing fallback will be used.');
 function keys(value: Record<string, unknown>, allowed: string[]): void {
   if (Object.keys(value).some(key => !allowed.includes(key))) throw new ApiError(400, 'invalid_request', 'Unknown avatar setting. A bot cannot override the owner theme.');
@@ -39,6 +43,7 @@ export class AvatarCoordinator {
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS avatar_receipts (operation_id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,data TEXT NOT NULL)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS avatar_jobs (id TEXT PRIMARY KEY,bot_id TEXT NOT NULL,data TEXT NOT NULL,theme TEXT NOT NULL,bot TEXT NOT NULL,output TEXT,artifact_id TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL)');
     ctx.storage.sql.exec('CREATE INDEX IF NOT EXISTS avatar_jobs_bot ON avatar_jobs(bot_id)');
+    ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS avatar_output_chunks (job_id TEXT NOT NULL,part INTEGER NOT NULL,content TEXT NOT NULL,PRIMARY KEY(job_id,part))');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS avatar_gc (key TEXT PRIMARY KEY,bot_id TEXT NOT NULL,next_at INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0)');
     ctx.storage.sql.exec('CREATE INDEX IF NOT EXISTS avatar_gc_pending ON avatar_gc(next_at)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS avatar_candidates (key TEXT PRIMARY KEY,bot_id TEXT NOT NULL,job_id TEXT NOT NULL)');
@@ -110,11 +115,32 @@ export class AvatarCoordinator {
   private update(job:AvatarJob, output:string|null=null, nextAt=0): void {
     job.updatedAt = now();
     const terminal=!['queued','running'].includes(job.status);
-    this.ctx.storage.sql.exec('UPDATE avatar_jobs SET data=?,output=?,next_at=? WHERE id=?',JSON.stringify(job),terminal?null:output,terminal?0:nextAt,job.id);
-    if(terminal){
-      this.ctx.storage.sql.exec("UPDATE avatar_jobs SET bot='{}',theme='{}' WHERE id=?",job.id);
-      if(job.status!=='completed'){const row=this.job(job.id);if(row)this.garbage(`bots/${job.botId}/avatars/${row.artifact_id}`,job.botId);}
-    }
+    this.ctx.storage.transactionSync(()=>{
+      this.ctx.storage.sql.exec('DELETE FROM avatar_output_chunks WHERE job_id=?',job.id);
+      let journal=terminal?null:output;
+      if(journal && journal.length>OUTPUT_CHUNK_SIZE){
+        for(let offset=0,part=0;offset<journal.length;offset+=OUTPUT_CHUNK_SIZE,part++){
+          this.ctx.storage.sql.exec('INSERT INTO avatar_output_chunks(job_id,part,content) VALUES(?,?,?)',job.id,part,journal.slice(offset,offset+OUTPUT_CHUNK_SIZE));
+        }
+        journal=OUTPUT_CHUNK_PREFIX+journal.length;
+      }
+      // The manifest and all chunks commit together, before publishing to R2.
+      this.ctx.storage.sql.exec('UPDATE avatar_jobs SET data=?,output=?,next_at=? WHERE id=?',JSON.stringify(job),journal,terminal?0:nextAt,job.id);
+      if(terminal){
+        this.ctx.storage.sql.exec("UPDATE avatar_jobs SET bot='{}',theme='{}' WHERE id=?",job.id);
+        if(job.status!=='completed'){const row=this.job(job.id);if(row)this.garbage(`bots/${job.botId}/avatars/${row.artifact_id}`,job.botId);}
+      }
+    });
+  }
+  private readOutput(jobId:string, stored:string): string {
+    if(!stored.startsWith(OUTPUT_CHUNK_PREFIX))return stored;
+    const length=Number(stored.slice(OUTPUT_CHUNK_PREFIX.length));
+    const invalid=()=>new ApiError(502,'avatar_storage_failed','The saved avatar data is incomplete or invalid. No new image generation was attempted.');
+    if(!Number.isSafeInteger(length) || length<=OUTPUT_CHUNK_SIZE || length>AVATAR_PNG_MAX_BASE64)throw invalid();
+    const count=Math.ceil(length/OUTPUT_CHUNK_SIZE);
+    const chunks=this.ctx.storage.sql.exec<{part:number;content:string}>('SELECT part,content FROM avatar_output_chunks WHERE job_id=? ORDER BY part LIMIT ?',jobId,count+1).toArray();
+    if(chunks.length!==count || chunks.some((chunk,index)=>chunk.part!==index || chunk.content.length!==Math.min(OUTPUT_CHUNK_SIZE,length-index*OUTPUT_CHUNK_SIZE)))throw invalid();
+    return chunks.map(chunk=>chunk.content).join('');
   }
   forgetBot(botId:string): void {
     // Fence publication before deletion drains the bot R2 prefix.
@@ -131,6 +157,7 @@ export class AvatarCoordinator {
     // Deletion waits for any in-flight upload before deleting its prefix. It
     // cannot race an uploader that has not yet resumed after its await.
     if (this.active && this.activeBotId===botId) await this.active;
+    this.ctx.storage.sql.exec('DELETE FROM avatar_output_chunks WHERE job_id IN (SELECT id FROM avatar_jobs WHERE bot_id=?)',botId);
     this.ctx.storage.sql.exec('DELETE FROM avatar_jobs WHERE bot_id=?',botId);
     this.ctx.storage.sql.exec('DELETE FROM avatar_gc WHERE bot_id=?',botId);
     this.ctx.storage.sql.exec('DELETE FROM avatar_candidates WHERE bot_id=?',botId);
@@ -352,7 +379,7 @@ export class AvatarCoordinator {
       return sanitizeAvatarSvg(candidate);
     };
     try {
-      if(output){const candidate=output;output=null;output=await validate(candidate);}
+      if(output){const candidate=output;output=null;output=await validate(this.readOutput(job.id,candidate));}
       if(!output) {
         job.status='running';this.update(job,null,Date.now()+35*60_000);
         await this.rearm();

@@ -2,6 +2,7 @@ import {afterEach, describe, expect, it, vi} from 'vitest';
 import type {Env} from '../apps/api/src/env';
 import {MODEL_FAILURES} from '@botspace/contracts';
 import {avatarModelCatalog, generateVectorAvatar, generateImageAvatar, imageGenerationError} from '../apps/api/src/avatar-provider';
+import {AVATAR_PNG_MAX_JSON_BYTES} from '../apps/api/src/avatar-png';
 const svg = '<svg viewBox="0 0 128 128"><path d="M5 5L20 5L10 20Z" fill="#abc"/></svg>';
 const input = {model: 'account-text-model', prompt: 'flat forest theme', botName: 'Helper', botInstructions: 'Organizes tasks'};
 const model = {id: input.model, name: 'Account text model', provider: 'openai', reasoningEfforts: ['high'], supportsFast: true, inputModalities: ['text', 'image']};
@@ -365,8 +366,12 @@ describe('explicit server-only OpenAI Image API', () => {
   it('POSTs one PNG image to the fixed endpoint for both reviewed IDs, no Responses fallback or URL follow', async () => {
     for (const id of ['gpt-image-2.5-sunburst', 'gpt-image-2.5-flare']) {
       const fetch = vi.fn(async (url: string, options: RequestInit) => {
+        // Use workerd's real Request validation, not just a permissive fetch
+        // mock: redirect:"error" previously passed tests but failed in prod.
+        const request = new Request(url, options);
+        expect(request.redirect).toBe('manual');
         expect(url).toBe('https://api.openai.com/v1/images/generations');
-        expect(options).toMatchObject({method: 'POST', redirect: 'error'});
+        expect(options).toMatchObject({method: 'POST', redirect: 'manual'});
         expect(new Headers(options.headers).get('authorization')).toBe(`Bearer ${imageEnv.OPENAI_API_KEY}`);
         const body = JSON.parse(options.body as string);
         expect(body).toMatchObject({model: id, n: 1, size: '1024x1024', quality: 'low', output_format: 'png'});
@@ -376,6 +381,17 @@ describe('explicit server-only OpenAI Image API', () => {
         return Response.json({data: [{b64_json: png}], usage: {total_tokens: 1}});
       }); vi.stubGlobal('fetch', fetch);
       expect(await generateImageAvatar(imageEnv, {...imageInput, model: id})).toBe(png);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    }
+  });
+  it('rejects redirects without following a destination or repeating the image request',async()=>{
+    for(const status of [301,302,303,307,308]){
+      const fetch=vi.fn(async(url:string,options:RequestInit)=>{
+        const request=new Request(url,options);expect(request.redirect).toBe('manual');
+        expect(request.url).toBe('https://api.openai.com/v1/images/generations');
+        return new Response(null,{status,headers:{location:'https://untrusted.test/image'}});
+      });vi.stubGlobal('fetch',fetch);
+      await expect(generateImageAvatar(imageEnv,imageInput)).rejects.toMatchObject({code:'avatar_image_generation_failed'});
       expect(fetch).toHaveBeenCalledTimes(1);
     }
   });
@@ -445,7 +461,7 @@ describe('explicit server-only OpenAI Image API', () => {
     let fetch = vi.fn(() => new Response(new ReadableStream<Uint8Array>({cancel: cancelled}), {headers: {'content-type': 'text/html'}})); vi.stubGlobal('fetch', fetch);
     await expect(generateImageAvatar(imageEnv, imageInput)).rejects.toMatchObject({code: 'avatar_image_invalid'});
     expect(cancelled).toHaveBeenCalled();
-    fetch = vi.fn(() => new Response(' '.repeat(7_100_000), {headers: {'content-type': 'application/json'}})); vi.stubGlobal('fetch', fetch);
+    fetch = vi.fn(() => new Response(' '.repeat(AVATAR_PNG_MAX_JSON_BYTES + 1), {headers: {'content-type': 'application/json'}})); vi.stubGlobal('fetch', fetch);
     await expect(generateImageAvatar(imageEnv, imageInput)).rejects.toMatchObject({code: 'avatar_response_limit'});
     const controller = new AbortController();
     fetch = vi.fn(() => new Response(new ReadableStream<Uint8Array>({start(stream) {stream.enqueue(new TextEncoder().encode('{')); queueMicrotask(() => controller.abort());}, cancel: cancelled}), {headers: {'content-type': 'application/json'}})); vi.stubGlobal('fetch', fetch);

@@ -1,8 +1,9 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, useId, memo, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, useId, memo, type ComponentProps, type ReactNode, type KeyboardEvent } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
-import { XIcon, PaperclipIcon, ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon, HistoryIcon, SquareIcon } from 'lucide-react';
-import { defaultUrlTransform, type UrlTransform } from 'streamdown';
+import { XIcon, PaperclipIcon, ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon, HistoryIcon, SquareIcon, PlusIcon, LockKeyholeIcon } from 'lucide-react';
+import {DropdownMenu} from 'radix-ui';
+import { defaultComponents, defaultUrlTransform, type UrlTransform } from 'streamdown';
 import { Conversation, ConversationContent, ConversationEmptyState, ConversationScrollButton, useConversationContext } from '@/components/ai-elements/conversation';
 import { Message, MessageActions, MessageAction, MessageContent, MessageResponse } from '@/components/ai-elements/message';
 import { PromptInput, PromptInputBody, PromptInputSubmit, PromptInputTextarea, usePromptInputAttachments } from '@/components/ai-elements/prompt-input';
@@ -21,6 +22,10 @@ import {AgentCreationCard, AgentMessageNotice, collectCollaboration, type Collab
 import {ModelSettings} from './model-settings';
 import {ModelBadge} from './model-identity';
 import {ContextMemoryControl} from './context-memory';
+import {KeychainProvider,KeychainControl,SecureRequestCard,SecureSavedPill,useKeychain} from './keychain';
+import {useInlineSecrets} from './inline-secrets';
+import {SecurePill,SecurePrompt,secureReference,hasSecureReference,maskSecureReferences} from './secure-prompt';
+import type {SecretMetadata,SecureInputRequest} from '../../../packages/contracts/src/index';
 import {collectCompactions, CompactionPill, type CompactionItem} from './compaction-timeline';
 import {mergeToolResult, mergeToolStatus, runOutcomes, toolActivityState, toolFailureSummary} from './cancellation-presentation';
 
@@ -31,7 +36,7 @@ const time = (value?: string) => value ? new Date(value).toLocaleTimeString([], 
 const label = (value: string) => value.replaceAll('_', ' ');
 const safeJSON = (value: unknown): string => JSON.stringify(value, (key, item) => /token|secret|password|authorization|credential/i.test(key) ? '[hidden]' : item, 2);
 const actionText = (approval: ChatApproval) => approval.action.type === 'type' ? 'Type text · input hidden' : approval.action.type === 'exec' ? approval.action.command : safeJSON(approval.action);
-const responseComponents = { img: () => null };
+const responseComponents = { img: () => null, code:({children,...props}:ComponentProps<'code'>)=>String(children)==='🔒 ••••••'?<SecurePill/>:<defaultComponents.code {...props}>{children}</defaultComponents.code> };
 // Keep Streamdown's URL sanitization, but use native links instead of its
 // confirmation buttons so browser navigation and long-press actions work.
 const responseLinkSafety = { enabled: false };
@@ -39,7 +44,7 @@ const responsePlugins = {};
 const responseUrlTransform: UrlTransform = (url, key, node) => url === 'streamdown:incomplete-link' ? undefined : defaultUrlTransform(url, key, node);
 
 const Response = memo(function Response({ text, streaming = false }: { text: string; streaming?: boolean }) {
-  return <MessageResponse className="timber-markdown" mode={streaming ? 'streaming' : 'static'} isAnimating={streaming} parseIncompleteMarkdown skipHtml plugins={responsePlugins} components={responseComponents} linkSafety={responseLinkSafety} urlTransform={responseUrlTransform} controls={false}>{text}</MessageResponse>;
+  return <MessageResponse className="timber-markdown" mode={streaming ? 'streaming' : 'static'} isAnimating={streaming} parseIncompleteMarkdown skipHtml plugins={responsePlugins} components={responseComponents} linkSafety={responseLinkSafety} urlTransform={responseUrlTransform} controls={false}>{maskSecureReferences(text)}</MessageResponse>;
 });
 
 const CopyMessage = memo(function CopyMessage({ text, kind = 'message', createdAt }: { text: string; kind?: 'message' | 'pending' | 'streaming'; createdAt?: string }) {
@@ -391,7 +396,7 @@ const TimelineHistory = memo(function TimelineHistory({entries}: {entries: Timel
   return <>{entries.map(entry => <div className="timber-timeline-entry" data-timeline-key={entry.key} key={entry.key}>{entry.node}</div>)}</>;
 });
 
-function timeline(model: ChatModel, callbacks: ChatCallbacks) {
+function timeline(model: ChatModel, callbacks: ChatCallbacks, secureRequests:SecureInputRequest[] = []) {
   const indexes = historyIndexes(model);
   const collaboration = collectCollaboration(model);
   const messages = model.messages.filter(message => !model.runFilter || message.runId === model.runFilter);
@@ -399,7 +404,7 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks) {
   const pendingApprovals = approvals.filter(approval => ['pending', 'executing', 'approved'].includes(approval.status));
   const current = pendingApprovals.reduce<ChatApproval | undefined>((latest, approval) => !latest || timestamp(approval.createdAt) > timestamp(latest.createdAt) ? approval : latest, undefined);
   const pendingApprovalRuns = new Set(pendingApprovals.map(approval => approval.runId));
-  const pendingConnectionRuns = new Set(model.connections.filter(connection => connection.status === 'pending').map(connection => connection.runId));
+  const pendingConnectionRuns = new Set([...model.connections.filter(connection => connection.status === 'pending').map(connection => connection.runId),...secureRequests.filter(item=>item.status==='pending').map(item=>item.runId)]);
   // The server run identifies a request even before its transcript row loads.
   // Device clock skew and equal timestamps must never put an effect before it.
   const deliveries = model.deliveries.map(delivery => {
@@ -444,6 +449,8 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks) {
   for (const connection of model.connections.filter(item => !model.runFilter || item.runId === model.runFilter)) {
     entries.push({key: `connection:${connection.id}`, ...afterRequest(connection.runId, timestamp(connection.createdAt)), node: <ConnectionEntry connection={connection} callbacks={callbacks} />});
   }
+  for(const item of secureRequests.filter(item=>!model.runFilter||item.runId===model.runFilter))entries.push({key:`secure:${item.id}`,...afterRequest(item.runId,timestamp(item.createdAt)),node:<SecureRequestCard item={item} onStop={()=>callbacks.onStop(model.bot.id,item.runId)}/>});
+  for(const event of model.events.filter(event=>event.type==='keychain.updated'&&!event.data.request&&Array.isArray(event.data.entries)&&(!model.runFilter||event.runId===model.runFilter)))entries.push({key:`secure-saved:${event.id}`,at:timestamp(event.createdAt),order:1,node:<SecureSavedPill names={(event.data.entries as {name:string}[]).map(item=>item.name)}/>});
   deliveries.forEach((delivery, index) => entries.push({key: `delivery:${delivery.operationId}`, at: timestamp(delivery.createdAt), order: (messages.length + index) * 2, node: <DeliveryEntry delivery={delivery} busy={model.sending} callbacks={callbacks} />}));
   for(const item of collaboration.items)entries.push({key:`collaboration:${item.key}`,...afterRequest(item.runId,timestamp(item.createdAt)),node:<TimelineCollaboration item={item} callbacks={callbacks}/>});
   const compactions = collectCompactions(model), unpositionedCompactions = compactions.filter(item => item.unpositioned);
@@ -516,7 +523,8 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
   }, [model.bot.id, model.runFilter, model.historyHasMore, model.historyLoading, model.historyError, callbacks, scrollRef]);
   // Drafts and response chunks never invalidate the completed history. The
   // transport supplies immutable, referentially stable collection revisions.
-  const {entries, unpositionedCompactions, indexes, toolRuns, pendingApprovalRuns, pendingConnectionRuns} = useMemo(() => timeline(model, callbacks), [model.bot.id, model.bot.name, model.bot.model, model.bot.computerApprovalMode, model.messages, model.runs, model.approvals, model.connections, model.events, model.deliveries, model.subagents, model.delegations, model.mentionBots, model.collaborationEvents, model.compactions, model.runFilter, model.sending, callbacks]);
+  const {requests:secureRequests}=useKeychain();
+  const {entries, unpositionedCompactions, indexes, toolRuns, pendingApprovalRuns, pendingConnectionRuns} = useMemo(() => timeline(model, callbacks, secureRequests), [secureRequests,model.bot.id, model.bot.name, model.bot.model, model.bot.computerApprovalMode, model.messages, model.runs, model.approvals, model.connections, model.events, model.deliveries, model.subagents, model.delegations, model.mentionBots, model.collaborationEvents, model.compactions, model.runFilter, model.sending, callbacks]);
   const visibleRun = model.currentRun && (!model.runFilter || model.runFilter === model.currentRun.id) ? model.currentRun : null;
   const hasInlineStatus = visibleRun && (
     pendingApprovalRuns.has(visibleRun.id) ||
@@ -530,6 +538,7 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
       {!entries.length && !unpositionedCompactions.length && <ConversationEmptyState className="timber-chat-empty" title={model.loading ? 'Loading…' : `Ask ${model.bot.name}`} description="" />}
       <UnpositionedCompactionHistory items={unpositionedCompactions}/>
       <TimelineHistory entries={entries}/>
+
       {model.feedback && (!model.runFilter || model.feedback.runId === model.runFilter) && <div id="approval-feedback" role="status" className={model.feedback.error ? 'timber-feedback timber-inline-error' : 'timber-feedback'}>{model.feedback.text}</div>}
       {model.stream && <Message from="assistant" id="streaming-message" className="timber-message" data-run-id={model.stream.runId}>
         <div className="timber-message-meta"><span>{model.bot.name}</span><span className="timber-responding"><LoaderCircleIcon className="timber-spinner" /> Responding</span></div>
@@ -538,7 +547,7 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
       </Message>}
       {!model.stream && visibleRun && !terminal.has(visibleRun.status) && !hasInlineStatus && <div className="timber-work-status" role="status">
         {visibleRun.status === 'waiting_connection' ? <GitBranchIcon /> : visibleRun.status === 'waiting_approval' ? <ShieldCheckIcon /> : visibleRun.status === 'queued' ? <ClockIcon /> : <LoaderCircleIcon className="timber-spinner" />}
-        <span>{visibleRun.status === 'waiting_connection' ? 'Waiting for GitHub access' : visibleRun.status === 'waiting_approval' ? 'Waiting for your approval' : visibleRun.status === 'queued' ? 'Queued' : indexes.retries.get(visibleRun.id) || `${model.bot.name} is working`}</span>
+        <span>{visibleRun.status === 'waiting_connection' ? 'Waiting for secure access' : visibleRun.status === 'waiting_approval' ? 'Waiting for your approval' : visibleRun.status === 'queued' ? 'Queued' : indexes.retries.get(visibleRun.id) || `${model.bot.name} is working`}</span>
       </div>}
       {visibleRun?.error && !indexes.requests.has(visibleRun.id) && <div className="timber-delivery-error" role="status"><p>{visibleRun.error}</p>{canRetryAdmission(visibleRun) && <Button variant="outline" size="sm" disabled={model.sending} onClick={() => callbacks.onRetry(model.bot.id, visibleRun.operationId)}>Retry sending</Button>}</div>}
     </ConversationContent>
@@ -546,7 +555,7 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
   </>;
 }
 
-function ImageControls({sending,hasText,acceptedIds,children}: {sending:boolean;hasText:boolean;acceptedIds?:string[];children:ReactNode}) {
+function ImageControls({sending,hasText,acceptedIds,children,onSecureInput}: {sending:boolean;hasText:boolean;acceptedIds?:string[];children:ReactNode;onSecureInput:()=>void}) {
   const attachments=usePromptInputAttachments();
   useEffect(()=>{
     for(const id of acceptedIds??[]) if(attachments.files.some(file=>file.id===id)) attachments.remove(id);
@@ -558,7 +567,7 @@ function ImageControls({sending,hasText,acceptedIds,children}: {sending:boolean;
       <button className="timber-image-remove" type="button" aria-label={`Remove ${file.filename || 'image'}`} title={`Remove ${file.filename || 'image'}`} disabled={sending} onClick={()=>attachments.remove(file.id)}><XIcon aria-hidden="true" /></button>
     </div>)}</div>}
     <div className="timber-composer-row">{children}
-      <Button className="timber-attach" type="button" variant="ghost" size="icon" disabled={sending || full} aria-label="Attach images" title={full ? 'Maximum 4 images attached' : 'Attach images · PNG or JPEG, up to 5 MB each'} onClick={()=>attachments.openFileDialog()}><PaperclipIcon aria-hidden="true" /></Button>
+      <DropdownMenu.Root><DropdownMenu.Trigger asChild><Button className="timber-attach" type="button" variant="ghost" size="icon" disabled={sending} aria-label="Add" title="Add"><PlusIcon aria-hidden="true"/></Button></DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content className="timber-add-menu" side="top" align="end" sideOffset={8}><DropdownMenu.Item onSelect={onSecureInput}><LockKeyholeIcon/>Secure input</DropdownMenu.Item><DropdownMenu.Item disabled={full} onSelect={()=>attachments.openFileDialog()}><PaperclipIcon/>Attach images</DropdownMenu.Item></DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu.Root>
       <PromptInputSubmit className="timber-send" aria-label="Send message" title="Send message" disabled={sending || (!hasText && !attachments.files.length)}>{sending ? <LoaderCircleIcon className="timber-spinner" aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}</PromptInputSubmit>
     </div>
     {attachments.files.length > 0 && <div className="timber-attachment-status" role="status">{sending ? 'Sending images…' : `${attachments.files.length} of 4 images · Ready to send`}</div>}
@@ -567,12 +576,27 @@ function ImageControls({sending,hasText,acceptedIds,children}: {sending:boolean;
 
 function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallbacks }) {
   const textarea = useRef<HTMLTextAreaElement>(null);
-  const [attachmentError,setAttachmentError]=useState('');
+  const [attachmentError,setAttachmentError]=useState(''),[securing,setSecuring]=useState(false);
+  const selection=useRef({start:model.draft.length,end:model.draft.length});
+  const [,renderSelection]=useState(0);
+  const trackSelection=(start:number,end:number)=>{if(start!==selection.current.start||end!==selection.current.end){selection.current={start,end};renderSelection(n=>n+1);}setCaret(start);};
+  const secrets=useInlineSecrets(model.draft,(text,swap)=>{if(swap){const adjust=(n:number)=>n<=swap.start?n:n<swap.start+swap.oldLength?swap.start+swap.newLength:n+swap.newLength-swap.oldLength;setCaret(adjust);selection.current={start:adjust(selection.current.start),end:adjust(selection.current.end)};}callbacks.onDraft(model.bot.id,text);});
   const pendingCaret = useRef<{text:string;position:number} | null>(null);
   const [caret, setCaret] = useState(model.draft.length), [mentionIndex, setMentionIndex] = useState(0), [dismissed, setDismissed] = useState(false);
+  const securePrompt=hasSecureReference(model.draft);
+  const wasSecure=useRef(securePrompt);
+  useLayoutEffect(()=>{if(wasSecure.current&&!securePrompt){textarea.current?.focus({preventScroll:true});textarea.current?.setSelectionRange(caret,caret);}wasSecure.current=securePrompt;},[securePrompt,caret]);
+  const addSecure=(mention=false,replacement?:SecretMetadata)=>{const start=mention?mentionStart:selection.current.start,end=mention?caret:selection.current.end;const next=secrets.create(Math.max(0,start),Math.max(0,end),replacement,!mention&&!replacement);setCaret(next);selection.current={start:next,end:next};setDismissed(true);};
+  const insertSecure=(entries:SecretMetadata[])=>{const addition=entries.map(entry=>secureReference(entry.id)).join(' '),text=model.draft.slice(0,caret)+addition+model.draft.slice(caret),position=caret+addition.length;setCaret(position);pendingCaret.current={text,position};callbacks.onDraft(model.bot.id,text);};
   const mentionMatch = /(?:^|\s)@([^\n@]{0,80})$/.exec(model.draft.slice(0, caret));
   const mentionStart = mentionMatch ? caret - mentionMatch[1].length - 1 : -1;
   const choices = !dismissed && mentionMatch ? model.mentionBots.filter(bot => bot.id !== model.bot.id && bot.name.toLocaleLowerCase().includes(mentionMatch[1].toLocaleLowerCase())).slice(0, 8) : [];
+  const mentionKeyDown=(event:KeyboardEvent<HTMLElement>)=>{
+            if (!mentionMatch || dismissed || event.nativeEvent.isComposing) return;
+            if (event.key === 'Escape') {event.preventDefault();event.stopPropagation();setDismissed(true);}
+            else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {event.preventDefault();setMentionIndex(index => (index + (event.key === 'ArrowDown' ? 1 : choices.length)) % (choices.length+1));}
+            else if (event.key === 'Enter' && !event.shiftKey || event.key === 'Tab') {event.preventDefault();if(mentionIndex>=choices.length)addSecure(true);else chooseMention(choices[mentionIndex]);}
+  };
   const selectedMentions = model.mentionBots.filter(bot => model.draftMentions.includes(bot.id) && hasBotMention(model.draft, bot.name));
   const mentionName = (bot:ChatModel['bot']) => model.mentionBots.filter(item=>item.name===bot.name).length > 1 ? `${bot.name} · ${bot.id.slice(-8)}` : bot.name;
   const chooseMention = (bot: ChatModel['bot']) => {
@@ -613,28 +637,26 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
     return () => observer.disconnect();
   }, [model.draft]);
   return <div className="timber-composer-wrap">
-      {choices.length > 0 && <div className="timber-mention-menu" id="bot-mentions" role="listbox" aria-label="Mention a bot">
-        <span className="timber-mention-heading">Send this message to another bot</span>
-        {choices.map((bot, index) => <button type="button" key={bot.id} id={`mention-${bot.id}`} role="option" aria-selected={index === Math.min(mentionIndex, choices.length - 1)} data-mention-bot={bot.id} title={bot.model} onMouseDown={event => event.preventDefault()} onClick={() => chooseMention(bot)}><span className="timber-mini-avatar timber-model-avatar" data-agent-color={agentColor(bot.id)} aria-hidden="true">{bot.name.slice(0, 1)}<ModelBadge model={bot.model}/></span><span><strong>{mentionName(bot)}</strong><small>{bot.instructions?.split('\n')[0] || 'Named bot'}</small></span></button>)}
+      {!dismissed && mentionMatch && <div className="timber-mention-menu" id="bot-mentions" role="listbox" aria-label="Mention a bot">
+        {choices.map((bot, index) => <button type="button" key={bot.id} id={`mention-${bot.id}`} role="option" aria-selected={index === mentionIndex} data-mention-bot={bot.id} title={bot.model} onMouseDown={event => event.preventDefault()} onClick={() => chooseMention(bot)}><span className="timber-mini-avatar timber-model-avatar" data-agent-color={agentColor(bot.id)} aria-hidden="true">{bot.name.slice(0, 1)}<ModelBadge model={bot.model}/></span><span><strong>{mentionName(bot)}</strong><small>{bot.instructions?.split('\n')[0] || 'Named bot'}</small></span></button>)}
+        <button type="button" role="option" aria-selected={mentionIndex===choices.length} onMouseDown={event=>event.preventDefault()} onClick={()=>addSecure(true)}><LockKeyholeIcon/><span><strong>Secure input</strong><small>Insert private text</small></span></button>
       </div>}
       {selectedMentions.length > 0 && <div className="timber-selected-mentions" aria-label="Message recipients">{selectedMentions.map(bot => <span key={bot.id}>To {mentionName(bot)}<button type="button" aria-label={`Remove ${mentionName(bot)} recipient`} onClick={() => callbacks.onDraft(model.bot.id, model.draft, model.draftMentions.filter(id => id !== bot.id))}>×</button></span>)}</div>}
-      <div className="timber-composer-controls"><ModelSettings value={model.bot} state={model.modelSettings} disabled={model.sending} onChange={value=>callbacks.onModelSettings(model.bot.id,value)} onRefresh={callbacks.onRefreshModels}/><ContextMemoryControl botId={model.bot.id} request={callbacks.onContextRequest} refreshKey={model.events.at(-1)?.id}/></div>
-      <PromptInput id="message-form" className="timber-composer" disabled={model.sending} accept="image/png,image/jpeg" multiple maxFiles={4} maxFileSize={5_000_000} onError={error=>setAttachmentError(error.message)} onReset={event => event.preventDefault()} onSubmit={async ({text,files}) => {
-        if(model.sending || (!text.trim() && !files.length)) throw new Error('Not ready');
+      {selection.current.end>selection.current.start&&<button type="button" className="timber-selection-secure quiet" onMouseDown={event=>event.preventDefault()} onClick={()=>addSecure()}>Make selection secure</button>}
+      <div className="timber-composer-controls"><ModelSettings value={model.bot} state={model.modelSettings} disabled={model.sending} onChange={value=>callbacks.onModelSettings(model.bot.id,value)} onRefresh={callbacks.onRefreshModels}/><KeychainControl onInsert={insertSecure} onAdd={()=>addSecure()} onReplace={item=>addSecure(false,item)} bots={model.mentionBots}/><ContextMemoryControl botId={model.bot.id} request={callbacks.onContextRequest} refreshKey={model.events.at(-1)?.id}/></div>
+      <PromptInput id="message-form" className="timber-composer" disabled={model.sending||securing} accept="image/png,image/jpeg" multiple maxFiles={4} maxFileSize={5_000_000} onError={error=>setAttachmentError(error.message)} onReset={event => event.preventDefault()} onSubmit={async ({text,files}) => {
+        if(model.sending || securing || (!text.trim() && !files.length)) throw new Error('Not ready');
+        if(securePrompt && selectedMentions.length){setAttachmentError('Send private inputs to one bot at a time; grant other bots access from your keychain.');throw new Error('Unsupported recipients');}
         if(files.length && selectedMentions.length) {setAttachmentError('Image messages cannot mention other bots yet.');throw new Error('Unsupported recipients');}
         setAttachmentError('');
-        try {await callbacks.onSend(model.bot.id,text,selectedMentions.map(bot=>bot.id),files);} catch {setAttachmentError(`${files.length ? 'Images were' : 'Message was'} not delivered. Retry sending to check the same request safely.`);throw new Error('Not delivered');}
+        setSecuring(true);try {const secured=await secrets.flush(text);await callbacks.onSend(model.bot.id,secured,selectedMentions.map(bot=>bot.id),files);} catch(reason) {setAttachmentError(reason instanceof Error?reason.message:'The message was not delivered. Retry sending.');throw new Error('Not delivered');}finally{setSecuring(false);}
       }}>
-        <PromptInputBody><ImageControls sending={model.sending} hasText={!!model.draft.trim()} acceptedIds={model.acceptedImageIds}><PromptInputTextarea ref={textarea} id="message" rows={1} aria-label={`Message ${model.bot.name}`} placeholder={`Message ${model.bot.name}`} value={model.draft}
+        <PromptInputBody><ImageControls onSecureInput={()=>addSecure()} sending={model.sending||securing} hasText={!!model.draft.trim()} acceptedIds={model.acceptedImageIds}><>{securePrompt?<SecurePrompt value={model.draft} name={`Message ${model.bot.name}`} disabled={model.sending||securing} caret={caret} onCaret={setCaret} onRange={trackSelection} onKeyDown={mentionKeyDown} renderDraft={secrets.render} onChange={text=>{setMentionIndex(0);setDismissed(false);callbacks.onDraft(model.bot.id,text);}}/>:<PromptInputTextarea ref={textarea} id="message" rows={1} aria-label={`Message ${model.bot.name}`} placeholder={`Message ${model.bot.name}`} value={model.draft}
           aria-autocomplete="list" aria-controls={choices.length ? 'bot-mentions' : undefined} aria-expanded={choices.length > 0} aria-activedescendant={choices.length ? `mention-${choices[Math.min(mentionIndex, choices.length - 1)].id}` : undefined}
-          onChange={event => {pendingCaret.current=null;setCaret(event.currentTarget.selectionStart);setMentionIndex(0);setDismissed(false);callbacks.onDraft(model.bot.id, event.currentTarget.value);}}
-          onSelect={event => setCaret(event.currentTarget.selectionStart)}
-          onKeyDown={event => {
-            if (!choices.length || event.nativeEvent.isComposing) return;
-            if (event.key === 'Escape') {event.preventDefault();event.stopPropagation();setDismissed(true);}
-            else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {event.preventDefault();setMentionIndex(index => (index + (event.key === 'ArrowDown' ? 1 : choices.length - 1)) % choices.length);}
-            else if (event.key === 'Enter' && !event.shiftKey || event.key === 'Tab') {event.preventDefault();chooseMention(choices[Math.min(mentionIndex, choices.length - 1)]);}
-          }} />
+          onChange={event => {selection.current={start:event.currentTarget.selectionStart,end:event.currentTarget.selectionEnd};pendingCaret.current=null;setCaret(event.currentTarget.selectionStart);setMentionIndex(0);setDismissed(false);callbacks.onDraft(model.bot.id, event.currentTarget.value);}}
+          onSelect={event => trackSelection(event.currentTarget.selectionStart,event.currentTarget.selectionEnd)}
+          onBlur={event => trackSelection(event.currentTarget.selectionStart,event.currentTarget.selectionEnd)}
+          onKeyDown={mentionKeyDown} />}</>
           </ImageControls>{attachmentError && <div className="timber-attachment-error" role="alert">{attachmentError}</div>}
 
         </PromptInputBody>
@@ -739,7 +761,7 @@ function Chat({ model, callbacks, dockTarget, headerTarget }: { model: ChatModel
 export function mountChat(element: HTMLElement, callbacks: ChatCallbacks, loadArtifact: ArtifactLoader, headerTarget: HTMLElement | null) {
   const root = createRoot(element);
   let model: ChatModel | null = null, dockTarget: HTMLElement | null = null;
-  const render = () => root.render(model ? <ArtifactProvider load={loadArtifact}><Chat key={model.bot.id} model={model} callbacks={callbacks} dockTarget={dockTarget} headerTarget={headerTarget}/></ArtifactProvider> : null);
+  const render = () => root.render(model ? <ArtifactProvider load={loadArtifact}><KeychainProvider key={model.bot.id} botId={model.bot.id} botName={model.bot.name} request={callbacks.onContextRequest} refreshKey={model.events.filter(event=>event.type==='keychain.updated').at(-1)?.id}><Chat key={model.bot.id} model={model} callbacks={callbacks} dockTarget={dockTarget} headerTarget={headerTarget}/></KeychainProvider></ArtifactProvider> : null);
   return {
     update(value: ChatModel) {model = value; render();},
     setDock(target: HTMLElement | null) {if (dockTarget !== target) {dockTarget = target; render();}},
