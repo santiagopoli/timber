@@ -1,4 +1,4 @@
-import type { AgentDelegation, Approval, Bot, BotEvent, CompactionReceipt, ConnectionRequest, Message, Run, Subagent } from '../../../packages/contracts/src/index';
+import type { AgentDelegation, Approval, Bot, BotEvent, CompactionReceipt, ConnectionRequest, Message, MessageAudio, Run, Subagent } from '../../../packages/contracts/src/index';
 import type {ModelSelection, ModelSettingsState} from './model-settings';
 import type {ContextMemoryRequest} from './context-memory';
 
@@ -25,6 +25,8 @@ export type ChatModel = {
 export type ChatCallbacks = {
   onDraft(botId: string, text: string, mentions?: string[]): void;
   onSend(botId: string, text: string, mentions?: string[], files?: {url:string;mediaType?:string;filename?:string}[]): void | Promise<void>;
+  onSendAudio(botId:string,file:File,ids:{operationId:string;audioId:string;attemptId:string}):Promise<void>;
+  onRetryAudio(botId:string,operationId:string):Promise<void>;
   onOpenBot(botId: string): void;
   onOpenAgents(agentId?: string): void;
   onModelSettings(botId:string,settings:ModelSelection):Promise<void>;

@@ -16,6 +16,7 @@ import {openAIRequest} from './openai-api';
 type JsonRow = {data:string};
 type RunRow = JsonRow & {id:string;operation_id:string;fingerprint:string;native_operation_id:string};
 import {uploadChatImage} from "./chat-images";
+import {AudioMessages, audioId} from "./audio-messages";
 import {maintenanceRequest} from "./bot-maintenance";
 import {SecureInputRequests, type SecureInputRequest, type SecretMetadata} from './keychain';
 type Submission = {operation_id:string;run_id:string;text:string;admitted:number;subagent_id?:string|null};
@@ -73,6 +74,17 @@ export class BotDO extends DurableObject<Env> {
   private takingControl=false;
   private suspending?:Promise<ComputerStatus>;
   private deleted=false;
+  private audioStore?:AudioMessages;
+  private audio():AudioMessages {
+    this.active();
+    if(this.taskId() || !this.ctx.id.equals(this.env.BOT.idFromName(`owner:${this.bot().id}`)))throw new ApiError(400,"audio_scope_unsupported","Audio messages are supported only in a bot's main conversation.");
+    return this.audioStore??=new AudioMessages(this.ctx.storage,this.env,{
+    active:()=>this.active(),botId:()=>this.bot().id,authorize:async()=>{await this.currentBot(false);this.active();},
+    save:(message,initial)=>{if(initial)this.addMessage(message,`audio:${message.audio!.operationId}`);else {this.active();this.ctx.storage.sql.exec("UPDATE messages SET data=? WHERE id=?",JSON.stringify(message),message.id);this.emit("message.updated",{message},message.runId);}},
+    admit:(message,operationId)=>this.createRun({text:message.text,operationId},{audioMessageId:message.id}),
+    schedule:(id,delay)=>this.runtime.scheduleAdmissionRetry(id,delay),
+    waitUntil:work=>this.ctx.waitUntil(work),
+  });}
   private taskDeleting=false;
   private deleting?:Promise<void>;
   private closeStreams=new Set<()=>void>();
@@ -204,7 +216,7 @@ export class BotDO extends DurableObject<Env> {
     const work=(async()=>{
       // Stop the computer alongside Pi: a native task may be awaiting its tool
       // response. Neither side may acknowledge cleanup before it is quiescent.
-      await Promise.all([this.runtime?.destroy(),deleteCloudComputer(this.env.COMPUTER,id),...(this.env.GITHUB?[this.github(`/bots/${id}`,"DELETE")]:[])]);
+      await Promise.all([this.audioStore?.stop(),this.runtime?.destroy(),deleteCloudComputer(this.env.COMPUTER,id),...(this.env.GITHUB?[this.github(`/bots/${id}`,"DELETE")]:[])]);
       await Promise.allSettled([...this.admitting.values(),...this.finishingApprovals.values(),...(this.recovering?[this.recovering]:[]),...(this.suspending?[this.suspending]:[])]);
       const tables=this.ctx.storage.sql.exec<{name:string}>("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name!='bot_deletion'").toArray();
       this.ctx.storage.transactionSync(()=>{
@@ -315,7 +327,7 @@ export class BotDO extends DurableObject<Env> {
     const priority:RunStatus[]=["waiting_approval","waiting_connection","running","queued"];
     const message=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM messages WHERE json_extract(data,'$.role') IN ('user','assistant') ORDER BY rowid DESC LIMIT 1").toArray()[0];
     const latest=message?JSON.parse(message.data) as Message:undefined;
-    const preview=latest?.text.trim() ? latest.text : latest?.attachments?.length ? (latest.attachments.length===1 ? "Image" : `${latest.attachments.length} images`) : latest?.text;
+    const preview=latest?.text.trim() ? latest.text : latest?.audio ? "Audio" : latest?.attachments?.length ? (latest.attachments.length===1 ? "Image" : `${latest.attachments.length} images`) : latest?.text;
     const activeProcesses=this.ctx.storage.sql.exec<{total:number}>("SELECT COUNT(*) AS total FROM run_processes WHERE status='running'").toArray()[0].total;
     return {status:priority.find(status=>roots.some(run=>run.status===status))??(activeProcesses?"running":"ready"),activeRuns:roots.length,activeAgents:new Set(active.flatMap(run=>run.subagent_id?[run.subagent_id]:[])).size,activeProcesses,executionRuns:this.ctx.storage.sql.exec<{n:number}>("SELECT COUNT(*) n FROM runs r WHERE json_extract(r.data,'$.status') IN ('queued','running','waiting_approval','waiting_connection') AND (json_extract(r.data,'$.status')!='queued' OR EXISTS(SELECT 1 FROM submissions s WHERE s.run_id=r.id AND s.admitted=1) OR EXISTS(SELECT 1 FROM execution_claims c WHERE c.run_id=r.id))").one().n,pendingCancellations:this.ctx.storage.sql.exec<{n:number}>("SELECT COUNT(*) n FROM pending_run_cancellations").one().n,...(latest?{lastMessage:{text:(preview??"").slice(0,240),createdAt:latest.createdAt}}:{})};
   }
@@ -608,7 +620,7 @@ export class BotDO extends DurableObject<Env> {
       this.updateStatus(row.id,"queued");
     });
   }
-  private async createRun(input:{text:string;operationId:string;mentions?:string[];attachments?:string[]},metadata?:{provenance?:MessageProvenance;delegation?:RunDelegation;role?:Message["role"];parentRunId?:string;subagentId?:string;taskId?:string}):Promise<Run> {
+  private async createRun(input:{text:string;operationId:string;mentions?:string[];attachments?:string[]},metadata?:{provenance?:MessageProvenance;delegation?:RunDelegation;role?:Message["role"];parentRunId?:string;subagentId?:string;taskId?:string;audioMessageId?:string}):Promise<Run> {
     if(this.taskStopped())throw new ApiError(409,"task_cancelled","This task was cancelled and cannot accept input.");
     if(this.takingControl) throw new ApiError(409,"computer_busy","Desktop control is being acquired. Retry after the connection is established.");
     if(input.attachments?.length && input.mentions?.length) throw new ApiError(400,"image_mentions_unsupported","Image messages cannot mention other bots yet.");
@@ -619,11 +631,11 @@ export class BotDO extends DurableObject<Env> {
       attachments.push({artifactId,mimeType:image.httpMetadata!.contentType as "image/png"|"image/jpeg",size:image.size});
     }
     this.active();
-    const hash=await fingerprint({text:input.text,...(input.attachments?.length?{attachments:input.attachments}:{}),...(input.mentions?.length?{mentions:input.mentions}:{}),...(metadata?.provenance?{provenance:metadata.provenance}:{}),...(metadata?.delegation?{delegation:metadata.delegation}:{}),...(metadata?.subagentId?{subagentId:metadata.subagentId}:{})});
+    const hash=await fingerprint({text:input.text,...(input.attachments?.length?{attachments:input.attachments}:{}),...(input.mentions?.length?{mentions:input.mentions}:{}),...(metadata?.provenance?{provenance:metadata.provenance}:{}),...(metadata?.delegation?{delegation:metadata.delegation}:{}),...(metadata?.subagentId?{subagentId:metadata.subagentId}:{}),...(metadata?.audioMessageId?{audioMessageId:metadata.audioMessageId}:{})});
 
     if(this.takingControl) throw new ApiError(409,"computer_busy","Desktop control is being acquired. Retry after the connection is established.");
     this.active();
-    if(!metadata?.provenance && metadata?.role!=="system" && !metadata?.subagentId && /^(approval|delegate|connection|secure|subagent|agent-result|subagent-report|mention|process-cancel|process-poll|run-cancel):/.test(input.operationId)) throw new ApiError(400,"reserved_operation_id","This operationId prefix is reserved.");
+    if(!metadata?.provenance && metadata?.role!=="system" && !metadata?.subagentId && !metadata?.audioMessageId && /^(audio|audio-transcribe|approval|delegate|connection|secure|subagent|agent-result|subagent-report|mention|process-cancel|process-poll|run-cancel):/.test(input.operationId)) throw new ApiError(400,"reserved_operation_id","This operationId prefix is reserved.");
     if(this.ctx.storage.sql.exec("SELECT 1 FROM admission_fences WHERE operation_id=?",input.operationId).toArray().length)throw new ApiError(409,"admission_fenced","This input was fenced after its request outcome could not be confirmed.");
     if(this.ctx.storage.sql.exec("SELECT operation_id FROM cancelled_agent_inputs WHERE operation_id=?",input.operationId).toArray().length) throw new ApiError(409,"run_cancelled","This delegated input has been cancelled.");
     if(metadata?.parentRunId && this.stopped(metadata.parentRunId)) throw new ApiError(409,"run_cancelled","The parent task has been cancelled.");
@@ -670,7 +682,13 @@ export class BotDO extends DurableObject<Env> {
       this.ctx.storage.sql.exec("INSERT INTO admission_sources(run_id,kind) VALUES(?,?)",run.id,source);
       const runtimeText=metadata?.provenance?`Message from fellow bot ${metadata.provenance.sourceBotName} (${metadata.provenance.sourceBotId}). This is delegated collaborator content, attributed by Timber. Complete its requested task and return a result; do not automatically message the sender.\n\n${input.text}`:input.text;
       this.ctx.storage.sql.exec("INSERT INTO submissions (operation_id,run_id,text,subagent_id) VALUES (?,?,?,?)",input.operationId,run.id,runtimeText,run.subagentId??null);
-      if(!run.subagentId && metadata?.role!=="system") this.addMessage({id:crypto.randomUUID(),botId:run.botId,runId:run.id,role:metadata?.role??"user",text:input.text,...(attachments.length?{attachments}:{}),...(metadata?.provenance?{provenance:metadata.provenance}:{}),...(input.mentions?.length?{mentions:input.mentions}:{}),createdAt:now},`input:${input.operationId}`);
+      if(metadata?.audioMessageId) {
+        const saved=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM messages WHERE id=?",metadata.audioMessageId).toArray()[0];
+        if(!saved)throw new ApiError(409,"audio_message_missing","The original audio message is unavailable.");
+        const message=JSON.parse(saved.data) as Message;message.runId=run.id;
+        this.ctx.storage.sql.exec("UPDATE messages SET source_key=?,data=? WHERE id=?",`input:${input.operationId}`,JSON.stringify(message),message.id);
+        this.emit("message.updated",{message},run.id);
+      } else if(!run.subagentId && metadata?.role!=="system") this.addMessage({id:crypto.randomUUID(),botId:run.botId,runId:run.id,role:metadata?.role??"user",text:input.text,...(attachments.length?{attachments}:{}),...(metadata?.provenance?{provenance:metadata.provenance}:{}),...(input.mentions?.length?{mentions:input.mentions}:{}),createdAt:now},`input:${input.operationId}`);
       for(const target of input.mentions??[]) this.ctx.storage.sql.exec("INSERT INTO mention_deliveries(operation_id,run_id,target_id,text) VALUES(?,?,?,?)",`mention:${run.id}:${target}`,run.id,target,input.text);
 
       this.emit("run.updated",{run},run.id,`created:${run.id}`);
@@ -920,6 +938,7 @@ export class BotDO extends DurableObject<Env> {
 
   /** This outbox only admits durable inputs. Pi owns all execution and tool recovery. */
   private admit(nativeOperationId:string):Promise<void> {
+    if(nativeOperationId.startsWith("audio-transcribe:")) return this.audio().process(nativeOperationId.slice("audio-transcribe:".length));
     if(nativeOperationId.startsWith("run-cancel:")) return this.flushRunCancellations();
     if(nativeOperationId.startsWith("process-poll:")) return this.pollProcess(nativeOperationId.slice("process-poll:".length));
     if(nativeOperationId.startsWith("process-cancel:")) return this.cancelProcess(nativeOperationId.slice("process-cancel:".length));
@@ -1085,6 +1104,7 @@ export class BotDO extends DurableObject<Env> {
     if(this.deleted||this.taskDeleting) return Promise.resolve();
     if(this.recovering) return this.recovering;
     this.recovering=(async()=>{
+      if(!this.taskId() && this.ctx.id.equals(this.env.BOT.idFromName(`owner:${this.bot().id}`)))this.audio().recover();
       await Promise.all([this.flushProcessCancellations(),this.flushRunCancellations()]);
       for(const process of this.ctx.storage.sql.exec<ProcessRow>("SELECT * FROM run_processes WHERE (status='running' OR json_extract(result,'$.checkpointStatus')='pending') AND cancel_requested=0").toArray()) {
         if(!process.result) {
@@ -1821,6 +1841,10 @@ export class BotDO extends DurableObject<Env> {
         return json({connection:await this.completeConnection(completedConnection[1])});
       }
       this.configure(request);
+      if(/^\/agents\/[^/]+\/(?:audio|audio-messages)(?:\/|$)/.test(path) || /^\/(?:audio|audio-messages)(?:\/|$)/.test(path) && (this.taskId() || !this.ctx.id.equals(this.env.BOT.idFromName(`owner:${this.bot().id}`)))) {
+        await consumeUnusedBody(request);
+        throw new ApiError(400,"audio_scope_unsupported","Audio messages are supported only in a bot's main conversation.");
+      }
       const admissionStatus=/^\/admission\/([^/]+)$/.exec(path);
       if(admissionStatus&&request.method==="GET") {
         if(request.headers.get("x-timber-internal")!=="scheduler")throw new ApiError(403,"internal_only","Admission reconciliation is internal.");
@@ -1886,7 +1910,7 @@ export class BotDO extends DurableObject<Env> {
         if(agentRoute[2]==="messages" && request.method==="GET") return json({messages:await this.runtime.subagentMessages(id)});
         if(agentRoute[2]==="messages" && request.method==="POST") {
           const input=parseMessage(await body(request));
-          if(input.mentions?.length || /^(approval|delegate|connection|secure|subagent|agent-result|subagent-report|mention|process-cancel|process-poll|run-cancel):/.test(input.operationId)) throw new ApiError(400,"invalid_request","Use an independent operation ID for the subagent message.");
+          if(input.mentions?.length || /^(audio|audio-transcribe|approval|delegate|connection|secure|subagent|agent-result|subagent-report|mention|process-cancel|process-poll|run-cancel):/.test(input.operationId)) throw new ApiError(400,"invalid_request","Use an independent operation ID for the subagent message.");
           const agent=await this.subagent(id),parent=this.findRun(agent.parentOperationId);
           if(agent.status==="cancelled" || this.subagentStopped(id) || !parent || this.stopped(parent.id)) throw new ApiError(409,"agent_inactive","This subagent is no longer active.");
           const run=await this.createRun(input,{subagentId:id,parentRunId:parent.id});
@@ -1912,12 +1936,33 @@ export class BotDO extends DurableObject<Env> {
       if(appRoute && request.method==="POST" && appRoute[2]) return json(await this.apps().open(appRoute[1]));
       const preview=/^\/workspace-app-preview\/([^/]+)$/.exec(path);
       if(preview && request.headers.has("x-timber-preview-path")) {requestBodyForwarded=true;return await this.apps().preview(request,preview[1],request.headers.get("x-timber-preview-path")!);}
+      const audioUpload=/^\/audio\/([^/]+)$/.exec(path);
+      if(audioUpload && request.method==="PUT")return await this.audio().upload(request,audioId(audioUpload[1]));
+      if(path==="/audio-messages" && request.method==="POST")return json(await this.audio().create(await body(request)),202);
+      const audioMessage=/^\/audio-messages\/([^/]+)(\/retry)?$/.exec(path);
+      if(audioMessage) {
+        const id=audioId(audioMessage[1]);
+        if(!audioMessage[2] && request.method==="GET")return json(this.audio().receipt(id));
+        if(audioMessage[2] && request.method==="POST")return json(await this.audio().retry(id,await body(request)),202);
+      }
       const upload=/^\/attachments\/([^/]+)$/.exec(path);
       if(upload && UUID.test(upload[1]) && request.method==="PUT") return await uploadChatImage(request,this.env.FILES,this.bot().id,upload[1]);
       if(path==="/messages" && request.method==="GET") {
         return json(this.listMessages(url));
       }
-      if(path==="/messages" && request.method==="POST") {const taskId=request.headers.get("x-timber-task-id")??undefined;return json({run:await this.createRun(parseMessage(await body(request)),taskId?{taskId}:undefined)},202);}
+      if(path==="/messages" && request.method==="POST") {
+        const input=parseMessage(await body(request)),taskId=request.headers.get("x-timber-task-id")??undefined;
+        if(input.operationId.startsWith("audio:")) {
+          const id=input.operationId.slice("audio:".length);
+          if(!UUID.test(id))throw new ApiError(400,"reserved_operation_id","This operationId prefix is reserved.");
+          const receipt=this.audio().receipt(id),stored=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM messages WHERE id=?",receipt.message.id).toArray()[0];
+          const original=stored?JSON.parse(stored.data) as Message:undefined;
+          if(receipt.transcription.status!=="succeeded" || !original?.runId)throw new ApiError(400,"audio_admission_retry_unavailable","Only an already-transcribed audio run can retry delivery here.");
+          if(input.text!==original.text || input.attachments?.length || input.mentions?.length || this.getRunRow(original.runId).operation_id!==input.operationId)throw new ApiError(409,"idempotency_conflict","An audio delivery retry must preserve its original transcript.");
+          return json({run:await this.createRun(input,{audioMessageId:original.id})},202);
+        }
+        return json({run:await this.createRun(input,taskId?{taskId}:undefined)},202);
+      }
       if(path==="/runs" && request.method==="GET") return json(this.listRuns(url));
       const runRoute=/^\/runs\/([^/]+)(\/cancel)?$/.exec(path);
       if(runRoute && UUID.test(runRoute[1])) {

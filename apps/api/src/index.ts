@@ -63,7 +63,7 @@ export default {
         const response=await env.ASSETS.fetch(new Request(assetUrl,request));
         const headers=new Headers(response.headers);
         const previewOrigin=env.PREVIEW_ORIGIN && /^https:\/\/[a-z0-9.-]+$/.test(env.PREVIEW_ORIGIN)?env.PREVIEW_ORIGIN:"";
-        headers.set("content-security-policy",`default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ${url.origin.replace(/^http/, 'ws')}; img-src 'self' blob: data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' ${previewOrigin}`);
+        headers.set("content-security-policy",`default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ${url.origin.replace(/^http/, 'ws')}; img-src 'self' blob: data:; media-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' ${previewOrigin}`);
         // A cross-origin form POST with no-referrer sends Origin: null. The
         // app ticket handoff requires our exact origin, without a path/query.
         headers.set("referrer-policy","strict-origin");
@@ -125,6 +125,7 @@ export default {
         if(!created.ok) return created;
         return created;
       }
+      if(/^\/v1\/tasks\/[^/]+(?:\/agents\/[^/]+)?\/(?:audio|audio-messages)(?:\/|$)/.test(url.pathname))throw new ApiError(400,"audio_scope_unsupported","Audio messages are supported only in a bot's main conversation.");
       const taskRoute=/^\/v1\/tasks\/([0-9a-f-]{36})(?:\/(messages|runs(?:\/[0-9a-f-]{36}(?:\/cancel)?)?|events|start|continue|cancel|approvals(?:\/[0-9a-f-]{36})?|agents(?:\/[^/]+\/(?:messages|cancel))?|connections(?:\/[^/]+\/connect)?))?$/.exec(url.pathname);
       if(taskRoute) {
         const [,taskId,endpoint]=taskRoute;
@@ -203,6 +204,13 @@ export default {
         if(!UUID.test(artifact[1])) throw new ApiError(404,"not_found","Artifact not found.");
         const stored=await env.FILES.get(`bots/${botId}/artifacts/${artifact[1]}`);
         if(!stored) throw new ApiError(404,"not_found","Artifact not found.");
+        if(stored.customMetadata?.chatAudio==='true') {
+          // R2 lookup may outlive registry removal. Recheck after the await,
+          // before exposing any private audio bytes from the stored stream.
+          const live=await registry.fetch(`https://workspace/${botId}`);
+          if(!live.ok) {await stored.body.cancel();return live;}
+          await live.body?.cancel();
+        }
         const contentType=stored.httpMetadata?.contentType??"application/octet-stream";
         return new Response(stored.body,{headers:{"content-type":contentType,"content-disposition":`attachment; filename="${artifact[1]}"`,"cache-control":"private, no-store","x-content-type-options":"nosniff","content-security-policy":"sandbox; default-src 'none'"}});
       }
@@ -214,6 +222,7 @@ export default {
       headers.set("x-botspace-config",encodeURIComponent(JSON.stringify(bot)));
       const contentType=request.headers.get("content-type");
       if(contentType) headers.set("content-type",contentType);
+      if(tail.startsWith("/audio/") && request.headers.has("content-encoding"))headers.set("content-encoding",request.headers.get("content-encoding")!);
       const lastEvent=request.headers.get("last-event-id");
       if(lastEvent) headers.set("last-event-id",lastEvent);
       let admissionToken:string|undefined;

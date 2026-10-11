@@ -39,6 +39,7 @@ export function operationId(value:unknown):string {
 }
 export function parseMessage(value:unknown):{text:string;operationId:string;mentions?:string[];attachments?:string[]} {
   const data=object(value);
+  if(Object.keys(data).some(key=>["audio","audioId","transcription","attemptId"].includes(key)))throw new ApiError(400,"audio_message_route_required","Audio cannot be submitted through a text-message endpoint.");
     const text=string(data.text,"text",32_000,0);
   if(/\[private-draft:[a-f0-9-]{36}\]/i.test(text))invalid("Complete the private input before sending.");
   const attachments=data.attachments;

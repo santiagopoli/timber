@@ -7,7 +7,7 @@ export interface Env {
   PREVIEW_ORIGIN?: string;
   CHATGPT?: DurableObjectNamespace;
   CHATGPT_CREDENTIAL_KEY?: string;
-  /** Server-only Worker secret. Enables paid OpenAI model inference and Image API. */
+  /** Server-only Worker secret. Enables paid OpenAI model inference, Image API and audio transcription. */
   OPENAI_API_KEY?: string;
   /** Server-only inference credential. Enables the OpenRouter catalog and paid quota fallback. */
   OPENROUTER_API_KEY?: string;

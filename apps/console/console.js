@@ -227,6 +227,8 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   const chat = mountChat($('chat-root'), {
     onDraft: (botId, text, mentions) => { if (selected?.id === botId && authenticated) { drafts.set(botId, text); draftMentions.set(botId, (mentions || draftMentions.get(botId) || []).filter(id => bots.some(bot => bot.id === id && hasBotMention(text, bot.name)))); renderMessages(); } },
     onSend: (botId, text, mentions, files) => sendMessage(botId, text, undefined, mentions, files),
+    onSendAudio: sendAudioMessage,
+    onRetryAudio: retryAudioMessage,
     onOpenBot: openAgentBot,
     onOpenAgents: openAgents,
     onModelSettings:updateModelSettings,
@@ -773,6 +775,40 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
       if (validView(version) && sequence === agentsRequest && (currentPanel === 'agents' || subagents.some(agent => !terminal.has(agent.status)) || delegations.some(task => !terminal.has(task.status)))) agentsTimer=setTimeout(() => void loadAgents(version),3000);
     }
   }
+  async function sendAudioMessage(botId,file,ids) {
+    if(!authenticated||selected?.id!==botId)throw new Error('Select a bot before sending audio.');
+    const version=generation;
+    await request(`${botPath(botId)}/audio/${encodeURIComponent(ids.audioId)}`,{method:'PUT',body:file});
+    if(!validView(version)||selected?.id!==botId)throw new DOMException('The bot changed.','AbortError');
+    let receipt;
+    try{receipt=await request(`${botPath(botId)}/audio-messages`,{method:'POST',body:{operationId:ids.operationId,audioId:ids.audioId,attemptId:ids.attemptId}});}
+    catch(submissionError){
+      // Resolve a lost admission receipt through the safe GET before asking the
+      // user to consider another submission. This endpoint never dispatches work.
+      try{receipt=await request(`${botPath(botId)}/audio-messages/${encodeURIComponent(ids.operationId)}`);}
+      catch{throw submissionError;}
+    }
+    if(!validView(version)||selected?.id!==botId)throw new DOMException('The bot changed.','AbortError');
+    if(!receipt?.message?.audio||receipt.message.audio.artifactId!==ids.audioId)throw new Error('The audio receipt was invalid. Refresh conversation history to inspect its status.');
+    mergeMessagePage([receipt.message]);
+    if(receipt.run){runs.set(receipt.run.id,receipt.run);runsValueRevision++;}
+    renderMessages();if(receipt.run)renderRuns();
+  }
+  async function retryAudioMessage(botId,operationId) {
+    if(!authenticated||selected?.id!==botId)throw new Error('Select a bot before retrying audio.');
+    const version=generation,attemptId=crypto.randomUUID();
+    let receipt;
+    try{receipt=await request(`${botPath(botId)}/audio-messages/${encodeURIComponent(operationId)}/retry`,{method:'POST',body:{attemptId,acknowledgePaidRetry:true}});}
+    catch(submissionError){
+      // The retry's new attempt ID is already fixed; read status rather than
+      // risking a second paid attempt after an uncertain response.
+      try{receipt=await request(`${botPath(botId)}/audio-messages/${encodeURIComponent(operationId)}`);}
+      catch{throw submissionError;}
+    }
+    if(!validView(version)||selected?.id!==botId)throw new DOMException('The bot changed.','AbortError');
+    if(!receipt?.message?.audio||receipt.message.audio.operationId!==operationId)throw new Error('The audio retry receipt was invalid. Refresh conversation history to inspect its status.');
+    mergeMessagePage([receipt.message]);if(receipt.run){runs.set(receipt.run.id,receipt.run);runsValueRevision++;}renderMessages();if(receipt.run)renderRuns();
+  }
   async function sendMessage(botId, rawText, retryOperationId, mentions = [], files = []) {
     const text = rawText.trim(); if (!authenticated || selected?.id !== botId || (!text && !files.length && !retryOperationId) || sendBusy.has(botId)||modelSettingsWork.has(botId)) return;
     const session = authSession;
@@ -1156,6 +1192,10 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
         if (message.role === 'assistant') streamDrafts.delete(event.runId);
         reconcileDeliveries([...runs.values()]); renderMessages();
       }
+    }
+    if(event.type==='message.updated'){
+      const message=event.data.message;
+      if(message?.botId===selected?.id&&typeof message.id==='string'&&message.audio){mergeMessagePage([message]);renderMessages();}
     }
     if (event.type === 'run.updated' && event.data.run) {
       const run = event.data.run;

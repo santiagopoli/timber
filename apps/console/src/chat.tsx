@@ -27,6 +27,7 @@ import {useInlineSecrets} from './inline-secrets';
 import {SecurePill,SecurePrompt,secureReference,hasSecureReference,maskSecureReferences} from './secure-prompt';
 import type {SecretMetadata,SecureInputRequest} from '../../../packages/contracts/src/index';
 import {collectCompactions, CompactionPill, type CompactionItem} from './compaction-timeline';
+import {AudioComposer,AudioMessage,AudioProvider} from './audio-ui';
 import {mergeToolResult, mergeToolStatus, runOutcomes, toolActivityState, toolFailureSummary} from './cancellation-presentation';
 
 const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
@@ -375,7 +376,7 @@ const HistoryMessage = memo(function HistoryMessage({message, botId, botName, ru
   if (message.provenance) return <AgentMessageNotice notice={{direction:'from',agent:{id:message.provenance.sourceBotId,name:message.provenance.sourceBotName,kind:'bot',model:sourceModel},text:message.text,messageId:message.id,status:run?.status}} callbacks={callbacks} eventKey={`message:${message.id}`}/>;
   return <Message from={message.role === 'user' ? 'user' : 'assistant'} data-message-id={message.id} data-message-kind={message.kind} data-progress-message-id={message.kind === 'progress' ? message.id : undefined} data-run-id={message.runId} className={`timber-message timber-message-${message.role}`}>
     {message.role !== 'user' && <div className="timber-message-meta"><span>{message.role === 'assistant' ? botName : label(message.role)}</span></div>}
-    <MessageContent className="timber-message-content"><Response text={message.text} />{message.attachments?.map(image=><ArtifactPreview key={image.artifactId} botId={botId} artifactId={image.artifactId} compact />)}{outcome}{message.role === 'user' && <MessageRunStatus run={run} botId={botId} sending={sending} callbacks={callbacks} />}</MessageContent>
+    <MessageContent className="timber-message-content">{message.audio?<AudioMessage botId={botId} audio={message.audio} onRetry={operationId=>callbacks.onRetryAudio(botId,operationId)} busy={sending}/>:<Response text={message.text} />}{message.attachments?.map(image=><ArtifactPreview key={image.artifactId} botId={botId} artifactId={image.artifactId} compact />)}{outcome}{message.role === 'user' && <MessageRunStatus run={run} botId={botId} sending={sending} callbacks={callbacks} />}</MessageContent>
     {['user', 'assistant'].includes(message.role) && <CopyMessage text={message.text} createdAt={message.createdAt} />}
   </Message>;
 });
@@ -564,7 +565,7 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
   </>;
 }
 
-function ImageControls({sending,hasText,acceptedIds,children,onSecureInput}: {sending:boolean;hasText:boolean;acceptedIds?:string[];children:ReactNode;onSecureInput:()=>void}) {
+function ImageControls({sending,hasText,acceptedIds,children,onSecureInput,botId,onSendAudio,onAudioDraft,audioDraft}: {sending:boolean;hasText:boolean;audioDraft:boolean;acceptedIds?:string[];children:ReactNode;onSecureInput:()=>void;botId:string;onSendAudio:ChatCallbacks['onSendAudio'];onAudioDraft:(value:boolean)=>void}) {
   const attachments=usePromptInputAttachments();
   useEffect(()=>{
     for(const id of acceptedIds??[]) if(attachments.files.some(file=>file.id===id)) attachments.remove(id);
@@ -573,11 +574,12 @@ function ImageControls({sending,hasText,acceptedIds,children,onSecureInput}: {se
   return <>
     {attachments.files.length > 0 && <div className="timber-image-attachments" aria-label="Attached images">{attachments.files.map(file=><div key={file.id} className="timber-image-attachment">
       <img src={file.url} alt={file.filename || 'Attached image'} />
-      <button className="timber-image-remove" type="button" aria-label={`Remove ${file.filename || 'image'}`} title={`Remove ${file.filename || 'image'}`} disabled={sending} onClick={()=>attachments.remove(file.id)}><XIcon aria-hidden="true" /></button>
+      <button className="timber-image-remove" type="button" aria-label={`Remove ${file.filename || 'image'}`} title={`Remove ${file.filename || 'image'}`} disabled={sending||audioDraft} onClick={()=>attachments.remove(file.id)}><XIcon aria-hidden="true" /></button>
     </div>)}</div>}
+    <AudioComposer textPresent={hasText} imagePresent={attachments.files.length>0} sending={sending} onSend={(file,ids)=>onSendAudio(botId,file,ids)} onDraftState={onAudioDraft}/>
     <div className="timber-composer-row">{children}
-      <DropdownMenu.Root><DropdownMenu.Trigger asChild><Button className="timber-attach" type="button" variant="ghost" size="icon" disabled={sending} aria-label="Add" title="Add"><PlusIcon aria-hidden="true"/></Button></DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content className="timber-add-menu" side="top" align="end" sideOffset={8}><DropdownMenu.Item onSelect={onSecureInput}><LockKeyholeIcon/>Secure input</DropdownMenu.Item><DropdownMenu.Item disabled={full} onSelect={()=>attachments.openFileDialog()}><PaperclipIcon/>Attach images</DropdownMenu.Item></DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu.Root>
-      <PromptInputSubmit className="timber-send" aria-label="Send message" title="Send message" disabled={sending || (!hasText && !attachments.files.length)}>{sending ? <LoaderCircleIcon className="timber-spinner" aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}</PromptInputSubmit>
+      <DropdownMenu.Root><DropdownMenu.Trigger asChild><Button className="timber-attach" type="button" variant="ghost" size="icon" disabled={sending||audioDraft} aria-label="Add" title="Add"><PlusIcon aria-hidden="true"/></Button></DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content className="timber-add-menu" side="top" align="end" sideOffset={8}><DropdownMenu.Item onSelect={onSecureInput}><LockKeyholeIcon/>Secure input</DropdownMenu.Item><DropdownMenu.Item disabled={full||audioDraft} onSelect={()=>attachments.openFileDialog()}><PaperclipIcon/>Attach images</DropdownMenu.Item></DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu.Root>
+      <PromptInputSubmit className="timber-send" aria-label="Send message" title="Send message" disabled={sending||audioDraft || (!hasText && !attachments.files.length)}>{sending ? <LoaderCircleIcon className="timber-spinner" aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}</PromptInputSubmit>
     </div>
     {attachments.files.length > 0 && <div className="timber-attachment-status" role="status">{sending ? 'Sending images…' : `${attachments.files.length} of 4 images · Ready to send`}</div>}
   </>;
@@ -585,7 +587,7 @@ function ImageControls({sending,hasText,acceptedIds,children,onSecureInput}: {se
 
 function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallbacks }) {
   const textarea = useRef<HTMLTextAreaElement>(null);
-  const [attachmentError,setAttachmentError]=useState(''),[securing,setSecuring]=useState(false);
+  const [attachmentError,setAttachmentError]=useState(''),[securing,setSecuring]=useState(false),[audioDraft,setAudioDraft]=useState(false);
   const selection=useRef({start:model.draft.length,end:model.draft.length});
   const [,renderSelection]=useState(0);
   const trackSelection=(start:number,end:number)=>{if(start!==selection.current.start||end!==selection.current.end){selection.current={start,end};renderSelection(n=>n+1);}setCaret(start);};
@@ -660,7 +662,7 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
         setAttachmentError('');
         setSecuring(true);try {const secured=await secrets.flush(text);await callbacks.onSend(model.bot.id,secured,selectedMentions.map(bot=>bot.id),files);} catch(reason) {if(typeof record(reason).deliveryOperationId!=='string')setAttachmentError(reason instanceof Error?reason.message:'The message was not delivered. Retry sending.');throw new Error('Not delivered');}finally{setSecuring(false);}
       }}>
-        <PromptInputBody><ImageControls onSecureInput={()=>addSecure()} sending={model.sending||securing} hasText={!!model.draft.trim()} acceptedIds={model.acceptedImageIds}><>{securePrompt?<SecurePrompt value={model.draft} name={`Message ${model.bot.name}`} disabled={model.sending||securing} caret={caret} onCaret={setCaret} onRange={trackSelection} onKeyDown={mentionKeyDown} renderDraft={secrets.render} onChange={text=>{setMentionIndex(0);setDismissed(false);callbacks.onDraft(model.bot.id,text);}}/>:<PromptInputTextarea ref={textarea} id="message" rows={1} aria-label={`Message ${model.bot.name}`} placeholder={`Message ${model.bot.name}`} value={model.draft}
+        <PromptInputBody><ImageControls onSecureInput={()=>addSecure()} sending={model.sending||securing} hasText={!!model.draft.trim()} acceptedIds={model.acceptedImageIds} botId={model.bot.id} audioDraft={audioDraft} onSendAudio={callbacks.onSendAudio} onAudioDraft={setAudioDraft}><>{securePrompt?<SecurePrompt value={model.draft} name={`Message ${model.bot.name}`} disabled={model.sending||securing||audioDraft} caret={caret} onCaret={setCaret} onRange={trackSelection} onKeyDown={mentionKeyDown} renderDraft={secrets.render} onChange={text=>{setMentionIndex(0);setDismissed(false);callbacks.onDraft(model.bot.id,text);}}/>:<PromptInputTextarea ref={textarea} id="message" rows={1} aria-label={`Message ${model.bot.name}`} placeholder={`Message ${model.bot.name}`} value={model.draft} disabled={model.sending||securing||audioDraft}
           aria-autocomplete="list" aria-controls={choices.length ? 'bot-mentions' : undefined} aria-expanded={choices.length > 0} aria-activedescendant={choices.length ? `mention-${choices[Math.min(mentionIndex, choices.length - 1)].id}` : undefined}
           onChange={event => {selection.current={start:event.currentTarget.selectionStart,end:event.currentTarget.selectionEnd};pendingCaret.current=null;setCaret(event.currentTarget.selectionStart);setMentionIndex(0);setDismissed(false);callbacks.onDraft(model.bot.id, event.currentTarget.value);}}
           onSelect={event => trackSelection(event.currentTarget.selectionStart,event.currentTarget.selectionEnd)}
@@ -770,7 +772,7 @@ function Chat({ model, callbacks, dockTarget, headerTarget }: { model: ChatModel
 export function mountChat(element: HTMLElement, callbacks: ChatCallbacks, loadArtifact: ArtifactLoader, headerTarget: HTMLElement | null) {
   const root = createRoot(element);
   let model: ChatModel | null = null, dockTarget: HTMLElement | null = null;
-  const render = () => root.render(model ? <ArtifactProvider load={loadArtifact}><KeychainProvider key={model.bot.id} botId={model.bot.id} botName={model.bot.name} request={callbacks.onContextRequest} refreshKey={model.events.filter(event=>event.type==='keychain.updated').at(-1)?.id}><Chat key={model.bot.id} model={model} callbacks={callbacks} dockTarget={dockTarget} headerTarget={headerTarget}/></KeychainProvider></ArtifactProvider> : null);
+  const render = () => root.render(model ? <AudioProvider load={loadArtifact}><ArtifactProvider load={loadArtifact}><KeychainProvider key={model.bot.id} botId={model.bot.id} botName={model.bot.name} request={callbacks.onContextRequest} refreshKey={model.events.filter(event=>event.type==='keychain.updated').at(-1)?.id}><Chat key={model.bot.id} model={model} callbacks={callbacks} dockTarget={dockTarget} headerTarget={headerTarget}/></KeychainProvider></ArtifactProvider></AudioProvider> : null);
   return {
     update(value: ChatModel) {model = value; render();},
     setDock(target: HTMLElement | null) {if (dockTarget !== target) {dockTarget = target; render();}},

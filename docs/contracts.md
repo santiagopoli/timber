@@ -187,6 +187,45 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   Repeated IDs with identical content succeed; different content returns 409.
   Images are immutable R2 artifacts under the bot prefix, deleted with the bot.
   GET uses the existing authenticated artifact route, never a public URL.
+- PUT /v1/bots/:id/audio/:audioId uploads original audio under a client UUID
+  -> `{audio:{artifactId,mimeType,size,durationMs}}`. Private immutable R2 bytes
+  use the authenticated artifact route; identical content replays succeed and
+  different content under the same ID conflicts. MIME plus container/framing
+  validation enforces 20 MB and 10-minute bounds without decompressing audio or
+  trusting client duration. WebM bounds cover both accumulated packet samples
+  and the maximum observed packet end; optional duration tags must be bounded
+  and consistent with encoded audio. Audio downloads recheck live membership
+  after the R2 lookup before returning bytes. See [audio-messages.md](audio-messages.md) for the
+  intentionally limited codec/container subset and provider billing.
+- POST /v1/bots/:id/audio-messages `{audioId,operationId,attemptId}` -> 202
+  `{message,transcription,run?}`. All three IDs are UUIDs. The original audio
+  message is durable before transcription; repeated identical requests return its
+  current receipt. Audio is one standalone input: captions, images, mentions,
+  task conversations and temporary-agent conversations are not supported by this
+  endpoint. No additional empty user message is created for the transcript.
+- GET /v1/bots/:id/audio-messages/:operationId -> `{message,transcription,run?}`.
+  `Message.audio` contains immutable audio metadata, its operation ID and
+  `transcription:{attemptId,status,text?,errorCode?,error?}`. Status is `pending`,
+  `dispatching`, `succeeded`, `failed` or `uncertain`. `message.updated` events
+  expose subsequent transcript/status/run associations. Original bytes remain
+  playable on failure; no diagnostic or invented text is sent to the bot.
+- POST /v1/bots/:id/audio-messages/:operationId/retry
+  `{attemptId,acknowledgePaidRetry:true}` -> 202 `{message,transcription,run?}`.
+  A fresh attempt UUID explicitly authorizes a potentially additional API charge.
+  A duplicate attempt only returns its receipt. Successful or still-processing
+  attempts cannot be retried. A durable dispatch marker is flushed before the
+  OpenAI request; lost/interrupted responses remain uncertain and never trigger
+  automatic paid retries. Only successful nonempty provider text enters normal
+  admission, under stable input ID `audio:<operationId>`. Admission recovery may
+  retry that saved input without retranscribing; busy bots retain native steering.
+  Reserved `audio-transcribe:` identities cannot be supplied through ordinary
+  user-message POSTs. The existing explicit delivery-retry control may repost
+  `audio:<operationId>` only for an already-transcribed run, with its exact saved
+  transcript and no attachments or mentions; this does not retranscribe audio.
+  Bot deletion fences in-flight work and removes its audio artifacts. The server-only `OPENAI_API_KEY` is used solely with OpenAI
+  `POST /v1/audio/transcriptions`, model `gpt-4o-mini-transcribe`; no provider or
+  subscription fallback. The console shows separate API billing before Send and
+  before an explicit retry. Production entitlement is not verified locally.
 - POST /v1/bots/:id/messages {text,operationId,mentions?:string[],attachments?:string[]} -> 202 {run:Run}
   Up to four distinct uploaded image IDs are allowed; text can be empty only with
   an image. References from other bots or non-chat artifacts are rejected.
