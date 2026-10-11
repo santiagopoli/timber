@@ -32,7 +32,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   let botSummaryTimer,botSummaryLoading=false,botSummaryPending=false,botRenderKey='';
   const drafts = new Map(), draftMentions = new Map(), pendingMessages = new Map(), pendingActions = new Map(), computerPending = new Map(), stopping = new Set(), approvalWork = new Map(), approvalFeedback = new Map(), connectionWork = new Map(), appWork = new Map();
   let authenticated = false, bots = [], selected = null, currentRun = null, stoppableRun = null, generation = 0, authSession = 0;
-  let tasksView = null, showingTasks = false;
+  let tasksView = null, showingTasks = false, tasksInitialId = null, tasksInitialVersion = 0;
   let sessionController = new AbortController(), streamController, refreshTimer, progressTimer, computerStatusTimer;
   let computerStatusRequest = 0, currentPanel = 'conversation', workspaceExpanded = false, desktopFullscreen = false;
   const wideLayout = matchMedia('(min-width: 761px)'), tabletLayout = matchMedia('(max-width: 1099px)');
@@ -254,12 +254,20 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     onOpenBot: openAgentBot,
   });
   function setupTasksView() {
-    const props={request:(path,options)=>request(path,options),bots,onClose:()=>{if(selected){showingTasks=false;$('tasks-nav').classList.remove('active');$('global-tasks-workspace').hidden=true;$('bot-workspace').hidden=false;document.body.dataset.mobileView='bot';history.pushState(null,'',`${location.pathname}${location.search}#bot=${encodeURIComponent(selected.id)}`);}else showBotList();}};
+    const taskSession=authSession;
+    const props={request:(path,options)=>request(path,options),bots,initialTaskId:tasksInitialId,initialTaskVersion:tasksInitialVersion,onOpenBot:openAgentBot,onBotCreated:bot=>{
+      // A newly-created task bot belongs in the sidebar immediately. Refresh only
+      // the authenticated session that mounted this callback; never select it or
+      // disturb drafts/current view, and don't issue requests after logout/switch.
+      if(!authenticated||taskSession!==authSession||!bot?.id)return;
+      void loadBots().catch(error=>{if(authenticated&&taskSession===authSession)showError(error);});
+    },onClose:()=>{if(selected){showingTasks=false;tasksInitialId=null;$('tasks-nav').classList.remove('active');$('global-tasks-workspace').hidden=true;$('bot-workspace').hidden=false;document.body.dataset.mobileView='bot';history.pushState(null,'',`${location.pathname}${location.search}#bot=${encodeURIComponent(selected.id)}`);}else showBotList();}};
     if(tasksView)tasksView.update(props);else tasksView=mountTasks($('global-tasks-root'),props);
   }
-  function openTasks(updateHistory=true) {
-    if(!authenticated)return;showingTasks=true;setupTasksView();$('empty').hidden=true;$('bot-workspace').hidden=true;$('global-tasks-workspace').hidden=false;document.body.dataset.mobileView='tasks';$('tasks-nav').classList.add('active');
-    if(updateHistory)history.pushState(null,'',`${location.pathname}${location.search}#tasks`);
+  function openTasks(updateHistory=true,taskId=null) {
+    if(!authenticated)return;
+    showingTasks=true;tasksInitialId=taskId||null;tasksInitialVersion++;setupTasksView();$('empty').hidden=true;$('bot-workspace').hidden=true;$('global-tasks-workspace').hidden=false;document.body.dataset.mobileView='tasks';$('tasks-nav').classList.add('active');
+    if(updateHistory)history.pushState(null,'',`${location.pathname}${location.search}${tasksHash(taskId)}`);
   }
   function openAgents(id) {
     selectedAgentId=id || null;
@@ -566,7 +574,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     clearTimeout(avatarPollTimer);avatarRequest++;avatarHistoryPage=0;avatarThemeDraft='';avatarReasoningDraft=null;avatarSettings={themes:[],selection:null,avatars:[],jobs:[]};avatarModels={connected:false,vectorModels:[],imageModels:[],imageAvailable:false};avatarLoading=false;avatarAdmissions.clear();revokeAvatarUrls();$('avatar-error').textContent='';$('avatar-status').textContent='Sign in to load avatar settings.';
 
     stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId=null; cancelStreamRender(); resetConversationHistory(); generation++; authSession++; authenticated = false; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
-    showingTasks=false;if($('global-tasks-workspace'))$('global-tasks-workspace').hidden=true;tasksView?.unmount();tasksView=null;selected = null; currentRun = null; stoppableRun = null; bots = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
+    showingTasks=false;tasksInitialId=null;tasksInitialVersion=0;if($('global-tasks-workspace'))$('global-tasks-workspace').hidden=true;tasksView?.unmount();tasksView=null;selected = null; currentRun = null; stoppableRun = null; bots = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
     clearTimeout(botSummaryTimer);botSummaries.clear();botSummaryLoading=false;botSummaryPending=false;botRenderKey='';
     removedBots.clear(); deletionPending.clear(); deleteTarget = null; deleteBusy = false; editBotId = null; drafts.clear(); draftMentions.clear(); pendingMessages.clear(); acceptedImageIds.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); connectionWork.clear(); appWork.clear(); closeDialogs(); clearScreen();
     chatGPTConnected = false; chatGPTAccount = null; chatGPTBusy = false;
@@ -646,7 +654,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     avatar.querySelector('.timber-model-badge')?.remove();
     if(showBadge&&bot.model){const badge=el('span','timber-model-badge',modelBadgeLabel(bot.model));badge.dataset.model=bot.model;badge.setAttribute('aria-hidden','true');avatar.append(badge);}
   }
-  function updateBotHeader() { $('selected-name').textContent = selected.name; $('selected-avatar').textContent = selected.name.slice(0, 1).toUpperCase();$('selected-avatar').dataset.agentColor=agentColor(selected.id);decorateModelAvatar($('selected-avatar'),selected);decorateGlobalAvatar($('selected-avatar'),selected.id); $('selected-model').textContent = `${selected.runtime} · ${modelDescription(selected)}`; $('selected-computer-mode').textContent = selected.computerApprovalMode === 'automatic' ? 'Computer · Use authorized' : 'Computer · Ask for each action'; }
+  function updateBotHeader() { $('selected-task-link').hidden=!selected?.taskId; $('selected-name').textContent = selected.name; $('selected-avatar').textContent = selected.name.slice(0, 1).toUpperCase();$('selected-avatar').dataset.agentColor=agentColor(selected.id);decorateModelAvatar($('selected-avatar'),selected);decorateGlobalAvatar($('selected-avatar'),selected.id); $('selected-model').textContent = `${selected.runtime} · ${modelDescription(selected)}`; $('selected-computer-mode').textContent = selected.computerApprovalMode === 'automatic' ? 'Computer · Use authorized' : 'Computer · Ask for each action'; }
   function modelDisplayName(item){const name=String(item.name||item.id||'');const publisher=modelPublisherLabel(item);return publisher&&name.toLowerCase().startsWith(publisher.toLowerCase()+': ')?name.slice(publisher.length+2):name;}
   function modelSourceLabel(item){const source=item.routes?.[0]?.source;const paidFallback=item.routes?.slice(1).some(route=>route.source==='openai-api'||route.source==='openrouter');return source==='chatgpt'?`ChatGPT subscription${paidFallback?' · Fallback uses API credits':''}`:source==='openai-api'?'OpenAI API · Uses API credits':source==='openrouter'?'OpenRouter · Uses API credits':undefined;}
   function modelSettingsState(){const error=modelCatalogError||modelCatalog.error;const warnings=(modelCatalog.sources||[]).filter(source=>source.error).map(source=>source.error).join(' ');return {choices:(error?[]:modelCatalog.models).map(item=>({id:item.id,label:modelDisplayName(item),providerLabel:modelPublisherLabel(item),available:modelCatalog.connected,reasoningEfforts:item.reasoningEfforts||[],defaultReasoningEffort:item.defaultReasoningEffort,supportsFast:item.supportsFast===true,sourceLabel:modelSourceLabel(item)})),loading:modelCatalogLoading,error,message:warnings||(!modelCatalogLoading&&!modelCatalog.connected&&!error?'Connect ChatGPT or configure OpenAI API or OpenRouter to choose a model.':undefined)};}
@@ -681,13 +689,18 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   }
   function readModelForm(prefix){const model=$(`${prefix}-model`),reasoning=$(`${prefix}-reasoning`);return model.disabled||!model.value?{}:{model:model.value,...(!reasoning.disabled&&reasoning.value?{reasoningEffort:reasoning.value}:{}),fast:!$(`${prefix}-fast-field`).hidden&&$(`${prefix}-fast`).checked};}
   function refreshModelForms(){for(const [prefix,dialog]of [['bot','bot-dialog'],['edit','edit-dialog']])if($(dialog).open)renderModelForm(prefix,{model:$(`${prefix}-model`).value,reasoningEffort:$(`${prefix}-reasoning`).value,fast:$(`${prefix}-fast`).checked});}
-  function chosenHash() { const value = new URLSearchParams(location.hash.slice(1)).get('bot'); return /^[a-f\d-]{36}$/i.test(value || '') ? value : null; }
+  const uuidPattern=/^[a-f\d-]{36}$/i;
+  function chosenHash() { const value = new URLSearchParams(location.hash.slice(1)).get('bot'); return uuidPattern.test(value || '') ? value : null; }
+  function chosenTasksHash() { return new URLSearchParams(location.hash.slice(1)).has('tasks'); }
+  function chosenTaskId() { const value=new URLSearchParams(location.hash.slice(1)).get('task'); return chosenTasksHash()&&uuidPattern.test(value||'')?value:null; }
+  function tasksHash(taskId=null) { const hash=new URLSearchParams();hash.set('tasks','');if(uuidPattern.test(taskId||''))hash.set('task',taskId);return `#${hash.toString().replace(/^tasks=/,'tasks')}`; }
   async function selectBot(bot, {replace = false} = {}) {
     if (removedBots.has(bot.id)) return;
     document.body.dataset.mobileView = 'bot';
-    showingTasks=false;$('global-tasks-workspace').hidden=true;$('tasks-nav').classList.remove('active');
+    showingTasks=false;tasksInitialId=null;$('global-tasks-workspace').hidden=true;$('tasks-nav').classList.remove('active');
     if (wideLayout.matches && tabletLayout.matches) {botsCollapsed = true; renderLayout();}
     if (selected?.id === bot.id) {
+      $('empty').hidden=true;$('bot-workspace').hidden=false;$('global-tasks-workspace').hidden=true;
       history[replace ? 'replaceState' : 'pushState'](null, '', `${location.pathname}${location.search}#bot=${encodeURIComponent(bot.id)}`);
       if (!$('panel-computer').hidden) {desktop.setActive(true); void guarded(computerStatus);}
       return;
@@ -1420,7 +1433,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     void loadModelCatalog();
     void loadAvatarSettings();
     void chatGPTTask(loadChatGPT);
-    if(location.hash==='#tasks'){openTasks(false);return;}
+    if(chosenTasksHash()){openTasks(false,chosenTaskId());return;}
     const bot = bots.find(item => item.id === chosenHash()) || (!matchMedia('(max-width: 760px)').matches ? bots[0] : null);
     // Restore layout before the workspace becomes interactive. Late initial reads
     // must not close a menu or change the panel the user has already opened.
@@ -1429,7 +1442,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     else {botsCollapsed = false; showBotList(false);}
   }
   function showBotList(updateHistory = true) {
-    showingTasks=false;$('global-tasks-workspace').hidden=true;$('tasks-nav').classList.remove('active');
+    showingTasks=false;tasksInitialId=null;$('global-tasks-workspace').hidden=true;$('tasks-nav').classList.remove('active');
     $('bot-workspace').hidden=!selected;$('empty').hidden=Boolean(selected);
     document.body.dataset.mobileView = 'bots';
     desktop.setActive(false); stopComputerStatus();
@@ -1461,8 +1474,9 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     finally {button.disabled = false;}
   });
   $('bot-search').addEventListener('input', renderBots); $('reload-bots').addEventListener('click', () => guarded(loadBots));
-  const navigateHistory = () => {if(location.hash==='#tasks'){openTasks(false);return;}const bot = bots.find(item => item.id === chosenHash()); if (bot) void guarded(() => selectBot(bot, {replace: true})); else showBotList(false);};
-  $('tasks-nav').addEventListener('click',()=>openTasks());
+  const navigateHistory = () => {if(chosenTasksHash()){openTasks(false,chosenTaskId());return;}const bot = bots.find(item => item.id === chosenHash()); if (bot) void guarded(() => selectBot(bot, {replace: true})); else showBotList(false);};
+  $('tasks-nav').addEventListener('click',()=>openTasks(true,null));
+  $('selected-task-link').addEventListener('click',()=>{if(selected?.taskId)openTasks(true,selected.taskId);});
   window.addEventListener('hashchange', navigateHistory); window.addEventListener('popstate', navigateHistory);
   $('mobile-back')?.addEventListener('click', () => showBotList());
   $('mobile-account')?.addEventListener('click', () => $('settings-button').click());

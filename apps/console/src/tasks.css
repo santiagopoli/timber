@@ -82,3 +82,21 @@
 .timber-tasks-approval-actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-top:10px}
 @media(max-width:760px){.timber-tasks-filters button,.timber-tasks-approval summary{min-height:44px}.timber-tasks-detail-heading{flex-wrap:wrap}.timber-tasks-title-block{flex-basis:calc(100% - 50px)}.timber-tasks-approvals{max-height:32%}.timber-tasks-controls{flex-wrap:wrap}}
 @media(prefers-reduced-motion:reduce){.timber-tasks-spinner{animation:none}}
+.timber-tasks-create fieldset{display:flex;min-width:0;flex-direction:column;gap:10px;padding:0;border:0}
+.timber-tasks-create legend{padding:0;margin-bottom:2px;font-size:14px;font-weight:650}
+.timber-tasks-create fieldset>label:not(.timber-tasks-checkbox){font-weight:550;font-size:12px}
+.timber-tasks-new-bot{display:flex;min-width:0;flex-direction:column;gap:10px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}
+.timber-tasks-new-bot h4{margin:0;font-size:13px}
+.timber-tasks-new-bot label{font-size:12px;font-weight:550}
+.timber-tasks-new-bot .timber-tasks-hint{margin:0;overflow-wrap:anywhere}
+.timber-tasks-dedicated-badge{display:inline-flex;margin-left:7px;padding:2px 7px;border-radius:999px;background:var(--soft);color:var(--ink);font-size:10px;font-weight:600}
+@media(max-width:420px){.timber-tasks-overview-heading{gap:8px}.timber-tasks-overview-heading p{max-width:220px}.timber-tasks-create{padding:12px}.timber-tasks-create .timber-tasks-form-actions{flex-wrap:wrap}.timber-tasks-create .timber-tasks-form-actions button{min-height:44px}}
+@media(max-width:760px){.timber-tasks .timber-tasks-quiet,.timber-tasks .timber-tasks-icon-button,.timber-tasks .timber-tasks-action,.timber-tasks .timber-tasks-composer button,.timber-tasks-filters button{min-height:44px}.timber-tasks .timber-tasks-icon-button{width:44px;height:44px}.timber-tasks .timber-tasks-composer button{width:44px;height:44px}}
+@media(max-width:760px){
+  .timber-tasks{overflow-x:hidden}
+  .timber-tasks-overview,.timber-tasks-detail,.timber-tasks-create,.timber-tasks-new-bot,.timber-tasks-create fieldset{min-width:0;max-width:100%;box-sizing:border-box}
+  .timber-tasks-create input:not([type=checkbox]),.timber-tasks-create textarea,.timber-tasks-create select{min-height:44px;max-width:100%;font-size:16px}
+  .timber-tasks-checkbox{min-height:44px!important}
+  .timber-tasks-form-actions button,.timber-tasks-approval-actions button,.timber-tasks-controls button{min-height:44px}
+  .timber-tasks-card{overflow:hidden}
+}
