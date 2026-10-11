@@ -49,6 +49,11 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   the combined connected catalogs, deduplicated by exact model identity, with
   ordered public routes and supported reasoning/Fast options of the preferred route.
   A disconnected or unavailable catalogue has no invented model entries.
+  `ModelOption.publisher` identifies the model creator (for example `openai`,
+  `anthropic`, `google`) independently of `provider`, which selects inference
+  transport. OpenRouter discovery retains the publisher namespace from the
+  upstream model ID before canonicalization; ChatGPT account models use `openai`.
+  The console first selects this creator, then one of its concrete models.
 - GET /v1/bots -> {bots:Bot[]}
 - POST /v1/bots {name,instructions?,model?,reasoningEffort?,fast?,computerApprovalMode?,allowNamedAgents?} -> 201 {bot:Bot}
 - GET /v1/bots/:id -> {bot:Bot}

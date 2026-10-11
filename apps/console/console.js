@@ -4,6 +4,8 @@ import { mountAgents } from './src/agents.tsx';
 import { hasBotMention } from './src/mentions.ts';
 import {agentColor} from './src/agent-colors.ts';
 import {modelBadgeLabel} from './src/model-identity.tsx';
+import {mountModelPicker} from './src/model-picker.tsx';
+import {modelPublisherLabel} from './src/model-publisher.ts';
 import {canRetryAdmission} from './src/run-recovery.ts';
 import './src/agent-colors.css';
 import { createDesktopViewer } from './src/desktop.ts';
@@ -15,6 +17,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
 (() => {
   'use strict';
   const $ = (id) => document.getElementById(id);
+  const modelPickers=new Map(['bot-model','edit-model','avatar-theme-model'].map(id=>[id,mountModelPicker($(id))]));
   const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
   const activeAgentStatuses = new Set(['queued', 'running', 'waiting_approval', 'waiting_connection']);
   const guiActions = new Set(['navigate', 'click', 'move', 'doubleClick', 'drag', 'type', 'key', 'scroll']);
@@ -418,6 +421,10 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     $('avatar-image-capability').textContent=kind==='image'?imageInfo:disconnected?'No connected text-model catalogue. Connect the text-model account before generating SVG avatars.':avatarModels.error||'';
     $('avatar-image-capability').hidden=kind!=='image'&&!disconnected&&!avatarModels.error;
     $('avatar-create-submit').disabled=avatarLoading||!select.options.length;
+    modelPickers.get(select.id).update({choices:[...select.options].map(entry=>{
+      const model=options.find(option=>option.id===entry.value),value=model?avatarModelOption(model):{id:entry.value,label:entry.value};
+      return {...value,available:entry.dataset.available!=='false',selectable:true,providerLabel:modelPublisherLabel(model||value),unavailableReason:model?.reason||'Not currently available'};
+    }),disabled:avatarLoading||!select.options.length});
     renderAvatarCreateReasoning();
   }
   function renderAvatarCollection(){
@@ -630,7 +637,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     if(showBadge&&bot.model){const badge=el('span','timber-model-badge',modelBadgeLabel(bot.model));badge.dataset.model=bot.model;badge.setAttribute('aria-hidden','true');avatar.append(badge);}
   }
   function updateBotHeader() { $('selected-name').textContent = selected.name; $('selected-avatar').textContent = selected.name.slice(0, 1).toUpperCase();$('selected-avatar').dataset.agentColor=agentColor(selected.id);decorateModelAvatar($('selected-avatar'),selected);decorateGlobalAvatar($('selected-avatar'),selected.id); $('selected-model').textContent = `${selected.runtime} · ${modelDescription(selected)}`; $('selected-computer-mode').textContent = selected.computerApprovalMode === 'automatic' ? 'Computer · Use authorized' : 'Computer · Ask for each action'; }
-  function modelSettingsState(){const error=modelCatalogError||modelCatalog.error;const warnings=(modelCatalog.sources||[]).filter(source=>source.error).map(source=>source.error).join(' ');return {choices:(error?[]:modelCatalog.models).map(item=>({id:item.id,label:item.name,available:modelCatalog.connected,reasoningEfforts:item.reasoningEfforts||[],defaultReasoningEffort:item.defaultReasoningEffort,supportsFast:item.supportsFast===true,sourceLabel:item.routes?.[0]?.source==='chatgpt'?`ChatGPT subscription${item.routes.some(route=>route.source==='openrouter')?' · OpenRouter fallback uses API credits':''}`:item.routes?.[0]?.source==='openrouter'?'OpenRouter · Uses API credits':undefined})),loading:modelCatalogLoading,error,message:warnings||(!modelCatalogLoading&&!modelCatalog.connected&&!error?'Connect ChatGPT or configure OpenRouter to choose a model.':undefined)};}
+  function modelSettingsState(){const error=modelCatalogError||modelCatalog.error;const warnings=(modelCatalog.sources||[]).filter(source=>source.error).map(source=>source.error).join(' ');return {choices:(error?[]:modelCatalog.models).map(item=>({id:item.id,label:item.name,providerLabel:modelPublisherLabel(item),available:modelCatalog.connected,reasoningEfforts:item.reasoningEfforts||[],defaultReasoningEffort:item.defaultReasoningEffort,supportsFast:item.supportsFast===true,sourceLabel:item.routes?.[0]?.source==='chatgpt'?`ChatGPT subscription${item.routes.some(route=>route.source==='openrouter')?' · OpenRouter fallback uses API credits':''}`:item.routes?.[0]?.source==='openrouter'?'OpenRouter · Uses API credits':undefined})),loading:modelCatalogLoading,error,message:warnings||(!modelCatalogLoading&&!modelCatalog.connected&&!error?'Connect ChatGPT or configure OpenRouter to choose a model.':undefined)};}
   async function loadModelCatalog(){
     if(!authenticated)return;
     const session=authSession,sequence=++modelCatalogRequest;modelCatalogLoading=true;modelCatalogError='';renderMessages();
@@ -651,6 +658,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     if(!choice){const option=el('option','',current||'Provider default');option.value=current;select.append(option);}
     for(const item of state.choices){const option=el('option','',item.label);option.value=item.id;option.disabled=!item.available;select.append(option);}
     select.value=current;select.disabled=modelCatalogLoading||!state.choices.some(item=>item.available);
+    modelPickers.get(select.id).update({choices:state.choices,disabled:select.disabled,loading:state.loading});
     reasoning.replaceChildren();
     if(!choice?.defaultReasoningEffort){const option=el('option','','Provider default');option.value='';reasoning.append(option);}
     for(const effort of choice?.reasoningEfforts||[]){const option=el('option','',effort==='xhigh'?'Extra high':effort.replace(/^./,letter=>letter.toUpperCase()));option.value=effort;reasoning.append(option);}

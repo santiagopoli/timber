@@ -23,7 +23,7 @@ export function normalizeOpenRouterCatalog(value:unknown):ModelOption[] {
     if(!outputs.includes('text')||!inputs.includes('text')||!params.includes('tools'))continue;
     seen.add(id);
     const pricing=object(raw.pricing),input=price(pricing.prompt),output=price(pricing.completion),cachedInput=price(pricing.input_cache_read);
-    const option:ModelOption={id:canonicalModelId(id),canonicalId:canonicalModelId(id),name:typeof raw.name==='string'?raw.name.slice(0,120):id,provider:'openrouter',
+    const option:ModelOption={id:canonicalModelId(id),canonicalId:canonicalModelId(id),name:typeof raw.name==='string'?raw.name.slice(0,120):id,provider:'openrouter',publisher:id.split('/')[0],
       reasoningEfforts:params.includes('reasoning')||params.includes('reasoning_effort')?[...ROUTER_EFFORTS]:[],supportsFast:false,
       ...(positive(raw.context_length)?{contextWindow:positive(raw.context_length)}:{}),
       ...(positive(limits.max_completion_tokens)?{maxOutputTokens:positive(limits.max_completion_tokens)}:{}),

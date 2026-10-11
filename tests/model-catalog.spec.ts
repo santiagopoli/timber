@@ -14,9 +14,11 @@ afterEach(()=>vi.restoreAllMocks());
 describe('multiple concrete model catalogs',()=>{
   it('deduplicates exact identity, prefers subscription capabilities, and retains priced alternate routes',()=>{
     const catalog=combined();expect(catalog.models.map(model=>model.id)).toEqual(['gpt-6.1-sol','moonshotai/kimi-k3']);
-    const model=catalog.models[0];expect(model).toMatchObject({name:'GPT-6.1 Sol',provider:'openai',reasoningEfforts:['medium'],defaultReasoningEffort:'medium'});
+    const model=catalog.models[0];expect(model).toMatchObject({name:'GPT-6.1 Sol',provider:'openai',publisher:'openai',reasoningEfforts:['medium'],defaultReasoningEffort:'medium'});
     expect(model.routes?.map(route=>[route.source,route.modelId])).toEqual([['chatgpt','gpt-6.1-sol'],['openrouter','openai/gpt-6.1-sol']]);
     expect(model.routes?.[1].pricing).toEqual({input:3,output:15,cachedInput:.3});
+    expect(model.routes?.map(route=>route.publisher)).toEqual(['openai','openai']);
+    expect(catalog.models[1]).toMatchObject({provider:'openrouter',publisher:'moonshotai'});
   });
   it('never merges different versions by label and excludes latest aliases and non-agent models',()=>{
     const catalog=mergeModelCatalogs([{id:'openrouter',priority:10,catalog:router([

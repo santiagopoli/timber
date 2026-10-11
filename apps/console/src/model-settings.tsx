@@ -3,9 +3,10 @@ import {Popover} from 'radix-ui';
 import {ChevronDownIcon, LoaderCircleIcon, XIcon, ZapIcon} from 'lucide-react';
 import type {ModelSettings as InferenceSettings} from '../../../packages/contracts/src/index';
 import './model-settings.css';
+import {ModelPicker} from './model-picker';
 
 export type ModelChoice = {
-  id:string;label:string;available:boolean;unavailableReason?:string;sourceLabel?:string;
+  id:string;label:string;available:boolean;unavailableReason?:string;sourceLabel?:string;providerLabel?:string;
   reasoningEfforts:string[];defaultReasoningEffort?:string;supportsFast:boolean;
 };
 export type ModelSelection = InferenceSettings;
@@ -38,10 +39,7 @@ export function ModelSettings({value,state,onChange,onRefresh,disabled=false}: {
           {state.loading&&<p className="timber-model-help" role="status"><LoaderCircleIcon className="timber-spinner"/>Loading available models…</p>}
           {state.message&&<p className="timber-model-help">{state.message}</p>}
           {state.error&&<div className="timber-model-error" role="alert"><p>{state.error}</p><button type="button" onClick={onRefresh}>Try again</button></div>}
-          <label className="timber-model-field">Model<select aria-label="Model" value={value.model} disabled={disabled||saving||state.loading||!state.choices.some(choice=>choice.available)} onChange={event=>selectModel(event.currentTarget.value)}>
-            {!current&&<option value={value.model}>{value.model}</option>}
-            {state.choices.map(choice=><option key={choice.id} value={choice.id} disabled={!choice.available}>{choice.label}{choice.available?'':' · Unavailable'}</option>)}
-          </select></label>
+          <div className="timber-model-field"><span>Model</span><ModelPicker value={value.model} choices={state.choices} disabled={disabled||saving||!state.choices.some(choice=>choice.available)} loading={state.loading} onChange={selectModel}/></div>
           {current?.unavailableReason&&<p className="timber-model-help">{current.unavailableReason}</p>}
           {current?.sourceLabel&&<p className="timber-model-help">{current.sourceLabel}</p>}
           {Boolean(current?.reasoningEfforts.length)&&<label className="timber-model-field">Reasoning<select aria-label="Reasoning effort" value={value.reasoningEffort||current?.defaultReasoningEffort||''} disabled={disabled||saving||!current?.available} onChange={event=>void update({...value,reasoningEffort:event.currentTarget.value})}>
