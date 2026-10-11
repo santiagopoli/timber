@@ -9,6 +9,7 @@ import {createConsoleFixture, TEST_TOKEN, BOT_A, BOT_B} from './console-fixture.
 let browser;
 after(async()=>{await browser?.close();});
 const statuses=['pending','queued','running','waiting_approval','waiting_connection','cancelling','completed','failed','cancelled'];
+const TASK_RUNNING_ID='11000000-0000-4000-8000-000000000001',TASK_FAILED_ID='11000000-0000-4000-8000-000000000002';
 const deferred=()=>{let resolve;const promise=new Promise(done=>{resolve=done});return {promise,resolve};};
 async function withTasks(work,width=1440) {
   browser??=await chromium.launch({headless:true,
@@ -17,7 +18,7 @@ async function withTasks(work,width=1440) {
   });
   const fixture=await createConsoleFixture(),context=await browser.newContext({viewport:{width,height:900},colorScheme:'light'});
   const page=await context.newPage(),errors=[];page.on('pageerror',error=>errors.push(error.message));page.setDefaultTimeout(8000);
-  const tasks={records:statuses.map(status=>({id:`task-${status}`,title:`Task ${status}`,description:`Independent ${status} work`,botId:BOT_A,botName:'Ada',status,createdAt:'2026-10-05T10:00:00.000Z'})),messages:new Map(),approvals:new Map(),calls:[],modelsCalls:[],modelCatalog:{models:[{id:'catalog/model-one',name:'Model One'},{id:'catalog/model-two',name:'Anthropic: Anthropic: Claude Sonnet',publisher:'anthropic'}]},createErrors:0,createGate:null,modelsGate:null,createdByOperation:new Map(),readGates:new Map(),reads:[],sendGate:null,sendError:false};
+  const tasks={records:statuses.map(status=>({id:status==='running'?TASK_RUNNING_ID:status==='failed'?TASK_FAILED_ID:`task-${status}`,title:`Task ${status}`,description:`Independent ${status} work`,botId:BOT_A,botName:'Ada',status,createdAt:'2026-10-05T10:00:00.000Z'})),messages:new Map(),approvals:new Map(),calls:[],modelsCalls:[],modelCatalog:{models:[{id:'catalog/model-one',name:'Model One'},{id:'catalog/model-two',name:'Anthropic: Anthropic: Claude Sonnet',publisher:'anthropic'}]},createErrors:0,createGate:null,modelsGate:null,createdByOperation:new Map(),readGates:new Map(),reads:[],sendGate:null,sendError:false};
   for(const task of tasks.records)tasks.messages.set(task.id,[{id:`${task.id}-reply`,role:'assistant',text:`Private conversation for ${task.id}`}]);
   const fulfill=(route,value,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify(value)});
   await page.route('**/v1/tasks**',async route=>{
@@ -84,8 +85,8 @@ for(const width of [390,1440])test(`global tasks: default auto-start, explicit p
   await filters.getByRole('button',{name:'Pending',exact:true}).click();assert.deepEqual(await cards.evaluateAll(nodes=>nodes.map(node=>node.dataset.taskId)),['task-pending']);
   await filters.getByRole('button',{name:'Completed',exact:true}).click();assert.deepEqual(await cards.evaluateAll(nodes=>nodes.map(node=>node.dataset.taskId)),['task-completed']);
   await filters.getByRole('button',{name:'All',exact:true}).click();
-  await open('task-running');
-  assert.equal(await page.getByLabel('Task conversation').innerText().then(value=>value.includes('Private conversation for task-running')),true);
+  await open(TASK_RUNNING_ID);
+  assert.equal(await page.getByLabel('Task conversation').innerText().then(value=>value.includes(`Private conversation for ${TASK_RUNNING_ID}`)),true);
   assert.equal(await page.getByLabel('Task conversation').innerText().then(value=>value.includes('Organize the research notes')),false,'ordinary bot transcript is not copied into task chat');
   await page.getByLabel('Message this task').fill('Task-only follow-up');await page.getByRole('button',{name:'Send task message',exact:true}).click();
   await page.getByLabel('Task conversation').getByText('Task-only follow-up',{exact:true}).waitFor();
@@ -161,7 +162,7 @@ test('global tasks: dedicated bot form stays accessible and fits a 320px viewpor
   assert.equal(tasks.modelsCalls.length,modelsBefore+1,'opening new-bot form fetches model catalogue once');
   const geometry=await page.getByRole('region',{name:'Global tasks'}).evaluate(node=>({scroll:node.scrollWidth,width:node.clientWidth,right:node.getBoundingClientRect().right}));
   assert.ok(geometry.scroll<=geometry.width+1&&geometry.right<=321,'new-bot form does not overflow 320px viewport');
-  for(const locator of [page.getByRole('button',{name:'Create task',exact:true}),page.getByRole('button',{name:'Cancel',exact:true}),page.getByRole('button',{name:'New task',exact:true})])assert.ok(await locator.evaluate(node=>node.getBoundingClientRect().height>=44),'touch targets are at least 44px tall');
+  for(const locator of [page.getByRole('button',{name:'Create task',exact:true}),page.getByRole('button',{name:'Cancel',exact:true}),page.locator('.timber-tasks-overview-heading button')])assert.ok(await locator.evaluate(node=>node.getBoundingClientRect().height>=44),'touch targets are at least 44px tall');
   assert.equal(await page.getByLabel('Bot name',{exact:true}).inputValue(),'Narrow helper','task title is an editable suggested bot name');
 },320));
 
@@ -177,7 +178,7 @@ test('global tasks: model catalogue errors leave backend default and do not refe
 }));
 
 test('global tasks: initial task deep links change selection, return to overview, and ignore unrelated props',async()=>withTasks(async({page,tasks,login,open})=>{
-  const running=tasks.records.find(task=>task.id==='task-running'),failed=tasks.records.find(task=>task.id==='task-failed');
+  const running=tasks.records.find(task=>task.id===TASK_RUNNING_ID),failed=tasks.records.find(task=>task.id===TASK_FAILED_ID);
   for(const task of [running,failed]){const old=task.id;task.id=randomUUID();tasks.messages.set(task.id,tasks.messages.get(old));tasks.messages.delete(old);}
   await login();
   const navigate=async(hash)=>page.evaluate(value=>{history.pushState(null,'',`${location.pathname}${location.search}${value}`);dispatchEvent(new PopStateEvent('popstate'));},hash);
@@ -196,17 +197,43 @@ test('global tasks: initial task deep links change selection, return to overview
 test('global tasks: pending creation freezes every form mutation until atomic response',async()=>withTasks(async({page,tasks,login})=>{
   await login();await page.getByRole('button',{name:'New task',exact:true}).click();
   await page.getByLabel('Title',{exact:true}).fill('Freeze while creating');tasks.createGate=deferred();
-  const dispatched=page.waitForRequest(request=>request.method()==='POST'&&new URL(request.url()).pathname==='/v1/tasks'),response=page.waitForResponse(reply=>reply.request().method()==='POST'&&new URL(reply.url()).pathname==='/v1/tasks');
+  const dispatched=page.waitForRequest(request=>request.method()==='POST'&&new URL(request.url()).pathname==='/v1/tasks');
   await page.getByRole('button',{name:'Create task',exact:true}).click();await dispatched;
-  assert.equal(await page.locator('.timber-tasks-create fieldset').isDisabled(),true);
+  await page.waitForFunction(()=>{const title=document.getElementById('timber-task-title');return title instanceof HTMLInputElement&&title.matches(':disabled');});
+  assert.equal(await page.getByLabel('Title',{exact:true}).isDisabled(),true,'the actual Title input is disabled while creation is pending');
+  assert.equal(await page.locator('.timber-tasks-create fieldset').getAttribute('disabled'),'');
   assert.equal(await page.getByRole('button',{name:'Cancel',exact:true}).isDisabled(),true);
-  assert.equal(await page.getByRole('button',{name:'Close',exact:true}).isDisabled(),true,'form view cannot close during creation');
-  assert.equal(await page.getByRole('button',{name:'New task',exact:true}).isDisabled(),true,'new task view cannot toggle during creation');
+  assert.equal(await page.locator('.timber-tasks-topbar button').isDisabled(),true,'form view cannot close during creation');
+  assert.equal(await page.locator('.timber-tasks-overview-heading button').isDisabled(),true,'new task view cannot toggle during creation');
   assert.equal(await page.locator('.timber-tasks-create input').first().isDisabled(),true);
   assert.equal(await page.locator('.timber-tasks-card').first().isDisabled(),true,'switching to another task is frozen');
   assert.equal(tasks.calls.filter(call=>call.method==='POST'&&call.path==='/v1/tasks').length,1);
+  const response=page.waitForResponse(reply=>reply.request().method()==='POST'&&new URL(reply.url()).pathname==='/v1/tasks');
   tasks.createGate.resolve();await response;await page.locator('.timber-tasks-detail h2').filter({hasText:'Freeze while creating'}).waitFor();
 }));
+
+
+for(const width of [390,1440])test(`global tasks: bot and associated task navigate both ways without losing a draft at ${width}px`,async()=>withTasks(async({page,tasks,fixture,login,open})=>{
+  const linked=tasks.records.find(task=>task.id===TASK_RUNNING_ID),old=linked.id;
+  linked.id=randomUUID();linked.dedicatedBot=true;tasks.messages.set(linked.id,tasks.messages.get(old));tasks.messages.delete(old);
+  fixture.state.bots.find(bot=>bot.id===BOT_A).taskId=linked.id;
+  await login();
+  await open(linked.id);await page.getByRole('button',{name:'Open bot',exact:true}).click();
+  await page.locator('#bot-workspace').waitFor({state:'visible'});
+  const composer=page.locator('.timber-composer textarea');await composer.fill('Keep this ordinary draft');
+  const link=page.getByRole('button',{name:'Open associated task',exact:true});
+  for(let attempt=0;attempt<2;attempt++){
+    await link.click();await page.locator('.timber-tasks-detail h2').filter({hasText:'Task running'}).waitFor();
+    assert.equal(await page.locator('.timber-tasks-detail').getAttribute('data-task-id'),linked.id);
+    await page.getByRole('button',{name:'Back to tasks',exact:true}).click();
+    await page.locator('.timber-tasks-topbar button').click();
+    await page.locator('#bot-workspace').waitFor({state:'visible'});
+    assert.equal(await composer.inputValue(),'Keep this ordinary draft');
+  }
+  await link.click();await page.getByRole('button',{name:'Open bot',exact:true}).click();
+  await page.locator('#bot-workspace').waitFor({state:'visible'});assert.equal(await composer.inputValue(),'Keep this ordinary draft');
+  assert.equal(fixture.state.calls.filter(call=>call.method==='POST'&&call.path.endsWith('/messages')).length,0);
+},width));
 
 test('global tasks: approval decisions are task-scoped, expired/executing approvals cannot be approved',async()=>withTasks(async({page,tasks,fixture,login,open,back})=>{
   const approval=(id,status='pending',expiresAt=new Date(Date.now()+60000).toISOString())=>({id,status,action:{type:'exec',command:'printf task-only'},expiresAt});
@@ -221,14 +248,14 @@ test('global tasks: approval decisions are task-scoped, expired/executing approv
   await panel.locator('[data-task-approval-id="task-approval"]').waitFor({state:'detached'});
   assert.deepEqual(tasks.calls.find(call=>call.method==='POST'&&call.path.endsWith('/approvals/task-approval')).body,{decision:'approve'});
   assert.equal(fixture.state.approvals.get(BOT_A)[0].status,'pending');
-  tasks.approvals.set('task-running',[approval('denied-task-approval')]);await back();await open('task-running');
+  tasks.approvals.set(TASK_RUNNING_ID,[approval('denied-task-approval')]);await back();await open(TASK_RUNNING_ID);
   await panel.locator('[data-task-approval-id="denied-task-approval"]').getByRole('button',{name:'Deny',exact:true}).click();await panel.locator('[data-task-approval-id="denied-task-approval"]').waitFor({state:'detached'});
   assert.equal(tasks.calls.filter(call=>call.method==='POST'&&call.path.includes('/approvals/')).length,2);
   assert.equal(fixture.state.calls.filter(call=>call.method==='POST'&&call.path.includes('/approvals/')).length,0,'no decision is posted to the assigned bot conversation');
 }));
 
 test('global tasks: retry identities include task ID and late sends cannot clear a replacement task draft',async()=>withTasks(async({page,tasks,login,open,back})=>{
-  await login();await open('task-running');tasks.sendError=true;
+  await login();await open(TASK_RUNNING_ID);tasks.sendError=true;
   const send=async()=>{await page.getByLabel('Message this task').fill('Identical follow-up');const response=page.waitForResponse(reply=>reply.request().method()==='POST'&&new URL(reply.url()).pathname.endsWith('/messages'));await page.getByRole('button',{name:'Send task message',exact:true}).click();await response;await page.getByRole('alert').filter({hasText:'Send response unavailable.'}).waitFor();};
   await send();await send();const first=tasks.calls.filter(call=>call.method==='POST'&&call.path.endsWith('/messages'));
   assert.equal(first[0].body.operationId,first[1].body.operationId,'same failed task message preserves retry identity');
@@ -237,27 +264,27 @@ test('global tasks: retry identities include task ID and late sends cannot clear
   tasks.sendError=false;tasks.sendGate=deferred();
   const dispatched=page.waitForRequest(request=>request.method()==='POST'&&new URL(request.url()).pathname.endsWith('/messages'));
   await page.getByRole('button',{name:'Send task message',exact:true}).click();await dispatched;
-  await back();await open('task-running');await page.getByLabel('Message this task').fill('Keep this new draft');const sent=page.waitForResponse(response=>response.request().method()==='POST'&&new URL(response.url()).pathname.endsWith('/messages'));tasks.sendGate.resolve();await sent;
+  await back();await open(TASK_RUNNING_ID);await page.getByLabel('Message this task').fill('Keep this new draft');const sent=page.waitForResponse(response=>response.request().method()==='POST'&&new URL(response.url()).pathname.endsWith('/messages'));tasks.sendGate.resolve();await sent;
   await page.getByRole('button',{name:'Refresh task'}).click();await page.locator('.timber-tasks-detail h2').filter({hasText:'Task running'}).waitFor();
-  assert.equal(await page.getByLabel('Message this task').inputValue(),'Keep this new draft');assert.equal(await page.locator('.timber-tasks-detail').getAttribute('data-task-id'),'task-running');
+  assert.equal(await page.getByLabel('Message this task').inputValue(),'Keep this new draft');assert.equal(await page.locator('.timber-tasks-detail').getAttribute('data-task-id'),TASK_RUNNING_ID);
 }));
 
 test('global tasks: a delayed polling response cannot replace a new task view',async()=>withTasks(async({page,tasks,login,open,back})=>{
-  await page.clock.install();await login();await open('task-running');
-  const gate=deferred();tasks.readGates.set('task-running',gate);
-  const before=tasks.reads.length,polling=page.waitForRequest(request=>request.method()==='GET'&&new URL(request.url()).pathname==='/v1/tasks/task-running/messages');await page.clock.fastForward(8001);await polling;
-  assert.ok(tasks.reads.slice(before).some(read=>read.id==='task-running'),'real task interval initiates polling');
+  await page.clock.install();await login();await open(TASK_RUNNING_ID);
+  const gate=deferred();tasks.readGates.set(TASK_RUNNING_ID,gate);
+  const before=tasks.reads.length,polling=page.waitForRequest(request=>request.method()==='GET'&&new URL(request.url()).pathname===`/v1/tasks/${TASK_RUNNING_ID}/messages`);await page.clock.fastForward(8001);await polling;
+  assert.ok(tasks.reads.slice(before).some(read=>read.id===TASK_RUNNING_ID),'real task interval initiates polling');
   await back();await open('task-waiting_connection');gate.resolve();
   await page.getByRole('button',{name:'Refresh task'}).click();
   await page.getByLabel('Task conversation').getByText('Private conversation for task-waiting_connection',{exact:true}).waitFor();
   assert.equal(await page.locator('.timber-tasks-detail').getAttribute('data-task-id'),'task-waiting_connection');
-  assert.equal(await page.getByLabel('Task conversation').getByText('Private conversation for task-running',{exact:true}).count(),0);
+  assert.equal(await page.getByLabel('Task conversation').getByText(`Private conversation for ${TASK_RUNNING_ID}`,{exact:true}).count(),0);
 }));
 
 test('global tasks: signing out aborts pending task reads and stops polling after unmount',async()=>withTasks(async({page,tasks,login,open})=>{
-  await page.clock.install();await login();await open('task-running');
-  const gate=deferred();tasks.readGates.set('task-running',gate);
-  const polling=page.waitForRequest(request=>new URL(request.url()).pathname==='/v1/tasks/task-running/messages');
+  await page.clock.install();await login();await open(TASK_RUNNING_ID);
+  const gate=deferred();tasks.readGates.set(TASK_RUNNING_ID,gate);
+  const polling=page.waitForRequest(request=>new URL(request.url()).pathname===`/v1/tasks/${TASK_RUNNING_ID}/messages`);
   await page.clock.fastForward(8001);await polling;
   await page.getByRole('button',{name:'Settings',exact:true}).click();
   await page.getByRole('button',{name:'Sign out',exact:true}).click();await page.locator('#login').waitFor({state:'visible'});
@@ -282,15 +309,15 @@ test('global tasks: assigned bot defaults recover when the catalogue arrives or 
 }));
 
 for(const status of ['completed','failed'])test(`global tasks: ${status} Continue is an explicit new task input, cancelled tasks stay stopped`,async()=>withTasks(async({page,tasks,fixture,login,open,back})=>{
-  await login();await open(`task-${status}`);
+  const task=tasks.records.find(record=>record.status===status);await login();await open(task.id);
   await page.getByRole('button',{name:'Continue task',exact:true}).waitFor();
   assert.equal(await page.getByRole('button',{name:'Start task',exact:true}).count(),0);
   await page.getByLabel('Message this task').fill('New instructions, not an old action retry');
   await page.getByRole('button',{name:'Continue task',exact:true}).click();
   await page.getByLabel('Task conversation').getByText('New instructions, not an old action retry',{exact:true}).waitFor();
-  const calls=tasks.calls.filter(call=>call.method==='POST'&&call.path===`/v1/tasks/task-${status}/continue`);
+  const calls=tasks.calls.filter(call=>call.method==='POST'&&call.path===`/v1/tasks/${task.id}/continue`);
   assert.equal(calls.length,1);assert.equal(typeof calls[0].body.operationId,'string');assert.equal(calls[0].body.text,'New instructions, not an old action retry');
-  assert.equal(tasks.calls.filter(call=>call.method==='POST'&&call.path===`/v1/tasks/task-${status}/start`).length,0);
+  assert.equal(tasks.calls.filter(call=>call.method==='POST'&&call.path===`/v1/tasks/${task.id}/start`).length,0);
   assert.equal(fixture.state.calls.filter(call=>call.method==='POST'&&call.path===`/v1/bots/${BOT_A}/messages`).length,0);
   await back();await open('task-cancelled');assert.equal(await page.getByRole('button',{name:'Continue task',exact:true}).count(),0);assert.equal(await page.getByLabel('Message this task').count(),0);assert.equal(await page.getByText('Cancelled tasks stay stopped. Create a new task to work again.',{exact:true}).isVisible(),true);
 }));
@@ -298,12 +325,12 @@ for(const status of ['completed','failed'])test(`global tasks: ${status} Continu
 test('global tasks: same-task deep link reopens after internal back and browser history navigation',async()=>withTasks(async({page,login})=>{
   await login();
   const visit=async(hash)=>page.evaluate(value=>{history.pushState(null,'',`${location.pathname}${location.search}${value}`);dispatchEvent(new PopStateEvent('popstate'));},hash);
-  await visit('#tasks&task=task-running');await page.locator('.timber-tasks-detail[data-task-id="task-running"]').waitFor();
+  await visit(`#tasks&task=${TASK_RUNNING_ID}`);await page.locator(`.timber-tasks-detail[data-task-id="${TASK_RUNNING_ID}"]`).waitFor();
   await page.getByRole('button',{name:'Back to tasks'}).click();await page.getByRole('button',{name:'New task'}).waitFor();
-  await visit('#tasks&task=task-running');await page.locator('.timber-tasks-detail[data-task-id="task-running"]').waitFor();
-  await visit('#tasks&task=task-failed');await page.locator('.timber-tasks-detail[data-task-id="task-failed"]').waitFor();
-  await page.goBack();await page.locator('.timber-tasks-detail[data-task-id="task-running"]').waitFor();
-  await page.goForward();await page.locator('.timber-tasks-detail[data-task-id="task-failed"]').waitFor();
+  await visit(`#tasks&task=${TASK_RUNNING_ID}`);await page.locator(`.timber-tasks-detail[data-task-id="${TASK_RUNNING_ID}"]`).waitFor();
+  await visit(`#tasks&task=${TASK_FAILED_ID}`);await page.locator(`.timber-tasks-detail[data-task-id="${TASK_FAILED_ID}"]`).waitFor();
+  await page.goBack();await page.locator(`.timber-tasks-detail[data-task-id="${TASK_RUNNING_ID}"]`).waitFor();
+  await page.goForward();await page.locator(`.timber-tasks-detail[data-task-id="${TASK_FAILED_ID}"]`).waitFor();
 }));
 
 test('global tasks: bot-name suggestion is capped but editable and can be cleared for validation',async()=>withTasks(async({page,tasks,fixture,login})=>{
@@ -330,7 +357,8 @@ test('global tasks: late catalogue response cannot mutate a submitted draft or o
   const post=tasks.calls.filter(call=>call.method==='POST'&&call.path==='/v1/tasks').at(-1);
   assert.deepEqual(post.body.newBot,{name:'Clear identity',instructions:'Keep this instruction'});
   assert.ok(post.body.operationId);
-  tasks.modelsGate.resolve();await page.waitForTimeout(30);
+  tasks.modelsGate.resolve();
+  await page.locator('.timber-tasks-detail h2').filter({hasText:'Submitted before catalogue'}).waitFor();
   assert.equal(await page.locator('.timber-tasks-detail h2').innerText(),'Submitted before catalogue');
   assert.equal(tasks.calls.filter(call=>call.method==='POST'&&call.path==='/v1/tasks').length,1,'late catalogue did not trigger or mutate a second create');
 }));
@@ -338,10 +366,11 @@ test('global tasks: late catalogue response cannot mutate a submitted draft or o
 test('global tasks: a successful stale-view response retains draft and operation identity for safe replay',async()=>withTasks(async({page,tasks,fixture,login})=>{
   fixture.state.bots=[];await login();await page.getByRole('button',{name:'New task'}).click();
   await page.getByLabel('Title',{exact:true}).fill('Retain stale view draft');await page.getByLabel('Bot instructions',{exact:true}).fill('Still available after navigation');
-  tasks.createGate=deferred();const dispatched=page.waitForRequest(request=>request.method()==='POST'&&new URL(request.url()).pathname==='/v1/tasks'),response=page.waitForResponse(reply=>reply.request().method()==='POST'&&new URL(reply.url()).pathname==='/v1/tasks');
+  tasks.createGate=deferred();const dispatched=page.waitForRequest(request=>request.method()==='POST'&&new URL(request.url()).pathname==='/v1/tasks');
+  const response=page.waitForResponse(reply=>reply.request().method()==='POST'&&new URL(reply.url()).pathname==='/v1/tasks');
   await page.getByRole('button',{name:'Create task'}).click();await dispatched;
-  const visit=page.evaluate(()=>{history.pushState(null,'',`${location.pathname}${location.search}#tasks&task=task-failed`);dispatchEvent(new PopStateEvent('popstate'));});await visit;
-  await page.locator('.timber-tasks-detail[data-task-id="task-failed"]').waitFor();tasks.createGate.resolve();await response;
+  const visit=page.evaluate(taskId=>{history.pushState(null,'',`${location.pathname}${location.search}#tasks&task=${taskId}`);dispatchEvent(new PopStateEvent('popstate'));},TASK_FAILED_ID);await visit;
+  await page.locator(`.timber-tasks-detail[data-task-id="${TASK_FAILED_ID}"]`).waitFor();tasks.createGate.resolve();await response;
   await page.getByRole('button',{name:'Back to tasks'}).click();
   await page.getByLabel('Title',{exact:true}).waitFor();
   assert.equal(await page.getByLabel('Title',{exact:true}).inputValue(),'Retain stale view draft');

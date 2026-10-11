@@ -77,8 +77,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         if(!stopped.ok) throw new Error("Task shutdown pending");
         this.ctx.storage.transactionSync(()=>{
           this.ctx.storage.sql.exec("DELETE FROM task_slots WHERE bot_id=? AND task_id=?",item.bot_id,item.task_id);
-          const dedicated=this.ctx.storage.sql.exec("SELECT 1 FROM task_operations WHERE task_id=? AND fingerprint LIKE 'dedicated:v1:%' LIMIT 1",item.task_id).toArray().length>0;
-          if(!dedicated)this.ctx.storage.sql.exec("DELETE FROM task_operations WHERE task_id=?",item.task_id);
+          this.ctx.storage.sql.exec("DELETE FROM task_operations WHERE task_id=? AND fingerprint NOT LIKE 'dedicated:v1:%'",item.task_id);
           // Dedicated operation rows retain only an opaque digest and IDs; task
           // metadata is erased synchronously when deletion is requested.
           this.ctx.storage.sql.exec("DELETE FROM tasks WHERE id=?",item.task_id);
@@ -398,8 +397,9 @@ export class WorkspaceDO extends DurableObject<Env> {
         const tasks=this.ctx.storage.sql.exec<{id:string;data:string}>("SELECT id,data FROM tasks WHERE json_extract(data,'$.botId')=?",id).toArray();
         for(const entry of tasks) {
           this.ctx.storage.sql.exec("INSERT OR IGNORE INTO bot_task_deletions(task_id,bot_id) VALUES(?,?)",entry.id,id);
-          const dedicated=(JSON.parse(entry.data) as {dedicatedBot?:boolean}).dedicatedBot===true;
-          if(!dedicated)this.ctx.storage.sql.exec("DELETE FROM task_operations WHERE task_id=?",entry.id);
+          // Preserve only the opaque dedicated-creation replay fence. Continue
+          // receipts contain explicit user instructions and must be erased too.
+          this.ctx.storage.sql.exec("DELETE FROM task_operations WHERE task_id=? AND fingerprint NOT LIKE 'dedicated:v1:%'",entry.id);
           this.ctx.storage.sql.exec("DELETE FROM tasks WHERE id=?",entry.id);
         }
         this.ctx.storage.sql.exec("DELETE FROM bots WHERE id=?",id);

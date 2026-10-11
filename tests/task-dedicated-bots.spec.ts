@@ -1,7 +1,7 @@
 import {env,exports} from "cloudflare:workers";
-import {evictDurableObject,runInDurableObject} from "cloudflare:test";
-import {describe,expect,it} from "vitest";
-import type {Bot,Task} from "@botspace/contracts";
+import {evictDurableObject,reset,runInDurableObject} from "cloudflare:test";
+import {afterEach,describe,expect,it} from "vitest";
+import type {Bot,Task,ModelSettings} from "@botspace/contracts";
 import type {Env} from "../apps/api/src/env";
 
 const bindings=env as unknown as Env;
@@ -10,6 +10,8 @@ const api=async<T>(path:string,input?:unknown,token="test-only-botspace-owner-to
   return {status:response.status,data:await response.json<T>()};
 };
 const registry=()=>bindings.WORKSPACE.get(bindings.WORKSPACE.idFromName("owner"));
+
+afterEach(async()=>{await reset();});
 
 describe("native dedicated bot + global task creation",()=>{
   it("creates a paired pending bot/task with safe defaults and replays the same pair",async()=>{
@@ -42,7 +44,7 @@ describe("native dedicated bot + global task creation",()=>{
     const sameOperation=crypto.randomUUID();
     const invalidModel=await api("/v1/tasks",{...base,operationId:sameOperation,newBot:{name:"Unknown explicit model",model:"not-in-any-catalog"}});
     expect(invalidModel.status).toBe(409);
-    expect(invalidModel.data).toMatchObject({error:{code:"invalid_model_settings"}});
+    expect(invalidModel.data).toMatchObject({error:{code:"chatgpt_not_connected"}});
     const laterValid=await api("/v1/tasks",{...base,operationId:sameOperation,newBot:{name:"Valid after rejected explicit model"}});
     expect(laterValid.status).toBe(201);
     const operationId=crypto.randomUUID();
@@ -71,6 +73,18 @@ describe("native dedicated bot + global task creation",()=>{
     expect(taskTwo.equals(botTwo)).toBe(false);
     expect(botOne.equals(botTwo)).toBe(false);
     expect(taskOne.equals(taskTwo)).toBe(false);
+    const configuredOne=await runInDurableObject(bindings.BOT.get(taskOne),(_instance,state)=>JSON.parse(state.storage.sql.exec<{data:string}>("SELECT data FROM config WHERE id=1").one().data) as Bot);
+    const configuredTwo=await runInDurableObject(bindings.BOT.get(taskTwo),(_instance,state)=>JSON.parse(state.storage.sql.exec<{data:string}>("SELECT data FROM config WHERE id=1").one().data) as Bot);
+    expect(configuredOne.id).toBe(first.bot.id);expect(configuredTwo.id).toBe(second.bot.id);
+    expect(bindings.COMPUTER.idFromName(configuredOne.id).equals(bindings.COMPUTER.idFromName(configuredTwo.id))).toBe(false);
+    const control=async(path:string)=>{const response=await registry().fetch(`https://workspace${path}`,{method:"POST"});await response.arrayBuffer();return response.status;};
+    const claims=await Promise.all([control(`/tasks/${first.task.id}/claim`),control(`/tasks/${second.task.id}/claim`)]);
+    try {
+      expect(claims).toEqual([200,200]);
+      expect(await control(`/tasks/bot-slot/${first.bot.id}`)).toBe(409);
+      expect(await control(`/tasks/bot-slot/${second.bot.id}`)).toBe(409);
+    } finally {await control(`/tasks/${first.task.id}/release`);await control(`/tasks/${second.task.id}/release`);}
+
   });
 
   it("returns the fresh post-schedule task state for immediate starts",async()=>{
@@ -98,6 +112,29 @@ describe("native dedicated bot + global task creation",()=>{
     expect(left.data.task).toEqual(right.data.task);
     const count=await runInDurableObject(registry(),(_instance,state)=>state.storage.sql.exec("SELECT id FROM tasks WHERE json_extract(data,'$.title')=?",input.title).toArray().length);
     expect(count).toBe(1);
+  });
+
+  it("deduplicates and conflicts after explicitly gated asynchronous model validation",async()=>{
+    type Internals={modelSettings(input:ModelSettings):Promise<ModelSettings>};
+    let release!:()=>void,entered=0;
+    let gate=new Promise<void>(resolve=>{release=resolve});
+    let original!:Internals["modelSettings"];
+    await runInDurableObject(registry(),instance=>{
+      const target=instance as unknown as Internals;original=target.modelSettings;
+      target.modelSettings=async(input)=>{entered++;await gate;return original.call(target,input);};
+    });
+    const submit=(operationId:string,name:string)=>api<{task:Task;bot:Bot}>("/v1/tasks",{operationId,title:"Async validation",description:"",startImmediately:false,newBot:{name,model:"@cf/test/dedicated-race"}});
+    try {
+      const operationId=crypto.randomUUID(),left=submit(operationId,"Identical async pair"),right=submit(operationId,"Identical async pair");
+      await expect.poll(()=>entered).toBe(2);release();
+      const pair=await Promise.all([left,right]);expect(pair.map(value=>value.status).sort()).toEqual([200,201]);expect(pair[0].data).toEqual(pair[1].data);
+      const nextOperation=crypto.randomUUID();entered=0;gate=new Promise<void>(resolve=>{release=resolve});
+      const differentLeft=submit(nextOperation,"Conflict async left"),differentRight=submit(nextOperation,"Conflict async right");
+      await expect.poll(()=>entered).toBe(2);release();
+      const conflict=await Promise.all([differentLeft,differentRight]);expect(conflict.map(value=>value.status).sort()).toEqual([201,409]);
+      const counts=await runInDurableObject(registry(),(_instance,state)=>state.storage.sql.exec<{count:number}>("SELECT count(*) AS count FROM bots WHERE json_extract(data,'$.name') IN ('Conflict async left','Conflict async right')").one().count);
+      expect(counts).toBe(1);
+    } finally {release();await runInDurableObject(registry(),instance=>{(instance as unknown as Internals).modelSettings=original;});}
   });
 
   it("keeps the bot on task cancellation and never resurrects it after explicit deletion",async()=>{
@@ -140,6 +177,37 @@ describe("native dedicated bot + global task creation",()=>{
     const finalized=await registry().fetch(`https://workspace/tasks/${completed.data.task.id}`,{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({status:"completed"})});
     expect(finalized.status).toBe(200);
     expect((await api<{bot:Bot}>(`/v1/bots/${completed.data.bot.id}`)).status).toBe(200);
+  });
+
+
+  it("erases private continuation and legacy receipts while retaining only the dedicated creation digest",async()=>{
+    const operationId=crypto.randomUUID();
+    const paired=await api<{task:Task;bot:Bot}>("/v1/tasks",{operationId,title:"Private deletion pair",description:"Private initial description",startImmediately:false,newBot:{name:"Private deletion bot"}});
+    expect(paired.status).toBe(201);
+    const legacy=await api<{task:Task}>("/v1/tasks",{operationId:crypto.randomUUID(),title:"Legacy private task",description:"Private legacy description",botId:paired.data.bot.id,startImmediately:false});
+    expect(legacy.status).toBe(201);
+    const held=await registry().fetch(`https://workspace/tasks/bot-slot/${paired.data.bot.id}`,{method:"POST"});
+    expect(held.status).toBe(200);await held.arrayBuffer();
+    // Pin the legitimate ordinary-work admission so slot reconciliation cannot
+    // reclaim an otherwise idle fixture bot and start inference behind the test.
+    const pinned=await registry().fetch(`https://workspace/tasks/bot-slot/${paired.data.bot.id}/admissions`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId:crypto.randomUUID()})});
+    expect(pinned.status).toBe(200);await pinned.arrayBuffer();
+    const finalized=await registry().fetch(`https://workspace/tasks/${paired.data.task.id}`,{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({status:"completed"})});
+    expect(finalized.status).toBe(200);await finalized.arrayBuffer();
+    const continuationId=crypto.randomUUID(),text="PRIVATE CONTINUATION MUST BE ERASED";
+    const continued=await api(`/v1/tasks/${paired.data.task.id}/continue`,{operationId:continuationId,text});
+    expect(continued.status).toBe(202);
+    const continuedKey=`task-continue:${paired.data.task.id}:${continuationId}`;
+    const before=await runInDurableObject(registry(),(_instance,state)=>state.storage.sql.exec<{fingerprint:string}>("SELECT fingerprint FROM task_operations WHERE operation_id=?",continuedKey).one().fingerprint);
+    expect(before).toContain(text);
+    const deleted=await exports.default.fetch(`https://timber.test/v1/bots/${paired.data.bot.id}`,{method:"DELETE",headers:{authorization:"Bearer test-only-botspace-owner-token-000000"}});
+    expect(deleted.status).toBe(200);await deleted.arrayBuffer();
+    const receipts=await runInDurableObject(registry(),(_instance,state)=>state.storage.sql.exec<{operation_id:string;task_id:string;fingerprint:string}>("SELECT operation_id,task_id,fingerprint FROM task_operations WHERE task_id IN (?,?)",paired.data.task.id,legacy.data.task.id).toArray());
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]).toMatchObject({operation_id:operationId,task_id:paired.data.task.id});
+    expect(receipts[0].fingerprint).toMatch(/^dedicated:v1:[0-9a-f]{64}$/);
+    await evictDurableObject(registry());
+    expect((await api(`/v1/tasks/${paired.data.task.id}`)).status).toBe(404);
   });
 
   it("keeps legacy existing-bot creation backward compatible and owner auth fail-closed",async()=>{
