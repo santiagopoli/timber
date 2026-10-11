@@ -25,14 +25,23 @@ export function useInlineSecrets(value:string,onChange:(text:string,swap?:Swap)=
     const id=crypto.randomUUID(),element=document.createElement('span'),field=document.createElement('span'),input=document.createElement('textarea'),error=document.createElement('span');
     element.className='timber-private-chip timber-private-edit';element.contentEditable='false';element.dataset.secureRef=privateDraftReference(id);element.title='Private input · Enter to save';
     field.className='timber-private-field';
-    input.className='timber-private-text timber-private-inline';input.rows=1;input.wrap='off';input.maxLength=16_000;input.setAttribute('aria-label','Private input');input.autocomplete='off';input.spellcheck=false;input.setAttribute('autocapitalize','none');input.dataset.secureValue='';input.dataset.focusPrivate='';
-    input.value=convert?current.current.slice(start,end):'';field.dataset.empty=String(!input.value);input.oninput=()=>{field.dataset.empty=String(!input.value);};
+    input.className='timber-private-text timber-private-inline';input.rows=1;input.wrap='off';input.maxLength=16_000;input.setAttribute('aria-label','Private input');input.autocomplete='off';input.spellcheck=false;input.setAttribute('autocapitalize','none');input.setAttribute('autocorrect','off');input.dataset.secureValue='';input.dataset.focusPrivate='';
+    input.value=convert?current.current.slice(start,end):'';field.dataset.empty=String(!input.value);
+    const measure=document.createElement('canvas').getContext('2d');
+    const size=()=>{
+      field.dataset.empty=String(!input.value);
+      if(measure)measure.font=getComputedStyle(input).font;
+      const width=Math.max(48,...input.value.split('\n').map(line=>measure?.measureText(line).width??line.length*8));
+      field.style.setProperty('--private-input-width',`${Math.min(240,Math.ceil(width)+4)}px`);
+    };
+    input.onfocus=size;input.oninput=size;
     error.className='timber-secure-inline-error';error.setAttribute('role','alert');
     const remove=()=>{input.value='';drafts.current.delete(id);const text=current.current.replaceAll(privateDraftReference(id),'');current.current=text;onChange(text);};
     input.onkeydown=event=>{event.stopPropagation();if(event.isComposing)return;if(event.key==='Escape'||event.key==='Backspace'&&!input.value){event.preventDefault();remove();}else if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();void commit(id).catch(()=>{});}};
     input.onblur=()=>{if(input.value&&!drafts.current.get(id)?.pending)void commit(id).catch(()=>{});};
-    // The same six-dot artwork is used before and after save. The private DOM
-    // field remains editable underneath; its contents never become layout text.
+    // Show the DOM field only while editing. Blur clears it before the save
+    // request, and the same six-dot artwork used by saved pills takes its place.
+    // Measure width without copying the value into text nodes or React state.
     field.append(input,createDots());element.append(createLockIcon(),field,error);drafts.current.set(id,{element,input,error,replacement});
     const text=current.current.slice(0,start)+privateDraftReference(id)+current.current.slice(end);current.current=text;onChange(text);
     if(convert&&end>start)void commit(id).catch(()=>{});

@@ -109,8 +109,9 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   .env files, shell injection or app-wide provider billing configuration.
 
   The console offers Add → Secure input and Secure input in the @ dropdown.
-  The masked field appears as the same compact locked pill inside the composer.
-  Enter, leaving the field or sending saves it; six centered dots remain, there is no reveal control. Selected existing text
+  The locked pill shows the value while its field is focused, growing to a bounded
+  width. Enter, leaving the field or sending clears the visible field and saves it;
+  the pill contracts to six centered dots, with no reveal control. Selected existing text
   can be converted directly with Make selection secure (or Add → Secure input).
   Owners write around pills, insert multiple inputs and reuse entries from their
   shared Keychain. The keychain lets them grant/revoke bots, replace a value or
@@ -119,7 +120,7 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   to the backend. The agent prepares credential format from surrounding text.
   Removing a pill or discarding a draft does not revoke an already saved entry.
   Private fields clear on save, removal, bot switch and logout. Their values stay
-  in masked DOM fields and the dedicated encrypted-write request, not React state,
+  in temporary DOM fields and the dedicated encrypted-write request, not React state,
   browser storage or message-delivery retries. Converting ordinary selected text
   immediately replaces it in the chat draft. An uncertain save reloads metadata
   and asks the owner to inspect the keychain before submitting another value.

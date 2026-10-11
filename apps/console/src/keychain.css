@@ -15,9 +15,12 @@
 .timber-private-chip{height:1.3em;line-height:1;align-items:center;position:relative}.timber-private-chip svg.timber-private-dots{width:30px;height:11px;opacity:1}
 .timber-composer .timber-private-edit{min-height:0;height:1.3em;padding:0 3px;gap:3px;border:1px solid color-mix(in srgb,var(--ink) 30%,var(--line));background:color-mix(in srgb,var(--ink) 17%,var(--bg));line-height:1;white-space:nowrap;vertical-align:baseline}
 .timber-private-edit:focus-within{outline:1px solid var(--muted);outline-offset:2px}.timber-private-edit[aria-busy=true]{opacity:.6}
-.timber-private-field{display:inline-flex;position:relative;align-items:center;justify-content:center;width:30px;height:11px;flex:none}
+.timber-private-field{display:inline-flex;position:relative;align-items:center;justify-content:center;width:30px;height:11px;flex:0 1 auto;min-width:0}
 .timber-private-field>svg{pointer-events:none}
 .timber-composer textarea.timber-private-inline{position:absolute;inset:-5px 0;flex:none;width:30px;min-width:30px;height:21px;min-height:21px;max-height:21px;padding:0;field-sizing:fixed;line-height:21px;white-space:pre;overflow:hidden;background:transparent;color:transparent;-webkit-text-fill-color:transparent;caret-color:var(--ink);opacity:1;font-size:16px}
+.timber-private-edit:focus-within:not([aria-busy=true]) .timber-private-field{width:var(--private-input-width,52px);height:100%}
+.timber-private-edit:focus-within:not([aria-busy=true]) .timber-private-field>svg{display:none}
+.timber-composer .timber-private-edit:focus-within:not([aria-busy=true]) textarea.timber-private-inline{position:relative;inset:auto;width:100%;min-width:0;height:100%;min-height:0;max-height:none;line-height:1;border:0;border-radius:0;outline:0;resize:none;color:var(--ink);-webkit-text-fill-color:currentColor;-webkit-text-security:none;text-security:none}
 .timber-private-edit:has(.timber-secure-inline-error:not(:empty)){height:auto;flex-wrap:wrap;white-space:normal}
 .timber-composer .timber-private-edit>svg{width:11px;height:11px}
 .timber-private-field[data-empty=true]>svg{opacity:.35}
