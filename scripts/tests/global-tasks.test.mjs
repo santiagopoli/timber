@@ -65,8 +65,10 @@ async function withTasks(work,width=1440) {
   });
   await page.route('**/v1/models',async route=>{tasks.modelsCalls.push({method:route.request().method(),path:new URL(route.request().url()).pathname});if(tasks.modelsGate)await tasks.modelsGate.promise;return fulfill(route,tasks.modelCatalog);});
   const login=async()=>{
+    await page.goto(fixture.url);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').waitFor({state:'visible'});
+    // The response timeout must cover authentication/catalogue work, not page boot.
     const modelCatalog=page.waitForResponse(response=>new URL(response.url()).pathname==='/v1/models');
-    await page.goto(fixture.url);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('#app').waitFor({state:'visible'});await modelCatalog;
+    await page.locator('#connect-form button').click();await page.locator('#app').waitFor({state:'visible'});await modelCatalog;
     await page.locator('#tasks-nav').click();await page.getByRole('region',{name:'Global tasks'}).waitFor();await page.locator('.timber-tasks-card').first().waitFor();
   };
   const open=async id=>{await page.locator(`.timber-tasks-card[data-task-id="${id}"]`).click();await page.locator('.timber-tasks-detail h2').filter({hasText:tasks.records.find(item=>item.id===id).title}).waitFor();};
