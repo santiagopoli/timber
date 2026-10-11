@@ -2564,24 +2564,27 @@ test('disconnecting ChatGPT immediately makes model controls read-only',async()=
   await withPage(async({page,state,login})=>{
     await page.route('**/v1/connections/chatgpt',route=>{if(route.request().method()!=='DELETE')return route.continue();state.modelCatalog={...state.modelCatalog,models:[],connected:false};return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:false,status:'disconnected',revoked:true})});});
     await login();await page.locator('#settings-button').click();await page.locator('#disconnect-chatgpt').click();await page.locator('#chatgpt-status').filter({hasText:'Not connected'}).waitFor();await page.getByRole('button',{name:'Close settings',exact:true}).click();
-    await page.getByRole('button',{name:/^Model settings:/}).click();const settings=page.getByRole('dialog',{name:'Model settings',exact:true});await settings.getByText('Connect ChatGPT or configure OpenRouter to choose a model.',{exact:true}).waitFor();
+    await page.getByRole('button',{name:/^Model settings:/}).click();const settings=page.getByRole('dialog',{name:'Model settings',exact:true});await settings.getByText('Connect ChatGPT or configure OpenAI API or OpenRouter to choose a model.',{exact:true}).waitFor();
     assert.equal(await settings.getByRole('combobox',{name:'Search model providers',exact:true}).isDisabled(),true);assert.equal(await settings.getByRole('switch',{name:'Fast mode'}).count(),0);
   });
 });
 
-test('combined model catalogs refresh concrete names and remain selectable after disconnecting ChatGPT',async()=>{
+for(const direct of [false,true])test(`combined catalogs remain selectable after disconnecting ChatGPT with ${direct?'direct OpenAI API':'OpenRouter'}`,async()=>{
   await withPage(async({page,state,login})=>{
-    const base={id:'gpt-6.1-sol',name:'GPT-6.1 Sol',provider:'openai',reasoningEfforts:['medium'],defaultReasoningEffort:'medium',supportsFast:false};
+    const base={id:'gpt-6.1-sol',name:'GPT-6.1 Sol',provider:'openai',publisher:'openai',reasoningEfforts:['medium'],defaultReasoningEffort:'medium',supportsFast:false};
     const paid={...base,id:'openai/gpt-6.1-sol',modelId:'openai/gpt-6.1-sol',provider:'openrouter',source:'openrouter'};
-    state.modelCatalog={connected:true,defaultModel:base.id,sources:[{id:'chatgpt',connected:true},{id:'openrouter',connected:true}],models:[{...base,routes:[{...base,modelId:base.id,source:'chatgpt'},paid]}]};
+    const api={...base,modelId:base.id,provider:'openai-api',source:'openai-api'};
+    const alternatives=direct?[api,paid]:[paid];
+    const source=direct?'openai-api':'openrouter';
+    state.modelCatalog={connected:true,defaultModel:base.id,sources:[{id:'chatgpt',connected:true},...alternatives.map(route=>({id:route.source,connected:true}))],models:[{...base,routes:[{...base,modelId:base.id,source:'chatgpt'},...alternatives]}]};
     await login();
     state.modelCatalog.models.push({id:'moonshotai/kimi-k3',name:'Kimi K3',provider:'openrouter',reasoningEfforts:[],supportsFast:false,routes:[{id:'moonshotai/kimi-k3',modelId:'moonshotai/kimi-k3',source:'openrouter',provider:'openrouter',name:'Kimi K3',reasoningEfforts:[],supportsFast:false}]});
     const trigger=page.getByRole('button',{name:/^Model settings:/});await trigger.click();const settings=page.getByRole('dialog',{name:'Model settings',exact:true}),select=settings;
-    await settings.getByText('ChatGPT subscription · OpenRouter fallback uses API credits',{exact:true}).waitFor();
+    await settings.getByText('ChatGPT subscription · Fallback uses API credits',{exact:true}).waitFor();
     const picker=settings;await picker.locator('[data-provider="Moonshot AI"]').waitFor();assert.equal(await picker.getByRole('option').count(),2,'model creators are separate from routing providers');await picker.locator('[data-provider="Moonshot AI"]').click();assert.equal(await picker.getByRole('option').count(),1,'only models from the chosen provider are listed');await page.keyboard.press('Escape');
-    await page.route('**/v1/connections/chatgpt',route=>{if(route.request().method()!=='DELETE')return route.continue();state.modelCatalog={...state.modelCatalog,sources:[{id:'chatgpt',connected:false},{id:'openrouter',connected:true}],models:[{...base,provider:'openrouter',routes:[paid]},state.modelCatalog.models[1]]};return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:false,status:'disconnected',revoked:true})});});
+    await page.route('**/v1/connections/chatgpt',route=>{if(route.request().method()!=='DELETE')return route.continue();state.modelCatalog={...state.modelCatalog,sources:[{id:'chatgpt',connected:false},...alternatives.map(route=>({id:route.source,connected:true}))],models:[{...base,provider:source,routes:alternatives},state.modelCatalog.models[1]]};return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({connected:false,status:'disconnected',revoked:true})});});
     await page.locator('#settings-button').click();await page.locator('#disconnect-chatgpt').click();await page.locator('#chatgpt-status').filter({hasText:'Not connected'}).waitFor();await page.getByRole('button',{name:'Close settings',exact:true}).click();
-    await trigger.click();await settings.getByText('OpenRouter · Uses API credits',{exact:true}).waitFor();await page.waitForFunction(()=>!document.querySelector('.timber-model-popover .timber-model-search input').disabled);assert.equal(await trigger.getAttribute('title'),'gpt-6.1-sol','disconnecting a source does not change the selected model');await chooseModel(page,select,'moonshotai/kimi-k3');await trigger.filter({hasText:'Kimi K3'}).waitFor();
+    await trigger.click();await settings.getByText(`${direct?'OpenAI API':'OpenRouter'} · Uses API credits`,{exact:true}).waitFor();await page.waitForFunction(()=>!document.querySelector('.timber-model-popover .timber-model-search input').disabled);assert.equal(await trigger.getAttribute('title'),'gpt-6.1-sol','disconnecting a source does not change the selected model');await chooseModel(page,select,'moonshotai/kimi-k3');await trigger.filter({hasText:'Kimi K3'}).waitFor();
   });
 });
 

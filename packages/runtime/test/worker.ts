@@ -1,4 +1,4 @@
-import type {ModelSettings} from '@botspace/contracts';
+import type {ModelCatalog,ModelSettings} from '@botspace/contracts';
 import { DurableObject } from 'cloudflare:workers';
 import { createPiRuntime, DEFAULT_MODEL, type RuntimeApprovalContext } from '../src/index.js';
 import { responsesFixture } from './responses-fixture.js';
@@ -28,14 +28,25 @@ export class HarnessProbe extends DurableObject {
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS child_reports(id INTEGER PRIMARY KEY AUTOINCREMENT, input TEXT)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS child_report_attempts(id INTEGER PRIMARY KEY AUTOINCREMENT, input TEXT)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY,value TEXT)');
+    const models=async():Promise<ModelCatalog>=>{
+      const catalog=({connected:true,defaultModel:DEFAULT_MODEL,models:[
+        {id:DEFAULT_MODEL,name:'Sol fixture',provider:'openai',reasoningEfforts:['low','medium','high'],defaultReasoningEffort:'medium',supportsFast:true,fastServiceTier:'fast',contextWindow:1_050_000,inputModalities:['text','image']},
+        {id:'gpt-6-astra',name:'Astra fixture',provider:'openai',reasoningEfforts:['high','ultra'],defaultReasoningEffort:'high',supportsFast:true,fastServiceTier:'priority',contextWindow:128_000,inputModalities:['text','image']},
+      ]});
+      return this.setting('openaiOnly')==='true'?{...catalog,models:catalog.models.map(model=>({...model,provider:'openai-api',publisher:'openai',routes:[{...model,provider:'openai-api',source:'openai-api',modelId:model.id}]}))}:catalog;
+    };
     this.runtime = createPiRuntime({
+      models,
+      openai:{fetch:async request=>{
+        const input=await request.json<{input:Record<string,unknown>[]}>();
+        if(isMemoryReview(input.input)){ctx.storage.sql.exec('INSERT INTO review_calls(input) VALUES(?)',JSON.stringify(input));return memoryReviewResponse('responses');}
+        const call=ctx.storage.sql.exec<{id:number}>('INSERT INTO calls(input) VALUES(?) RETURNING id',JSON.stringify({...input,fixtureUrl:request.url,fixtureHeaders:Object.fromEntries(request.headers)})).one();
+        return responsesFixture(input,call.id,true);
+      }},
       owner: this, storage: ctx.storage, defaultModel: CF_MODEL,
       maxGenerations: JSON.parse(this.setting('maxGenerations') ?? 'null'),
       maxToolCalls: JSON.parse(this.setting('maxToolCalls') ?? 'null'),
-      chatgpt: { models:async()=>({connected:true,defaultModel:DEFAULT_MODEL,models:[
-        {id:DEFAULT_MODEL,name:'Sol fixture',provider:'openai',reasoningEfforts:['low','medium','high'],defaultReasoningEffort:'medium',supportsFast:true,fastServiceTier:'fast',contextWindow:1_050_000,inputModalities:['text','image']},
-        {id:'gpt-6-astra',name:'Astra fixture',provider:'openai',reasoningEfforts:['high','ultra'],defaultReasoningEffort:'high',supportsFast:true,fastServiceTier:'priority',contextWindow:128_000,inputModalities:['text','image']},
-      ]}), fetch: async request => {
+      chatgpt: { models, fetch: async request => {
         const input = await request.json<{ input: Record<string, unknown>[] }>();
         if(isMemoryReview(input.input)) {
           ctx.storage.sql.exec('INSERT INTO review_calls(input) VALUES(?)',JSON.stringify(input));
@@ -181,7 +192,8 @@ export class HarnessProbe extends DurableObject {
       return Response.json({ ok: true });
     }
     if (path === '/submit') {
-      const input = await request.json<{ text: string; operationId: string; images?: {data:string;mimeType:string}[]; chatgpt?: boolean; modelSettings?:ModelSettings }>();
+      const input = await request.json<{ text: string; operationId: string; images?: {data:string;mimeType:string}[]; chatgpt?: boolean; openai?: boolean; modelSettings?:ModelSettings }>();
+      if(input.openai){this.ctx.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)','openaiOnly','true');this.ctx.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)','model',DEFAULT_MODEL);}
       if (input.chatgpt) this.ctx.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)', 'model', DEFAULT_MODEL);
       return Response.json(await this.runtime.submit(input.text, { operationId: input.operationId, images:input.images, modelSettings:input.modelSettings }));
     }

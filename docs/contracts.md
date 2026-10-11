@@ -402,8 +402,13 @@ loopback callback and imported over the authenticated HTTPS API. No iOS app.
 ### Combined model catalogs and routing
 Sources implement independent discovery and normalize into `ModelOption` entries.
 The shared merge accepts source IDs and numeric priorities. ChatGPT has priority
-0; OpenRouter has priority 10 and is enabled only by the server secret
-`OPENROUTER_API_KEY`. OpenRouter discovery uses its authenticated `/models/user`
+0; OpenAI API has priority 5 and OpenRouter has priority 10. Paid sources are
+enabled only by the server secrets `OPENAI_API_KEY` and `OPENROUTER_API_KEY`.
+OpenAI discovery intersects the account's authenticated `/v1/models` IDs with
+public `models.dev/api.json` metadata for exact IDs and advertised tool, input,
+reasoning, Fast and context capabilities. Unknown capabilities are never guessed;
+new IDs become selectable once both sources list them. Metadata has a shared
+five-minute cache and receives no credentials. OpenRouter discovery uses its authenticated `/models/user`
 endpoint, with concurrent reads coalesced and a five-minute, credential-scoped
 cache. Only concrete text models supporting tools are selectable; `latest`
 aliases, batch-only variants, classifiers and image generators are excluded.
@@ -421,7 +426,9 @@ and do not hide healthy catalogs. If all configured sources fail, `error` is set
 Every admission snapshots the concrete model, selected settings and ordered routes
 in its immutable native model reference. Subscription inference is tried first.
 If it terminates with a quota error before emitting any content or tool call,
-the same generation can try OpenRouter for that exact model using API credits.
+the same generation can try OpenAI API, then OpenRouter, for that exact model
+using independently billed API credits. Without a subscription route, OpenAI API
+is preferred over OpenRouter and can fall back when its billing credits run out.
 The bot's model never changes. Recorded tool results are forwarded, not executed
 again. Fallback requires compatible reasoning/Fast and image capabilities and
 enough advertised context/output capacity. Authentication failures, throttling,
@@ -429,9 +436,10 @@ server errors, Stop and partially streamed responses never trigger paid fallback
 If the connected ChatGPT catalog is temporarily unavailable, OpenAI-model
 admission waits for discovery instead of starting paid inference; other families
 from healthy sources remain usable.
-No fallback exists without an independently configured OpenRouter credential and
-an exact alternate route. The native assistant record retains the actual provider
-and upstream model ID. Later generations try the subscription first again.
+No fallback exists without an independently configured paid credential and
+an exact alternate route. `OPENAI_API_KEY` also remains the explicit credential
+for image generation; avatar generation has no subscription or router fallback. The native assistant record retains the actual provider
+and upstream model ID. Later generations try their admitted preferred route first again.
 
 ### ChatGPT account model settings
 ChatGPT model discovery calls `GET https://api.openai.com/v1/models` using the

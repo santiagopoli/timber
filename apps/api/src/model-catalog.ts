@@ -1,6 +1,7 @@
 import {classifyModelFailure,mergeModelCatalogs,normalizeOpenRouterCatalog,resolveModelSettings,subscriptionDiscoveryBlocked,type ModelCatalog,type ModelCatalogSource,type ModelSettings} from '@botspace/contracts';
 import type {Env} from './env';
 import {ApiError} from './errors';
+import {openAICatalog} from './openai-api';
 
 const OPENROUTER='https://openrouter.ai/api/v1';
 const caches=new WeakMap<Env,{key:string;expiresAt:number;catalog?:ModelCatalog;pending?:Promise<ModelCatalog>}>();
@@ -38,18 +39,19 @@ export async function modelCatalog(env:Env,owner='owner'):Promise<ModelCatalog>{
       const response=await env.CHATGPT.get(env.CHATGPT.idFromName(owner)).fetch('https://chatgpt/models');
       if(!response.ok)throw new Error('catalog');return response.json<ModelCatalog>();
     }},
+    {id:'openai-api',priority:5,load:()=>openAICatalog(env)},
     {id:'openrouter',priority:10,load:()=>routerCatalog(env)},
   ];
   const sources:ModelCatalogSource[]=await Promise.all(loaders.map(async source=>{
     try{return {id:source.id,priority:source.priority,catalog:await source.load()};}
-    catch{return {id:source.id,priority:source.priority,catalog:{connected:true,models:[],defaultModel:'',error:`${source.id==='chatgpt'?'ChatGPT':'OpenRouter'} model discovery is unavailable. Retry shortly.`}};}
+    catch{return {id:source.id,priority:source.priority,catalog:{connected:true,models:[],defaultModel:'',error:`${source.id==='chatgpt'?'ChatGPT':source.id==='openai-api'?'OpenAI API':'OpenRouter'} model discovery is unavailable. Retry shortly.`}};}
   }));
   return mergeModelCatalogs(sources,env.BOTSPACE_DEFAULT_MODEL??'gpt-6.1-sol');
 }
 
 export async function validateModelSettings(env:Env,input:ModelSettings):Promise<ModelSettings>{
   const catalog=await modelCatalog(env);
-  if(!catalog.connected)throw new ApiError(409,'chatgpt_not_connected','Connect ChatGPT or configure OpenRouter before choosing a model.');
+  if(!catalog.connected)throw new ApiError(409,'chatgpt_not_connected','Connect ChatGPT or configure OpenAI API or OpenRouter before choosing a model.');
   if(catalog.error)throw new ApiError(503,'model_catalog_unavailable',catalog.error);
   const model=catalog.models.find(model=>model.id===input.model);
   if(model&&subscriptionDiscoveryBlocked(catalog,model))throw new ApiError(503,'model_catalog_unavailable','The ChatGPT catalog is temporarily unavailable. Retry before using paid OpenAI inference.');

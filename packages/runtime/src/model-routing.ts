@@ -12,7 +12,7 @@ const zeroUsage={input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{i
 
 function providerFailure(source:string,message?:string){
   const failure=classifyFailure('model_error',message);
-  if(source!=='openrouter')return failure;
+  if(source!=='openrouter'&&source!=='openai-api')return failure;
   if(failure.errorCode==='chatgpt_allowance_exhausted')return modelFailure('model_billing_required');
   if(failure.errorCode==='chatgpt_not_connected')return modelFailure('model_access_denied');
   return failure;
@@ -21,11 +21,11 @@ function providerFailure(source:string,message?:string){
 export function routeModel(route:ModelRoute,settings:ModelSettings):ConfiguredModel {
   const cost=route.pricing?{input:route.pricing.input,output:route.pricing.output,cacheRead:route.pricing.cachedInput??route.pricing.input,cacheWrite:0}:{input:0,output:0,cacheRead:0,cacheWrite:0};
   return {...chatgptModel,id:route.modelId,name:route.name,
-    provider:route.provider,api:route.source==='chatgpt'?'openai-responses':'openai-completions',
-    baseUrl:route.source==='chatgpt'?chatgptModel.baseUrl:'https://openrouter.ai/api/v1',
+    provider:route.provider,api:route.source==='chatgpt'||route.source==='openai-api'?'openai-responses':'openai-completions',
+    baseUrl:route.source==='chatgpt'||route.source==='openai-api'?chatgptModel.baseUrl:'https://openrouter.ai/api/v1',
     contextWindow:route.contextWindow??128_000,maxTokens:route.maxOutputTokens??32_768,
     input:route.inputModalities??['text'],reasoning:route.reasoningEfforts.length>0,cost,
-    compat:route.source==='chatgpt'?chatgptModel.compat:{supportsDeveloperRole:true},
+    compat:route.source==='chatgpt'?chatgptModel.compat:route.source==='openai-api'?{supportsDeveloperRole:true,supportsMaxOutputTokens:true,supportsLongCacheRetention:false}:{supportsDeveloperRole:true},
     timberSettings:{...settings,model:route.modelId},timberCapability:route};
 }
 

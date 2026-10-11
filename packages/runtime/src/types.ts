@@ -101,6 +101,7 @@ export interface PiRuntimeOptions<Env extends object> {
   /** Combined public catalog and host-owned paid inference transport; no credentials. */
   models?(): Promise<ModelCatalog>;
   openrouter?: {fetch(request:Request):Promise<Response>};
+  openai?: {fetch(request:Request):Promise<Response>};
   getBot(): Promise<Pick<Bot, 'name' | 'instructions' | 'model' | 'reasoningEffort' | 'fast' | 'computerApprovalMode'>>;
   getApprovalContext?(): Promise<RuntimeApprovalContext>;
   tools: RuntimeTools;

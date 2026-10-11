@@ -5,7 +5,7 @@ import type {PiRuntimeOptions} from './types.js';
 import {routeModel} from './model-routing.js';
 
 const configurationFailures = {
-  chatgpt_not_connected: {message:'Connect ChatGPT, then retry this message.',retryable:false},
+  chatgpt_not_connected: {message:'Connect ChatGPT or configure OpenAI API or OpenRouter, then retry this message.',retryable:false},
   model_catalog_unavailable: {message:'The connected account’s model catalogue is temporarily unavailable. Retry this message shortly.',retryable:true},
   model_unavailable: {message:'This model is not available in the connected account. Choose an available model, then retry this message.',retryable:false},
   reasoning_unsupported: {message:'This reasoning level is not supported by the selected model. Update the model settings, then retry this message.',retryable:false},

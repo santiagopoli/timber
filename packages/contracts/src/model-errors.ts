@@ -38,6 +38,7 @@ export function classifyModelFailure({status,code,param,message}:{status?:number
     && !/\b(?:tokens?|requests?) per minute\b/i.test(text)
     && /\b(?:usage (?:quota|limit)[\s\S]{0,80}(?:reached|exceeded|exhausted)|(?:reached|exceeded|exhausted)[\s\S]{0,80}usage (?:quota|limit))\b/i.test(text);
   if(/subscription_sharing_usage_limit_exceeded|chatgpt_allowance_exhausted|insufficient_quota/.test(name)||sharedAllowance)return modelFailure('chatgpt_allowance_exhausted');
+  if(/billing_hard_limit_reached|billing_not_active/.test(name))return modelFailure('model_billing_required');
   if(/subscription_sharing_(?:usage|user)_unavailable|chatgpt_(?:usage_unavailable|refresh_pending|refresh_failed)/.test(name))return modelFailure('chatgpt_usage_unavailable');
   if(/rate_limit/.test(name))return modelFailure('model_rate_limited');
   if(/context_(?:length|window)_exceeded|too_many_tokens/.test(name))return modelFailure('model_context_length_exceeded');

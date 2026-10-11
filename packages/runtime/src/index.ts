@@ -13,6 +13,7 @@ import type { ModelSettings } from '@botspace/contracts';
 import { createModelSettings, ModelConfigurationError } from './model-settings.js';
 import { CHATGPT_MODEL, createChatGPTProvider } from './chatgpt.js';
 import {createOpenRouterProvider,withQuotaFallback} from './model-routing.js';
+import {createOpenAIProvider} from './openai-api.js';
 import { createBudget } from './budget.js';
 import { createStopGate } from './stop-gate.js';
 import { createSubagents } from './subagents.js';
@@ -34,7 +35,8 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
   const modelSettings = createModelSettings(options.storage,options.chatgpt,id=>ai(id),options.models);
   const chatgpt = createChatGPTProvider(options.chatgpt,modelSettings.models);
   const openrouter=createOpenRouterProvider(options.openrouter,modelSettings.models);
-  const providers=new Map<string,Provider>([['chatgpt',chatgpt],['openrouter',openrouter]]);
+  const openai=createOpenAIProvider(options.openai,modelSettings.models);
+  const providers=new Map<string,Provider>([['chatgpt',chatgpt],['openai-api',openai],['openrouter',openrouter]]);
   const resolveModel = modelSettings.resolve;
   const consume = createBudget(options.storage, {
     generation: options.maxGenerations,
@@ -160,7 +162,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
       storage = context.storage;
       background = context.context;
       const models = createModels();
-      for (const provider of [ai.provider, withQuotaFallback(chatgpt,providers),withQuotaFallback(openrouter,providers)]) models.setProvider({
+      for (const provider of [ai.provider, withQuotaFallback(chatgpt,providers),withQuotaFallback(openai,providers),withQuotaFallback(openrouter,providers)]) models.setProvider({
         ...provider,
         streamSimple(model, context, streamOptions) {
           const output = createAssistantMessageEventStream();

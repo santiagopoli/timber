@@ -772,6 +772,26 @@ it('uses the official credential-free ChatGPT transport and supported request fi
   for (const forbidden of ['max_output_tokens', 'max_tool_calls', 'metadata', 'temperature', 'top_p', 'background', 'previous_response_id', 'prompt_cache_retention', 'safety_identifier']) expect(wire).not.toHaveProperty(forbidden);
 });
 
+it('runs direct OpenAI tools and restores the paid model and recorded results after eviction',async()=>{
+  await request('/submit',{text:'request-vision',operationId:'paid-vision',openai:true});
+  expect(await(await request('/wait?id=paid-vision')).json()).toMatchObject({status:'done'});
+  const first=await(await request('/inspect')).json<{calls:{input:string}[];toolCalls:unknown[]}>();
+  expect(first.calls).toHaveLength(2);expect(first.toolCalls).toHaveLength(1);
+  const wire=JSON.parse(first.calls[1]!.input);
+  expect(wire).toMatchObject({model:'gpt-6.1-sol',store:false,stream:true,max_output_tokens:4096});
+  expect(wire.fixtureHeaders).toEqual({accept:'text/event-stream','content-type':'application/json'});
+  expect(wire.tools.every((tool:{type:string})=>tool.type==='function')).toBe(true);
+  expect(wire.input).toContainEqual(expect.objectContaining({type:'function_call',name:'desktop_screenshot'}));
+  expect(JSON.stringify(wire.input)).not.toContain('timber_computer');
+  await abortAllDurableObjects();
+  await request('/submit',{text:'Continue the conversation',operationId:'paid-continued'});
+  expect(await(await request('/wait?id=paid-continued')).json()).toMatchObject({status:'done'});
+  const resumed=await(await request('/inspect')).json<{calls:{input:string}[];toolCalls:unknown[]}>();
+  expect(resumed.calls).toHaveLength(3);expect(resumed.toolCalls).toHaveLength(1);
+  expect(resumed.calls[2]!.input).toContain('request-vision');
+  expect(JSON.parse(resumed.calls[2]!.input).model).toBe('gpt-6.1-sol');
+});
+
 it('replays namespaced calls, full history and screenshot pixels through native Pi', async () => {
   await request('/submit', { text: 'request-vision', operationId: 'vision', chatgpt: true });
   expect(await (await request('/wait?id=vision')).json()).toMatchObject({ status: 'done' });

@@ -211,6 +211,6 @@ export function createChatGPTProvider(transport: PiRuntimeOptions<object>['chatg
       streamSimple: (model, context, options) => run(model as Model<'openai-responses'>, context, options),
     },
   });
-  const models=()=>available().filter((model):model is ConfiguredModel & Model<'openai-responses'>=>model.api==='openai-responses');
+  const models=()=>available().filter((model):model is ConfiguredModel & Model<'openai-responses'>=>model.api==='openai-responses'&&model.provider==='openai');
   return {...provider,getModels:models,getAllModels:models};
 }

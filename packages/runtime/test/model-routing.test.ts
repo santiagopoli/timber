@@ -1,13 +1,16 @@
-import {describe,expect,it} from 'vitest';
+import {describe,expect,it,vi} from 'vitest';
 import {createAssistantMessageEventStream,type AssistantMessage,type AssistantMessageEvent} from '@earendil-works/pi-ai';
 import {normalizeContext} from '@earendil-works/pi-ai/utils/transcript';
 import {createProvider,type Provider} from '@earendil-works/pi-ai/models';
 import {modelFailure,type ModelRoute,type ModelSettings} from '@botspace/contracts';
 import {chatgptModel,createChatGPTProvider} from '../src/chatgpt';
 import {createOpenRouterProvider,routeModel,withQuotaFallback} from '../src/model-routing';
+import {createOpenAIProvider} from '../src/openai-api';
+import {openAIRequest} from '../../../apps/api/src/openai-api';
+import type {Env} from '../../../apps/api/src/env';
 import {responsesFixture} from './responses-fixture';
 
-const route=(source:string,extra:Partial<ModelRoute>={}):ModelRoute=>({id:'gpt-6.1-sol',modelId:source==='chatgpt'?'gpt-6.1-sol':'openai/gpt-6.1-sol',source,name:'GPT-6.1 Sol',provider:source==='chatgpt'?'openai':'openrouter',reasoningEfforts:['medium'],supportsFast:false,inputModalities:['text','image'],contextWindow:1_048_576,maxOutputTokens:128_000,...extra});
+const route=(source:string,extra:Partial<ModelRoute>={}):ModelRoute=>({id:'gpt-6.1-sol',modelId:source==='openrouter'?'openai/gpt-6.1-sol':'gpt-6.1-sol',source,name:'GPT-6.1 Sol',provider:source==='chatgpt'?'openai':source,reasoningEfforts:['medium'],supportsFast:false,inputModalities:['text','image'],contextWindow:1_048_576,maxOutputTokens:128_000,...extra});
 const settings:ModelSettings={model:'gpt-6.1-sol',reasoningEffort:'medium',fast:false};
 const model=(routes=[route('chatgpt'),route('openrouter')])=>({...chatgptModel,timberSettings:settings,timberRoutes:routes});
 const context=normalizeContext({messages:[{role:'user',content:'Hello',timestamp:0}]});
@@ -17,6 +20,62 @@ function fake(source:string,result:AssistantMessage,events:AssistantMessageEvent
 async function collect(provider:Provider,selected=model(),messages=context,signal?:AbortSignal){const stream=provider.streamSimple(selected,messages,{signal});const events=[];for await(const event of stream)events.push(event);return {events,result:await stream.result()};}
 
 describe('same-model quota fallback',()=>{
+  it('exhausts the subscription and API credits in order before using the same model on OpenRouter',async()=>{
+    const a=fake('chatgpt',quota),b=fake('openai-api',message('error','model_billing_required')),c=fake('openrouter',message('stop'));
+    const providers=new Map([['chatgpt',a.provider],['openai-api',b.provider],['openrouter',c.provider]]);
+    const selected=model([route('chatgpt'),route('openai-api'),route('openrouter')]);
+    const result=await collect(withQuotaFallback(a.provider,providers),selected);
+    expect(result.result.stopReason).toBe('stop');expect([a.calls(),b.calls(),c.calls()]).toEqual([1,1,1]);expect(result.events.map(event=>event.type)).toEqual(['done']);
+  });
+  it('never calls a paid route when the subscription succeeds',async()=>{
+    const a=fake('chatgpt',message('stop')),b=fake('openai-api',message('stop')),c=fake('openrouter',message('stop'));
+    await collect(withQuotaFallback(a.provider,new Map([['chatgpt',a.provider],['openai-api',b.provider],['openrouter',c.provider]])),model([route('chatgpt'),route('openai-api'),route('openrouter')]));
+    expect([a.calls(),b.calls(),c.calls()]).toEqual([1,0,0]);
+  });
+  it('skips an incompatible paid route without dropping Fast or reasoning settings',async()=>{
+    const a=fake('chatgpt',quota),b=fake('openai-api',message('stop')),c=fake('openrouter',message('stop'));
+    const providers=new Map([['chatgpt',a.provider],['openai-api',b.provider],['openrouter',c.provider]]);
+    const selected={...model([route('chatgpt',{supportsFast:true}),route('openai-api'),route('openrouter',{supportsFast:true})]),timberSettings:{...settings,fast:true}};
+    await collect(withQuotaFallback(a.provider,providers),selected);expect([a.calls(),b.calls(),c.calls()]).toEqual([1,0,1]);
+  });
+  it.each(['model_rate_limited','model_access_denied','model_provider_unavailable'])('does not switch away from the API for %s',async code=>{
+    const a=fake('openai-api',message('error',code)),b=fake('openrouter',message('stop'));
+    await collect(withQuotaFallback(a.provider,new Map([['openai-api',a.provider],['openrouter',b.provider]])),model([route('openai-api'),route('openrouter')]));expect(b.calls()).toBe(0);
+  });
+  it.each(['named','failed','nested'])('runs the actual paid Responses adapter and falls back for %s quota SSE without exposing provider prose',async kind=>{
+    const error={code:'insufficient_quota',message:'PRIVATE_PROVIDER_DETAIL'};
+    const data=kind==='failed'?{type:'response.failed',response:{id:'resp_quota',status:'failed',output:[],error}}:kind==='nested'?{error}:{type:'error',...error};
+    const fetch=vi.spyOn(globalThis,'fetch').mockResolvedValue(new Response(`${kind==='named'?'event: error\n':''}data: ${JSON.stringify(data)}\n\n`,{headers:{'content-type':'text/event-stream'}}));
+    try{
+      const a=createOpenAIProvider({fetch:request=>openAIRequest({OPENAI_API_KEY:'fixture-secret'} as Env,request)},()=>[]),b=fake('openrouter',message('stop'));
+      const result=await collect(withQuotaFallback(a,new Map([['openai-api',a],['openrouter',b.provider]])),model([route('openai-api'),route('openrouter')]));
+      expect(result.result.stopReason).toBe('stop');expect(b.calls()).toBe(1);expect(JSON.stringify(result)).not.toContain('PRIVATE');
+      expect(new Headers(fetch.mock.calls[0][1]?.headers).get('authorization')).toBe('Bearer fixture-secret');
+    }finally{fetch.mockRestore();}
+  });
+  it('does not replay a failed terminal response that already contains output',async()=>{
+    const data={type:'response.failed',response:{id:'resp_partial',status:'failed',output:[{type:'message',content:[{type:'output_text',text:'partial'}]}],error:{code:'insufficient_quota',message:'PRIVATE_DETAIL'}}};
+    const fetch=vi.spyOn(globalThis,'fetch').mockResolvedValue(new Response(`data: ${JSON.stringify(data)}\n\n`,{headers:{'content-type':'text/event-stream'}}));
+    try{
+      const a=createOpenAIProvider({fetch:request=>openAIRequest({OPENAI_API_KEY:'fixture-secret'} as Env,request)},()=>[]),b=fake('openrouter',message('stop'));
+      const result=await collect(withQuotaFallback(a,new Map([['openai-api',a],['openrouter',b.provider]])),model([route('openai-api'),route('openrouter')]));
+      expect(result.result.stopReason).toBe('error');expect(result.result.errorMessage).toContain('model_connection_interrupted');expect(b.calls()).toBe(0);
+    }finally{fetch.mockRestore();}
+  });
+  it('preserves recorded tools while switching to the actual paid Responses API and strips subscription namespaces and credentials',async()=>{
+    let payload:Record<string,unknown>|undefined,authorization:string|null='not called';
+    const paid=createOpenAIProvider({fetch:async request=>{
+      payload=await request.json();authorization=request.headers.get('authorization');
+      return responsesFixture({input:[{role:'user',content:'Hello'}]});
+    }},()=>[]);
+    const history=normalizeContext({messages:[{role:'user',content:'Hello',timestamp:0},{...message('toolUse'),content:[{type:'toolCall',id:'call_fixture|fc_fixture',name:'exec',arguments:{command:'echo once'},namespace:'timber_computer'}]},{role:'toolResult',toolCallId:'call_fixture|fc_fixture',toolName:'exec',content:[{type:'text',text:'already executed once'}],isError:false,timestamp:1}]});
+    const a=fake('chatgpt',quota);const selected=model([route('chatgpt'),route('openai-api',{supportsFast:true,fastServiceTier:'priority'})]);
+    const result=await collect(withQuotaFallback(a.provider,new Map([['chatgpt',a.provider],['openai-api',paid]])),selected,history);
+    expect(result.result.stopReason).toBe('stop');expect(result.result.provider).toBe('openai-api');expect(result.result.model).toBe('gpt-6.1-sol');
+    expect(payload).toMatchObject({model:'gpt-6.1-sol',store:false,stream:true,reasoning:{effort:'medium'},max_output_tokens:4096});
+    expect(JSON.stringify(payload)).toContain('already executed once');expect(JSON.stringify(payload)).not.toContain('timber_computer');expect(authorization).toBeNull();
+    const input=payload!.input as Record<string,unknown>[];expect(input.find(item=>item.type==='function_call')?.call_id).toBe(input.find(item=>item.type==='function_call_output')?.call_id);
+  });
   it('uses the subscription first and forwards the existing history once on quota exhaustion',async()=>{
     const a=fake('chatgpt',quota),b=fake('openrouter',message('stop'));const providers=new Map([['chatgpt',a.provider],['openrouter',b.provider]]);
     const result=await collect(withQuotaFallback(a.provider,providers));expect(result.result.stopReason).toBe('stop');expect(a.calls()).toBe(1);expect(b.calls()).toBe(1);expect(result.events.map(event=>event.type)).toEqual(['done']);

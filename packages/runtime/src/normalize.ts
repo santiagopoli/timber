@@ -63,7 +63,7 @@ export function classifyFailure(reason: string, detail: unknown): { errorCode: s
   if(allowance.errorCode==='chatgpt_allowance_exhausted')return allowance;
   if(/chatgpt_invalid_tool_namespace|invalid_encrypted_content/.test(text))return modelFailure('model_history_invalid');
   if(/chatgpt_invalid_protocol|chatgpt_unsupported_tool|chatgpt_invalid_request|chatgpt_invalid_endpoint/.test(text))return modelFailure('model_request_invalid');
-  const providerCode=text.match(/\b(?:subscription_sharing_[a-z_]+|chatpass_v2_[a-z_]+|context_length_exceeded|invalid_request_error|invalid_value|unsupported_parameter|model_not_found|rate_limit_exceeded|server_error|internal_error|service_unavailable)\b/)?.[0];
+  const providerCode=text.match(/\b(?:subscription_sharing_[a-z_]+|chatpass_v2_[a-z_]+|insufficient_quota|billing_hard_limit_reached|billing_not_active|context_length_exceeded|invalid_request_error|invalid_value|unsupported_parameter|model_not_found|rate_limit_exceeded|server_error|internal_error|service_unavailable)\b/)?.[0];
   if(providerCode)return classifyModelFailure({code:providerCode,message:text});
   if (/model_empty_response/.test(text)) {
     return { errorCode: 'model_empty_response', publicMessage: 'The model returned no answer after automatic retries. Your recorded tool results are preserved.' };

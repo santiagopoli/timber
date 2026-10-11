@@ -91,30 +91,34 @@ it('classifies missing connections, provider catalogue failures and unsupported 
   });
 });
 
-it('preserves admitted routes across source changes and restores both provider references after eviction',async()=>{
+it('preserves admitted routes across source changes and restores all three provider references after eviction',async()=>{
   const bot=await setup();
   const choice:ModelOption={id:'gpt-6.1-sol',name:'GPT-6.1 Sol',provider:'openai',reasoningEfforts:['medium'],defaultReasoningEffort:'medium',supportsFast:false,contextWindow:1_048_576};
   const plan:ModelCatalog={connected:true,models:[choice],defaultModel:choice.id};
   const router:ModelCatalog={connected:true,models:[{...choice,id:'openai/gpt-6.1-sol',provider:'openrouter',routes:[{...choice,id:'openai/gpt-6.1-sol',modelId:'openai/gpt-6.1-sol',provider:'openrouter',source:'openrouter'}]}],defaultModel:choice.id};
-  const combined=mergeModelCatalogs([{id:'chatgpt',priority:0,catalog:plan},{id:'openrouter',priority:10,catalog:router}],choice.id);
+  const direct:ModelCatalog={connected:true,models:[{...choice,provider:'openai-api',routes:[{...choice,provider:'openai-api',source:'openai-api',modelId:choice.id}]}],defaultModel:choice.id};
+  const combined=mergeModelCatalogs([{id:'chatgpt',priority:0,catalog:plan},{id:'openai-api',priority:5,catalog:direct},{id:'openrouter',priority:10,catalog:router}],choice.id);
+  const apiOnly=mergeModelCatalogs([{id:'openai-api',priority:5,catalog:direct}],choice.id);
   const routerOnly=mergeModelCatalogs([{id:'openrouter',priority:10,catalog:router}],choice.id);
   const refs=await runInDurableObject(stubFor(bot),async(_instance,state)=>{
     let catalog=combined;
     const settings=createModelSettings(state.storage,undefined,()=>{throw new Error('No cloud inference');},async()=>catalog);
     const first=await settings.configure({model:choice.id});
     expect((await settings.configure({model:choice.id})).model.id).toBe(first.model.id);
+    catalog=apiOnly;const third=await settings.configure({model:choice.id});
     catalog=routerOnly;
     const second=await settings.configure({model:choice.id});
     expect(first.model.id).not.toBe(second.model.id);expect(settings.resolve(first.model.id).provider).toBe('openai');expect(settings.resolve(second.model.id).provider).toBe('openrouter');
     catalog={...routerOnly,sources:[{id:'chatgpt',connected:true,error:'Temporary discovery failure'},{id:'openrouter',connected:true}]};
     await expect(settings.configure({model:choice.id})).rejects.toMatchObject({code:'model_catalog_unavailable',retryable:true});
-    return [first.model.id,second.model.id];
+    return [first.model.id,second.model.id,third.model.id];
   });
   await abortAllDurableObjects();
   await runInDurableObject(stubFor(bot),(_instance,state)=>{
     const settings=createModelSettings(state.storage,undefined,()=>{throw new Error('No cloud inference');},async()=>routerOnly);
     expect(settings.resolve(refs[0]).provider).toBe('openai');expect(settings.resolve(refs[1]).provider).toBe('openrouter');
-    expect(settings.models().find(model=>model.id===refs[0])?.timberRoutes?.map(route=>route.source)).toEqual(['chatgpt','openrouter']);
+    expect(settings.resolve(refs[2]).provider).toBe('openai-api');
+    expect(settings.models().find(model=>model.id===refs[0])?.timberRoutes?.map(route=>route.source)).toEqual(['chatgpt','openai-api','openrouter']);
     expect(settings.settingsFor(refs[1])).toEqual({model:choice.id,reasoningEffort:'medium',fast:false});
   });
 });

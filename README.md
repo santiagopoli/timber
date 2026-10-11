@@ -356,10 +356,23 @@ the console tells you to revoke access in ChatGPT settings.
 The subscription allowance is shared and limited. Existing bots retain their
 concrete model selection; new bots use the configured default (`gpt-6.1-sol`
 unless changed). The picker combines configured catalogs and shows one entry per
-exact model identity, preferring the ChatGPT subscription over OpenRouter. Fast uses the
+exact model identity, with priority **ChatGPT subscription → OpenAI API → OpenRouter**. Fast uses the
 provider’s Fast/Priority tier and may consume allowance faster; reasoning levels
 are model-specific. Explicit `@cf/...` model IDs remain available
 through the API and smoke command for deliberate Workers AI usage.
+
+To enable direct OpenAI API discovery and inference, set the server-only Worker secret:
+
+```sh
+npx wrangler secret put OPENAI_API_KEY --config apps/api/wrangler.production.jsonc
+```
+
+The same key is used for avatar images. Configuring it also enables paid text
+inference and fallback; if it is already configured, no extra secret is needed.
+The catalog intersects models available to that API account with exact model
+metadata from [models.dev](https://models.dev). Both refresh with a five-minute
+cache. Models are selectable once their concrete ID and agent capabilities are
+available; no static model allowlist or `latest` alias is used.
 
 To enable OpenRouter discovery and inference, set the server-only Worker secret:
 
@@ -373,8 +386,10 @@ refreshes from OpenRouter's authenticated model API with a five-minute cache;
 model names and versions are discovered, not maintained in a static allowlist.
 Latest aliases and models without agent tool support are excluded.
 
-Configuring OpenRouter also enables **paid fallback for the same concrete model**
+Configuring either paid source enables **paid fallback for the same concrete model**
 when ChatGPT exhausts its subscription allowance before producing content.
+Timber tries ChatGPT first, then direct OpenAI API, then OpenRouter. If OpenAI API
+runs out of billing credits, an exact OpenRouter route can serve the request.
 Fallback preserves recorded tool history and requires compatible selected
 settings and context capacity. Fast selections are not silently downgraded.
 Authentication failures, ordinary rate limits and partial responses still stop
