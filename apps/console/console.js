@@ -7,7 +7,7 @@ import {agentColor} from './src/agent-colors.ts';
 import {modelBadgeLabel} from './src/model-identity.tsx';
 import {mountModelPicker} from './src/model-picker.tsx';
 import {modelPublisherLabel} from './src/model-publisher.ts';
-import {modelUsage,modelBillingLines} from './src/model-billing.ts';
+import {modelUsage,modelBillingView} from './src/model-billing.ts';
 import {canRetryAdmission} from './src/run-recovery.ts';
 import './src/agent-colors.css';
 import { createDesktopViewer } from './src/desktop.ts';
@@ -687,7 +687,8 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     fast.checked=Boolean(settings.fast&&choice?.supportsFast);fast.disabled=select.disabled;$(`${prefix}-fast-field`).hidden=!choice?.supportsFast;
     const effective={model:current,reasoningEffort:reasoning.value||undefined,fast:fast.checked};
     modelPickers.get(select.id).update({choices:state.choices,disabled:select.disabled,loading:state.loading,settings:effective});
-    $(`${prefix}-model-help`).textContent=[state.loading?'Loading available models…':state.error||state.message||'Subagents inherit these settings unless another model is chosen.',...(!state.loading?modelBillingLines(choice?.usage,effective):[])].join('\n');
+    const billing=modelBillingView(choice?.usage,effective),price=billing.preview.input&&billing.preview.output?`${billing.preview.input} in / ${billing.preview.output} out · USD / 1M tokens`:'';
+    $(`${prefix}-model-help`).textContent=state.loading?'Loading models…':state.error||state.message||[billing.label,billing.preview.hint,price].filter(Boolean).join(' · ');
   }
   function readModelForm(prefix){const model=$(`${prefix}-model`),reasoning=$(`${prefix}-reasoning`);return model.disabled||!model.value?{}:{model:model.value,...(!reasoning.disabled&&reasoning.value?{reasoningEffort:reasoning.value}:{}),fast:!$(`${prefix}-fast-field`).hidden&&$(`${prefix}-fast`).checked};}
   function refreshModelForms(){for(const [prefix,dialog]of [['bot','bot-dialog'],['edit','edit-dialog']])if($(dialog).open)renderModelForm(prefix,{model:$(`${prefix}-model`).value,reasoningEffort:$(`${prefix}-reasoning`).value,fast:$(`${prefix}-fast`).checked});}

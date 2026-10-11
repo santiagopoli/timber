@@ -56,6 +56,16 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   admission and checks the original run/native-operation fence. A stopped request
   cannot resume. If Stop races an already committed save, the owner's saved input
   remains but the bot stays stopped. Continuations contain references only.
+- PATCH /v1/keychain/:secretId {name,expectedRevision,operationId}
+  -> {entries:SecretMetadata[]}. Rename an existing input without resubmitting or
+  revealing its value. Names are nonempty single-line labels up to 80 characters.
+  The encrypted value is re-bound to the new name and revision atomically with a
+  durable receipt. IDs, approved destinations and bot grants stay unchanged.
+  Stale revisions, revocation and conflicting operation retries are rejected.
+  The route also has a /v1/bots/:id/keychain/:secretId alias.
+  The name_secret tool can name a permitted input still called "Private input",
+  using the conversation's context; it preserves every existing nondefault name.
+  It requires a live named-bot run and rechecks permission before committing.
 - POST /v1/keychain/:secretId/permissions {botId,allowed:boolean}
   -> {entries:SecretMetadata[]}. Only the authenticated owner can grant or revoke
   bot access. The target must be a live registered bot. Grants are signed and
@@ -92,7 +102,7 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   R2 checkpoints, API responses or operation journals. BotDO stores only request
   metadata; the host's internal check/resume routes are blocked at the gateway.
 
-  Host tools request_secret, configure_secret, list_secrets and secret_request
+  Host tools request_secret, configure_secret, name_secret, list_secrets and secret_request
   work with public references only. request_secret is a durable pending_connection
   wait with provider keychain. list_secrets returns only permitted entries;
   temporary subagents must ask their parent to perform authenticated work.
@@ -114,7 +124,9 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   the pill contracts to six centered dots, with no reveal control. Selected existing text
   can be converted directly with Make selection secure (or Add → Secure input).
   Owners write around pills, insert multiple inputs and reuse entries from their
-  shared Keychain. The keychain lets them grant/revoke bots, replace a value or
+  shared Keychain. Names can be edited directly in Keychain; unnamed entries are
+  named proactively by the agent when their purpose is clear from the conversation.
+  The keychain lets owners grant/revoke bots, replace a value or
   explicitly remove it for all bots. Internal [private:UUID] references are rendered
   as locked dots in composer and transcript. Unsaved placeholders cannot be sent
   to the backend. The agent prepares credential format from surrounding text.
@@ -152,7 +164,12 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   and cached-input tokens. ChatGPT entries show subscription allowance separately
   from conditional paid fallback rates. Missing prices are unknown, never zero;
   Fast does not inherit standard-tier prices as a Fast quote. The selected model
-  shows the complete ordered billing routes and settings-incompatible fallbacks.
+  uses compact model rows with aligned input/output prices and one unit legend.
+  IDs are available as row titles rather than repeated beneath the name. Reasoning
+  and Fast stay in the selected-model footer; a collapsed inline “Usage & prices”
+  table exposes cached-input rates, ordered billing routes and incompatible
+  fallbacks without opening another popover. Only the model list scrolls during
+  comparison, leaving the settings in view.
   Image-avatar API billing stays separate and has no inferred token price.
 - GET /v1/bots -> {bots:Bot[]}
 - POST /v1/bots {name,instructions?,model?,reasoningEffort?,fast?,computerApprovalMode?,allowNamedAgents?,allowTaskCreation?} -> 201 {bot:Bot}

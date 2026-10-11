@@ -19,11 +19,67 @@ async function sqlDump(b:Bot){return JSON.stringify(await Promise.all([owner(),s
   return JSON.stringify(tables.map(({name})=>({name,rows:state.storage.sql.exec(`SELECT * FROM "${name}"`).toArray()})));
 }))));}
 async function useSecret(b:Bot,args:Record<string,unknown>,op=crypto.randomUUID()):Promise<ComputerResult>{return runInDurableObject(owner(),(_instance,state)=>new OwnerKeychain(state.storage,'owner',bindings.CHATGPT_CREDENTIAL_KEY,()=>{}).call(op,args,new AbortController().signal,()=>{},b.id));}
+async function nameSecret(b:Bot,run:Run,entry:SecretMetadata,name:string,op=crypto.randomUUID()):Promise<RuntimeToolResult>{return runInDurableObject(stub(b),(instance,state)=>{
+  const row=state.storage.sql.exec<{native_operation_id:string}>('SELECT native_operation_id FROM runs WHERE id=?',run.id).one();
+  return (instance as unknown as {executeHostTool:(input:RuntimeHostToolRequest)=>Promise<RuntimeToolResult>}).executeHostTool({operationId:op,runOperationId:row.native_operation_id,name:'name_secret',arguments:{secretId:entry.id,name,expectedRevision:entry.revision},signal:new AbortController().signal});
+});}
 async function waiting(b:Bot,text='fixture:secret'){const {run}=await (await api(`/bots/${b.id}/messages`,'POST',{text,operationId:crypto.randomUUID()})).json<{run:Run}>();for(let i=0;i<100;i++){const value=await list(b);if(value.requests.length)return {run,request:value.requests[0]};await new Promise(resolve=>setTimeout(resolve,10));}throw new Error('Secure request did not appear');}
-beforeEach(async()=>{await api('/keychain');await runInDurableObject(owner(),(_i,state)=>{for(const name of ['keychain_entries','keychain_writes','secure_input_requests','keychain_calls','keychain_grants','keychain_deliveries'])state.storage.sql.exec(`DELETE FROM ${name}`);});});
+beforeEach(async()=>{await api('/keychain');await runInDurableObject(owner(),(_i,state)=>{for(const name of ['keychain_entries','keychain_writes','keychain_names','secure_input_requests','keychain_calls','keychain_grants','keychain_deliveries'])state.storage.sql.exec(`DELETE FROM ${name}`);});});
 afterEach(()=>vi.restoreAllMocks());
 
 describe('owner keychain security and durable flow',()=>{
+  it('renames without revealing or replacing a value and preserves both bot grants across restart',async()=>{
+    const a=await bot(),b=await bot(),input=payload(),[entry]=await save(a,input);
+    await api(`/keychain/${entry.id}/permissions`,'POST',{botId:b.id,allowed:true});
+    const grants=()=>runInDurableObject(owner(),(_i,state)=>state.storage.sql.exec('SELECT * FROM keychain_grants WHERE secret_id=? ORDER BY bot_id',entry.id).toArray());
+    const before=await grants();
+    const rename={name:'Cloudflare · Production',expectedRevision:entry.revision,operationId:crypto.randomUUID()};
+    const response=await api(`/bots/${a.id}/keychain/${entry.id}`,'PATCH',rename);expect(response.status).toBe(200);
+    const result=await response.json<{entries:SecretMetadata[]}>();expect(result.entries[0]).toMatchObject({...entry,name:rename.name,revision:2,updatedAt:expect.any(String),botIds:expect.arrayContaining([a.id,b.id])});
+    expect(JSON.stringify(result)).not.toContain(input.entries[0].value);expect(await grants()).toEqual(before);
+    await evictDurableObject(owner());expect((await list(b)).entries[0].name).toBe(rename.name);
+    const transport=vi.spyOn(globalThis,'fetch').mockImplementation(async(_url,init)=>{expect(new Headers(init?.headers).get('authorization')).toBe(`Bearer ${input.entries[0].value}`);return Response.json({ok:true});});
+    expect((await useSecret(a,{secretId:entry.id,path:'/profile'})).status).toBe('completed');expect((await useSecret(b,{secretId:entry.id,path:'/profile'})).status).toBe('completed');expect(transport).toHaveBeenCalledTimes(2);
+    expect(await sqlDump(a)).not.toContain(input.entries[0].value);
+  });
+  it('deduplicates rename retries and rejects stale or conflicting renames without undoing later names',async()=>{
+    const b=await bot(),[entry]=await save(b),path=`/keychain/${entry.id}`,input={name:'First name',expectedRevision:1,operationId:crypto.randomUUID()};
+    expect((await api(path,'PATCH',input)).status).toBe(200);await evictDurableObject(owner());expect((await api(path,'PATCH',input)).status).toBe(200);
+    expect((await list(b)).entries[0].revision).toBe(2);
+    expect((await api(path,'PATCH',{...input,name:'Conflicting name'})).status).toBe(409);
+    expect((await api(path,'PATCH',{...input,operationId:crypto.randomUUID()})).status).toBe(409);
+    const concurrent=await Promise.all(['Second name','Other name'].map(name=>api(path,'PATCH',{name,expectedRevision:2,operationId:crypto.randomUUID()})));expect(concurrent.map(item=>item.status).sort()).toEqual([200,409]);
+    const latest=(await list(b)).entries[0];expect((await api(path,'PATCH',input)).status).toBe(200);expect((await list(b)).entries[0]).toEqual(latest);
+    await api(path,'DELETE');expect((await api(path,'PATCH',input)).status).toBe(404);expect((await list(b)).entries).toEqual([]);
+  });
+  it('requires authentication, membership and a valid metadata-only rename',async()=>{
+    const b=await bot(),[entry]=await save(b),input={name:'Cloudflare',expectedRevision:1,operationId:crypto.randomUUID()};
+    expect((await exports.default.fetch(`https://timber.test/v1/keychain/${entry.id}`,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify(input)})).status).toBe(401);
+    expect((await api(`/bots/${crypto.randomUUID()}/keychain/${entry.id}`,'PATCH',input)).status).toBe(404);
+    for(const name of ['', '   ','line\nbreak','x'.repeat(81)])expect((await api(`/keychain/${entry.id}`,'PATCH',{...input,name})).status).toBe(400);
+    for(const field of ['value','origin','botIds'])expect((await api(`/keychain/${entry.id}`,'PATCH',{...input,[field]:'not-allowed'})).status).toBe(400);
+    expect((await list(b)).entries[0].name).toBe(entry.name);
+  });
+  it('lets a permitted named bot name an unnamed input while preserving owner names and refusing other bots',async()=>{
+    const a=await bot(),b=await bot(),[entry]=await save(a,payload({entries:[{value:'fixture-only-value'}]})),{run}=await waiting(a),other=await waiting(b);
+    await expect(nameSecret(b,other.run,entry,'Unauthorized name')).rejects.toThrow('permission');
+    const op=crypto.randomUUID();expect((await nameSecret(a,run,entry,'Cloudflare API key',op)).status).toBe('completed');
+    expect((await nameSecret(a,run,entry,'Cloudflare API key',op)).status).toBe('completed');
+    const named=(await list(a)).entries[0];expect(named).toMatchObject({id:entry.id,name:'Cloudflare API key',revision:2,botIds:[a.id],origin:''});
+    expect((await api(`/keychain/${entry.id}`,'PATCH',{name:'My production key',expectedRevision:2,operationId:crypto.randomUUID()})).status).toBe(200);
+    const owned=(await list(a)).entries[0];expect((await nameSecret(a,run,owned,'Different agent label')).status).toBe('completed');expect((await list(a)).entries[0].name).toBe('My production key');
+    const request=await runInDurableObject(owner(),(_i,state)=>new OwnerKeychain(state.storage,'owner',bindings.CHATGPT_CREDENTIAL_KEY,()=>{}).requestInput('fixture-preserve-name',{secretId:entry.id,name:'Another label',origin:'https://api.example.com',purpose:'Use the key'},run.id,'fixture-operation',a.id));expect(request.name).toBe('My production key');
+    await api(`/keychain/${entry.id}/permissions`,'POST',{botId:a.id,allowed:false});await expect(nameSecret(a,run,named,'Cloudflare API key',op)).rejects.toThrow('permission');
+    expect(await sqlDump(a)).not.toContain('fixture-only-value');
+  });
+  it.each(['revoke','permission','stop'])('fences a rename when %s races its encrypted update',async action=>{
+    const b=await bot(),[entry]=await save(b,payload({entries:[{value:'fixture-only-value'}]}));
+    await expect(runInDurableObject(owner(),(_i,state)=>{
+      const store=new OwnerKeychain(state.storage,'owner',bindings.CHATGPT_CREDENTIAL_KEY,()=>{});
+      return store.rename('race',entry.id,{name:'New name',expectedRevision:1},async()=>{if(action==='revoke')store.revoke(entry.id);else if(action==='permission')await store.grantAccess(entry.id,b.id,false);else throw new Error('Task stopped');},b.id);
+    })).rejects.toThrow();
+    const entries=(await list(b)).entries;if(action==='revoke')expect(entries).toHaveLength(0);else expect(entries[0].name).toBe('Private input');
+  });
   it('requires owner authentication and bot membership; never offers a reveal route',async()=>{
     const b=await bot();expect((await exports.default.fetch(`https://timber.test/v1/bots/${b.id}/keychain`)).status).toBe(401);
     expect((await api(`/bots/${crypto.randomUUID()}/keychain`)).status).toBe(404);
@@ -189,11 +245,11 @@ describe('owner keychain security and durable flow',()=>{
     expect((await api(`/bots/${b.id}/keychain/requests/${request.id}/authorize`,'POST',{})).status).toBe(409);
     expect((await list(b)).entries[0].origin).toBe('');
   });
-  it('prevents a child run from obtaining named-bot keychain access',async()=>{
+  it.each(['list_secrets','name_secret'])('prevents a child run from obtaining named-bot keychain access through %s',async tool=>{
     const b=await bot(),{run}=await waiting(b);
     const result=await runInDurableObject(stub(b),async(instance,state)=>{
       const row=state.storage.sql.exec<{data:string;native_operation_id:string}>('SELECT data,native_operation_id FROM runs WHERE id=?',run.id).toArray()[0];state.storage.sql.exec('UPDATE runs SET data=? WHERE id=?',JSON.stringify({...JSON.parse(row.data),subagentId:'fixture-child'}),run.id);
-      return (instance as unknown as {executeHostTool:(input:RuntimeHostToolRequest)=>Promise<RuntimeToolResult>}).executeHostTool({operationId:crypto.randomUUID(),runOperationId:row.native_operation_id,name:'list_secrets',arguments:{},signal:new AbortController().signal});
+      return (instance as unknown as {executeHostTool:(input:RuntimeHostToolRequest)=>Promise<RuntimeToolResult>}).executeHostTool({operationId:crypto.randomUUID(),runOperationId:row.native_operation_id,name:tool,arguments:tool==='name_secret'?{secretId:crypto.randomUUID(),name:'Fixture name',expectedRevision:1}:{},signal:new AbortController().signal});
     });expect(result.status).toBe('failed');expect(JSON.stringify(result)).toContain('Only the named bot');
   });
 });

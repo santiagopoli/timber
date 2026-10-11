@@ -25,3 +25,7 @@
 .timber-composer .timber-private-edit>svg{width:11px;height:11px}
 .timber-private-field[data-empty=true]>svg{opacity:.35}
 .timber-private-dots circle{stroke:none;fill:currentColor}
+.timber-keychain-name{display:inline-flex;align-items:center;gap:8px;max-width:100%;padding:3px 0;border:0;border-radius:4px;background:transparent;color:var(--ink);text-align:left;cursor:pointer;font:inherit}
+.timber-keychain-name strong{overflow-wrap:anywhere;min-width:0}.timber-keychain-name svg{width:13px;height:13px;flex:none;color:var(--muted)}.timber-keychain-name:hover svg{color:var(--ink)}
+.timber-keychain-entry>small{display:block;margin-top:6px;font-size:12px;line-height:1.5}
+.timber-keychain-name-form input{width:100%;padding:8px 10px;font-size:16px}.timber-keychain-name-form .timber-secure-actions{margin-top:8px}
