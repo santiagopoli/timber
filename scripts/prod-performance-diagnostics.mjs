@@ -8,6 +8,7 @@ export const PERFORMANCE_TASKS = `SELECT t.id,json_extract(t.data,'$.status') AS
 export const PERFORMANCE_RUNS = `SELECT json_extract(data,'$.createdAt') AS created_at,
  json_extract(data,'$.updatedAt') AS updated_at,json_extract(data,'$.status') AS status,
  json_extract(data,'$.errorCode') AS error_code,
+ (SELECT kind FROM admission_sources a WHERE a.run_id=r.id) AS source,
  (SELECT COUNT(*) FROM botspace_runtime_budget b JOIN submissions s ON s.operation_id=b.operation_id WHERE s.run_id=r.id AND b.kind='generation') AS generations,
  (SELECT COUNT(*) FROM botspace_runtime_budget b JOIN submissions s ON s.operation_id=b.operation_id WHERE s.run_id=r.id AND b.kind='tool') AS tools,
  (SELECT COUNT(*) FROM events e WHERE json_extract(e.data,'$.runId')=r.id AND json_extract(e.data,'$.type')='run.retrying') AS retries
@@ -62,7 +63,7 @@ const allow=(set,value)=>set.has(value)?value:'unknown';
 export function summarizePerformance({runs=[],tools:actions=[],native=[],usage=[],processes=[],deliveries=[],wakes=[],recovery=[]},window) {
  const inside=value=>{const at=Date.parse(value??'');return Number.isFinite(at)&&at>=window.from&&at<=window.to;};
  return {
-  runs:runs.slice(0,12).filter(row=>inside(iso(row.updated_at))||inside(iso(row.created_at))).map(row=>({createdAt:iso(row.created_at),updatedAt:iso(row.updated_at),status:allow(states,row.status),generations:count(row.generations),tools:count(row.tools),retries:count(row.retries)})),
+  runs:runs.slice(0,12).filter(row=>inside(iso(row.updated_at))||inside(iso(row.created_at))).map(row=>({createdAt:iso(row.created_at),updatedAt:iso(row.updated_at),status:allow(states,row.status),source:allow(new Set(['user','internal']),row.source),generations:count(row.generations),tools:count(row.tools),retries:count(row.retries)})),
   tools:actions.slice(0,60).filter(row=>inside(iso(row.finished_at))||inside(iso(row.started_at))).map(row=>{const startedAt=iso(row.started_at),finishedAt=iso(row.finished_at);return {startedAt,finishedAt,tool:allow(tools,row.tool),status:allow(states,row.status),durationMs:startedAt&&finishedAt?count(Date.parse(finishedAt)-Date.parse(startedAt)):null,exitCode:Number.isSafeInteger(row.exit_code)?row.exit_code:null,checkpoint:allow(new Set(['pending','saved','failed']),row.checkpoint),outputCharacters:count(row.output_characters)};}),
   nativeTasks:native.slice(0,60).map(row=>({kind:allow(kinds,row.kind),status:allow(states,row.status),phase:allow(phases,row.phase),tool:allow(tools,row.tool),replay:allow(new Set(['safe','unsafe']),row.replay),isRoot:row.is_root===1,attempt:count(row.attempt),outcome:allow(states,row.outcome),background:row.background===1})),
   recovery:recovery.slice(0,1).map(row=>({waitGraphs:count(row.wait_graphs),activeNativeTasks:count(row.active_native_tasks),queuedInputs:count(row.queued_inputs)})),
