@@ -615,6 +615,7 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
 
 function ImageControls({sending,disabled=false,hasText,acceptedIds,children,onSecureInput}: {sending:boolean;disabled?:boolean;hasText:boolean;acceptedIds?:string[];children:ReactNode;onSecureInput:()=>void}) {
   const attachments=usePromptInputAttachments();
+  const afterClose=useRef<(()=>void)|undefined>(undefined);
   useEffect(()=>{
     for(const id of acceptedIds??[]) if(attachments.files.some(file=>file.id===id)) attachments.remove(id);
   },[acceptedIds,attachments]);
@@ -625,7 +626,7 @@ function ImageControls({sending,disabled=false,hasText,acceptedIds,children,onSe
       <button className="timber-image-remove" type="button" aria-label={`Remove ${file.filename || 'image'}`} title={`Remove ${file.filename || 'image'}`} disabled={sending} onClick={()=>attachments.remove(file.id)}><XIcon aria-hidden="true" /></button>
     </div>)}</div>}
     <div className="timber-composer-row">{children}
-      <DropdownMenu.Root><DropdownMenu.Trigger asChild><Button className="timber-attach" type="button" variant="ghost" size="icon" disabled={sending} aria-label="Add" title="Add"><PlusIcon aria-hidden="true"/></Button></DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content className="timber-add-menu" side="top" align="end" sideOffset={8}><DropdownMenu.Item onSelect={onSecureInput}><LockKeyholeIcon/>Secure input</DropdownMenu.Item><DropdownMenu.Item disabled={full} onSelect={()=>attachments.openFileDialog()}><PaperclipIcon/>Attach images</DropdownMenu.Item></DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu.Root>
+      <DropdownMenu.Root><DropdownMenu.Trigger asChild><Button className="timber-attach" type="button" variant="ghost" size="icon" disabled={sending} aria-label="Add" title="Add"><PlusIcon aria-hidden="true"/></Button></DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content className="timber-add-menu" side="top" align="end" sideOffset={8} onCloseAutoFocus={event=>{const action=afterClose.current;if(action){afterClose.current=undefined;event.preventDefault();action();}}}><DropdownMenu.Item onSelect={()=>{afterClose.current=onSecureInput;}}><LockKeyholeIcon/>Secure input</DropdownMenu.Item><DropdownMenu.Item disabled={full} onSelect={()=>attachments.openFileDialog()}><PaperclipIcon/>Attach images</DropdownMenu.Item></DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu.Root>
       <PromptInputSubmit className="timber-send" aria-label="Send message" title="Send message" disabled={disabled || sending || (!hasText && !attachments.files.length)}>{sending ? <LoaderCircleIcon className="timber-spinner" aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}</PromptInputSubmit>
     </div>
     {attachments.files.length > 0 && <div className="timber-attachment-status" role="status">{sending ? 'Sending images…' : `${attachments.files.length} of 4 images · Ready to send`}</div>}

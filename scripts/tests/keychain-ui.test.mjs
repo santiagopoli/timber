@@ -5,6 +5,15 @@ import {chromium} from 'playwright';
 import {createConsoleFixture,TEST_TOKEN,BOT_A,BOT_B} from './console-fixture.mjs';
 let browser;
 after(async()=>{await browser?.close();});
+test('closing the keychain before adding a private input preserves editing focus on a slow device',()=>scenario(390,async({page,login,savedInline,posts})=>{
+  await login();const session=await page.context().newCDPSession(page);await session.send('Emulation.setCPUThrottlingRate',{rate:4});
+  await page.getByRole('button',{name:'Your keychain',exact:true}).click();
+  await page.getByRole('button',{name:'Add secure input',exact:true}).click();
+  const input=page.getByLabel('Private input',{exact:true});await input.waitFor();await input.fill('slow-device-fixture-value');
+  assert.equal(await page.getByRole('dialog',{name:'Your keychain',exact:true}).count(),0);
+  await commitPrivateInput(page);await savedInline();assert.equal(posts.length,1);
+  assert.equal(posts[0].entries[0].value,'slow-device-fixture-value');
+}));
 const entry=(overrides={})=>({id:'20000000-0000-4000-8000-000000000001',name:'Private input',origin:'',header:'',prefix:'',revision:1,createdAt:'2026-10-10T10:00:00Z',updatedAt:'2026-10-10T10:00:00Z',botIds:[BOT_A],...overrides});
 const request=(overrides={})=>({id:'30000000-0000-4000-8000-000000000001',name:'Example API',origin:'https://api.example.com',header:'Authorization',prefix:'Bearer ',purpose:'Read your account profile.',runId:'run-secure',nativeOperationId:'op-secure',status:'pending',createdAt:'2026-10-10T10:00:00Z',...overrides});
 // Enter intentionally disables/replaces this node; dispatch the gesture once, not a locator retry.
