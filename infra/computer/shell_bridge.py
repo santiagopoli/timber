@@ -218,12 +218,34 @@ def supervisor_startup_failed(control, subreaper_ready):
     return 1
 
 
+def workspace_shell_command():
+    """Fixed root-owned launcher; no local/root or configurable-UID fallback.
+
+    The trusted supervisor stays root so workspace code cannot kill it or forge
+    cleanup receipts. Only the forkpty child execs setpriv before any bash/code.
+    Numeric identities match both Docker/start.sh and the bootstrap image.
+    """
+    launcher = Path("/usr/bin/setpriv")
+    if os.geteuid() != 0:
+        raise OSError(errno.EPERM, "trusted supervisor required")
+    for path in (launcher, launcher.parent, launcher.parent.parent):
+        info = path.stat()
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            raise OSError(errno.EPERM, "untrusted privilege launcher")
+    if not launcher.is_file() or not os.access(launcher, os.X_OK):
+        raise OSError(errno.ENOENT, "privilege launcher unavailable")
+    return [str(launcher), "--reuid=10001", "--regid=10001", "--clear-groups",
+            "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all",
+            "--no-new-privs", "--", "/bin/bash", "--noprofile", "--norc", "-i"]
+
+
 def supervisor_main(control_fd, workspace):
     """Entered by exec, never by Python fork from the threaded HTTP server."""
     control = socket.socket(fileno=control_fd)
     control.settimeout(CONTROL_TIMEOUT)
     subreaper_ready = False
     try:
+        command = workspace_shell_command()
         libc = ctypes.CDLL(None, use_errno=True)
         if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
             raise OSError(ctypes.get_errno(), "subreaper unavailable")
@@ -240,8 +262,12 @@ def supervisor_main(control_fd, workspace):
     if pid == 0:
         try:
             control.close()
+            # forkpty creates a root-owned slave: give the workspace identity
+            # its terminal, then irrevocably drop before bash can run any code.
+            os.fchown(0, 10001, 10001)
+            os.fchmod(0, 0o600)
             os.chdir(workspace)
-            os.execve("/bin/bash", ["bash", "--noprofile", "--norc", "-i"], shell_environment(workspace))
+            os.execve(command[0], command, shell_environment(workspace))
         finally:
             os._exit(127)
     closing = False

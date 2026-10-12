@@ -256,6 +256,10 @@ def main():
         view.close()
         control.close()
     native_mouse_smoke(token)
+    # Existing image CI runs this root-owned fixture through docker exec/stdin.
+    # Keep the shipped native PTY proof in that same verified-image gate.
+    import runpy
+    runpy.run_path("/opt/botspace/smoke_shell.py", run_name="__main__")
     print("PASS desktop: authenticated live framebuffer, visible cursor, enforced observation, native pointer and keyboard, agent hover, double-click deduplication and drag/release")
 
 

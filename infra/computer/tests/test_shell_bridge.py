@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import shutil
 import struct
 import subprocess
 import sys
@@ -80,9 +81,14 @@ class Client:
         self.sock.close()
 
 
+@unittest.skipUnless(os.geteuid() == 0 and shutil.which("setpriv"),
+                     "requires Linux trusted root supervisor and setpriv")
 class ShellBridgeTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        # Match the production workspace boundary, not a root-only test cwd.
+        os.chown(self.tmp.name, 0, 10001)
+        os.chmod(self.tmp.name, 0o2770)
         self.manager = shell.ShellManager(self.tmp.name)
         self.bridge = shell.start_bridge(self.manager, TOKEN, "127.0.0.1", 0)
         self.port = self.bridge.server_address[1]
@@ -194,6 +200,7 @@ os.setsid()
 if os.fork(): os._exit(0)
 os.chdir(sys.argv[1])
 open('escaped.pid', 'w').write(str(os.getpid()))
+open('escaped.clean-env', 'w').write(str('TIMBER_SHELL_SESSION' not in os.environ))
 fd = os.open('writes', os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
 while True:
     os.write(fd, b'x')
@@ -219,7 +226,10 @@ while True:
             while shell.process_table()[pid][0] != session.helper.pid and time.monotonic() < deadline:
                 time.sleep(.01)
             self.assertEqual(shell.process_table()[pid][0], session.helper.pid)
-            self.assertNotIn(b"TIMBER_SHELL_SESSION", Path(f"/proc/{pid}/environ").read_bytes())
+            # Cross-UID proc environment access is now intentionally denied even
+            # on root test hosts lacking CAP_SYS_PTRACE; inspect the real writer's
+            # own observation rather than loosening /proc isolation.
+            self.assertEqual((Path(self.tmp.name)/"escaped.clean-env").read_text(), "True")
             self.assertEqual(self.manager.close(client.ident), {"ok": True})
             self.assertFalse(Path(f"/proc/{pid}").exists(), "detached writer was not reaped")
             size = writes.stat().st_size
@@ -577,10 +587,15 @@ while True:
         self.wait_closed()
 
 
+@unittest.skipUnless(os.geteuid() == 0 and shutil.which("setpriv"),
+                     "requires Linux trusted root supervisor and setpriv")
 class ShellControlTests(unittest.TestCase):
     def test_real_http_renew_close_checkpoint_and_health(self):
         with tempfile.TemporaryDirectory() as directory:
+            os.chmod(directory, 0o755)
             computer = server.Computer(Path(directory)/"workspace", Path(directory)/"state")
+            os.chown(computer.workspace, 0, 10001)
+            os.chmod(computer.workspace, 0o2770)
             bridge = shell.start_bridge(computer.shell, TOKEN, "127.0.0.1", 0)
             port = bridge.server_address[1]
             control = server.ComputerHTTPServer(("127.0.0.1", 0), server.create_handler(computer, TOKEN))
@@ -595,6 +610,10 @@ class ShellControlTests(unittest.TestCase):
                 conn.close()
                 return result
             try:
+                private_op = "close-http-" + str(uuid.uuid4())
+                self.assertEqual(post("/secure-deploy/close", {"operationId": private_op}, "wrong")[0], 401)
+                self.assertEqual(post("/secure-deploy/close", {"operationId": private_op, "unexpected": True})[0], 400)
+                self.assertEqual(post("/secure-deploy/close", {"operationId": private_op}), (200, {"operationId": private_op, "quiescent": True}))
                 self.assertEqual(post("/shell/renew", {"sessionId":client.ident,"expiresAt":int(time.time()*1000)+59000}), (200,{"ok":True}))
                 self.assertEqual(post("/shell/close", {"sessionId":client.ident}, "wrong")[0], 401)
                 self.assertEqual(post("/checkpoint", {})[0], 400)

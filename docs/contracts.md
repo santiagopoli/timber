@@ -449,6 +449,21 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   mutations, desktop control and explicit/background checkpoints are blocked;
   passive reads, screenshot and desktop Watch remain available. Shell admission
   and the shared task scheduler reuse the existing human-control lease boundary.
+  PTY commands run as the fixed workspace UID/GID 10001 with no supplementary
+  groups, no capabilities and no-new-privileges. The root cleanup supervisor is
+  trusted image code, not writable or signalable by that user; its environment
+  contains no controller token or credential. Private deploy UID 10002 and root
+  state/process memory remain outside the workspace user's access.
+  Private credential operations also hold the workspace/execution gate. A
+  metadata-only `privateOperation` reservation survives uncertain HTTP delivery;
+  it blocks Shell, desktop control, managed/mutating commands and checkpoints.
+  Cancellation remains responsive but is not cleanup proof. An authenticated
+  internal `POST /secure-deploy/close {operationId}` tombstones delayed dispatch
+  and returns `{operationId,quiescent:true}` only after local runner cleanup;
+  uncertain cleanup retains the reservation and maintenance retries shutdown,
+  never credential dispatch. Normal private receipts release the reservation
+  only with an explicit private quiescence proof (not duplicate-dispatch receipts).
+  Public receipts omit this internal proof and all credential material.
   Save intent is durable **before** PTY launch. Closing the shell schedules a normal
   quiet-period checkpoint, not a claim that its files are already saved. Suspend
   rejects active runs/managed commands, then explicitly closes and confirms shell

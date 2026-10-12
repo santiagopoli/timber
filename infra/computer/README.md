@@ -48,8 +48,8 @@ Official deployment guidance:
 
 Tools execute in a reusable `/workspace`. Paths supplied to file tools are relative
 to that directory; absolute paths, parent traversal and escaping symlinks fail.
-Terminal commands intentionally have full control of this bot's computer, and must
-be approved by host policy before model invocation.
+Terminal commands control this bot's workspace and its same-UID desktop processes,
+not root/private credential services. Model invocation requires host policy approval.
 
 The desktop is 1280×800. `navigate`, `screenshot`, `click`, `move`, `doubleClick`,
 `drag`, `type`, `key` and `scroll` operate the real X11 desktop. `move` does not
@@ -249,10 +249,46 @@ is not silently written into workspace checkpoints. The authorized owner can
 still explicitly write files or change history settings; this is not an attempt
 to suppress authorized filesystem effects.
 
-**Isolation caveat:** the VM remains the trust boundary. This is not a
-privilege-separating sandbox: hostile same-UID code can inspect other processes or
-kill the supervisor. Losing the supervisor without its cleanup receipt fails
-closed and blocks replacement/checkpoint rather than claiming successful cleanup.
+**Private-service boundary:** the root controller and fresh-exec cleanup
+supervisor are trusted, fixed root-owned code. Only the native-forkpty child execs
+`/usr/bin/setpriv` before bash: real/effective UID/GID **10001**, empty supplementary
+groups, empty inheritable/permitted/effective/bounding/ambient capability sets,
+and `NoNewPrivs=1`. The fixed launcher fails closed without a root supervisor or
+root-owned non-writable launcher; there is no root/local fallback. No workspace
+code runs before the irreversible drop. The child owns its PTY slave and starts
+with only the minimal allowlisted environment. Root supervisor ownership prevents
+workspace code from signalling/ptracing it or forging its private socket receipt;
+losing the helper without proof still blocks replacement/checkpoint.
+
+UID10002 is reserved for the private credential runner, distinct from the
+workspace/desktop UID. Workspace code cannot read root/private process env,
+memory or descriptors, read root-private `/state`, overwrite trusted controller
+code, or escalate via setuid binaries. The authenticated management HTTP/shell
+bridges reject missing/incorrect bearer tokens even from localhost: reachability
+is not authorization. The shell cannot obtain the controller token via its env
+or cross-UID `/proc`. There is no claim of network-namespace isolation. The shell
+and desktop deliberately share UID10001 and can inspect/signal each other;
+the VM remains the cross-bot boundary, not a separate sandbox per shell job.
+
+Private dispatch and shell admission are additionally arbitrated by the DO.
+A private dispatch response has an **internal-only** `quiescent` boolean: normal
+provider outcome status/code does not certify local cleanup. Authenticated
+`POST /secure-deploy/close {"operationId":"..."}` on 8080 returns
+`{"operationId":"...","quiescent":true}` only after tombstoning that ID against
+delayed dispatch and proving no active dispatch/private runner remains. False or
+missing proof retains the upstream shell exclusion guard; maintenance retries
+close the same operation. `/secure-deploy/cancel` retains its old outcome meaning
+and is not a quiescence receipt. Close waits up to ten seconds; prelaunch IO and
+spawn-publication races cannot release early. Dispatch cleanup reaps its direct
+runner and requires **kernel-atomic original-group emptiness** (`killpg(pgid,0)`
+returns ESRCH), never a sampled `/proc` table or direct-parent reap alone.
+Zombie processes, reused groups and errors retain the guard; image PID1 init must
+reap orphaned trusted CLI children. Signals use identity-checked pidfds collected
+only while the original leader is live, never late numeric `killpg` after reap.
+Observation/signal/proof uncertainty retains the tombstone and guard for retry.
+This private-runner proof relies on the pinned trusted runner/CLI not deliberately
+escaping its cancellation group; it is **not** the arbitrary detached descendant
+`ECHILD` containment guarantee of the dedicated shell subreaper.
 Real Linux tests cover environment-cleared, detached double-fork writers, complete
 reaping, unrelated process survival, and failed cleanup followed by explicit retry.
 They also inject a real helper-level pidfd signal failure while a detached writer
@@ -267,3 +303,31 @@ backpressure, and internal HTTP/checkpoint exclusion:
 ```
 python3 -m unittest discover -s infra/computer/tests -p test_shell_bridge.py -v
 ```
+
+The privilege-boundary fixtures require a Linux root test controller plus
+`setpriv`; they explicitly model production workspace/root-code permissions and
+skip on hosts that cannot establish that boundary. They execute adversarial
+probes **inside the actual PTY**, including UID/GID/groups/all capability sets,
+no-new-privs, private process env/memory/pipe access, signals/ptrace, root-private
+paths, protected code writes, a genuine setuid-root executable, unauthenticated
+localhost management requests, and non-root supervisor rejection. Existing root
+trust expectations are preserved. Tests no longer read workspace-UID environments
+from a root fixture without CAP_SYS_PTRACE; the real detached writer records its
+own cleared-env observation instead, preserving the strengthened cross-UID boundary.
+
+`smoke_shell.py` is standalone built-image verification using only shipped modules:
+run `docker exec -i timber-image-smoke python3 - < infra/computer/smoke_shell.py`
+after `start.sh` is ready. It checks genuine identity/caps/no-new-privs, protected
+paths and setuid suppression, Unicode stdin, resize, Ctrl-C, detached descendant
+adoption/reaping, replacement/checkpoint exclusion, and unauthenticated localhost
+management denial. Docker is unavailable in the editing workspace, so a local
+Linux subprocess smoke is not a claimed Docker image run; actual image smoke
+must pass in CI before image delivery can be reported. The existing
+`smoke_desktop.py` image gate invokes the root-owned shipped `smoke_shell.py`,
+so both verification and desktop-release workflows exercise the actual built
+PTY image without changing workflow permissions. Root-only private lifecycle
+unit fixtures require a separate root test run; a nonroot `npm run check` may
+skip them and must not be presented as that root-isolation evidence.
+
+Automated Chromium/WebKit terminal coverage does not verify a physical device:
+**physical Safari/iPhone testing remains unverified**.

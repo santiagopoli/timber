@@ -30,5 +30,7 @@ setpriv --reuid=10001 --regid=10001 --clear-groups --bounding-set=-all --inh-cap
 python3 /opt/botspace/desktop_bridge.py view > /state/desktop-view-bridge.log 2>&1 &
 python3 /opt/botspace/desktop_bridge.py control > /state/desktop-control-bridge.log 2>&1 &
 # server.py embeds shell_bridge.py on private 6082 with one shared manager,
-# so shell admission and checkpoint/restore exclusion are atomic.
+# so shell admission and checkpoint/restore exclusion are atomic. Its trusted
+# root supervisor execs fixed setpriv ONLY in the native-forkpty child: bash runs
+# UID/GID10001, no supplementary groups/capabilities, with no-new-privs.
 exec python3 /opt/botspace/server.py

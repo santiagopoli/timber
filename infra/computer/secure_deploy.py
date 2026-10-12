@@ -9,6 +9,7 @@ import re
 import subprocess
 import stat
 import signal
+import select
 import threading
 import time
 
@@ -135,6 +136,55 @@ def _validate_request(request: object) -> tuple[dict, dict, list[dict]]:
     return auth, pin, values
 
 
+def _signal_runner(state: dict) -> bool:
+    """Signal a pidfd-pinned snapshot only while the original leader is live.
+
+    Never killpg after communicate/poll reaps the leader: a numeric PGID could
+    refer to unrelated new processes. A dead/missing leader is uncertainty until
+    normal dispatch cleanup proves the trusted group has no live members.
+    """
+    process, leader = state.get("process"), state.get("leader_fd")
+    if process is None or leader is None:
+        return False
+    fds = []
+    try:
+        if select.select([leader], [], [], 0)[0]:
+            return False
+        for path in Path("/proc").iterdir():
+            if not path.name.isdigit():
+                continue
+            try:
+                fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
+                if int(fields[2]) != process.pid:
+                    continue
+                fd = os.pidfd_open(int(path.name))
+                try:
+                    current = (path / "stat").read_text().rsplit(")", 1)[1].split()
+                    if current[19] != fields[19] or int(current[2]) != process.pid:
+                        os.close(fd)
+                        continue
+                except Exception:
+                    os.close(fd)
+                    raise
+                fds.append(fd)
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+        # The original live leader reserves this group identity during the scan.
+        if select.select([leader], [], [], 0)[0]:
+            return False
+        for fd in fds:
+            try:
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        return True
+    except (OSError, ValueError, IndexError):
+        return False
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
 def cancel(operation_id: object) -> dict:
     """Fence pre-launch work or kill the exact in-flight deploy process group."""
     if not isinstance(operation_id, str) or not OP.fullmatch(operation_id):
@@ -146,17 +196,64 @@ def cancel(operation_id: object) -> dict:
         state["cancelled"] = True
         process = state.get("process")
         launched = bool(state.get("launched"))
-    if process is not None and process.poll() is None:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+    if process is not None:
+        with _ACTIVE_LOCK:
+            _signal_runner(state)
     # Once the runner was launched the provider may already have accepted the
     # write. Report uncertainty rather than a falsely safe cancellation receipt.
     return {"operationId": operation_id, "result": "already_dispatched" if launched else "cancelled"}
 
 
-def dispatch(workspace: Path, request: object, *, runner_path: str = "/opt/botspace/secure_deploy_runner.py", setpriv: str = "/usr/bin/setpriv") -> dict:
+def _group_quiescent(pgid: int) -> bool:
+    """Kernel-atomic empty-group proof; /proc sampling is never completion proof.
+
+    Signal 0 has no effect. ESRCH proves there are no members, even one born
+    during a /proc enumeration. Reused PGIDs and zombies conservatively retain
+    the guard; the production PID1 init reaps orphaned trusted CLI processes.
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def close(operation_id: object, *, seconds: float = 10) -> dict:
+    """Fence even a delayed dispatch; certify only proven runner quiescence.
+
+    /cancel preserves its provider-outcome meaning and is NOT this receipt.
+    close never reports whether the provider accepted an already sent request.
+    """
+    if not isinstance(operation_id, str) or not OP.fullmatch(operation_id):
+        return {"operationId": operation_id if isinstance(operation_id, str) else "", "quiescent": False}
+    with _ACTIVE_LOCK:
+        _SEEN.add(operation_id)
+        state = _ACTIVE.get(operation_id)
+        if state is not None:
+            state["cancelled"] = True
+            process = state.get("process")
+            if process is not None:
+                _signal_runner(state)
+    deadline = time.monotonic() + seconds
+    while True:
+        with _ACTIVE_LOCK:
+            state = _ACTIVE.get(operation_id)
+            if state is None:
+                return {"operationId": operation_id, "quiescent": True}
+            # A failed final proof leaves a tombstoned record for close retry,
+            # never a new dispatch. Only after direct reap may it be released.
+            process = state.get("process")
+            if state.get("cleanup_pending") and process is not None and _group_quiescent(process.pid):
+                _ACTIVE.pop(operation_id, None)
+                return {"operationId": operation_id, "quiescent": True}
+        if time.monotonic() >= deadline:
+            return {"operationId": operation_id, "quiescent": False}
+        time.sleep(.01)
+
+
+def _dispatch(workspace: Path, request: object, *, runner_path: str = "/opt/botspace/secure_deploy_runner.py", setpriv: str = "/usr/bin/setpriv") -> dict:
     """Snapshot pinned artifact, then pass secrets only on a private pipe to deploy UID."""
     operation = request.get("operationId") if isinstance(request, dict) else None
     if not isinstance(operation, str) or not OP.fullmatch(operation):
@@ -204,19 +301,17 @@ def dispatch(workspace: Path, request: object, *, runner_path: str = "/opt/botsp
         with _ACTIVE_LOCK:
             state["process"] = process
             state["launched"] = True
+            # Open before communicate/poll can reap/recycle the leader PID.
+            state["leader_fd"] = os.pidfd_open(process.pid)
             cancelled = state["cancelled"]
         if cancelled:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            with _ACTIVE_LOCK:
+                _signal_runner(state)
         try:
             stdout, _ = process.communicate(input=encoded, timeout=240)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            with _ACTIVE_LOCK:
+                _signal_runner(state)
             process.communicate()
             return {"operationId": operation, "status": "interrupted", "code": "runner_interrupted"}
         try:
@@ -245,10 +340,8 @@ def dispatch(workspace: Path, request: object, *, runner_path: str = "/opt/botsp
         with _ACTIVE_LOCK:
             process = state.get("process")
         if process is not None:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            with _ACTIVE_LOCK:
+                _signal_runner(state)
             try:
                 process.communicate()
             except (OSError, ValueError):
@@ -256,5 +349,31 @@ def dispatch(workspace: Path, request: object, *, runner_path: str = "/opt/botsp
                     process.wait()
                 except OSError:
                     pass
+        # SIGKILL delivery, sampled /proc states and direct runner reap do not
+        # prove group emptiness. Only kernel-atomic ESRCH can publish absence.
+        quiescent = process is None
+        if process is not None:
+            deadline = time.monotonic() + 10
+            while process.returncode is not None and not quiescent:
+                quiescent = _group_quiescent(process.pid)
+                if quiescent or time.monotonic() >= deadline:
+                    break
+                time.sleep(.01)
         with _ACTIVE_LOCK:
-            _ACTIVE.pop(operation, None)
+            leader = state.pop("leader_fd", None)
+            if leader is not None:
+                os.close(leader)
+            if quiescent:
+                _ACTIVE.pop(operation, None)
+            else:
+                state["cleanup_pending"] = process is not None and process.returncode is not None
+
+
+def dispatch(workspace: Path, request: object, *, runner_path: str = "/opt/botspace/secure_deploy_runner.py", setpriv: str = "/usr/bin/setpriv") -> dict:
+    """Internal receipt carries explicit cleanup proof, separate from outcome."""
+    result = _dispatch(workspace, request, runner_path=runner_path, setpriv=setpriv)
+    operation = result.get("operationId")
+    with _ACTIVE_LOCK:
+        result["quiescent"] = (isinstance(operation, str) and bool(OP.fullmatch(operation))
+                               and operation in _SEEN and operation not in _ACTIVE)
+    return result

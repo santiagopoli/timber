@@ -31,8 +31,10 @@ COPY start.sh /opt/botspace/start.sh
 COPY desktop_bridge.py /opt/botspace/desktop_bridge.py
 # Includes the fresh-exec per-session Linux subreaper helper (--supervisor).
 COPY shell_bridge.py /opt/botspace/shell_bridge.py
+COPY smoke_shell.py /opt/botspace/smoke_shell.py
 COPY workspace.py /opt/botspace/workspace.py
 RUN chmod 755 /opt/botspace/start.sh /opt/botspace/server.py /opt/botspace/secure_deploy.py \
+    && chmod 644 /opt/botspace/shell_bridge.py \
     && chmod 755 /opt/botspace/patch_wrangler_cli.py \
     && chmod 755 /opt/botspace/secure_deploy_runner.py /opt/botspace/workspace_archive.py \
     && chown -R root:root /opt/botspace \

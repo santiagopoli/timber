@@ -31,7 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import TCPServer
 from urllib.parse import urlparse, parse_qs
 from workspace import WorkspaceInspector
-from secure_deploy import dispatch as secure_deploy_dispatch, cancel as secure_deploy_cancel
+from secure_deploy import dispatch as secure_deploy_dispatch, cancel as secure_deploy_cancel, close as secure_deploy_close
 import workspace_archive
 import shell_bridge
 import socket
@@ -1448,6 +1448,10 @@ def create_handler(computer: Computer, token: str):
                 if length > MAX_JSON or length < 0:
                     return self.respond(413, {"error": "Request too large"})
                 body = json.loads(self.rfile.read(length)) if length else {}
+                if self.path == "/secure-deploy/close":
+                    if not isinstance(body, dict) or set(body) != {"operationId"}:
+                        return self.respond(400, {"error": "Invalid private close request"})
+                    return self.respond(200, secure_deploy_close(body["operationId"]))
                 if self.path == "/secure-deploy/cancel":
                     operation = body.get("operationId")
                     return self.respond(200, secure_deploy_cancel(operation))

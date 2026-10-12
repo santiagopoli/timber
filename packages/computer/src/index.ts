@@ -197,7 +197,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         }
         executionPending ||= session.result.status==='running' || session.checkpoint==='pending';
       }
-      if(executionPending || (retry && !retry.blocked)) await ctx.storage.setAlarm(Date.now()+1_000);
+      if(executionPending || (retry && !retry.blocked) || await this.privateOperationActive()) await ctx.storage.setAlarm(Date.now()+1_000);
       if (this.container?.running) await stage("computer_lifecycle_failed", () => this.container!.setInactivityTimeout(SAFETY_TIMEOUT_MS));
     });
   }
@@ -268,6 +268,38 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     this.workspaceTail = result.catch(() => undefined);
     return result;
   }
+  /** Metadata-only reservation survives DO recovery and uncertain private HTTP delivery. */
+  private async privateOperationActive():Promise<boolean> {
+    return !!await this.ctx.storage.get("privateOperation");
+  }
+  private withPrivateOperation<T>(botId:string,work:(confirmQuiescent:()=>void)=>Promise<T>,operationId?:string):Promise<T> {
+    return this.serialize(()=>this.withWorkspace(async()=>{
+      if(await this.privateOperationActive() || await this.shell.active() || await this.live.controlled() || await this.hasManagedExecutions()) throw new ComputerProviderError("computer_execution_active");
+      const health=await this.initializeWorkspace(botId);
+      if(operationId) await this.ctx.storage.transaction(async txn=>{await txn.put("privateOperation",{operationId,bootId:health.bootId});await txn.setAlarm(Date.now()+EXEC_POLL_MS);});
+      let confirmed=false;
+      try {return await work(()=>{confirmed=true;});}
+      finally {
+        if(operationId) {
+          if(confirmed) await this.ctx.storage.delete("privateOperation");
+          else await this.ctx.storage.setAlarm(Date.now()+EXEC_POLL_MS);
+        }
+      }
+    }));
+  }
+  private async closePrivateOperation():Promise<boolean> {
+    const record=await this.ctx.storage.get<{operationId:string;bootId:string}>("privateOperation");
+    if(!record)return true;
+    // A stopped container cannot retain a private process or receive a delayed old request.
+    if(!this.container?.running) {await this.ctx.storage.delete("privateOperation");return true;}
+    try {
+      const response=await this.call("/secure-deploy/close",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId:record.operationId}),signal:AbortSignal.timeout(15_000)});
+      if(!response.ok) {void response.body?.cancel();return false;}
+      const value=await response.json<{operationId?:unknown;quiescent?:unknown}>();
+      if(value.operationId!==record.operationId || value.quiescent!==true)return false;
+      await this.ctx.storage.delete("privateOperation");return true;
+    } catch {return false;}
+  }
   private remove(botId:string):Promise<void> {
     if(this.deleting) return this.deleting;
     this.deleted=true;
@@ -322,7 +354,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         await this.backgroundCheckpoint?.catch(()=>{});
         return Response.json(await this.serialize(() => this.withWorkspace(async () => {
           this.active();
-          if(await this.hasManagedExecutions()) throw new ComputerProviderError('computer_execution_active');
+          if(!(await this.closePrivateOperation()) || await this.hasManagedExecutions()) throw new ComputerProviderError('computer_execution_active');
           await this.shell.closeAll();
           await this.live.closeAll();
           if (this.container?.running) {
@@ -360,7 +392,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       if(!this.container?.running) throw new ComputerProviderError("computer_app_not_running");
       return this.container.getTcpPort(port).fetch(new Request(`http://127.0.0.1:${port}/`,{headers:{Upgrade:"websocket",Authorization:`Bearer ${this.token}`,"Sec-WebSocket-Protocol":"binary"}}));
     },()=>this.touch());
-    if(url.pathname==="/desktop/control" && request.method==="GET") return Response.json({controlled:await this.live.controlled() || await this.shell.active()});
+    if(url.pathname==="/desktop/control" && request.method==="GET") return Response.json({controlled:await this.live.controlled() || await this.shell.active() || await this.privateOperationActive()});
     if(url.pathname==="/shell-ws") return this.shell.connect(botId,request,async session=>{
       if(!this.container?.running) throw new ComputerProviderError("computer_app_not_running");
       const abort=new AbortController(),timer=setTimeout(()=>abort.abort(),10_000);
@@ -370,7 +402,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     },()=>this.markShellDirty(),()=>this.touch());
     if(url.pathname==="/shell" && request.method==="POST") {
       return this.serialize(()=>this.withWorkspace(async()=>{
-        if(await this.hasManagedExecutions()) throw new ComputerProviderError("computer_execution_active");
+        if(await this.privateOperationActive() || await this.hasManagedExecutions()) throw new ComputerProviderError("computer_execution_active");
         if(await this.live.controlled()) throw new ShellError("computer_controlled",409,"Release desktop control before opening a shell.");
         let health=this.container?.running && this.workspaceHealth?this.workspaceHealth:await this.initializeWorkspace(botId);
         for(let attempt=0;health.capabilities?.includes("shellPtySupported") && !health.capabilities.includes("shellPty") && attempt<10;attempt++) {
@@ -483,6 +515,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         if (existingRecord.digest !== digest) return {operationId, status:"failed" as const, error:"operationId was already used with different arguments"};
         return existingRecord.result ?? {operationId, status:"interrupted" as const, error:"Operation outcome is unknown; it will not be replayed"};
       }
+      if(!["screenshot","readFile","listFiles"].includes(action.type) && await this.privateOperationActive()) return {operationId,status:"failed" as const,error:"A private computer operation is active or cleanup is unconfirmed. No action was executed."};
       if(!["screenshot","readFile","listFiles"].includes(action.type) && await this.shell.active()) return {operationId,status:"failed" as const,error:"A person has an open shell. No action was executed. Close the shell before mutating or checkpointing the computer."};
       if(!["screenshot","readFile","listFiles"].includes(action.type) && await this.live.controlled()) return {operationId,status:"failed" as const,error:"A person has control of the desktop. No action was executed. Release desktop control before issuing a new action."};
       const health=await this.ensureReady(botId);
@@ -576,7 +609,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   }
 
   private async hasActiveExecutions():Promise<boolean> {
-    return await this.shell.active() || await this.hasManagedExecutions();
+    return await this.privateOperationActive() || await this.shell.active() || await this.hasManagedExecutions();
   }
   private async hasManagedExecutions():Promise<boolean> {
     for await(const page of this.journalPages<ExecutionWork>('exec-work:'))if([...page.values()].some(work=>work.status==='running'))return true;
@@ -651,6 +684,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         return undefined;
       }
       if(await this.ctx.storage.get(`exec-cancelled:${processId}`)) return {operationId:processId,processId,status:'cancelled' as const,output:''};
+      if(await this.privateOperationActive()) return {operationId:processId,status:'failed' as const,error:'A private computer operation is active or cleanup is unconfirmed. No action was executed.'};
       if(await this.shell.active()) return {operationId:processId,status:'failed' as const,error:'A person has an open shell. No action was executed. Close the shell before starting a managed command.'};
       if(await this.live.controlled()) return {operationId:processId,status:'failed' as const,error:'A person has control of the desktop. No action was executed. Release desktop control before issuing a new action.'};
       const health=await this.ensureReady(botId);
@@ -994,6 +1028,10 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       await this.shell.sweep();
       if(await this.shell.active()) {await this.touch();await this.scheduleComputerAlarm(Date.now()+EXEC_POLL_MS);return;}
     } catch {await this.ctx.storage.setAlarm(Date.now()+EXEC_POLL_MS);return;}
+    if(await this.privateOperationActive()) {
+      const closed=await this.serialize(()=>this.withWorkspace(()=>this.closePrivateOperation()));
+      if(!closed) {await this.ctx.storage.setAlarm(Date.now()+EXEC_POLL_MS);return;}
+    }
     if(botId && await this.needsExecutionMaintenance()) {
       try {
         for await(const page of this.journalPages<ExecutionWork>('exec-work:')) for(const [key,work] of page) {
