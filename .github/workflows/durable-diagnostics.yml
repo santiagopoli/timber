@@ -25,7 +25,7 @@ on:
         default: '1'
         type: string
       recipient_public_key:
-        description: Optional ephemeral RSA public key PEM (3072+ bits); encrypts only three native failure details for private diagnosis
+        description: Optional ephemeral RSA public key PEM (3072+ bits); encrypts bounded private diagnostic evidence
         required: false
         type: string
 permissions:

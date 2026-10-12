@@ -678,12 +678,16 @@ the usual GUI approval policy and human-control exclusion. Pi exposes
 `desktop_move`, `desktop_double_click` and `desktop_drag`.
 
 Pi `exec {command,timeoutMs?,yieldMs?}` starts a managed process with no default
-execution deadline. `timeoutMs`, when explicitly supplied, is a positive safe
+execution deadline. Pi accepts an omitted or `null` timeout, normalized to no
+host deadline. Its provider-visible schema explicitly includes `null`, so a
+provider requiring every property does not force the model to invent a number.
+`timeoutMs`, when explicitly supplied as a number, is a positive safe
 integer; there is no 120-second maximum. Its expiry terminates the process group
 and retains output and the terminal outcome. `yieldMs` is an integer from 0 to
-30,000, default 1,000; it limits how long a request waits for output and never
-terminates a process. These values have the same meaning for direct computer API
-clients and Pi tools.
+30,000; it limits how long a request waits for output and never terminates a
+process. Pi waits 10,000 ms by default (also for `null`) to reduce unnecessary
+model/poll round trips; direct computer API clients retain their 1,000 ms default.
+The host still receives only validated integers and an absent deadline.
 
 A response with `status:"running"` includes `processId`, equal to the initial
 exec operation ID. It confirms the command continues in the computer. Pi exposes

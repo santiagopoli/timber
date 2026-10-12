@@ -43,9 +43,12 @@ test('performance queries measure real SQLite receipts without projecting conver
   assert.equal(JSON.parse(db.prepare(PRIVATE_PROGRESS_MESSAGES).get().detail)[0].text,'public progress');
   assert.equal(JSON.parse(db.prepare(PRIVATE_PROGRESS_MESSAGES).get().detail).length,1);
   assert.equal(JSON.parse(db.prepare(PRIVATE_PROGRESS_GOAL).get().detail).title,'private-canary');
-  event(8,'failed:start','tool.started',updated,{operationId:'failed-canary',actionType:'exec',input:{command:'false'}});
-  event(9,'tool:failed-canary','tool.completed',updated,{result:{status:'failed',exitCode:1,output:'bounded failure'}});
+  event(8,'failed:start','tool.started',updated,{operationId:'failed-canary',actionType:'exec',input:{command:'false',timeoutMs:10000,yieldMs:1000}});
+  event(9,'tool:failed-canary','tool.completed',updated,{result:{status:'failed',exitCode:1,output:'bounded failure',error:'Command timed out; its process group was terminated.'}});
   assert.equal(JSON.parse(db.prepare(PRIVATE_PROGRESS_FAILURES).get().detail)[0].command,'false');
+  const deadlines=summarizePerformance({tools:db.prepare(PERFORMANCE_TOOLS).all()},window).tools;
+  assert.equal(deadlines[0].deadlineMs,10000);assert.equal(deadlines[0].yieldMs,1000);assert.equal(deadlines[0].failureKind,'timeout');
+  assert.equal(summarizeActivity(db.prepare(PERFORMANCE_ACTIVITY).all(),window).find(row=>row.tool==='exec').timedOut,1);
  }finally{db.close();}
 });
 test('performance summary drops arbitrary labels, private fields and invalid timestamps',()=>{

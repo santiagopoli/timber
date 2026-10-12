@@ -126,12 +126,14 @@ describe('runtime computer bridge', () => {
     const host = bridge();
     const exec = computerTools(host).find(tool => tool.name === 'exec')!;
     await exec.execute({command: 'install dependencies'}, api, context);
-    expect(vi.mocked(host.tools.execute).mock.calls[0]?.[0].action).toEqual({type: 'exec', command: 'install dependencies', yieldMs: 1000});
+    expect(vi.mocked(host.tools.execute).mock.calls[0]?.[0].action).toEqual({type: 'exec', command: 'install dependencies', yieldMs: 10000});
     await exec.execute({command: 'long build', timeoutMs: 900000, yieldMs: 0}, api, context);
     expect(vi.mocked(host.tools.execute).mock.calls[1]?.[0].action).toEqual({type: 'exec', command: 'long build', timeoutMs: 900000, yieldMs: 0});
     const properties = exec.parameters.properties as Record<string, unknown>;
-    expect(properties.timeoutMs).toMatchObject({minimum: 1, maximum: Number.MAX_SAFE_INTEGER});
+    expect(properties.timeoutMs).toMatchObject({anyOf:[{type:'integer',minimum:1,maximum:Number.MAX_SAFE_INTEGER},{type:'null'}]});
     expect(properties.timeoutMs).not.toHaveProperty('default');
+    await exec.execute({command:'build without deadline',timeoutMs:null,yieldMs:null},api,context);
+    expect(vi.mocked(host.tools.execute).mock.calls[2]?.[0].action).toEqual({type:'exec',command:'build without deadline',yieldMs:10000});
   });
   it('polls and cancels only the supplied process while retaining independent invocation identities', async () => {
     const host = bridge(), tools = computerTools(host), processId = 'pi-tool:original:exec';
@@ -142,7 +144,7 @@ describe('runtime computer bridge', () => {
     await cancel.execute({processId}, {...api, callId: 'cancel-process'}, context);
     const calls = vi.mocked(host.tools.execute).mock.calls.map(([request]) => request);
     expect(calls.map(call => call.action)).toEqual([
-      {type: 'execPoll', processId, yieldMs: 1000},
+      {type: 'execPoll', processId, yieldMs: 10000},
       {type: 'execPoll', processId, yieldMs: 30000},
       {type: 'execCancel', processId},
     ]);

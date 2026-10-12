@@ -28,6 +28,8 @@ export const PERFORMANCE_TOOLS = `WITH recent AS (
  json_extract(c.data,'$.data.result.exitCode') AS exit_code,
  json_extract(c.data,'$.data.result.checkpointStatus') AS checkpoint,
  length(json_extract(c.data,'$.data.result.output')) AS output_characters,
+ json_extract(s.data,'$.data.input.timeoutMs') AS deadline_ms,
+ json_extract(s.data,'$.data.input.yieldMs') AS yield_ms,
  length(json_extract(s.data,'$.data.input.content')) AS written_characters,
  CASE WHEN json_extract(s.data,'$.data.actionType') IN ('readFile','writeFile') THEN
  CASE WHEN json_extract(s.data,'$.data.input.path') LIKE '%.sh' THEN 'shell'
@@ -37,7 +39,8 @@ export const PERFORMANCE_TOOLS = `WITH recent AS (
  WHEN json_extract(s.data,'$.data.input.path') LIKE '%.log' OR json_extract(s.data,'$.data.input.path') LIKE '%.out' THEN 'log'
  ELSE 'other' END ELSE NULL END AS file_kind,
  CASE WHEN lower(json_extract(s.data,'$.data.input.key')) IN ('return','enter','ctrl+c','ctrl+d','ctrl+v','ctrl+l','alt+f2','ctrl+alt+t') THEN lower(json_extract(s.data,'$.data.input.key')) ELSE NULL END AS key_kind,
- CASE WHEN instr(lower(json_extract(c.data,'$.data.result.error')),'session is unavailable')>0 THEN 'session_unavailable'
+ CASE WHEN instr(lower(json_extract(c.data,'$.data.result.error')),'timed out')>0 THEN 'timeout'
+ WHEN instr(lower(json_extract(c.data,'$.data.result.error')),'session is unavailable')>0 THEN 'session_unavailable'
  WHEN instr(lower(json_extract(c.data,'$.data.result.error')),'restarted')>0 THEN 'computer_restarted'
  WHEN instr(lower(json_extract(c.data,'$.data.result.error')),'checkpoint')>0 THEN 'checkpoint'
  WHEN instr(lower(json_extract(c.data,'$.data.result.error')),'person has control')>0 THEN 'human_control'
@@ -85,13 +88,14 @@ export const PERFORMANCE_ACTIVITY = `WITH effects AS (
  SELECT s.hour,s.tool,COUNT(*) AS actions,
  SUM(json_extract(c.data,'$.data.result.status')='failed') AS failed,
  SUM(json_extract(c.data,'$.data.result.status')='interrupted') AS interrupted,
+ SUM(COALESCE(instr(lower(json_extract(c.data,'$.data.result.error')),'timed out')>0,0)) AS timed_out,
  SUM(CASE WHEN c.data IS NOT NULL THEN MAX(0,CAST((julianday(json_extract(c.data,'$.createdAt'))-julianday(json_extract(s.data,'$.createdAt')))*86400000 AS INTEGER)) ELSE 0 END) AS duration_ms,
  SUM(length(json_extract(s.data,'$.data.input.content'))) AS written_characters
  FROM effects s LEFT JOIN events c ON c.source_key='tool:'||json_extract(s.data,'$.data.operationId')
  GROUP BY s.hour,s.tool
 ) SELECT * FROM grouped ORDER BY hour DESC,actions DESC LIMIT 90`;
 
-export function summarizeActivity(records,window){return records.slice(0,90).filter(row=>{const at=Date.parse(iso(row.hour)??'');return at>=window.from&&at<=window.to;}).map(row=>({hour:iso(row.hour),tool:allow(tools,row.tool),actions:count(row.actions),failed:count(row.failed),interrupted:count(row.interrupted),durationMs:count(row.duration_ms),writtenCharacters:count(row.written_characters)}));}
+export function summarizeActivity(records,window){return records.slice(0,90).filter(row=>{const at=Date.parse(iso(row.hour)??'');return at>=window.from&&at<=window.to;}).map(row=>({hour:iso(row.hour),tool:allow(tools,row.tool),actions:count(row.actions),failed:count(row.failed),interrupted:count(row.interrupted),timedOut:count(row.timed_out),durationMs:count(row.duration_ms),writtenCharacters:count(row.written_characters)}));}
 
 const states=new Set(['pending','queued','running','waiting','waiting_approval','waiting_connection','completed','failed','interrupted','cancelling','cancelled','completing','terminal','aborted','faulted','orphaned']);
 const tools=new Set(['exec','exec_poll','exec_cancel','call_tool','spawn_subagent','send_subagent_message','wait_subagent','list_subagents','cancel_subagent','execPoll','execCancel','readFile','writeFile','listFiles','checkpoint','gitClone','gitPush','screenshot','navigate','click','type','key','scroll','list_tools','load_skill','github_clone','github_push','github_create_pull_request','github_list_pull_requests','github_list_repositories','publish_app','list_apps','create_task','list_tasks','update_task','request_secret','configure_secret','name_secret','list_secrets','secret_request']);
@@ -104,7 +108,7 @@ export function summarizePerformance({runs=[],tools:actions=[],native=[],usage=[
  const inside=value=>{const at=Date.parse(value??'');return Number.isFinite(at)&&at>=window.from&&at<=window.to;};
  return {
   runs:runs.slice(0,12).filter(row=>inside(iso(row.updated_at))||inside(iso(row.created_at))).map(row=>({createdAt:iso(row.created_at),updatedAt:iso(row.updated_at),status:allow(states,row.status),source:allow(new Set(['user','internal']),row.source),generations:count(row.generations),tools:count(row.tools),retries:count(row.retries)})),
-  tools:actions.slice(0,60).filter(row=>inside(iso(row.finished_at))||inside(iso(row.started_at))).map(row=>{const startedAt=iso(row.started_at),finishedAt=iso(row.finished_at);return {startedAt,finishedAt,tool:allow(tools,row.tool),status:allow(states,row.status),durationMs:startedAt&&finishedAt?count(Date.parse(finishedAt)-Date.parse(startedAt)):null,exitCode:Number.isSafeInteger(row.exit_code)?row.exit_code:null,checkpoint:allow(new Set(['pending','saved','failed']),row.checkpoint),outputCharacters:count(row.output_characters),writtenCharacters:count(row.written_characters),fileKind:row.file_kind==null?null:allow(new Set(['shell','python','typescript','javascript','log','other']),row.file_kind),keyKind:row.key_kind==null?null:allow(new Set(['return','enter','ctrl+c','ctrl+d','ctrl+v','ctrl+l','alt+f2','ctrl+alt+t']),row.key_kind),failureKind:row.failure_kind==null?null:allow(new Set(['session_unavailable','computer_restarted','checkpoint','human_control','connection','command_not_found','other']),row.failure_kind)};}),
+  tools:actions.slice(0,60).filter(row=>inside(iso(row.finished_at))||inside(iso(row.started_at))).map(row=>{const startedAt=iso(row.started_at),finishedAt=iso(row.finished_at);return {startedAt,finishedAt,tool:allow(tools,row.tool),status:allow(states,row.status),durationMs:startedAt&&finishedAt?count(Date.parse(finishedAt)-Date.parse(startedAt)):null,exitCode:Number.isSafeInteger(row.exit_code)?row.exit_code:null,checkpoint:allow(new Set(['pending','saved','failed']),row.checkpoint),outputCharacters:count(row.output_characters),deadlineMs:count(row.deadline_ms),yieldMs:count(row.yield_ms),writtenCharacters:count(row.written_characters),fileKind:row.file_kind==null?null:allow(new Set(['shell','python','typescript','javascript','log','other']),row.file_kind),keyKind:row.key_kind==null?null:allow(new Set(['return','enter','ctrl+c','ctrl+d','ctrl+v','ctrl+l','alt+f2','ctrl+alt+t']),row.key_kind),failureKind:row.failure_kind==null?null:allow(new Set(['timeout','session_unavailable','computer_restarted','checkpoint','human_control','connection','command_not_found','other']),row.failure_kind)};}),
   nativeTasks:native.slice(0,60).map(row=>({kind:allow(kinds,row.kind),status:allow(states,row.status),phase:allow(phases,row.phase),tool:allow(tools,row.tool),replay:allow(new Set(['safe','unsafe']),row.replay),isRoot:row.is_root===1,attempt:count(row.attempt),outcome:allow(states,row.outcome),background:row.background===1})),
   recovery:recovery.slice(0,1).map(row=>({waitGraphs:count(row.wait_graphs),activeNativeTasks:count(row.active_native_tasks),queuedInputs:count(row.queued_inputs)})),
   wakes:wakes.slice(0,40).map(row=>({capability:allow(new Set(['pi-harness','botspace-subagents','botspace-admission']),row.capability),fn:allow(new Set(['wake','retry']),row.fn),at:count(row.time)===null?null:new Date(row.time).toISOString(),running:row.running===1,executionStartedAt:count(row.execution_started_at)===null?null:new Date(row.execution_started_at).toISOString(),recoveryLoop:row.recovery_loop===1})),

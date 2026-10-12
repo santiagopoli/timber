@@ -533,13 +533,24 @@ it.each([false, true])('continues a running exec through its process ID with can
   const state = await (await request('/inspect')).json<{toolCalls: {input: string}[]; calls: {input: string}[]; events: {event: string}[]}>();
   const tools = state.toolCalls.map(row => JSON.parse(row.input));
   expect(tools.map(tool => tool.action.type)).toEqual(['exec', cancel ? 'execCancel' : 'execPoll']);
-  expect(tools[0].action).toEqual({type: 'exec', command: 'fixture managed command', yieldMs: 1000});
+  expect(tools[0].action).toEqual({type: 'exec', command: 'fixture managed command', yieldMs: 10000});
   expect(tools[1].action.processId).toBe(tools[0].operationId);
   expect(tools[1].operationId).not.toBe(tools[0].operationId);
   const events = state.events.map(row => JSON.parse(row.event));
   expect(events).toContainEqual(expect.objectContaining({type: 'tool.completed', data: expect.objectContaining({status: 'running', processId: tools[0].operationId})}));
   expect(events).toContainEqual(expect.objectContaining({type: 'tool.completed', data: expect.objectContaining({status: cancel ? 'cancelled' : 'completed', processId: tools[0].operationId})}));
   expect(events.some(event => event.type === 'run.failed')).toBe(false);
+});
+it('accepts a nullable deadline through the actual namespaced Responses schema and native Pi validation',async()=>{
+  await request('/host-context',{mode:'automatic'});
+  await request('/submit',{text:'request-resumable-exec null-deadline',operationId:'nullable-deadline',chatgpt:true});
+  expect(await(await request('/wait?id=nullable-deadline')).json()).toMatchObject({status:'done',text:'The managed command completed.'});
+  const state=await(await request('/inspect')).json<{calls:{input:string}[];toolCalls:{input:string}[]}>();
+  const wire=JSON.parse(state.calls[0]!.input),exec=wire.tools.flatMap((namespace:{tools:{name:string}[]})=>namespace.tools).find((tool:{name:string})=>tool.name==='exec');
+  expect(exec.parameters.properties.timeoutMs.anyOf).toContainEqual({type:'null'});
+  const actions=state.toolCalls.map(row=>JSON.parse(row.input).action);
+  expect(actions).toEqual([{type:'exec',command:'fixture managed command',yieldMs:10000},{type:'execPoll',processId:expect.any(String),yieldMs:0}]);
+  expect(actions[0]).not.toHaveProperty('timeoutMs');
 });
 it('recovers after a saved running exec result by polling without launching the command again', async () => {
   const namespace = (env as unknown as {PROBE: DurableObjectNamespace<HarnessProbe>}).PROBE;
