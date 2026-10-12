@@ -25,6 +25,13 @@ put tokens in commands, or use browser sign-in to bypass a missing connection.
    problem, changes and actual verification. Never claim a check passed without evidence.
 5. Report the PR URL and test outcome in a final response. Every tool completion
    needs an assistant follow-up; don't leave the user with only command logs.
+6. Inspect CI through github_inspect_ci. List runs for the branch/full commit,
+   then inspect the chosen run ID to read jobs, failed steps and a bounded failure
+   log. Fix the concrete failure before rerunning checks. A green verification
+   job is not proof of deployment: inspect the deployment job and production.
+   This read does not need the computer and is safe to repeat. Normal development
+   dependencies may be installed in the computer; no separate user instruction
+   is needed beyond the task and current host approval policy.
 The workspace checkpoint limit is 256 MiB and 10,000 entries, including .git.
 Use shallow clones when appropriate; dependencies/caches are not durable. A failed
 checkpoint means the working tree is not yet durable; don't rerun completed effects.

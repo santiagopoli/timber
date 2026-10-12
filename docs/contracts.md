@@ -677,6 +677,13 @@ images reject before journaling and never report a simulated result. They share
 the usual GUI approval policy and human-control exclusion. Pi exposes
 `desktop_move`, `desktop_double_click` and `desktop_drag`.
 
+The normal computer runs as root and can install project dependencies/tools under
+the current host approval policy. The shipped image includes Node/npm, Python,
+virtual environments/pip, ripgrep, jq and patch. Python packages should use a
+virtual environment; project setup remains reproducible because dependency
+directories and caches are not durable workspace checkpoints.
+
+
 Pi `exec {command,timeoutMs?,yieldMs?}` starts a managed process with no default
 execution deadline. Pi accepts an omitted or `null` timeout, normalized to no
 host deadline. Its provider-visible schema explicitly includes `null`, so a
@@ -1007,6 +1014,22 @@ recipient; a plain `@` string never grants authority to choose a different bot.
 
 
 ## Host tools and GitHub connection
+`github_inspect_ci {repository,branch?,commit?,runId?,jobId?}` is a read-only
+host capability, including for computerless coordinating turns. Without a run
+ID it lists ten recent runs, optionally for a branch/full SHA. With a run ID it
+returns up to 30 job states, step details for the selected/first failed/current
+job, and a failed job's log tail; an
+explicit job ID must belong to that returned run. Log downloads retain at most
+16,000 characters, cap total bytes at 8 MB, and never forward GitHub credentials
+to a signed log redirect. Only HTTPS GitHub Actions/Azure log hosts are accepted.
+The source bot's installed repository grant is checked before reading and again
+before returning. Disconnect/deletion/reinstallation fences results. CI reads
+do not hold the integration mutation lock while fetching logs and never restart
+jobs or execute commands. Public repo CI uses unauthenticated reads after the
+connected account confirms repository visibility; private repo CI requires the
+existing GitHub App/user authorization to include Actions read permission.
+Verification success and deployment success are returned as separate job states.
+
 The host advertises a small catalog through runtime-independent `catalog` / `call`
 ports. Pi implements native `list_tools` and `call_tool`; neither engine nor skill
 owns provider credentials. Standard Agent Skills sources live in `skills/*/SKILL.md`

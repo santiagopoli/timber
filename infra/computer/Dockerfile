@@ -7,7 +7,7 @@ FROM mirror.gcr.io/library/node:24.14.0-bookworm-slim@sha256:d8e448a56fc63242f70
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 chromium xvfb xdotool xclip scrot openbox fonts-liberation \
     x11vnc python3-websockify xterm \
-    ca-certificates curl git procps tini \
+    ca-certificates curl git procps tini ripgrep jq patch python3-pip python3-venv \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /workspace /state /opt/botspace
 

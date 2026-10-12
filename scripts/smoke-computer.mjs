@@ -33,6 +33,9 @@ async function action(action, operationId = randomUUID()) {
 }
 await action({type:'writeFile',path:'image-smoke.txt',content:'Timber image smoke\n'});
 assert.equal((await action({type:'readFile',path:'image-smoke.txt'})).output,'Timber image smoke\n');
+const developmentTools=await action({type:'exec',command:'command -v apt-get && command -v rg && command -v jq && command -v patch && npm --version && python3 -m pip --version && python3 -m venv /tmp/timber-venv-smoke && /tmp/timber-venv-smoke/bin/python -c \'print("venv-ready")\'',yieldMs:10000});
+assert.equal(developmentTools.exitCode,0,'development tools and package managers are available');
+assert.match(developmentTools.output,/venv-ready/,'Python dependencies can use a real virtual environment');
 const operationId = randomUUID();
 const command = {type:'exec',command:'printf x >> effect-count.txt; cat effect-count.txt',timeoutMs:10000};
 const result = await action(command,operationId);assert.equal(result.exitCode,0);assert.equal(result.output,'x');

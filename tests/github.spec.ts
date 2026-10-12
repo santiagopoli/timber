@@ -62,6 +62,43 @@ beforeEach(async()=>{
 afterEach(()=>vi.restoreAllMocks());
 
 describe("GitHub authorization host",()=>{
+  it('reads CI only for installed repositories and does not expose integration credentials',async()=>{
+    const instance=stub();await setup(instance);
+    const original=vi.mocked(fetch).getMockImplementation()!,ciCalls:string[]=[];
+    vi.mocked(fetch).mockImplementation(async(input,init)=>{
+      const url=input instanceof Request?input.url:String(input);
+      if(url===`https://api.github.com/repos/${repository}`)return Response.json({full_name:repository,private:false});
+      if(url.includes(`/repos/${repository}/actions/runs?`)){
+        ciCalls.push(url);expect(new Headers(init?.headers).has('authorization')).toBe(false);
+        return Response.json({workflow_runs:[{id:42,name:'Verify',status:'completed',conclusion:'failure'}]});
+      }
+      return original(input,init);
+    });
+    const response=await post(instance,'/ci',{botId:BOT,repository,branch:'main'});
+    expect(response.status).toBe(200);const data=await response.text();expect(data).toContain('failure');expect(data).not.toContain('private-user-token');expect(ciCalls).toHaveLength(1);
+    const denied=await post(instance,'/ci',{botId:BOT,repository:'owner/other'});expect(denied.status).toBe(403);await denied.text();expect(ciCalls).toHaveLength(1);
+  });
+  it('fences CI results when the owner disconnects during the read without serializing the download',async()=>{
+    const instance=stub(),flow=await setup(instance);await flow.oauth.text();
+    const result=await runInDurableObject(instance,async(target)=>{
+      const original=vi.mocked(fetch).getMockImplementation()!;
+      vi.mocked(fetch).mockImplementation(async(input,init)=>{
+        const url=input instanceof Request?input.url:String(input);
+        if(url===`https://api.github.com/repos/${repository}`)return Response.json({full_name:repository,private:false});
+        if(url.includes(`/repos/${repository}/actions/runs?`)){
+          // Same actor I/O context, real disconnect route. Holding the CI read
+          // under the mutation lock would deadlock this request.
+          const revoked=await target.fetch(new Request('https://github/disconnect',{method:'POST',headers:{'content-type':'application/json'},body:'{}'}));
+          expect(revoked.status).toBe(200);await revoked.text();
+          return Response.json({workflow_runs:[{id:42,name:'private CI evidence'}]});
+        }
+        return original(input,init);
+      });
+      const response=await target.fetch(new Request('https://github/ci',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({botId:BOT,repository})}));
+      return {status:response.status,text:await response.text()};
+    });
+    expect(result.status).toBe(403);expect(result.text).not.toContain('private CI evidence');
+  });
   it('resumes a task-scoped GitHub consent in the exact conversation and rejects a mismatched bot',async()=>{
     const api=async(path:string,method='GET',body?:unknown)=>{const r=await exports.default.fetch(`${origin}/v1${path}`,{method,headers:{authorization:'Bearer test-only-botspace-owner-token-000000','content-type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})});return new Response(await r.text(),{status:r.status,headers:r.headers});};
     const created=await api('/tasks','POST',{operationId:crypto.randomUUID(),title:'Connect task',description:'fixture:github-account',botId:BOT,startImmediately:true});expect(created.status).toBe(201);
