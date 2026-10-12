@@ -3,6 +3,7 @@ import { pathToFileURL } from 'node:url';
 import {createCipheriv,createHash,createPublicKey,publicEncrypt,randomBytes,constants} from 'node:crypto';
 import { DIAGNOSTIC_CODES, timeframe } from './prod-diagnostics.mjs';
 import {PERFORMANCE_SCHEMA,PERFORMANCE_REQUESTS,summarizeInferenceRequests,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_PROCESSES,PERFORMANCE_DELIVERIES,PERFORMANCE_WAKES,PERFORMANCE_RECOVERY,PERFORMANCE_USAGE,summarizePerformance,performanceTaskMetadata} from './prod-performance-diagnostics.mjs';
+import {PERFORMANCE_ACTIVITY,summarizeActivity} from './prod-performance-diagnostics.mjs';
 
 // Cloudflare Data Studio's SQL API. These are fixed read-only statements;
 // neither SQL nor object names can be supplied by workflow dispatch inputs.
@@ -223,7 +224,8 @@ export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now
       const tables=await query(bot,name,PERFORMANCE_SCHEMA);
       if(!['runs','submissions','events','botspace_runtime_budget','pi_tasks','pi_entries'].every(name=>tables.some(row=>row.name===name)))return {initialized:false};
       const inference=tables.some(row=>row.name==='timber_inference_requests')?summarizeInferenceRequests(await query(bot,name,PERFORMANCE_REQUESTS)):[];
-      return {...summarizePerformance({runs:await query(bot,name,PERFORMANCE_RUNS),tools:await query(bot,name,PERFORMANCE_TOOLS),native:await query(bot,name,PERFORMANCE_NATIVE),wakes:await query(bot,name,PERFORMANCE_WAKES),recovery:await query(bot,name,PERFORMANCE_RECOVERY),processes:await query(bot,name,PERFORMANCE_PROCESSES),deliveries:await query(bot,name,PERFORMANCE_DELIVERIES),usage:await query(bot,name,PERFORMANCE_USAGE)},window),inference};
+      const activity=summarizeActivity(await query(bot,name,PERFORMANCE_ACTIVITY),window);
+      return {...summarizePerformance({runs:await query(bot,name,PERFORMANCE_RUNS),tools:await query(bot,name,PERFORMANCE_TOOLS),native:await query(bot,name,PERFORMANCE_NATIVE),wakes:await query(bot,name,PERFORMANCE_WAKES),recovery:await query(bot,name,PERFORMANCE_RECOVERY),processes:await query(bot,name,PERFORMANCE_PROCESSES),deliveries:await query(bot,name,PERFORMANCE_DELIVERIES),usage:await query(bot,name,PERFORMANCE_USAGE)},window),inference,activity};
     };
     const root=await inspect(name),tasks=[];
     for(const task of await query(workspace,'owner',PERFORMANCE_TASKS)){
