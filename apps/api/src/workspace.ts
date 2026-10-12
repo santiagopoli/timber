@@ -139,6 +139,18 @@ export class WorkspaceDO extends DurableObject<Env> {
     this.ctx.waitUntil(this.rearmDeletion());
     return admissionToken;
   }
+  private beginTaskInboxAdmission(botId:string,taskId:string,operationId:string):string {
+    const row=this.ctx.storage.sql.exec<{data:string}>('SELECT data FROM tasks WHERE id=?',taskId).toArray()[0];
+    const task=row?JSON.parse(row.data) as Task & {cancelRequested?:boolean}:undefined;
+    if(!task||task.botId!==botId)throw new ApiError(404,'not_found','Task not found for this bot.');
+    if(task.cancelRequested||!['queued','running','waiting_approval','waiting_connection'].includes(task.status))throw new ApiError(409,'task_not_running','The task is not accepting messages.');
+    // Pin the receipt, not the computer. This prevents a concurrent scheduler
+    // observation from finishing a task while its incoming message is in flight.
+    const slot=this.slotFor(botId),token=crypto.randomUUID();
+    this.ctx.storage.sql.exec('INSERT INTO computer_admissions(token,bot_id,task_id,operation_id,slot_token,created_at) VALUES(?,?,?,?,?,?)',token,botId,taskId,operationId,slot?.task_id===taskId?slot.token??'inbox':'inbox',Date.now());
+    this.ctx.waitUntil(this.rearmDeletion());
+    return token;
+  }
   private completeComputerAdmission(token:string):void {
     const row=this.ctx.storage.sql.exec<{bot_id:string;task_id:string;slot_token:string}>("SELECT bot_id,task_id,slot_token FROM computer_admissions WHERE token=?",token).toArray()[0];
     if(!row)return;
@@ -513,7 +525,11 @@ export class WorkspaceDO extends DurableObject<Env> {
         // Freeze routing before dispatch. A lost acknowledgment must not turn a
         // now-completed message into an unintended second continuation.
         if(mode==='continue')return this.fetch(new Request(`https://workspace/tasks/${task.id}/continue`,{method:'POST',headers,body:JSON.stringify(message)}));
-        return this.env.BOT.get(this.env.BOT.idFromName(`owner:task:${task.id}`)).fetch('https://task/messages',{method:'POST',headers:{...headers,'x-timber-task-id':task.id},body:JSON.stringify(message)});
+        // A settled replay already has a receipt and must not reopen the task.
+        const admission=['queued','running','waiting_approval','waiting_connection'].includes(task.status)?this.beginTaskInboxAdmission(bot.id,task.id,message.operationId):undefined;
+        const response=await this.env.BOT.get(this.env.BOT.idFromName(`owner:task:${task.id}`)).fetch('https://task/messages',{method:'POST',headers:{...headers,'x-timber-task-id':task.id},body:JSON.stringify(message)});
+        if(admission)this.completeComputerAdmission(admission);
+        return response;
       }
       if(path==="/tasks" && request.method==="GET") {
         const tasks=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks ORDER BY rowid DESC").toArray().map(row=>JSON.parse(row.data));
@@ -579,6 +595,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         if(typeof operationId!=="string"||!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(operationId))throw new ApiError(400,"invalid_request","A valid admission operationId is required.");
         const taskId=input.taskId===undefined?null:input.taskId;
         if(taskId!==null&&(typeof taskId!=="string"||!UUID.test(taskId)))throw new ApiError(400,"invalid_request","Invalid task admission identity.");
+        if(input.inbox===true&&typeof taskId==='string')return json({token:this.beginTaskInboxAdmission(admissionRoute[1],taskId,operationId)});
         return json({token:this.beginComputerAdmission(admissionRoute[1],taskId as string|null,operationId)});
       }
       if(admissionRoute && request.method==="DELETE" && admissionRoute[2]) {this.completeComputerAdmission(admissionRoute[2]);await this.rearmDeletion();return json({released:true});}

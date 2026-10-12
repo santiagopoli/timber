@@ -23,6 +23,17 @@ async function taskRuns(id:string){return (await (await api(`/v1/tasks/${id}/run
 async function settled(id:string,status:string){for(let i=0;i<100;i++){const result=await taskRuns(id);if(result.runs[0]?.status===status)return result.runs[0];await new Promise(resolve=>setTimeout(resolve,5));}throw new Error(`Task run did not become ${status}`);}
 async function slot(id:string){return runInDurableObject(registry(),(_instance,state)=>state.storage.sql.exec<{task_id:string;token:string;generation:number;updated_at:number}>("SELECT task_id,token,generation,updated_at FROM task_slots WHERE bot_id=?",id).toArray()[0]);}
 describe("durable task computer scheduler",()=>{
+ it("does not finalize an idle task while an incoming chat receipt is in flight",async()=>{
+  const owner=await bot(),record=await task(owner,"Finish this short task");await settled(record.id,"completed");
+  const held=await slot(owner.id),operationId=crypto.randomUUID();
+  const reserved=await registry().fetch(`https://workspace/tasks/bot-slot/${owner.id}/admissions`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({taskId:record.id,operationId,inbox:true})});
+  expect(reserved.status).toBe(200);const {token}=await reserved.json<{token:string}>();
+  await tick();expect((await slot(owner.id))?.task_id).toBe(record.id);expect((await slot(owner.id))?.generation).toBe(held?.generation);
+  const response=await taskDO(record.id).fetch('https://task/messages',{method:'POST',headers:{'content-type':'application/json','x-botspace-config':encodeURIComponent(JSON.stringify(owner)),'x-timber-task-id':record.id},body:JSON.stringify({operationId,text:'fixture:approval'})});
+  expect(response.status).toBe(202);await response.text();
+  const released=await registry().fetch(`https://workspace/tasks/bot-slot/${owner.id}/admissions/${token}`,{method:'DELETE'});await released.text();
+  await settled(record.id,'waiting_approval');await tick();expect((await slot(owner.id))?.task_id).toBe(record.id);
+ },60000);
  it("receipts messages to a queued task, preserves them across eviction and starts the original work first",async()=>{
   const owner=await bot(),held=await task(owner),queued=await task(owner);
   await settled(held.id,"waiting_approval");expect(queued.status).toBe("queued");

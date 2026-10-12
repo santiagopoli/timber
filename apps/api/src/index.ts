@@ -18,9 +18,9 @@ async function discardRequestBody(request:Request):Promise<void> {
   try { await request.body.cancel(); } catch { /* A forwarded/locked stream is already owned elsewhere. */ }
 }
 
-async function beginAdmission(env:Env,botId:string,operationId:string,taskId?:string):Promise<string> {
+async function beginAdmission(env:Env,botId:string,operationId:string,taskId?:string,inbox=false):Promise<string> {
   const path=`https://workspace/tasks/bot-slot/${botId}/admissions`;
-  const response=await env.WORKSPACE.get(env.WORKSPACE.idFromName("owner")).fetch(new Request(path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId,...taskId?{taskId}:{}})}));
+  const response=await env.WORKSPACE.get(env.WORKSPACE.idFromName("owner")).fetch(new Request(path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId,...taskId?{taskId}:{},...(inbox?{inbox:true}:{})})}));
   if(!response.ok)throw new ApiError(response.status,"computer_busy","The bot's shared computer is occupied; retry when its current work finishes.");
   return (await response.json<{token:string}>()).token;
 }
@@ -176,8 +176,8 @@ export default {
         let admissionToken:string|undefined;
         // BotDO durably receipts chat input before claiming execution. A queued
         // task must remain writable without acquiring the shared computer here.
-        const taskInput=/^agents\/[^/]+\/messages$/.test(endpoint);
-        if(taskInput&&request.method==="POST")admissionToken=await beginAdmission(env,task.botId,await bodyOperationId(request),taskId);
+        const taskInput=endpoint==='messages'||/^agents\/[^/]+\/messages$/.test(endpoint);
+        if(taskInput&&request.method==="POST")admissionToken=await beginAdmission(env,task.botId,await bodyOperationId(request),taskId,endpoint==='messages');
         if(/^approvals\/[^/]+$/.test(endpoint)&&request.method==="POST")admissionToken=await beginAdmission(env,task.botId,`mutation:${crypto.randomUUID()}`,taskId);
         requestBodyForwarded=true;
         const response=await stub.fetch(new Request(`https://task/${endpoint}${url.search}`,{method:request.method,headers,body:["GET","HEAD"].includes(request.method)?undefined:request.body,redirect:"manual",signal:request.signal}));
