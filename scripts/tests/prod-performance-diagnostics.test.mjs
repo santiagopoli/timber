@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
-import {PERFORMANCE_SCHEMA,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_USAGE,summarizePerformance,performanceTaskMetadata} from '../prod-performance-diagnostics.mjs';
+import {PERFORMANCE_SCHEMA,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_PROCESSES,PERFORMANCE_DELIVERIES,PERFORMANCE_USAGE,summarizePerformance,performanceTaskMetadata} from '../prod-performance-diagnostics.mjs';
 import {collectDurable} from '../prod-durable-diagnostics.mjs';
 
 const now=Date.parse('2026-10-12T10:00:00Z'),window={from:now-86_400_000,to:now};
@@ -9,8 +9,8 @@ const created='2026-10-12T09:00:00.000Z',updated='2026-10-12T09:30:00.000Z';
 test('performance queries measure real SQLite receipts without projecting conversation or tool content',()=>{
  const db=new DatabaseSync(':memory:');
  try{
-  db.exec('CREATE TABLE bots(id TEXT,data TEXT);CREATE TABLE tasks(id TEXT,data TEXT);CREATE TABLE runs(id TEXT,data TEXT);CREATE TABLE submissions(operation_id TEXT,run_id TEXT);CREATE TABLE botspace_runtime_budget(operation_id TEXT,kind TEXT,item_id TEXT);CREATE TABLE events(id INTEGER,source_key TEXT,data TEXT);CREATE TABLE pi_tasks(id INTEGER,status TEXT,record TEXT);CREATE TABLE pi_entries(id INTEGER,record TEXT)');
-  for(const sql of [PERFORMANCE_SCHEMA,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_USAGE]){assert.match(sql,/^(SELECT|WITH) /);assert.doesNotMatch(sql,/\b(INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE|ATTACH|PRAGMA)\b/i);assert.doesNotMatch(sql,/;/);}
+  db.exec('CREATE TABLE bots(id TEXT,data TEXT);CREATE TABLE tasks(id TEXT,data TEXT);CREATE TABLE runs(id TEXT,data TEXT);CREATE TABLE submissions(operation_id TEXT,run_id TEXT);CREATE TABLE botspace_runtime_budget(operation_id TEXT,kind TEXT,item_id TEXT);CREATE TABLE events(id INTEGER,source_key TEXT,data TEXT);CREATE TABLE pi_tasks(id INTEGER,status TEXT,record TEXT,conversation_id INTEGER);CREATE TABLE pi_submissions(request_id TEXT,status TEXT,conversation_id INTEGER);CREATE TABLE run_processes(status TEXT,dispatch_state TEXT,cancel_requested INTEGER,result TEXT);CREATE TABLE pi_entries(id INTEGER,record TEXT)');
+  for(const sql of [PERFORMANCE_SCHEMA,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_PROCESSES,PERFORMANCE_DELIVERIES,PERFORMANCE_USAGE]){assert.match(sql,/^(SELECT|WITH) /);assert.doesNotMatch(sql,/\b(INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE|ATTACH|PRAGMA)\b/i);assert.doesNotMatch(sql,/;/);}
   db.prepare('INSERT INTO bots VALUES(?,?)').run('bot-canary',JSON.stringify({name:'Polibot'}));
   db.prepare('INSERT INTO tasks VALUES(?,?)').run('task-canary',JSON.stringify({botId:'bot-canary',title:'private-canary',status:'running',createdAt:created,updatedAt:updated}));
   db.prepare('INSERT INTO runs VALUES(?,?)').run('run-canary',JSON.stringify({status:'running',createdAt:created,updatedAt:updated,error:'private-canary'}));
@@ -20,9 +20,9 @@ test('performance queries measure real SQLite receipts without projecting conver
   event(1,'start:canary','tool.started',created,{operationId:'tool-canary',actionType:'exec',input:{command:'private-canary'}});
   event(2,'tool:tool-canary','tool.completed',updated,{result:{status:'completed',exitCode:0,output:'private-canary',checkpointStatus:'saved'}});
   event(3,'retry:canary','run.retrying',updated,{error:'private-canary'});
-  db.prepare('INSERT INTO pi_tasks VALUES(?,?,?)').run(1,'running',JSON.stringify({kind:'pi.generation',state:{checkpoint:{phase:'request',attempt:2,messages:'private-canary'}}}));
+  db.prepare('INSERT INTO pi_tasks(id,status,record) VALUES(?,?,?)').run(1,'running',JSON.stringify({kind:'pi.generation',state:{checkpoint:{phase:'request',attempt:2,messages:'private-canary'}}}));
   db.prepare('INSERT INTO pi_entries VALUES(?,?)').run(1,JSON.stringify({kind:'pi.assistant',model:[{timestamp:now-1000,content:'private-canary',stopReason:'toolUse',usage:{input:120000,output:200,cacheRead:100000}}]}));
-  const report=summarizePerformance({runs:db.prepare(PERFORMANCE_RUNS).all(),tools:db.prepare(PERFORMANCE_TOOLS).all(),native:db.prepare(PERFORMANCE_NATIVE).all(),usage:db.prepare(PERFORMANCE_USAGE).all()},window);
+  const report=summarizePerformance({runs:db.prepare(PERFORMANCE_RUNS).all(),tools:db.prepare(PERFORMANCE_TOOLS).all(),native:db.prepare(PERFORMANCE_NATIVE).all(),processes:db.prepare(PERFORMANCE_PROCESSES).all(),deliveries:db.prepare(PERFORMANCE_DELIVERIES).all(),usage:db.prepare(PERFORMANCE_USAGE).all()},window);
   assert.equal(db.prepare(PERFORMANCE_SCHEMA).all().length,6);assert.equal(report.runs[0].retries,1);assert.equal(report.runs[0].generations,1);assert.equal(report.tools[0].durationMs,1_800_000);assert.equal(report.tools[0].tool,'exec');assert.equal(report.modelResponses[0].inputTokens,120000);assert.equal(report.nativeTasks[0].attempt,2);
   assert.doesNotMatch(JSON.stringify(report),/canary/);assert.doesNotMatch(JSON.stringify(performanceTaskMetadata(db.prepare(PERFORMANCE_TASKS).get())),/canary/);
  }finally{db.close();}

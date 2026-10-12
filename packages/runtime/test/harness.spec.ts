@@ -153,6 +153,63 @@ it('attends a new root request and spawns its own child while an earlier child i
     });
   } finally { await runInDurableObject(stub, instance => instance.releaseHeldTool?.()); }
 });
+it('steers a waiting nested agent without stopping its child or asking the user to intervene', async () => {
+  const stub = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE.getByName(probeId);
+  await runInDurableObject(stub, instance => { instance.heldTool = new Promise(resolve => { instance.releaseHeldTool = resolve; }); });
+  try {
+    await request('/submit', {text:'request-subagent-wait nested-steering',operationId:'nested-steering-parent'});
+    await expect.poll(() => runInDurableObject(stub, (_instance, state) => state.storage.sql.exec<{event:string}>('SELECT event FROM projected').toArray().map(row=>JSON.parse(row.event)).filter(event=>event.type==='subagent.tool.started'&&event.data.toolName==='wait_subagent').length)).toBe(1);
+    const parent = await runInDurableObject(stub, async instance => (await instance.runtime.subagents()).find(agent=>!agent.parentSubagentId)!);
+    await runInDurableObject(stub, instance => instance.runtime.sendSubagent(parent.id,'Here is the missing information. Respond now while your child continues.',{operationId:'nested-steering-message'}));
+    await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagentMessages(parent.id)).some(message=>message.role==='user'&&message.text.includes('missing information')))).toBe(true);
+    await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents()).find(agent=>agent.id===parent.id)?.status)).toBe('completed');
+    await runInDurableObject(stub, async instance => {
+      expect((await instance.runtime.subagents()).find(agent=>agent.parentSubagentId===parent.id)?.status).toBe('running');
+      expect((await instance.runtime.subagentMessages(parent.id)).filter(message=>message.role==='user'&&message.text.includes('missing information'))).toHaveLength(1);
+    });
+    expect(await (await request('/wait?id=nested-steering-parent')).json()).toMatchObject({status:'done'});
+  } finally { await runInDurableObject(stub, instance => instance.releaseHeldTool?.()); }
+});
+it('repairs legacy queued follow-up reports after eviction without resubmitting them', async () => {
+  const namespace=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE;
+  let stub=namespace.getByName(probeId);
+  const original=PiHarness.prototype.enqueue;
+  try {
+    await runInDurableObject(stub,(instance,state)=>{state.storage.sql.exec('INSERT INTO config(key,value) VALUES(?,?)','holdComputerTools','true');instance.heldTool=new Promise(resolve=>{instance.releaseHeldTool=resolve;});});
+    await request('/submit',{text:'request-subagent-wait nested-steering',operationId:'legacy-wait-parent'});
+    await expect.poll(()=>runInDurableObject(stub,(_,state)=>state.storage.sql.exec<{event:string}>('SELECT event FROM projected').toArray().some(row=>{const e=JSON.parse(row.event);return e.type==='subagent.tool.started'&&e.data.toolName==='wait_subagent';}))).toBe(true);
+    const parent=await runInDurableObject(stub,async instance=>(await instance.runtime.subagents()).find(agent=>!agent.parentSubagentId)!);
+    PiHarness.prototype.enqueue=function(session,input,options){return original.call(this,session,input,{...options,...(options.operationId==='legacy-follow-up'?{whenBusy:'followUp' as const}:{})});};
+    await runInDurableObject(stub,instance=>instance.runtime.sendSubagent(parent.id,'Legacy queued information',{operationId:'legacy-follow-up'}));
+    await expect.poll(()=>runInDurableObject(stub,(_,state)=>state.storage.sql.exec<{status:string}>('SELECT status FROM pi_submissions WHERE request_id=?',JSON.stringify('legacy-follow-up')).toArray()[0]?.status)).toBe('queued');
+    PiHarness.prototype.enqueue=original;
+    await abortAllDurableObjects();stub=namespace.getByName(probeId);
+    await runInDurableObject(stub,(_,state)=>state.storage.sql.exec("UPDATE cf_agents_jobs SET time=0 WHERE capability IN ('pi-harness','botspace-subagents')"));
+    await runDurableObjectAlarm(stub);
+    await expect.poll(()=>runInDurableObject(stub,async instance=>(await instance.runtime.subagentMessages(parent.id)).some(m=>m.role==='user'&&m.text==='Legacy queued information'))).toBe(true);
+    await runInDurableObject(stub,async(instance,state)=>{
+      expect(state.storage.sql.exec('SELECT id FROM pi_submissions WHERE request_id=?',JSON.stringify('legacy-follow-up')).toArray()).toHaveLength(1);
+      expect((await instance.runtime.subagents()).find(agent=>agent.parentSubagentId===parent.id)?.status).toBe('running');
+    });
+  } finally {PiHarness.prototype.enqueue=original;await runInDurableObject(stub,instance=>instance.releaseHeldTool?.());}
+});
+it('rejects circular sibling waits and lets both agents finish', async () => {
+  const stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+  await runInDurableObject(stub,instance=>{instance.heldTool=new Promise(resolve=>{instance.releaseHeldTool=resolve;});});
+  try {
+    await request('/submit',{text:'request-subagent-peers wait-cycle',operationId:'cycle-parent'});await request('/wait?id=cycle-parent');
+    await expect.poll(()=>runInDurableObject(stub,async instance=>(await instance.runtime.subagents()).length)).toBe(2);
+    const [a,b]=await runInDurableObject(stub,instance=>instance.runtime.subagents());
+    await runInDurableObject(stub,async instance=>{
+      await instance.runtime.sendSubagent(a!.id,`request-wait-existing:${b!.id}`,{operationId:'wait-for-b'});
+      await instance.runtime.sendSubagent(b!.id,`request-wait-existing:${a!.id}`,{operationId:'wait-for-a'});
+      instance.releaseHeldTool?.();
+    });
+    await expect.poll(()=>runInDurableObject(stub,async instance=>(await instance.runtime.subagents()).every(agent=>agent.status==='completed'))).toBe(true);
+    const found=await runInDurableObject(stub,async(instance,state)=>state.storage.sql.exec<{record:string}>("SELECT record FROM pi_entries WHERE json_extract(record,'$.kind')='pi.tool-result'").toArray().some(row=>row.record.includes('Circular subagent wait')));
+    expect(found).toBe(true);
+  } finally {await runInDurableObject(stub,instance=>instance.releaseHeldTool?.());}
+});
 it('stops an older joined task without aborting the newer root input or its child', async () => {
   const stub = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE.getByName(probeId);
   await runInDurableObject(stub, instance => { instance.abortHeldTool = true; instance.heldTool = new Promise(resolve => { instance.releaseHeldTool = resolve; }); });

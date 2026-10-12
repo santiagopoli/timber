@@ -463,6 +463,27 @@ export class WorkspaceDO extends DurableObject<Env> {
       if(path==='/keychain'||path.startsWith('/keychain/'))return await this.keychain.fetch(request);
       if(path.startsWith("/avatar")) return await this.avatars.fetch(request);
       if(path.startsWith("/agents/")) return await this.agents.fetch(request);
+      const inspectTasks=/^\/tasks\/inspect\/([0-9a-f-]{36})$/.exec(path);
+      if(inspectTasks && request.method==='GET') {
+        if(request.headers.get('x-timber-internal')!=='task')throw new ApiError(403,'internal_only','Task inspection is internal.');
+        const botId=inspectTasks[1],url=new URL(request.url),taskId=url.searchParams.get('taskId'),before=url.searchParams.get('before');
+        if(before!==null&&(!/^\d+$/.test(before)||!Number.isSafeInteger(Number(before))||Number(before)<1))throw new ApiError(400,'invalid_cursor','Invalid task inspection cursor.');
+        const row=this.ctx.storage.sql.exec<{data:string}>('SELECT data FROM bots WHERE id=?',botId).toArray()[0];
+        if(!row)throw new ApiError(404,'not_found','Bot not found.');
+        if(taskId===null) {
+          const rows=this.ctx.storage.sql.exec<{cursor:number;data:string}>("SELECT rowid AS cursor,data FROM tasks WHERE json_extract(data,'$.botId')=? AND rowid<? ORDER BY rowid DESC LIMIT 31",botId,before===null?Number.MAX_SAFE_INTEGER:Number(before)).toArray();
+          return json({tasks:rows.slice(0,30).map(row=>{const task=JSON.parse(row.data) as Task;return {id:task.id,title:task.title,status:task.status,createdAt:task.createdAt,updatedAt:task.updatedAt};}),nextCursor:rows.length>30?String(rows[29].cursor):null});
+        }
+        if(!UUID.test(taskId))throw new ApiError(400,'invalid_request','Invalid task ID.');
+        const saved=this.ctx.storage.sql.exec<{data:string}>('SELECT data FROM tasks WHERE id=?',taskId).toArray()[0];
+        const task=saved?JSON.parse(saved.data) as Task:undefined;
+        if(!task||task.botId!==botId)throw new ApiError(404,'not_found','Task not found for this bot.');
+        const bot=JSON.parse(row.data) as Bot,query=new URLSearchParams();
+        for(const key of ['before','limit'])if(url.searchParams.has(key))query.set(key,url.searchParams.get(key)!);
+        const response=await this.env.BOT.get(this.env.BOT.idFromName(`owner:task:${taskId}`)).fetch(`https://task/progress?${query}`,{headers:{'x-botspace-config':encodeURIComponent(JSON.stringify(bot)),'x-timber-task-id':taskId}});
+        if(!response.ok)return response;
+        return json({task:{id:task.id,title:task.title,status:task.status},progress:await response.json()});
+      }
       if(path==="/tasks" && request.method==="GET") {
         const tasks=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks ORDER BY rowid DESC").toArray().map(row=>JSON.parse(row.data));
         return json({tasks});
