@@ -8,6 +8,7 @@ export interface ToolBridge {
   tools: RuntimeTools;
   imageInputSupported?(api: ToolExecutionApi): Promise<boolean>;
   operationForCall(api: ToolExecutionApi, context: Context): Promise<string>;
+  operationIdForCall?(taskId:string,callId:string):Promise<string>;
   childForCall?(api: ToolExecutionApi, context: Context): Promise<{ subagentId: string; subagentOperationId: string } | undefined>;
   consume(runOperationId: string, kind: 'tool', itemId: string): void;
   paused?(runOperationId: string): RuntimePause | undefined;
@@ -33,7 +34,7 @@ async function executeBridgeTool(
   render?: (result: Exclude<RuntimeToolResult, RuntimePause>) => Promise<NonNullable<ToolExecutionResult['content']>>,
 ): Promise<ToolExecutionResult> {
   const runOperationId = await bridge.operationForCall(api, context);
-  const operationId = await computerToolOperationId(String(api.taskId), api.callId);
+  const operationId = await (bridge.operationIdForCall?.(String(api.taskId),api.callId)??computerToolOperationId(String(api.taskId), api.callId));
   const child = await bridge.childForCall?.(api, context);
   const pauseOperationId = child?.subagentOperationId ?? runOperationId;
   const paused = bridge.paused?.(pauseOperationId);

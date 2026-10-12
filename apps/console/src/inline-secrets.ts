@@ -1,7 +1,7 @@
 import {useEffect,useRef} from 'react';
 import type {SecretMetadata} from '../../../packages/contracts/src/index';
 import {useKeychain} from './keychain';
-import {secureReference,privateDraftReference,privateDraftPattern,createLockIcon,createDots} from './secure-prompt';
+import {secureReference,privateDraftReference,privateDraftPattern,createLockIcon,createDots,readSecurePrompt,createSavedSecurePill} from './secure-prompt';
 
 type Swap={start:number;oldLength:number;newLength:number};
 type Draft={element:HTMLSpanElement;input:HTMLTextAreaElement;error:HTMLSpanElement;replacement?:SecretMetadata;pending?:Promise<string>};
@@ -12,11 +12,37 @@ export function useInlineSecrets(value:string,onChange:(text:string,swap?:Swap)=
   const commit=async(id:string):Promise<string>=>{
     const draft=drafts.current.get(id);if(!draft)throw new Error('Add this secure input again.');if(draft.pending)return draft.pending;
     if(!draft.input.value){draft.error.textContent='Paste a value first.';draft.input.focus();throw new Error('Complete the secure input first.');}
+    const editing=document.activeElement===draft.input;
     const entries=[{value:draft.input.value,...(draft.replacement?{id:draft.replacement.id,expectedRevision:draft.replacement.revision}:{})}];draft.input.value='';draft.input.disabled=true;draft.element.setAttribute('aria-busy','true');draft.error.textContent='';
+    // Masking is immediate, not an acknowledgement that persistence finished.
+    // Let the user continue after this pending pill without waiting for the
+    // network; completion will replace only the pill, never the typed text.
+    const editor=draft.element.closest<HTMLElement>('.timber-secure-prompt');
+    if(editor&&editing){editor.focus({preventScroll:true});const range=document.createRange();range.setStartAfter(draft.element);range.collapse(true);getSelection()?.removeAllRanges();getSelection()?.addRange(range);}
     const pending=(async()=>{
       try{
         const saved=await save({operationId:crypto.randomUUID(),entries}),reference=secureReference(saved[0].id);
-        if(mounted.current){const marker=privateDraftReference(id),start=current.current.indexOf(marker),text=current.current.replaceAll(marker,reference);current.current=text;onChange(text,start<0?undefined:{start,oldLength:marker.length,newLength:reference.length});drafts.current.delete(id);}return reference;
+        if(mounted.current&&drafts.current.get(id)===draft){
+          const marker=privateDraftReference(id),editor=draft.element.closest<HTMLElement>('.timber-secure-prompt');
+          // DOM text can be newer than the last React value when a save and a
+          // keystroke complete together. Opaque markers exclude private values.
+          const source=editor?readSecurePrompt(editor):current.current,start=source.indexOf(marker);
+          if(start>=0){
+            if(editor){
+              const selection=getSelection(),range=selection?.rangeCount?selection.getRangeAt(0):null;
+              const preserve=editor===document.activeElement&&range&&editor.contains(range.startContainer)&&editor.contains(range.endContainer);
+              const points=preserve?{start:range.startContainer,startOffset:range.startOffset,end:range.endContainer,endOffset:range.endOffset}:null;
+              draft.element.replaceWith(createSavedSecurePill(reference));
+              // Replacing a sibling can move a live Range boundary. Preserve
+              // the actual nodes/offsets, including a non-collapsed selection.
+              if(points&&editor.contains(points.start)&&editor.contains(points.end)){
+                const restored=document.createRange();restored.setStart(points.start,points.startOffset);restored.setEnd(points.end,points.endOffset);selection?.removeAllRanges();selection?.addRange(restored);
+              }
+            }
+            const text=source.replaceAll(marker,reference);current.current=text;onChange(text,{start,oldLength:marker.length,newLength:reference.length});
+          }
+          drafts.current.delete(id);
+        }return reference;
       }catch(reason){const message=reason instanceof Error?reason.message:'Could not save the private input.';draft.error.textContent=message;throw new Error(message);}
       finally{entries[0].value='';draft.input.disabled=false;draft.element.removeAttribute('aria-busy');draft.pending=undefined;}
     })();draft.pending=pending;return pending;

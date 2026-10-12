@@ -49,6 +49,10 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
   options.storage.sql.exec('CREATE TABLE IF NOT EXISTS botspace_runtime_generations (task_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL)');
   options.storage.sql.exec('CREATE TABLE IF NOT EXISTS timber_generation_models (task_id TEXT PRIMARY KEY, model_id TEXT NOT NULL)');
   options.storage.sql.exec('CREATE TABLE IF NOT EXISTS timber_task_handoffs (operation_id TEXT PRIMARY KEY, task_id TEXT NOT NULL)');
+  const operationIdForCall=async(taskId:string,callId:string):Promise<string>=>{
+    const legacyOperationId=await computerToolOperationId(taskId,callId);
+    return options.resolveToolOperationId?options.resolveToolOperationId({taskId,callId,legacyOperationId}):legacyOperationId;
+  };
   const stopped = async (operationId: string, tx?: Tx) => Boolean((tx ? await tx.doc(Stops) : await native.snapshot(Stops, background))?.operations[operationId]);
   const cancellation = async (operationId: string, reason?: string): Promise<{cancellationId?: string}> => {
     if (reason !== 'aborted') return {};
@@ -223,7 +227,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
               return result;
             },
           } satisfies Pick<NonNullable<ToolBridge['tools']>, 'catalog' | 'call'> : {}),
-        }, operationForCall, consume, paused, pause,
+        }, operationForCall, operationIdForCall, consume, paused, pause,
         childForCall: async (api, context) => {
           const child = await subagents.forConversation(api.conversationId);
           if (!child) return undefined;
@@ -399,7 +403,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
         for (const message of event.entry.model ?? []) {
           if (message.role !== 'toolResult') continue;
           const completed = toolCompletion(event.entry);
-          if (!completed.operationId && event.entry.byTaskId !== undefined) completed.operationId = await computerToolOperationId(String(event.entry.byTaskId), message.toolCallId);
+          if (!completed.operationId && event.entry.byTaskId !== undefined) completed.operationId = await operationIdForCall(String(event.entry.byTaskId), message.toolCallId);
           await emit({ type: 'tool.completed', operationId: activeOperationId,
             eventKey: `tool_execution_end:${message.toolCallId}`,
             data: { toolCallId: message.toolCallId, toolName: message.toolName, ...completed },

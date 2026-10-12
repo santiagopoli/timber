@@ -288,3 +288,12 @@ it('restores host tool namespaces from original call provenance after switching 
   expect(()=>chatgptPayload({input:[{...input,namespace:'foreign'}],tools:[tool]})).toThrow('chatgpt_invalid_tool_namespace');
   expect(()=>chatgptPayload({input:[{...input,name:'unknown'}],tools:[tool]})).toThrow('chatgpt_invalid_tool_namespace');
 });
+it('uses the host conversation namespace for computer and host effects, including the durable tool budget',async()=>{
+ const host=bridge(),identity='pi-tool-v2:fixture-conversation';host.operationIdForCall=vi.fn(async()=>identity);
+ host.tools.call=vi.fn(async({operationId})=>({operationId,status:'completed' as const,output:'Created task'}));
+ await executeComputerTool(host,{type:'exec',command:'printf scope'},api,context);
+ await executeHostTool(host,{name:'create_task',arguments:{title:'Independent work',description:'Verify effect isolation'}},api,context);
+ expect(host.operationIdForCall).toHaveBeenCalledWith('task-17','call-42');
+ expect(host.tools.execute).toHaveBeenCalledWith(expect.objectContaining({operationId:identity}));expect(host.tools.call).toHaveBeenCalledWith(expect.objectContaining({operationId:identity}));
+ expect(host.consume).toHaveBeenNthCalledWith(1,'user-operation','tool',identity);expect(host.consume).toHaveBeenNthCalledWith(2,'user-operation','tool',identity);
+});

@@ -1,12 +1,13 @@
 import {createElement, memo, useCallback, useEffect, useMemo, useRef, useState, type FormEvent} from 'react';
 import {createRoot} from 'react-dom/client';
 import {createPortal} from 'react-dom';
-import {ArrowLeftIcon, ArrowUpIcon, CheckSquareIcon, LoaderCircleIcon, PlusIcon, RefreshCwIcon, SearchIcon, SquareIcon} from 'lucide-react';
+import {ArrowLeftIcon, ArrowUpIcon, CheckSquareIcon, CircleAlertIcon, LoaderCircleIcon, PlusIcon, RefreshCwIcon, SearchIcon, SquareIcon} from 'lucide-react';
 import {MessageResponse} from './components/ai-elements/message';
 import type {Bot, BotEvent, Message, Run} from '../../../packages/contracts/src/index';
 import {ActivityPanel} from './chat';
 import {ArtifactProvider,type ArtifactLoader} from './artifact-preview';
 import {useConversationScroll} from './use-conversation-scroll';
+import {failureRecovery} from './failure-recovery';
 import type {ReactNode} from 'react';
 import './tasks.css';
 
@@ -28,7 +29,8 @@ type TaskStatus = 'pending'|'queued'|'running'|'waiting_approval'|'waiting_conne
 type Task = {id:string;title:string;description?:string;botId:string;botName?:string;status:TaskStatus;createdAt?:string;updatedAt?:string;lastActivity?:string};
 type TaskFilter = 'all'|'active'|'pending'|'completed';
 type TaskApproval = {id:string;status:string;action:Record<string,unknown>;expiresAt:string};
-type TaskMessage = {id?:string;role?:string;text?:string;content?:string;createdAt?:string};
+type TaskMessage = {id?:string;runId?:string;role?:string;text?:string;content?:string;createdAt?:string};
+type TaskFailure = {run:Run;failure:ReturnType<typeof failureRecovery>};
 const isRecord = (value: unknown): value is Record<string, unknown> => Boolean(value && typeof value === 'object' && !Array.isArray(value));
 const text = (value: unknown) => typeof value === 'string' ? value : '';
 const label = (value: string) => value.replaceAll('_',' ');
@@ -45,7 +47,7 @@ function taskDetail(value: unknown): Task | undefined {
 }
 function messageList(value: unknown): TaskMessage[] {
   const source = Array.isArray(value) ? value : isRecord(value) && Array.isArray(value.messages) ? value.messages : [];
-  return source.filter(isRecord).map(item=>({id:text(item.id),role:text(item.role)||'assistant',text:text(item.text)||text(item.content),createdAt:text(item.createdAt)}));
+  return source.filter(isRecord).map(item=>({id:text(item.id),runId:text(item.runId),role:text(item.role)||'assistant',text:text(item.text)||text(item.content),createdAt:text(item.createdAt)}));
 }
 function mergeMessages(previous:TaskMessage[],incoming:TaskMessage[],older=false){
   const known=new Set(previous.map(message=>message.id));
@@ -58,10 +60,19 @@ function approvalList(value: unknown): TaskApproval[] {
   return source.filter(isRecord).map(item=>({id:text(item.id),status:text(item.status),action:isRecord(item.action)?item.action:{},expiresAt:text(item.expiresAt)})).filter(item=>item.id);
 }
 const approvalExpired = (approval:TaskApproval) => Boolean(approval.expiresAt && Date.parse(approval.expiresAt)<=Date.now());
-const TaskMessageRow=memo(function TaskMessageRow({message,name}:{message:TaskMessage;name:string}){
+function TaskFailureNotice({outcome,detached=false}:{outcome:TaskFailure;detached?:boolean}){
+  const {run,failure}=outcome;
+  return <section className={`timber-task-message-failure${detached?' is-detached':''}`} data-task-run-failure={run.id} role="status">
+    <div><CircleAlertIcon aria-hidden="true"/><strong>{run.status==='failed'?'Request failed':'Response interrupted'}</strong></div>
+    <p>{failure.message||'The response did not complete. Review this task before continuing.'}</p>
+    {failure.code&&<details><summary>Details</summary><code>{failure.code}</code></details>}
+  </section>;
+}
+const TaskMessageRow=memo(function TaskMessageRow({message,name,outcome}:{message:TaskMessage;name:string;outcome?:TaskFailure}){
   return <article className={`timber-task-message timber-task-message-${message.role}`} data-task-message-id={message.id} data-timeline-key={`message:${message.id}`}>
     <div className="timber-task-message-meta"><strong>{message.role==='user'?'You':message.role==='assistant'?name:label(message.role||'message')}</strong>{message.createdAt&&<time>{date(message.createdAt)}</time>}</div>
     <MessageResponse className="timber-task-markdown" mode="static" skipHtml plugins={{}} components={{img:()=>null}} linkSafety={{enabled:false}} controls={false}>{message.text||''}</MessageResponse>
+    {outcome&&<TaskFailureNotice outcome={outcome}/>}
   </article>;
 });
 function TaskConversation({children}:{children:ReactNode}){
@@ -266,6 +277,11 @@ function TaskView({props}:{props:TasksProps}) {
   const activityModel=useMemo(()=>({bot:(props.bots.find(bot=>bot.id===detail?.botId)||{id:detail?.botId||'',name:detail?.botName||'Assigned bot'}) as Bot,events,runs,approvals:[],runFilter:null,subagents:[],delegations:[],mentionBots:[],messages:messages as Message[],collaborationEvents:[]}),[props.bots,detail?.botId,detail?.botName,events,runs,messages]);
   const activityCallbacks=useMemo(()=>({onOpenBot:(id:string)=>propsRef.current.onOpenBot?.(id),onOpenAgents:()=>{}}),[]);
   const artifactLoader=useCallback<ArtifactLoader>((botId,artifactId,signal)=>propsRef.current.loadArtifact?propsRef.current.loadArtifact(botId,artifactId,signal):Promise.reject(new Error('Task image unavailable.')),[]);
+  const visibleMessageList=messages.slice(-visibleMessages);
+  const failures=useMemo(()=>runs.filter(run=>!run.subagentId&&['failed','interrupted'].includes(run.status)).map(run=>({run,failure:failureRecovery(run,events)})),[runs,events]);
+  const requestMessages=new Map<string,string|undefined>();
+  for(const message of visibleMessageList)if(message.role==='user'&&message.runId&&!requestMessages.has(message.runId))requestMessages.set(message.runId,message.id);
+  const failuresByRun=new Map(failures.map(outcome=>[outcome.run.id,outcome]));
   const canDecideApproval=Boolean(detail&&['running','waiting_approval','waiting_connection'].includes(detail.status));
   const waitingApprovals=approvals.filter(approval=>['pending','approved','executing'].includes(approval.status));
   const detailContent=selected ? <section className="timber-tasks-detail" data-task-id={selected}>
@@ -287,8 +303,9 @@ function TaskView({props}:{props:TasksProps}) {
       {(messageCursor||messages.length>visibleMessages)&&<button type="button" className="timber-tasks-quiet timber-task-history" disabled={olderBusy} onClick={()=>messages.length>visibleMessages?setVisibleMessages(value=>Math.min(500,value+100)):void loadOlder('messages')}>{olderBusy?'Loading…':'Load older messages'}</button>}
       {(loadingMessages&&!messages.length)&&<p className="timber-tasks-hint">Loading task conversation…</p>}
       {!loadingMessages&&!messages.length&&<p className="timber-tasks-hint">No messages in this task yet.</p>}
-      {messages.slice(-visibleMessages).map((message,index)=><TaskMessageRow message={message} name={detail?.botName||botNames.get(detail?.botId||'')||'Assigned bot'} key={message.id||index}/>)}
+      {visibleMessageList.map((message,index)=><TaskMessageRow message={message} name={detail?.botName||botNames.get(detail?.botId||'')||'Assigned bot'} outcome={message.role==='user'&&message.runId&&requestMessages.get(message.runId)===message.id?failuresByRun.get(message.runId):undefined} key={message.id||index}/>)}
       {Object.entries(partials).filter(([,value])=>value).map(([id,value])=><article className="timber-task-message timber-task-message-assistant" data-task-stream-run-id={id} data-timeline-key={`stream:${id}`} key={`stream:${id}`}><MessageResponse className="timber-task-markdown" mode="streaming" skipHtml plugins={{}} components={{img:()=>null}} linkSafety={{enabled:false}} controls={false}>{value}</MessageResponse></article>)}
+      {failures.filter(outcome=>!requestMessages.has(outcome.run.id)).map(outcome=><div data-timeline-key={`failure:${outcome.run.id}`} key={`failure:${outcome.run.id}`}><TaskFailureNotice outcome={outcome} detached/></div>)}
     </TaskConversation>
     <section className="timber-tasks-activity" aria-label="Task activity"><div className="timber-task-activity-heading"><button type="button" className="timber-tasks-quiet" aria-expanded={activityOpen} onClick={()=>setActivityOpen(value=>!value)}>Activity {events.filter(event=>event.type==='tool.started').length>0&&<span className="counter">{events.filter(event=>event.type==='tool.started').length}</span>}</button>{archivedActivity&&<button type="button" className="timber-tasks-quiet" onClick={latestActivity}>Latest activity</button>}{eventCursor&&<button type="button" className="timber-tasks-quiet" disabled={olderBusy} onClick={()=>void loadOlder('events')}>{olderBusy?'Loading…':'Older activity'}</button>}</div>{activityOpen&&<div className="timber-task-activity-content">{events.length?<ArtifactProvider load={artifactLoader}><ActivityPanel model={activityModel} callbacks={activityCallbacks}/></ArtifactProvider>:<p className="timber-tasks-hint">Commands and tool activity appear here as this task works.</p>}</div>}</section>
     {error&&<p className="timber-tasks-error" role="alert">{error}</p>}

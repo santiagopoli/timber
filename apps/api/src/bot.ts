@@ -93,6 +93,7 @@ export class BotDO extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS task_deletion (id INTEGER PRIMARY KEY CHECK(id=1),bot_id TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS config (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS task_reports (task_id TEXT PRIMARY KEY, version INTEGER NOT NULL, data TEXT NOT NULL, updated_sequence INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS runtime_tool_operations (native_call TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE);
       CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, fingerprint TEXT NOT NULL, native_operation_id TEXT NOT NULL, data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS runs_status_idx ON runs (json_extract(data,'$.status'));
       CREATE INDEX IF NOT EXISTS runs_parent_idx ON runs (json_extract(data,'$.parentRunId'));
@@ -158,6 +159,7 @@ export class BotDO extends DurableObject<Env> {
       getBot:async()=>this.currentBot(false),
       getTaskId:()=>this.taskId(),
       getTaskContext:()=>this.taskContext(),
+      resolveToolOperationId:input=>this.toolOperationId(input),
       getApprovalContext:async()=>this.approvalContext(),
       onAdmissionRetry:async(operationId)=>this.admit(operationId),
       onSubagentMessage:async(input)=>this.receiveSubagentMessage(input),
@@ -754,6 +756,25 @@ export class BotDO extends DurableObject<Env> {
       :"This bot's collaborator backlog is full. Delivery can be retried after queued inputs settle.");
   }
 
+  private async toolOperationId(input:{taskId:string;callId:string;legacyOperationId:string}):Promise<string> {
+    const key=JSON.stringify([input.taskId,input.callId]);
+    const known=()=>this.ctx.storage.sql.exec<{operation_id:string}>("SELECT operation_id FROM runtime_tool_operations WHERE native_call=?",key).toArray()[0]?.operation_id;
+    const previous=known();if(previous)return previous;
+    const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(JSON.stringify([this.ctx.id.toString(),input.taskId,input.callId])));
+    const scoped=`pi-tool-v2:${Array.from(new Uint8Array(digest),byte=>byte.toString(16).padStart(2,'0')).join('')}`;
+    return this.ctx.storage.transactionSync(()=>{
+      const raced=known();if(raced)return raced;
+      // Every host effect records a local admission before reaching its shared
+      // journal. Preserve precisely those legacy IDs, including uncertain and
+      // approval-pending effects; never rename one merely because of upgrade.
+      const legacy=input.legacyOperationId;
+      const admitted=this.ctx.storage.sql.exec("SELECT 1 FROM computer_operations WHERE operation_id=?",legacy).toArray().length>0
+        ||this.ctx.storage.sql.exec("SELECT 1 FROM approvals WHERE operation_id=?",legacy).toArray().length>0
+        ||this.ctx.storage.sql.exec("SELECT 1 FROM events WHERE source_key IN (?,?) LIMIT 1",`tool-start:${legacy}`,`tool:${legacy}`).toArray().length>0;
+      const operationId=admitted?legacy:scoped;
+      this.ctx.storage.sql.exec("INSERT INTO runtime_tool_operations(native_call,operation_id) VALUES(?,?)",key,operationId);return operationId;
+    });
+  }
   private taskContext():string {
     const coordinator=this.ctx.storage.sql.exec("SELECT 1 FROM runs WHERE json_extract(data,'$.status') IN ('queued','running','waiting_approval','waiting_connection') AND json_extract(data,'$.coordinatorMode')=1 LIMIT 1").toArray().length>0;
     const policy=coordinator?'This chat turn is a computerless coordinator while a persistent task owns the shared computer. Answer the user naturally, inspect metadata or create a new persistent task for new work. Do not run computer commands, spawn temporary agents for computer work, perform service actions or wait for the other task here. Never claim that a refused action executed. Your own Stop affects this chat turn only.\n':'';

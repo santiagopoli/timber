@@ -18,7 +18,7 @@ async function withTasks(work,width=1440) {
   });
   const fixture=await createConsoleFixture(),context=await browser.newContext({viewport:{width,height:900},colorScheme:'light'});
   const page=await context.newPage(),errors=[];page.on('pageerror',error=>errors.push(error.message));page.setDefaultTimeout(8000);
-  const tasks={records:statuses.map(status=>({id:`task-${status}`,title:`Task ${status}`,description:`Independent ${status} work`,botId:BOT_A,botName:'Ada',status,createdAt:'2026-10-05T10:00:00.000Z'})),messages:new Map(),events:new Map(),approvals:new Map(),calls:[],readGates:new Map(),reads:[],sendGate:null,sendError:false};
+  const tasks={records:statuses.map(status=>({id:`task-${status}`,title:`Task ${status}`,description:`Independent ${status} work`,botId:BOT_A,botName:'Ada',status,createdAt:'2026-10-05T10:00:00.000Z'})),messages:new Map(),events:new Map(),runs:new Map(),approvals:new Map(),calls:[],readGates:new Map(),reads:[],sendGate:null,sendError:false};
   for(const task of tasks.records)tasks.messages.set(task.id,[{id:`${task.id}-reply`,role:'assistant',text:`Private conversation for ${task.id}`}]);
   const fulfill=(route,value,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify(value)});
   await page.route('**/v1/tasks**',async route=>{
@@ -38,7 +38,7 @@ async function withTasks(work,width=1440) {
         const before=Number(url.searchParams.get('before')||Infinity),eligible=source.filter(event=>event.id<before),events=eligible.slice(-100);
         return fulfill(route,{events,nextCursor:eligible.length>100?String(events[0].id):null});
       }
-      if(tail==='/runs')return fulfill(route,{runs:[{id:`${id}-run`,status:task.status==='cancelled'?'cancelled':['completed','failed'].includes(task.status)?task.status:'running'}]});
+      if(tail==='/runs')return fulfill(route,{runs:tasks.runs.get(id)||[{id:`${id}-run`,status:task.status==='cancelled'?'cancelled':['completed','failed'].includes(task.status)?task.status:'running'}]});
       // Snapshot before the delayed response, as a real stale read would do.
       const source=tasks.messages.get(id)||[],before=Number(url.searchParams.get('before')||source.length+1),eligible=source.filter((message,index)=>(message.row||index+1)<before),messages=eligible.slice(-Number(url.searchParams.get('limit')||100));
       const payload=structuredClone(tail==='/messages'?{messages,nextCursor:eligible.length>messages.length?String(messages[0].row||source.indexOf(messages[0])+1):null}:tail==='/approvals'?{approvals:tasks.approvals.get(id)||[]}:{task});
@@ -263,3 +263,22 @@ for(const width of [390,1440])test(`global tasks: chat opens at newest, follows 
   const retained=await scroll.evaluate(node=>node.scrollTop);events.push({id:2,botId:BOT_A,runId,type:'message.created',createdAt:'2026-10-05T10:00:02.000Z',data:{message:{id:'scroll-live-second',role:'assistant',text:'Another later task answer.'}}});await page.locator('[data-task-message-id="scroll-live-second"]').waitFor();assert.ok(Math.abs(await scroll.evaluate(node=>node.scrollTop)-retained)<=3,'later answers do not pull the reader away from older messages');
   assert.ok(await scroll.evaluate(node=>node.scrollHeight-node.clientHeight-node.scrollTop)>100,'older reader stays away from latest');
 },width));
+
+test('global tasks: accepted billing failure appears inside its original message with safe details and no implicit retry',async()=>withTasks(async({page,tasks,login,open})=>{
+  const id='task-failed',runId=`${id}-run`;tasks.runs.set(id,[{id:runId,status:'failed',errorCode:'model_billing_required',error:'Untrusted provider diagnostic fixture.'}]);
+  tasks.messages.set(id,[{id:'failed-task-request',runId,role:'user',text:'Prepare this task report.'},{id:'unrelated-task-message',role:'user',text:'Another task instruction.'}]);
+  await login();await open(id);const message=page.locator('[data-task-message-id="failed-task-request"]'),notice=message.locator('[data-task-run-failure]');await notice.waitFor();
+  assert.ok((await notice.innerText()).includes('The selected model provider requires paid access or available billing credits.'));assert.equal((await page.getByLabel('Task conversation').innerText()).includes('Untrusted provider diagnostic fixture.'),false,'allowlisted model diagnostic replaces provider prose');
+  assert.equal(await page.locator('[data-task-run-failure]').count(),1);assert.equal(await page.locator('.timber-task-message-failure.is-detached').count(),0);assert.equal(await page.locator('[data-task-message-id="unrelated-task-message"] [data-task-run-failure]').count(),0);
+  await notice.getByText('Details',{exact:true}).click();assert.equal(await notice.locator('code').innerText(),'model_billing_required');assert.equal(await notice.getByRole('button').count(),0,'a diagnostic never authorizes replay');
+  const continuation=page.getByRole('button',{name:'Continue task',exact:true});assert.equal(await continuation.isVisible(),true,'existing explicit continuation remains available');assert.ok(await continuation.evaluate(node=>node.scrollWidth<=node.clientWidth),'existing Continue label fits its control');assert.equal(tasks.calls.filter(call=>call.method==='POST').length,0);
+  await mkdir('/tmp/timber-task-views',{recursive:true});await page.screenshot({path:'/tmp/timber-task-views/task-inline-failure-390.png'});
+},390));
+
+test('global tasks: failure remains visible until its original older message is loaded, then moves into that bubble once',async()=>withTasks(async({page,tasks,login,open})=>{
+  const id='task-failed',runId=`${id}-run`;tasks.runs.set(id,[{id:runId,status:'interrupted',errorCode:'model_request_failed',error:'The model request failed before an answer completed.'}]);
+  tasks.messages.set(id,[{id:'older-failed-task-request',row:1,runId,role:'user',text:'Original archived task request.'},...Array.from({length:100},(_,index)=>({id:`later-task-message-${index+2}`,row:index+2,role:'assistant',text:`Later task update ${index+2}.`}))]);
+  await login();await open(id);const fallback=page.locator('.timber-task-message-failure.is-detached');await fallback.waitFor();assert.ok((await fallback.innerText()).includes('Response interrupted'));assert.equal(await page.locator('[data-task-message-id="older-failed-task-request"]').count(),0);
+  await page.getByRole('button',{name:'Load older messages',exact:true}).click();const original=page.locator('[data-task-message-id="older-failed-task-request"]');await original.locator('[data-task-run-failure]').waitFor();assert.equal(await fallback.count(),0);assert.equal(await page.locator('[data-task-run-failure]').count(),1,'history reconciliation leaves one diagnostic');
+  assert.equal(await original.locator('[data-task-run-failure]').getByRole('button').count(),0);assert.equal(tasks.calls.filter(call=>call.method==='POST').length,0);
+}));

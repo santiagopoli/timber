@@ -77,3 +77,32 @@ it('a live coordinator neither blocks the next task nor stops its independent ru
   await runInDurableObject(registry,(_,state)=>expect(state.storage.sql.exec<{task_id:string}>('SELECT task_id FROM task_slots WHERE bot_id=?',bot.id).one().task_id).toBe(next.id));
  }finally{release();delete inferenceFixtureControl.gate;delete inferenceFixtureControl.matches;}
 });
+it('fresh task conversations sharing one computer keep repeated provider call IDs isolated',async()=>{
+ const {bot}=await api<{bot:Bot}>('/v1/bots',{name:'Task effect identity isolation',allowTaskCreation:true,computerApprovalMode:'automatic'});
+ const registry=bindings.WORKSPACE.get(bindings.WORKSPACE.idFromName('owner')),effects:string[]=[];
+ for(let index=0;index<2;index++) {
+  const {task}=await api<{task:Task}>('/v1/tasks',{operationId:crypto.randomUUID(),title:`Independent command ${index}`,description:'request-exec same provider call identity',botId:bot.id});
+  await expect.poll(async()=> (await api<{runs:Run[]}>(`/v1/tasks/${task.id}/runs`)).runs[0]?.status).toBe('completed');
+  const target=bindings.BOT.get(bindings.BOT.idFromName(`owner:task:${task.id}`));
+  const ids=await runInDurableObject(target,(_instance,state)=>state.storage.sql.exec<{operation_id:string}>('SELECT operation_id FROM computer_operations').toArray().map(row=>row.operation_id));expect(ids).toHaveLength(1);effects.push(ids[0]!);
+  expect(await runDurableObjectAlarm(registry)).toBe(true);
+ }
+ expect(new Set(effects).size).toBe(2);
+ const computer=bindings.COMPUTER.get(bindings.COMPUTER.idFromName(bot.id));
+ const journal=await runInDurableObject(computer,(_instance,state)=>state.storage.sql.exec<{id:string}>('SELECT id FROM effects').toArray().map(row=>row.id));expect(journal).toEqual(expect.arrayContaining(effects));expect(journal).toHaveLength(2);
+});
+it('separate task conversations can create independent tasks with repeated provider host call IDs',async()=>{
+ const {bot}=await api<{bot:Bot}>('/v1/bots',{name:'Host task identity isolation',allowTaskCreation:true});
+ const registry=bindings.WORKSPACE.get(bindings.WORKSPACE.idFromName('owner')),parents:string[]=[];
+ for(let index=0;index<2;index++) {
+  const {task}=await api<{task:Task}>('/v1/tasks',{operationId:crypto.randomUUID(),title:`Persistent parent ${index}`,description:'request-task-handoff independently requested work',botId:bot.id});parents.push(task.id);
+  await expect.poll(async()=> (await api<{runs:Run[]}>(`/v1/tasks/${task.id}/runs`)).runs[0]?.status).toBe('completed');
+  const child=(await api<{tasks:Task[]}>('/v1/tasks')).tasks.find(record=>record.sourceTaskId===task.id);expect(child).toBeDefined();
+  expect(await runDurableObjectAlarm(registry)).toBe(true);
+  await expect.poll(async()=> (await api<{runs:Run[]}>(`/v1/tasks/${child!.id}/runs`)).runs[0]?.status).toBe('completed');
+  expect(await runDurableObjectAlarm(registry)).toBe(true);
+ }
+ const {tasks}=await api<{tasks:Task[]}>('/v1/tasks');const created=tasks.filter(record=>record.sourceTaskId&&parents.includes(record.sourceTaskId));expect(created).toHaveLength(2);expect(new Set(created.map(record=>record.id)).size).toBe(2);
+ const identities=await Promise.all(parents.map(id=>runInDurableObject(bindings.BOT.get(bindings.BOT.idFromName(`owner:task:${id}`)),(_instance,state)=>state.storage.sql.exec<{native_call:string;operation_id:string}>('SELECT native_call,operation_id FROM runtime_tool_operations').toArray()[0]!)));
+ expect(identities[0]!.native_call).toBe(identities[1]!.native_call);expect(identities[0]!.operation_id).not.toBe(identities[1]!.operation_id);
+});

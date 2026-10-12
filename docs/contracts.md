@@ -345,6 +345,10 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   syntax spans. Messages above 256 KiB retain their exact text as plain text;
   copying preserves the complete original Markdown, outputs and line endings.
   Diagnostic JSON renders only when its disclosure is opened.
+  A private-input save masks its field immediately and moves the caret after the
+  pending pill. On acknowledgement only that pill is replaced, preserving newer
+  public draft text, selection and focus. Removing it, changing bots or opening
+  another control during the save never reinstates it or steals focus.
   The conversation header represents active work only. Terminal failures and
   cancellation appear once after that task's activity; they do not label the bot
   or the entire conversation. Continue submits a new explicit request using the
@@ -692,10 +696,14 @@ after fixing an actionable archive problem, without repeating the command.
 
 Computer operation IDs accept 1–160 ASCII letters, digits, dots, colons, hyphens
 or underscores. Runtime adapters must map opaque model call IDs into this space
-before requesting approval or invoking a computer. Pi preserves existing valid
-`pi-tool:<taskId>:<callId>` IDs for journal compatibility; incompatible IDs use
-a deterministic SHA-256 mapping in a separate namespace. Never strip characters
-or truncate IDs, which could merge distinct operations. Stored interrupted
+before requesting approval or invoking a computer. New Pi effects use a SHA-256
+identity scoped to the host conversation, native task and provider call, pinned
+durably before dispatch. Independent task conversations sharing a computer or
+workspace cannot reuse each other's receipts. Exact indexed local admission
+records preserve IDs already dispatched before upgrade, including legacy
+`pi-tool:<taskId>:<callId>` identities and pending or uncertain approvals.
+Completion events use the same pinned mapping. Never strip characters or
+truncate IDs, which could merge distinct operations. Stored interrupted
 approvals are not rewritten or replayed by this mapping change.
 
 Computer actions from the model pass through host policy. The bot configuration
