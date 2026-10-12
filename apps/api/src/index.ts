@@ -172,9 +172,11 @@ export default {
           return json({taskId,cancelRequested:true,confirmed:!failed&&processState.confirmed&&data.activeRuns.length===0,runCount:outcomes.length});
         }
         if(endpoint==="messages" && request.method==="POST" && task.status==="cancelled") {await discardRequestBody(request);throw new ApiError(409,"task_cancelled","Cancelled tasks cannot accept new messages.");}
-        if(endpoint==="messages" && request.method==="POST" && !["running","waiting_approval","waiting_connection"].includes(task.status)) {await discardRequestBody(request);throw new ApiError(409,"task_not_running","This task is not currently running; wait for it to start before messaging it.");}
+        if(endpoint==="messages" && request.method==="POST" && !["queued","running","waiting_approval","waiting_connection"].includes(task.status)) {await discardRequestBody(request);throw new ApiError(409,"task_not_running","Start or continue this task before messaging it.");}
         let admissionToken:string|undefined;
-        const taskInput=endpoint==="messages"||/^agents\/[^/]+\/messages$/.test(endpoint);
+        // BotDO durably receipts chat input before claiming execution. A queued
+        // task must remain writable without acquiring the shared computer here.
+        const taskInput=/^agents\/[^/]+\/messages$/.test(endpoint);
         if(taskInput&&request.method==="POST")admissionToken=await beginAdmission(env,task.botId,await bodyOperationId(request),taskId);
         if(/^approvals\/[^/]+$/.test(endpoint)&&request.method==="POST")admissionToken=await beginAdmission(env,task.botId,`mutation:${crypto.randomUUID()}`,taskId);
         requestBodyForwarded=true;

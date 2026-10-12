@@ -344,3 +344,12 @@ test('global tasks: provider connection recovery opens owner Settings from the t
   await login();await open(id);await taskChat(page).getByRole('button',{name:'Open Settings',exact:true}).click();
   await page.locator('#settings-dialog').waitFor({state:'visible'});assert.equal(await page.getByRole('dialog',{name:'Task details',exact:true}).count(),0);
 }));
+
+for(const width of [390,1440])test(`queued task keeps its composer writable at ${width}px`,async()=>withTasks(async({page,tasks,login,open})=>{
+ await login();await open('task-queued');
+ await taskDraft(page).fill('Keep this correction for when the computer is available');
+ assert.equal(await taskSend(page).isEnabled(),true);
+ await taskSend(page).click();
+ await taskChat(page).getByText('Keep this correction for when the computer is available',{exact:true}).waitFor();
+ assert.equal(tasks.calls.filter(call=>call.method==='POST'&&call.path==='/v1/tasks/task-queued/messages').length,1);
+},width));

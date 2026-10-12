@@ -184,7 +184,7 @@ async function readJson(response) {
   try {return JSON.parse(Buffer.concat(chunks).toString('utf8'));}catch{throw new Error('durable_diagnostics_invalid_response');}
 }
 
-export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now()}={}) {
+export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now(),onProgress=()=>{}}={}) {
   const recipient=env.DIAGNOSTIC_RECIPIENT_PUBLIC_KEY?recipientPublicKey(env.DIAGNOSTIC_RECIPIENT_PUBLIC_KEY):undefined;
   const account=env.CLOUDFLARE_ACCOUNT_ID;
   if(typeof account!=='string'||!/^[a-f0-9]{24,64}$/i.test(account))throw new Error('durable_diagnostics_account_missing');
@@ -196,11 +196,12 @@ export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now
   const base=`https://api.cloudflare.com/client/v4/accounts/${account}/workers/durable_objects/namespaces`;
   async function request(url,body){
     let response;
-    try {response=await fetcher(url,{method:body?'POST':'GET',headers,...(body?{body:JSON.stringify(body)}:{}),redirect:'manual',signal:AbortSignal.timeout(30_000)});}
+    try {response=await fetcher(url,{method:body?'POST':'GET',headers,...(body?{body:JSON.stringify(body)}:{}),redirect:'manual',signal:AbortSignal.timeout(60_000)});}
     catch{throw new Error('durable_diagnostics_transport_failed');}
     if(!response.ok){await response.body?.cancel().catch(()=>{});throw new Error(`durable_diagnostics_http_${response.status}`);}
     return readJson(response);
   }
+  onProgress({phase:'namespaces'});
   const list=await request(`${base}?per_page=1000`);
   if(list?.success!==true||!Array.isArray(list.result)||list.result.length>=1000)throw new Error('durable_diagnostics_invalid_response');
   function namespace(name){
@@ -208,7 +209,8 @@ export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now
     if(matches.length!==1)throw new Error('durable_diagnostics_namespace_missing');
     return matches[0].id;
   }
-  async function query(namespaceId,name,sql){return rows(await request(`${base}/${namespaceId}/query/v2`,{durable_object_name:name,jurisdiction:'none',queries:[{sql}]}));}
+  let querySequence=0;
+  async function query(namespaceId,name,sql){onProgress({phase:'query',sequence:++querySequence});return rows(await request(`${base}/${namespaceId}/query/v2`,{durable_object_name:name,jurisdiction:'none',queries:[{sql}]}));}
   const workspace=namespace('WorkspaceDO');
   if(env.DIAGNOSTIC_SCOPE==='avatars')return summarizeAvatars(await query(workspace,'owner',AVATAR_QUERY),window);
   const bot=namespace('BotDO');
@@ -241,6 +243,6 @@ export function safeError(error) {
   return ERRORS.has(error?.message)||/^durable_diagnostics_http_[1-5]\d{2}$/.test(error?.message??'')?error.message:'durable_diagnostics_failed';
 }
 if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href){
-  try{console.log(JSON.stringify(await collectDurable(),null,2));}
+  try{console.log(JSON.stringify(await collectDurable({onProgress:value=>console.error(JSON.stringify({diagnosticProgress:value}))}),null,2));}
   catch(error){console.error(JSON.stringify({error:safeError(error)}));process.exitCode=1;}
 }

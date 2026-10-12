@@ -241,7 +241,7 @@ function TaskView({props}:{props:TasksProps}) {
   };
   const send=async(rawText:string,mentions:string[]=[],files:TaskFiles=[],retry?:TaskSendOperation)=>{
     const value=rawText.trim(),id=selectedRef.current,task=detailRef.current;if(!id||!task||(!value&&!files.length)||busyRef.current)return;
-    if(['cancelled','cancelling'].includes(task.status)||!retry&&['pending','queued'].includes(task.status))throw new Error('This task is not accepting messages. Review its details.');
+    if(['cancelled','cancelling'].includes(task.status)||!retry&&task.status==='pending')throw new Error('This task is not accepting messages. Review its details.');
     const key=JSON.stringify([id,value,mentions,files.map(file=>[(file as typeof file&{id?:string}).id||file.url,file.mediaType,file.filename])]);
     if(retry&&retry.key!==key&&!(retry.attachments?.length&&!files.length&&JSON.stringify(JSON.parse(retry.key).slice(0,3))===JSON.stringify([id,value,mentions])))throw new Error('The recorded message changed. Send it as a new request.');
     const operation:TaskSendOperation=retry||(sendOperation.current?.key===key?sendOperation.current:{key,id:crypto.randomUUID(),imageIds:files.map(()=>crypto.randomUUID()),endpoint:['completed','failed'].includes(task.status)?'continue':'messages'});sendOperation.current=operation;
@@ -357,7 +357,7 @@ function TaskView({props}:{props:TasksProps}) {
   },[selected,active,viewVersion.current]);
   const chatModel:ChatModel={bot,messages:visibleMessageList,runs,approvals:approvals.map(item=>({...item,status:item.status==='pending'&&approvalExpired(item)?'expired':item.status,busy:busy||Boolean(approvalError)})),connections,events,
     deliveries,draft,draftMentions,acceptedImageIds,mentionBots:props.bots as Bot[],subagents,delegations,collaborationEvents:events.filter(event=>event.type.startsWith('agent.')||event.type.startsWith('delegation.')),compactions,
-    sending:busy,composerDisabled:!detail||['pending','queued','cancelling','cancelled'].includes(detail.status),loading:loadingMessages,modelSettings:props.modelSettings||{choices:[],loading:false},
+    sending:busy,composerDisabled:!detail||['pending','cancelling','cancelled'].includes(detail.status),loading:loadingMessages,modelSettings:props.modelSettings||{choices:[],loading:false},
     currentRun,runFilter:null,focusApproval:0,stream:streamed?{runId:streamed[0],text:streamed[1]}:null,
     historyLoading:olderBusy,historyHasMore:Boolean(messageCursor||eventCursor||messages.length>visibleMessages),historyError:loadError||undefined,
   };

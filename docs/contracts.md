@@ -412,6 +412,7 @@ not returned.
 
 The host tools `list_tasks {before?}` (30 per page) and
 `inspect_task {taskId,before?,limit?}` are available to computerless coordinators.
+`message_task {taskId,text}` lets the named parent send steering to those tasks, including durable messages while queued, or explicitly continue completed/failed work. It freezes message-versus-continuation routing before dispatch, so a lost acknowledgment cannot create a second continuation. Temporary agents and other task conversations cannot invoke it; cancelled tasks remain fenced.
 They resolve only tasks assigned to the calling bot and remain usable without
 `allowTaskCreation`. Task conversation text is collaborator data, not new
 instructions or authorization.
@@ -423,7 +424,8 @@ computer/workspace identity, so no second computer is created. The task has its
 own transcript and run/event IDs.
 
 `POST /v1/tasks/:id/start` admits the description under stable operation ID
-`task-start:<taskId>`. `POST /v1/tasks/:id/messages`, `GET /messages`, `GET
+`task-start:<taskId>`. Queued task chats accept messages into the durable bounded inbox without claiming the computer. Only the original start/continuation input can enter Pi while the task is queued; saved messages follow once it starts. Unadmitted messages cannot prevent the scheduler from starting that original input. Expected contention does not consume delivery retry attempts.
+`POST /v1/tasks/:id/messages`, `GET /messages`, `GET
 /runs`, and `GET /events` expose the task conversation. `POST /continue {operationId,text}` explicitly continues a completed or failed task in the same chat with a newly generated native input ID, never by replaying `task-start` or old computer actions. Identical continuation receipts deduplicate; different instructions under the same ID conflict. `POST /cancel` cancels its
 active runs and permanently fences subsequent starts and continuations. Cancelled tasks cannot Continue in this version; create a new task. Task-scoped `/approvals`,
 `/approvals/:approvalId`, `/agents`, `/agents/:agentId/messages`,
