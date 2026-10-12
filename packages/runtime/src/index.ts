@@ -491,6 +491,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
       });
       await finishStops();
       await subagents.start();
+      await subagents.resumeQueued();
     }
   }
   class AdmissionRetries extends LifecycleCapability {
@@ -523,6 +524,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
     async onJob() {
       if (destroyed) return;
       await finishStops();
+      await subagents.resumeQueued();
       native.resume();
       if (await subagents.hasDeliveries() || await maintenance.hasWork()) return { rescheduleAt: Date.now() + 5_000 };
     }

@@ -107,3 +107,15 @@ also verifies a capacity-waited input wakes through the real Lifecycle alarm aft
 eviction without an HTTP read triggering opportunistic recovery. These local
 checks do not establish production deployment, paid/live provider behavior, or
 cloud computer readiness.
+
+## Idle subagent inbox recovery
+
+Pi can end a failed child generation while leaving later accepted inputs in its
+inbox. A durable delivery wait cannot advance that inbox by itself. On startup
+and the existing subagent wake alarm, Timber checks the exact queued receipt,
+its inbox item and the absence of a live run/task in that child conversation.
+After checking parent/child Stop fences and pending decisions, it submits a
+passive entry with no model content through Pi's public admission API. This
+applies the idle boundary to the original queued inputs; it does not resubmit
+the failed input, replace operation IDs or replay earlier computer effects.
+Active children and approval/connection waits are left to their normal lifecycle.

@@ -1314,3 +1314,31 @@ it('recovers an SDK connection loss automatically in the same run without repeat
  expect(state.toolCalls).toHaveLength(1);expect(state.calls).toHaveLength(3);expect(JSON.stringify(state.calls.at(-1))).toContain('function_call_output');
  expect(state.events.some(row=>JSON.parse(row.event).type==='run.retrying')).toBe(true);
 });
+
+it.each(['normal','evicted','stopped'] as const)('recovers an accepted child input after an earlier generation fails (%s)',async mode=>{
+  const namespace=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE;
+  let stub=namespace.getByName(probeId);
+  await request('/submit',{text:'request-model-child',operationId:'queued-child-parent',chatgpt:true});await request('/wait?id=queued-child-parent');
+  await expect.poll(()=>runInDurableObject(stub,async instance=>(await instance.runtime.subagents())[0]?.status)).toBe('completed');
+  const child=await runInDurableObject(stub,async instance=>(await instance.runtime.subagents())[0]!);
+  const before=await runInDurableObject(stub,(_instance,state)=>state.storage.sql.exec('SELECT id FROM calls').toArray().length);
+  const effects=await runInDurableObject(stub,(_instance,state)=>state.storage.sql.exec('SELECT id FROM tool_calls').toArray().length);
+  await runInDurableObject(stub,instance=>{instance.holdInferenceAfterToolCount=0;instance.heldInference=new Promise(resolve=>{instance.releaseHeldInference=resolve;});});
+  try{
+    await runInDurableObject(stub,instance=>instance.runtime.sendSubagent(child.id,'request-wire-allowance',{operationId:'child-fails-first'}));
+    await expect.poll(()=>runInDurableObject(stub,(_instance,state)=>state.storage.sql.exec('SELECT id FROM calls').toArray().length)).toBeGreaterThan(before);
+    await runInDurableObject(stub,instance=>instance.runtime.sendSubagent(child.id,'Healthy follow-up after failure',{operationId:'accepted-child-next'}));
+    if(mode==='stopped')await runInDurableObject(stub,instance=>instance.runtime.cancelSubagent(child.id));
+    await runInDurableObject(stub,instance=>{instance.holdInferenceAfterToolCount=undefined;instance.releaseHeldInference?.();});
+    if(mode==='evicted'){
+      await expect.poll(()=>runInDurableObject(stub,(_instance,state)=>state.storage.sql.exec<{status:string}>('SELECT status FROM pi_submissions WHERE request_id=json_quote(?)','child-fails-first').toArray()[0]?.status)).toBe('unanswered');
+      await abortAllDurableObjects();stub=namespace.getByName(probeId);
+      await runInDurableObject(stub,(_instance,state)=>{state.storage.sql.exec("UPDATE cf_agents_jobs SET time=0 WHERE capability IN ('pi-harness','botspace-subagents')");});
+      await runDurableObjectAlarm(stub);
+    }
+    await expect.poll(()=>runInDurableObject(stub,async instance=>(await instance.runtime.subagents())[0]?.status),{timeout:5000}).toBe(mode==='stopped'?'cancelled':'completed');
+    const messages=await runInDurableObject(stub,instance=>instance.runtime.subagentMessages(child.id));
+    expect(messages.filter(m=>m.role==='user'&&m.text==='Healthy follow-up after failure')).toHaveLength(mode==='stopped'?0:1);
+    expect(await runInDurableObject(stub,(_instance,state)=>state.storage.sql.exec('SELECT id FROM tool_calls').toArray().length)).toBe(effects);
+  }finally{await runInDurableObject(stub,instance=>{instance.releaseHeldInference?.();});}
+},15000);
