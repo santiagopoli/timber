@@ -3,6 +3,7 @@ import { streamSimple } from '@earendil-works/pi-ai/api/openai-responses';
 import { createProvider } from '@earendil-works/pi-ai/models';
 import {classifyModelFailure,type ModelOption,type ModelRoute,type ModelSettings} from '@botspace/contracts';
 import type { PiRuntimeOptions } from './types.js';
+import {inferenceCacheKey} from './inference-policy.js';
 
 export const CHATGPT_MODEL = 'gpt-6.1-sol';
 export const RESPONSES_URL = 'https://api.openai.com/v1/responses';
@@ -56,7 +57,7 @@ function callOrigins(messages:TranscriptContext['messages']) {
 }
 
 /** Rebuild the allowed request shape; future SDK defaults cannot add paid-API-only fields. */
-export function chatgptPayload(value: unknown, settings: ModelSettings = {model:CHATGPT_MODEL}, capability?: ModelOption,originalMessages:TranscriptContext['messages']=[]): JsonObject {
+export function chatgptPayload(value: unknown, settings: ModelSettings = {model:CHATGPT_MODEL}, capability?: ModelOption,originalMessages:TranscriptContext['messages']=[],cacheKey?:string): JsonObject {
   const payload = object(value);
   if (!Array.isArray(payload.input)) throw new Error('chatgpt_invalid_protocol');
   const functions = Array.isArray(payload.tools) ? payload.tools.map(value => {
@@ -80,6 +81,7 @@ export function chatgptPayload(value: unknown, settings: ModelSettings = {model:
   });
   return {
     model: settings.model, input, store: false, stream: true,
+    ...(cacheKey?{prompt_cache_key:cacheKey}:{}),
     ...(settings.reasoningEffort ? {reasoning:{effort:settings.reasoningEffort,...(capability?.supportsReasoningSummary!==false?{summary:'auto'}:{})}} : {}),
     include: ['reasoning.encrypted_content'],
     ...(settings.fast?{service_tier:capability?.fastServiceTier??'fast'}:{}),
@@ -92,7 +94,7 @@ const SDK_SENTINEL = 'timber-host-owned-oauth-transport';
 
 export type ConfiguredModel = Model<Api> & {timberSettings?:ModelSettings; timberCapability?:ModelOption;timberRoutes?:ModelRoute[]};
 
-export function createChatGPTProvider(transport: PiRuntimeOptions<object>['chatgpt'], available:()=>readonly ConfiguredModel[]=()=>[chatgptModel]) {
+export function createChatGPTProvider(transport: PiRuntimeOptions<object>['chatgpt'], available:()=>readonly ConfiguredModel[]=()=>[chatgptModel],cacheScope?:()=>Promise<string>) {
   const run = (model: Model<'openai-responses'>, context: TranscriptContext, options?: SimpleStreamOptions) => {
     const configured=model as ConfiguredModel;
     const settings=configured.timberSettings??{model:model.id};
@@ -118,8 +120,8 @@ export function createChatGPTProvider(transport: PiRuntimeOptions<object>['chatg
     const upstream=streamSimple({...model,id:settings.model}, context, {
       // Deliberately do not forward apiKey, base URL, headers, env, fetch or payload hooks.
       apiKey: SDK_SENTINEL, signal, timeoutMs: options?.timeoutMs ?? 1_800_000,
-      maxRetries: 0, cacheRetention: 'none', env: {},
-      onPayload: value=>chatgptPayload(value,settings,configured.timberCapability,context.messages),
+      maxRetries: 0, cacheRetention: 'short', env: {},
+      onPayload: async value=>chatgptPayload(value,settings,configured.timberCapability,context.messages,cacheScope?await inferenceCacheKey(await cacheScope(),options?.sessionId):undefined),
       fetch: async (input, init) => {
         const incoming = new Request(input, init);
         if (incoming.url !== RESPONSES_URL || incoming.method !== 'POST') throw new Error('chatgpt_invalid_endpoint');

@@ -2,7 +2,7 @@
 import { pathToFileURL } from 'node:url';
 import {createCipheriv,createHash,createPublicKey,publicEncrypt,randomBytes,constants} from 'node:crypto';
 import { DIAGNOSTIC_CODES, timeframe } from './prod-diagnostics.mjs';
-import {PERFORMANCE_SCHEMA,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_PROCESSES,PERFORMANCE_DELIVERIES,PERFORMANCE_WAKES,PERFORMANCE_RECOVERY,PERFORMANCE_USAGE,summarizePerformance,performanceTaskMetadata} from './prod-performance-diagnostics.mjs';
+import {PERFORMANCE_SCHEMA,PERFORMANCE_REQUESTS,summarizeInferenceRequests,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_PROCESSES,PERFORMANCE_DELIVERIES,PERFORMANCE_WAKES,PERFORMANCE_RECOVERY,PERFORMANCE_USAGE,summarizePerformance,performanceTaskMetadata} from './prod-performance-diagnostics.mjs';
 
 // Cloudflare Data Studio's SQL API. These are fixed read-only statements;
 // neither SQL nor object names can be supplied by workflow dispatch inputs.
@@ -217,12 +217,13 @@ export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now
   const selected=await query(workspace,'owner',BOT_LOOKUP);
   if(selected.length!==1||!uuid(selected[0]?.id))throw new Error('durable_diagnostics_bot_not_unique');
   const name=`owner:${selected[0].id}`;
-  if(env.DIAGNOSTIC_SCOPE==='queue')return {source:'durable_queue_fixed_select',tasks:(await query(workspace,'owner',PERFORMANCE_TASKS)).map(performanceTaskMetadata)};
+  if(env.DIAGNOSTIC_SCOPE==='queue'){const schema=await query(bot,name,PERFORMANCE_SCHEMA);return {source:'durable_queue_fixed_select',tasks:(await query(workspace,'owner',PERFORMANCE_TASKS)).map(performanceTaskMetadata),inference:schema.some(row=>row.name==='timber_inference_requests')?summarizeInferenceRequests(await query(bot,name,PERFORMANCE_REQUESTS)):[]};}
   if(env.DIAGNOSTIC_SCOPE==='performance'){
     const inspect=async name=>{
       const tables=await query(bot,name,PERFORMANCE_SCHEMA);
-      if(tables.length!==6)return {initialized:false};
-      return summarizePerformance({runs:await query(bot,name,PERFORMANCE_RUNS),tools:await query(bot,name,PERFORMANCE_TOOLS),native:await query(bot,name,PERFORMANCE_NATIVE),wakes:await query(bot,name,PERFORMANCE_WAKES),recovery:await query(bot,name,PERFORMANCE_RECOVERY),processes:await query(bot,name,PERFORMANCE_PROCESSES),deliveries:await query(bot,name,PERFORMANCE_DELIVERIES),usage:await query(bot,name,PERFORMANCE_USAGE)},window);
+      if(!['runs','submissions','events','botspace_runtime_budget','pi_tasks','pi_entries'].every(name=>tables.some(row=>row.name===name)))return {initialized:false};
+      const inference=tables.some(row=>row.name==='timber_inference_requests')?summarizeInferenceRequests(await query(bot,name,PERFORMANCE_REQUESTS)):[];
+      return {...summarizePerformance({runs:await query(bot,name,PERFORMANCE_RUNS),tools:await query(bot,name,PERFORMANCE_TOOLS),native:await query(bot,name,PERFORMANCE_NATIVE),wakes:await query(bot,name,PERFORMANCE_WAKES),recovery:await query(bot,name,PERFORMANCE_RECOVERY),processes:await query(bot,name,PERFORMANCE_PROCESSES),deliveries:await query(bot,name,PERFORMANCE_DELIVERIES),usage:await query(bot,name,PERFORMANCE_USAGE)},window),inference};
     };
     const root=await inspect(name),tasks=[];
     for(const task of await query(workspace,'owner',PERFORMANCE_TASKS)){

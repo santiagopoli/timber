@@ -46,3 +46,12 @@ test('performance inspection visits only selected registered task conversations 
  }});
  assert.equal(result.tasks[0].execution.initialized,false);assert.ok(calls.some(call=>call.durable_object_name===`owner:task:${task}`));assert.doesNotMatch(JSON.stringify(result),new RegExp(`canary|${id}|${task}`));
 });
+test('inference diagnostics retain progress timestamps without provider bodies or prompt material',async()=>{
+ const {PERFORMANCE_REQUESTS,summarizeInferenceRequests}=await import('../prod-performance-diagnostics.mjs');
+ const db=new DatabaseSync(':memory:');try{
+  db.exec('CREATE TABLE timber_inference_requests(id INTEGER,source TEXT,phase TEXT,started_at INTEGER,last_progress_at INTEGER,bytes INTEGER,http_status INTEGER,idle INTEGER,estimated_tokens INTEGER)');
+  db.prepare('INSERT INTO timber_inference_requests VALUES(1,?,?,?,?,?,?,?,?)').run('chatgpt','streaming',now-1000,now,500,200,0,110000);
+  const report=summarizeInferenceRequests(db.prepare(PERFORMANCE_REQUESTS).all());assert.equal(report[0].lastProgressAt,new Date(now).toISOString());assert.equal(report[0].estimatedTokens,110000);
+  assert.doesNotMatch(JSON.stringify(summarizeInferenceRequests([{source:'private-canary',phase:'private-canary',secret:'private-canary'}])),/private-canary/);
+ }finally{db.close();}
+});

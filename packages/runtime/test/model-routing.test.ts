@@ -1,3 +1,4 @@
+import {isRetryableAssistantError} from '@earendil-works/pi-ai/utils/retry';
 import {describe,expect,it,vi} from 'vitest';
 import {createAssistantMessageEventStream,type AssistantMessage,type AssistantMessageEvent} from '@earendil-works/pi-ai';
 import {normalizeContext} from '@earendil-works/pi-ai/utils/transcript';
@@ -111,4 +112,14 @@ describe('same-model quota fallback',()=>{
     expect(requests.map(request=>request.payload.model)).toEqual(['gpt-6.1-sol','openai/gpt-6.1-sol']);expect(requests.every(request=>request.authorization===null)).toBe(true);
     expect(JSON.stringify(requests[1].payload)).toContain('already executed once');expect(requests[1].payload.reasoning).toEqual({effort:'medium'});expect(requests[1].payload).not.toHaveProperty('service_tier');
   });
+});
+
+it('preserves transient SDK connection failures as native-retryable errors instead of generic terminal failures',async()=>{
+ const provider=createChatGPTProvider({fetch:async()=>{throw new Error('fixture network failure');}});
+ const guarded=withQuotaFallback(provider,new Map([['chatgpt',provider]]));
+ const model={...chatgptModel,timberRoutes:[{source:'chatgpt',provider:'openai',modelId:chatgptModel.id,name:'Fixture',reasoningEfforts:[],supportsFast:false}]};
+ const stream=guarded.streamSimple(model,{messages:[{role:'user',content:'Hello',timestamp:0}]},{});
+ for await(const _ of stream){}const result=await stream.result();
+ expect(result.errorMessage).toContain('model_connection_interrupted');expect(isRetryableAssistantError(result)).toBe(true);
+ expect(result.errorMessage).not.toContain('fixture network failure');
 });

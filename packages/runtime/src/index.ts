@@ -14,6 +14,7 @@ import { createModelSettings, ModelConfigurationError } from './model-settings.j
 import { CHATGPT_MODEL, createChatGPTProvider } from './chatgpt.js';
 import {createOpenRouterProvider,withQuotaFallback} from './model-routing.js';
 import {createOpenAIProvider} from './openai-api.js';
+import {fetchInference,inferenceIdleMs,workingContextModel} from './inference-policy.js';
 import { createBudget } from './budget.js';
 import { createStopGate } from './stop-gate.js';
 import { createSubagents } from './subagents.js';
@@ -32,12 +33,30 @@ const Stops = defineDoc<{operations: Record<string, {cancellationId?: string}>; 
 
 export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<Env>): AgentRuntime {
   const ai = createAI({ binding: options.ai });
+  options.storage.sql.exec('CREATE TABLE IF NOT EXISTS timber_inference_requests(id INTEGER PRIMARY KEY,source TEXT NOT NULL,phase TEXT NOT NULL,started_at INTEGER NOT NULL,last_progress_at INTEGER NOT NULL,bytes INTEGER NOT NULL DEFAULT 0,http_status INTEGER,idle INTEGER NOT NULL DEFAULT 0,estimated_tokens INTEGER NOT NULL)');
+  const monitor=<T extends {fetch:(request:Request)=>Promise<Response>}>(transport:T|undefined,source:string):T|undefined=>transport?{...transport,fetch:async(request:Request)=>{
+    const payload=await request.clone().json<{model?:string;input?:unknown;messages?:unknown;reasoning?:{effort?:string}}>();
+    const estimatedTokens=Math.ceil(JSON.stringify(payload.input??payload.messages??[]).length/4);
+    const now=Date.now(),row=options.storage.sql.exec<{id:number}>('INSERT INTO timber_inference_requests(source,phase,started_at,last_progress_at,estimated_tokens) VALUES(?,?,?,?,?) RETURNING id',source,'request',now,now,estimatedTokens).one();
+    options.storage.sql.exec('DELETE FROM timber_inference_requests WHERE id<?',row.id-200);
+    let lastWrite=0;
+    return fetchInference(value=>transport.fetch(value),request,inferenceIdleMs(payload,estimatedTokens),value=>{
+      if(destroyed)return;
+      if(value.phase==='streaming'&&value.bytes>0&&value.at-lastWrite<5000)return;
+      lastWrite=value.at;
+      options.storage.sql.exec('UPDATE timber_inference_requests SET phase=?,last_progress_at=?,bytes=?,http_status=?,idle=? WHERE id=?',value.phase,value.at,value.bytes,value.httpStatus??null,value.idle?1:0,row.id);
+    });
+  }}:undefined;
   const modelSettings = createModelSettings(options.storage,options.chatgpt,id=>ai(id),options.models);
-  const chatgpt = createChatGPTProvider(options.chatgpt,modelSettings.models);
-  const openrouter=createOpenRouterProvider(options.openrouter,modelSettings.models);
-  const openai=createOpenAIProvider(options.openai,modelSettings.models);
+  options.storage.sql.exec('CREATE TABLE IF NOT EXISTS timber_inference_scope(id INTEGER PRIMARY KEY,scope TEXT NOT NULL)');
+  options.storage.sql.exec('INSERT OR IGNORE INTO timber_inference_scope(id,scope) VALUES(1,?)',crypto.randomUUID());
+  const scope=options.storage.sql.exec<{scope:string}>('SELECT scope FROM timber_inference_scope WHERE id=1').one().scope;
+  const cacheScope=async()=>scope;
+  const chatgpt = createChatGPTProvider(monitor(options.chatgpt,'chatgpt'),modelSettings.models,cacheScope);
+  const openrouter=createOpenRouterProvider(monitor(options.openrouter,'openrouter'),modelSettings.models);
+  const openai=createOpenAIProvider(monitor(options.openai,'openai-api'),modelSettings.models,cacheScope);
   const providers=new Map<string,Provider>([['chatgpt',chatgpt],['openai-api',openai],['openrouter',openrouter]]);
-  const resolveModel = modelSettings.resolve;
+  const resolveModel = (id:string)=>workingContextModel(modelSettings.resolve(id));
   const consume = createBudget(options.storage, {
     generation: options.maxGenerations,
     tool: options.maxToolCalls,
@@ -169,6 +188,8 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
       const models = createModels();
       for (const provider of [ai.provider, withQuotaFallback(chatgpt,providers),withQuotaFallback(openai,providers),withQuotaFallback(openrouter,providers)]) models.setProvider({
         ...provider,
+        getModels:()=>provider.getModels().map(workingContextModel),
+        ...(provider.getAllModels?{getAllModels:()=>provider.getAllModels!().map(workingContextModel)}:{}),
         streamSimple(model, context, streamOptions) {
           const output = createAssistantMessageEventStream();
           void (async () => {

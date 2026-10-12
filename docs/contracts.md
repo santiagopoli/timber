@@ -1341,3 +1341,31 @@ is rejected. Candidate identities precede PUT; pointer replacement and old-objec
 GC admission commit atomically. Deletion stops the target runtime before avatar
 drain, never awaiting another bot’s avatar. Receipts are compact and terminal
 private snapshots are cleared; status/next-time and GC scheduling are indexed.
+
+
+## Inference liveness and working context
+
+OpenAI Responses requests use stable opaque prompt cache affinity per durable
+conversation, isolated across bot and task computers and retained through eviction.
+The ChatGPT proxy derives its `session_id` header from that host hash; it does not
+forward arbitrary client headers or retain provider-side conversation history.
+Native Pi uses a working context window of at most 128,000 tokens, bounded by the
+model's actual smaller window. Threshold compaction preserves the full archive and
+recent verbatim context, and runs before a million-token catalogue limit is reached.
+
+Inference connections watch elapsed time without headers or stream bytes. The
+stream silence allowance is 180 seconds, 240 seconds over 50,000 estimated tokens,
+and 300 seconds over 100,000; named reasoning models and high reasoning settings
+have at least 600 seconds. Each received chunk resets this allowance, so active
+reasoning can exceed it. The existing 30-minute total inference ceiling remains.
+This applies only to model inference; command/process deadlines are unchanged.
+Expired connections fail through native Pi's inference retry policy, preserving
+recorded tool effects. Explicit Stop stays an abort.
+
+`timber_inference_requests` stores at most 201 recent connection records with
+source, stage, start/last-progress times, bytes, HTTP status, estimated input size
+and idle-expiry status; no prompts, model output, cache keys or credentials.
+Task progress and private production diagnostics expose those stages to distinguish
+a request waiting for headers from an active stream and a dead connection.
+The policy follows Hermes' separation of total and stale-stream budgets and Codex's
+per-session cache affinity.
