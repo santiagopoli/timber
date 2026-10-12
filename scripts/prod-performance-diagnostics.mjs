@@ -1,6 +1,6 @@
 // Fixed read-only projections. Never select prompts, arguments, tool output or
 // credentials; identifiers used for routing stay inside collectDurable.
-export const PERFORMANCE_SCHEMA = "SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('runs','submissions','events','botspace_runtime_budget','pi_tasks','pi_entries','timber_inference_requests') ORDER BY name";
+export const PERFORMANCE_SCHEMA = "SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('runs','submissions','events','botspace_runtime_budget','pi_tasks','pi_entries','timber_inference_requests','admission_sources','cf_agents_jobs','pi_documents','pi_submissions','run_processes') ORDER BY name";
 export const PERFORMANCE_TASKS = `SELECT t.id,json_extract(t.data,'$.status') AS status,
  json_extract(t.data,'$.createdAt') AS created_at,json_extract(t.data,'$.updatedAt') AS updated_at,
  CASE WHEN s.task_id IS NULL THEN 'none' WHEN s.task_id=t.id THEN 'self' WHEN s.task_id='@bot' THEN 'bot' WHEN s.task_id LIKE '@direct:%' THEN 'direct' ELSE 'other_task' END AS holder,

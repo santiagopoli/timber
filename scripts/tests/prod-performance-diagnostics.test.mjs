@@ -26,7 +26,7 @@ test('performance queries measure real SQLite receipts without projecting conver
   db.prepare('INSERT INTO pi_entries VALUES(?,?)').run(1,JSON.stringify({kind:'pi.assistant',model:[{timestamp:now-1000,content:'private-canary',stopReason:'toolUse',usage:{input:120000,output:200,cacheRead:100000}}]}));
   const report=summarizePerformance({runs:db.prepare(PERFORMANCE_RUNS).all(),tools:db.prepare(PERFORMANCE_TOOLS).all(),native:db.prepare(PERFORMANCE_NATIVE).all(),wakes:db.prepare(PERFORMANCE_WAKES).all(),recovery:db.prepare(PERFORMANCE_RECOVERY).all(),processes:db.prepare(PERFORMANCE_PROCESSES).all(),deliveries:db.prepare(PERFORMANCE_DELIVERIES).all(),usage:db.prepare(PERFORMANCE_USAGE).all()},window);
   assert.equal(report.recovery[0].waitGraphs,1);
-  assert.equal(db.prepare(PERFORMANCE_SCHEMA).all().length,6);assert.equal(report.runs[0].retries,1);assert.equal(report.runs[0].generations,1);assert.equal(report.tools[0].durationMs,1_800_000);assert.equal(report.tools[0].tool,'exec');assert.equal(report.modelResponses[0].inputTokens,120000);assert.equal(report.nativeTasks[0].attempt,2);
+  assert.equal(db.prepare(PERFORMANCE_SCHEMA).all().length,11);assert.equal(report.runs[0].retries,1);assert.equal(report.runs[0].generations,1);assert.equal(report.tools[0].durationMs,1_800_000);assert.equal(report.tools[0].tool,'exec');assert.equal(report.modelResponses[0].inputTokens,120000);assert.equal(report.nativeTasks[0].attempt,2);
   assert.doesNotMatch(JSON.stringify(report),/canary/);assert.doesNotMatch(JSON.stringify(performanceTaskMetadata(db.prepare(PERFORMANCE_TASKS).get())),/canary/);
   event(4,'key:start','tool.started',updated,{operationId:'key-canary',actionType:'key',input:{key:'Ctrl+C'}});
   event(5,'tool:key-canary','tool.completed',updated,{result:{status:'completed',output:'private-canary'}});
@@ -76,4 +76,19 @@ test('inference diagnostics retain progress timestamps without provider bodies o
   const report=summarizeInferenceRequests(db.prepare(PERFORMANCE_REQUESTS).all());assert.equal(report[0].lastProgressAt,new Date(now).toISOString());assert.equal(report[0].estimatedTokens,110000);
   assert.doesNotMatch(JSON.stringify(summarizeInferenceRequests([{source:'private-canary',phase:'private-canary',secret:'private-canary'}])),/private-canary/);
  }finally{db.close();}
+});
+test('queued conversations without native wake tables remain inspectable without inventing zero recovery counts',async()=>{
+ const ws='a'.repeat(32),bot='b'.repeat(32),id='10000000-0000-4000-8000-000000000001',task='20000000-0000-4000-8000-000000000002';
+ const core=['runs','submissions','events','botspace_runtime_budget','pi_tasks','pi_entries'];
+ const result=await collectDurable({now,env:{CLOUDFLARE_ACCOUNT_ID:ws,CLOUDFLARE_API_TOKEN:'private-canary',DIAGNOSTIC_SCOPE:'performance'},fetcher:async(url,init)=>{
+  if(init.method==='GET')return Response.json({success:true,result:[{id:ws,class:'WorkspaceDO',script:'timber-api',use_sqlite:true},{id:bot,class:'BotDO',script:'timber-api',use_sqlite:true}]});
+  const input=JSON.parse(init.body),sql=input.queries[0].sql;
+  assert.ok(![PERFORMANCE_WAKES,PERFORMANCE_RECOVERY,PERFORMANCE_DELIVERIES,PERFORMANCE_PROCESSES,PERFORMANCE_RUNS].includes(sql),'must not query absent lazy tables');
+  const records=sql.includes('SELECT id FROM bots')?[{id}]:sql===PERFORMANCE_SCHEMA?core.map(name=>({name})):sql===PERFORMANCE_TASKS?[{id:task,status:'queued',holder:'none',created_at:created,updated_at:updated}]:[];
+  const columns=records.length?Object.keys(records[0]):[];
+  return Response.json({success:true,result:{results:[{columns,rows:records.map(row=>columns.map(name=>row[name])),meta:{rows_written:0}}]}});
+ }});
+ assert.equal(result.tasks[0].status,'queued');assert.equal(result.tasks[0].scheduler.holder,'none');
+ assert.deepEqual(result.tasks[0].execution.unavailable,['runs','wakes','recovery','processes','deliveries']);
+ assert.doesNotMatch(JSON.stringify(result),new RegExp(`canary|${id}|${task}`));
 });
