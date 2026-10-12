@@ -23,7 +23,7 @@ function png() {
 }
 const image = png();
 const consoleRoot = process.env.CONSOLE_DIST ? resolve(process.env.CONSOLE_DIST) : fileURLToPath(new URL('../../apps/console/dist/', import.meta.url));
-const assetTypes = new Map([['.html', 'text/html'], ['.js', 'text/javascript'], ['.css', 'text/css'], ['.svg', 'image/svg+xml'], ['.png', 'image/png'], ['.woff', 'font/woff'], ['.woff2', 'font/woff2'], ['.ttf', 'font/ttf'], ['.wasm', 'application/wasm']]);
+const assetTypes = new Map([['.html', 'text/html'], ['.webmanifest', 'application/manifest+json'], ['.js', 'text/javascript'], ['.css', 'text/css'], ['.svg', 'image/svg+xml'], ['.png', 'image/png'], ['.woff', 'font/woff'], ['.woff2', 'font/woff2'], ['.ttf', 'font/ttf'], ['.wasm', 'application/wasm']]);
 export async function createConsoleFixture({port = 0} = {}) {
   // Exercise the same bundled React island and asset graph that is deployed.
   await readFile(resolve(consoleRoot, 'index.html'));
@@ -74,7 +74,7 @@ export async function createConsoleFixture({port = 0} = {}) {
         const asset = resolve(consoleRoot, filename), contentType = assetTypes.get(extname(asset));
         if (!asset.startsWith(consoleRoot + (consoleRoot.endsWith(sep) ? '' : sep)) || !contentType) {response.writeHead(404).end(); return;}
         let data; try {data = await readFile(asset);} catch (error) {if (error.code === 'ENOENT') {response.writeHead(404).end(); return;} throw error;}
-        response.writeHead(200, {'content-type': contentType, 'referrer-policy': 'strict-origin', 'content-security-policy': `default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob: data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' ${state.previewOrigin}`}); response.end(data); return;
+        response.writeHead(200, {'content-type': contentType, 'referrer-policy': 'strict-origin', 'content-security-policy': `default-src 'self'; manifest-src 'self'; worker-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob: data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' ${state.previewOrigin}`}); response.end(data); return;
       }
       if (path === '/github-connect') {response.writeHead(200, {'content-type': 'text/html'}).end('<!doctype html><title>GitHub connection</title><p>GitHub consent fixture</p>'); return;}
       const sessionId = /(?:^|;\s*)timber_fixture_session=([^;]+)/.exec(request.headers.cookie || '')?.[1];

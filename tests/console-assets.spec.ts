@@ -30,6 +30,18 @@ describe("console entry points", () => {
     }
   });
 
+  it("revalidates PWA metadata and worker without broadening its scope", async()=>{
+    for(const path of ["/console/sw.js", "/console/manifest.webmanifest"]) {
+      const response=await worker.fetch(new Request(`https://timber.test${path}`),bindings);
+      expect(response.status).toBe(200);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(response.headers.get("content-security-policy")).toContain("worker-src 'self'");
+      expect(response.headers.get("content-security-policy")).toContain("manifest-src 'self'");
+      expect(response.headers.get("service-worker-allowed")).toBeNull();
+      expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    }
+  });
+
   it("preserves fingerprinted asset caching without exposing the API", async()=>{
     const asset=await worker.fetch(new Request("https://timber.test/console/assets/current.js"),bindings);
     expect(asset.status).toBe(200);

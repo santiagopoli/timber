@@ -2,6 +2,13 @@
 <html lang="en">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><meta name="referrer" content="strict-origin"><meta name="theme-color" content="#111214">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Timber">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="/console/manifest.webmanifest">
+  <link rel="apple-touch-icon" sizes="180x180" href="/console/icons/apple-touch-icon.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="/console/icons/icon-192.png">
   <title>Timber</title>
 </head>
 <body data-mobile-view="bots">
@@ -15,6 +22,7 @@
   <h1>Sign in</h1>
   <form id="connect-form"><label for="token">Access token</label><input id="token" type="password" placeholder="Enter your access token" autocomplete="current-password" spellcheck="false" required><button type="submit">Continue <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></button></form>
   <p id="login-error" class="error" role="alert"></p>
+  <details id="pwa-install-help" class="setup-details"><summary>Install Timber on iPhone or iPad</summary><p>Open this page in Safari, tap Share, then Add to Home Screen. If offered, keep Open as Web App enabled, then tap Add.</p><p>Launch Timber from its home-screen icon. You may need to sign in once in the installed app. An internet connection is required; conversations and credentials are not cached for offline use.</p></details>
 </main>
 <div id="app" class="app" hidden>
   <button id="sidebar-scrim" class="sidebar-scrim" aria-label="Close conversations" hidden></button>
@@ -144,6 +152,7 @@
     <div class="section-title"><h3>GitHub</h3><button id="refresh-github" class="quiet">Refresh</button></div>
     <p id="github-status" class="hint">Checking…</p><button id="connect-github">Connect GitHub</button><button id="disconnect-github" class="quiet" hidden>Disconnect</button><p id="github-error" class="error" role="alert"></p>
   </section>
+  <section class="connection-section" aria-label="Install Timber"><h3>Install Timber</h3><p class="hint">On iPhone or iPad, open Timber in Safari and choose Share → Add to Home Screen. If offered, keep Open as Web App enabled. Launch from the home-screen icon to use Timber as an app. An internet connection is required.</p></section>
   <div class="settings-footer"><button id="disconnect" class="quiet" hidden>Sign out</button></div>
 </dialog>
 <script type="module" src="./console.js"></script>

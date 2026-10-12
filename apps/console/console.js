@@ -1,3 +1,4 @@
+import './src/pwa.ts';
 import './src/styles.css';
 import { mountChat, mountToolActivity } from './src/chat.tsx';
 import { mountAgents } from './src/agents.tsx';
