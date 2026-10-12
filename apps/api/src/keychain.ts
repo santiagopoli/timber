@@ -175,56 +175,70 @@ export class OwnerKeychain {
     return this.save({operationId:`authorize:${request.id}`,entries:[{id:entry.id,expectedRevision:request.expectedRevision,name:request.name,origin:request.origin,header:request.header,prefix:request.prefix,value}]},(entries,replay)=>{if(!replay&&request.botId&&request.secretId&&this.permissionEpoch(request.secretId,request.botId)!==request.permissionEpoch)throw new ApiError(409,'credential_changed','Permission changed.');commit(entries,replay);},request.botId,true);
   }
   async call(op:string,args:Record<string,unknown>,signal:AbortSignal,canDispatch:()=>void|Promise<void>=()=>{},botId?:string):Promise<ComputerResult> {
-    const id=string(args.secretId,'secretId',36),path=string(args.path,'path',2000),method=String(args.method??'GET').toUpperCase();
+    const primary=string(args.secretId,'secretId',36),additional=args.additionalSecretIds===undefined?[]:args.additionalSecretIds;
+    if(!Array.isArray(additional)||additional.length>3||additional.some(id=>typeof id!=='string'||id.length>36)||new Set([primary,...additional]).size!==1+additional.length)invalid('Use one to four distinct private input references.');
+    const ids=[primary,...additional as string[]],path=string(args.path,'path',2000),method=String(args.method??'GET').toUpperCase();
     if(!['GET','POST','PUT','PATCH','DELETE'].includes(method))invalid('Unsupported HTTP method.');
     if(!path.startsWith('/')||path.startsWith('//')||path.includes('\\')||/[\x00-\x20\x7f]/.test(path))invalid('Use an absolute path within the authorized origin.');
     const payload=args.body===undefined?undefined:string(args.body,'body',32_000,0);if(method==='GET'&&payload!==undefined)invalid('GET cannot include a body.');
-    const stored=this.row(id);if(!stored?.envelope)throw new ApiError(404,'credential_unavailable','Credential is unavailable or revoked.');
-    const permission=botId?await this.requireAccess(id,botId):undefined;
-    const entry:SecretMetadata=JSON.parse(stored.data);
-    if(!entry.origin)throw new ApiError(409,'credential_unconfigured','Use configure_secret to prepare this private input for the intended service. The user only confirms access; do not ask them to configure headers or URLs.');
-    const url=new URL(path,entry.origin);if(url.origin!==entry.origin||url.hash)invalid('The destination must match the authorized origin.');
+    const snapshots=await Promise.all(ids.map(async id=>{
+      const stored=this.row(id);if(!stored?.envelope)throw new ApiError(404,'credential_unavailable','Credential is unavailable or revoked.');
+      const entry:SecretMetadata=JSON.parse(stored.data);
+      if(!entry.origin)throw new ApiError(409,'credential_unconfigured','Use configure_secret to prepare this private input for the intended service. The user only confirms access; do not ask them to configure headers or URLs.');
+      const permission=botId?await this.requireAccess(id,botId):undefined;
+      return {id,stored,entry,permission};
+    }));
+    const origin=snapshots[0].entry.origin;
+    if(snapshots.some(item=>item.entry.origin!==origin))invalid('All private inputs must be approved for the same HTTPS origin.');
+    const managedHeaders=snapshots.map(item=>item.entry.header.toLowerCase());
+    if(new Set(managedHeaders).size!==managedHeaders.length)invalid('Each private input must use a unique authentication header.');
+    const url=new URL(path,origin);if(url.origin!==origin||url.hash)invalid('The destination must match the authorized origin.');
     const headers:Record<string,string>={accept:'application/json',...(payload===undefined?{}:{'content-type':'application/json'})};
     const publicHeaders=args.headers===undefined?{}:object(args.headers);
     if(Object.keys(publicHeaders).length>16)invalid('Use at most 16 public headers.');
+    const publicHeaderNames=new Set<string>();
     for(const [name,value] of Object.entries(publicHeaders)) {
-      if(!/^[A-Za-z][A-Za-z0-9-]{0,79}$/.test(name)||name.toLowerCase()===entry.header.toLowerCase()||/^(?:authorization|cookie|set-cookie|host|content-.+|connection|transfer-encoding|proxy-.+|sec-.+|cf-.+|x-forwarded-.+)$/i.test(name)||typeof value!=='string'||value.length>1000||/[^\x20-\x7e]/.test(value))invalid('Use public API configuration headers only. Authentication headers are managed by the keychain.');
+      const normalizedName=name.toLowerCase();if(publicHeaderNames.has(normalizedName))invalid('Public header names must be unique case-insensitively.');publicHeaderNames.add(normalizedName);
+      if(!/^[A-Za-z][A-Za-z0-9-]{0,79}$/.test(name)||managedHeaders.includes(normalizedName)||/^(?:authorization|cookie|set-cookie|host|content-.+|connection|transfer-encoding|proxy-.+|sec-.+|cf-.+|x-forwarded-.+)$/i.test(name)||typeof value!=='string'||value.length>1000||/[^\x20-\x7e]/.test(value))invalid('Use public API configuration headers only. Authentication headers are managed by the keychain.');
       headers[name.toLowerCase()]=value as string;
     }
-    const digest=await this.digest(args);this.active();signal.throwIfAborted();
+    const digest=await this.digest(['secret_request.v2',args]);this.active();signal.throwIfAborted();
     const prior=this.storage.sql.exec<{fingerprint:string;result:string|null}>('SELECT fingerprint,result FROM keychain_calls WHERE operation_id=?',op).toArray()[0];
     if(prior){if(prior.fingerprint!==digest)throw new ApiError(409,'idempotency_conflict','Request arguments changed.');return prior.result?JSON.parse(prior.result):{operationId:op,status:'interrupted',error:'The authenticated request may have been sent. Inspect the service before making another request.'};}
-    const envelope:Envelope=JSON.parse(stored.envelope);
-    const clear=await crypto.subtle.decrypt({name:'AES-GCM',iv:decode(envelope.iv),additionalData:this.aad(entry)},await this.encryptionKey(),decode(envelope.ciphertext));
-    const value=new TextDecoder().decode(clear);
-    if(/[^\x20-\x7e]/.test(value)||value.length>8192)throw new ApiError(422,'credential_format','This private input cannot be used as a single HTTP authentication header. Request the specific API key in a new secure input.');
-    this.active();signal.throwIfAborted();
-    await canDispatch();signal.throwIfAborted();
-    if(botId&&this.permissionEpoch(id,botId)!==permission)throw new ApiError(409,'credential_changed','Permission was revoked before dispatch.');
-    if(this.row(id)?.envelope!==stored.envelope)throw new ApiError(409,'credential_changed','Credential changed before the request was sent.');
-    // No await between the second replay fence and dispatch registration.
+    // Decrypt and validate every value before dispatch. Plaintext exists only in this stack frame.
+    const credentials=await Promise.all(snapshots.map(async item=>{
+      const envelope:Envelope=JSON.parse(item.stored.envelope!);
+      const clear=new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:decode(envelope.iv),additionalData:this.aad(item.entry)},await this.encryptionKey(),decode(envelope.ciphertext)));
+      const value=new TextDecoder().decode(clear);clear.fill(0);
+      if(/[^\x20-\x7e]/.test(value)||value.length>8192)throw new ApiError(422,'credential_format','A private input cannot be used as a single HTTP authentication header. Request the specific API key in a new secure input.');
+      return {value,header:item.entry.header,prefix:item.entry.prefix};
+    }));
+    this.active();signal.throwIfAborted();await canDispatch();this.active();signal.throwIfAborted();
+    // Recheck every signed grant, revision/envelope and task fence after the last await.
+    for(const item of snapshots){
+      if(botId&&this.permissionEpoch(item.id,botId)!==item.permission)throw new ApiError(409,'credential_changed','Permission was revoked before dispatch.');
+      const latest=this.row(item.id);if(!latest?.envelope||latest.envelope!==item.stored.envelope||latest.data!==item.stored.data)throw new ApiError(409,'credential_changed','A private input changed before the request was sent.');
+    }
     if(this.storage.sql.exec('SELECT operation_id FROM keychain_calls WHERE operation_id=?',op).toArray().length)return {operationId:op,status:'interrupted',error:'This authenticated request is already being handled.'};
     this.storage.sql.exec('INSERT INTO keychain_calls(operation_id,fingerprint) VALUES(?,?)',op,digest);
-    let result:ComputerResult;
-    const timeout=new AbortController(),timer=setTimeout(()=>timeout.abort(),30_000);
+    let result:ComputerResult;const timeout=new AbortController(),timer=setTimeout(()=>timeout.abort(),30_000);
     try {
-      const response=await fetch(url,{method,headers:{...headers,[entry.header]:entry.prefix+value},body:payload,redirect:'manual',signal:AbortSignal.any([signal,timeout.signal])});
+      const injected={...headers};for(let i=0;i<credentials.length;i++)injected[credentials[i].header]=credentials[i].prefix+credentials[i].value;
+      const response=await fetch(url,{method,headers:injected,body:payload,redirect:'manual',signal:AbortSignal.any([signal,timeout.signal])});
       if(response.status>=300&&response.status<400){await response.body?.cancel();result={operationId:op,status:'failed',error:'The service redirected the request. Credentials were not forwarded.'};}
       else {
         const reader=response.body?.getReader();let output='',size=0;const decoder=new TextDecoder();
         if(reader)while(true){const chunk=await reader.read();if(chunk.done)break;size+=chunk.value.length;if(size>64_000){await reader.cancel();throw new Error('Response too large');}output+=decoder.decode(chunk.value,{stream:true});}output+=decoder.decode();
-        const variants=[value,encode(encoder.encode(value)),encodeURIComponent(value),JSON.stringify(value).slice(1,-1)];
-        const redact=(text:string)=>{for(const token of variants.filter(Boolean).sort((a,b)=>b.length-a.length))text=text.split(token).join('[redacted]');return text;};
-        // Service-issued tokens are also excluded when providers return JSON credentials.
+        const variants=new Set<string>();for(const credential of credentials){const value=credential.value;for(const raw of [value,credential.prefix+value]){const bytes=encoder.encode(raw),base64=encode(bytes),percent=encodeURIComponent(raw);for(const v of [raw,base64,base64.replace(/=+$/,''),base64.replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''),Array.from(bytes,byte=>byte.toString(16).padStart(2,'0')).join(''),Array.from(bytes,byte=>byte.toString(16).padStart(2,'0')).join('').toUpperCase(),percent,percent.replace(/%[0-9A-F]{2}/g,token=>token.toLowerCase()),JSON.stringify(raw).slice(1,-1)])if(v)variants.add(v);}}
+        const redact=(text:string)=>{for(const token of [...variants].sort((a,b)=>b.length-a.length))text=text.split(token).join('[redacted]');return text;};
         try{output=JSON.stringify(JSON.parse(output),(key,v)=>/token|secret|password|authorization|api[_-]?key|private[_-]?key|cookie/i.test(key)?'[redacted]':typeof v==='string'?redact(v):v);}catch{output=redact(output);}
         output=redact(output);
         result={operationId:op,status:response.ok?'completed':'failed',output:JSON.stringify({status:response.status,body:output}),...(!response.ok?{error:`The service returned HTTP ${response.status}.`}:{})};
       }
     }catch{result={operationId:op,status:'interrupted',error:'The authenticated request could not be confirmed. It may have reached the service; inspect its state before retrying.'};}
-    finally{clearTimeout(timer);}
-    this.active();
-    this.storage.sql.exec('UPDATE keychain_calls SET result=? WHERE operation_id=?',JSON.stringify(result),op);
-    const latest=this.row(id);if(latest?.envelope===stored.envelope)this.storage.sql.exec('UPDATE keychain_entries SET data=? WHERE id=?',JSON.stringify({...entry,lastUsedAt:now()}),id);
+    finally{clearTimeout(timer);for(const credential of credentials)(credential as {value:string}).value='';}
+    this.active();this.storage.sql.exec('UPDATE keychain_calls SET result=? WHERE operation_id=?',JSON.stringify(result),op);
+    for(const item of snapshots){const latest=this.row(item.id);if(latest?.envelope===item.stored.envelope)this.storage.sql.exec('UPDATE keychain_entries SET data=? WHERE id=?',JSON.stringify({...JSON.parse(latest.data) as SecretMetadata,lastUsedAt:now()}),item.id);}
     return result;
   }
 }
