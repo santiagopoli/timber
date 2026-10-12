@@ -112,3 +112,13 @@ Primary platform references:
 - https://developers.cloudflare.com/sandbox/previews/
 - https://developers.cloudflare.com/sandbox/previews/serve-previews-on-their-own-hostnames/
 - https://developers.cloudflare.com/containers/examples/websocket/
+
+## Task workspaces
+
+Task runtime registrations and preview tickets are stored in the task conversation.
+Their base path is `/apps/<botId>.<taskId>.<appId>/`; the preview gateway checks the
+task belongs to that bot before routing. Probes and previews use the task's own
+computer (or its retained shared computer for legacy work). Authenticated
+`/v1/tasks/:taskId/apps`, `/apps/refresh` and `/apps/:appId/open` reuse the bot
+app contract. Clicking a registered task root link obtains and posts a one-use
+ticket; another task's link cannot mint a grant in this conversation.

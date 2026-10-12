@@ -2,14 +2,22 @@ import { DurableObject } from "cloudflare:workers";
 import type { ComputerAction, ComputerResult } from "@botspace/contracts";
 import { ChatGPTAuthDO } from "../../apps/api/src/chatgpt";
 import type { Env } from "../../apps/api/src/env";
+import {WorkspaceDO as ProductionWorkspaceDO} from '../../apps/api/src/workspace';
+import {ComputerDO as ProductionComputerDO,computerName} from '../../packages/computer/src/index';
 export { ChatGPTAuthDO };
 export { GitHubAuthDO } from "../../apps/api/src/github";
 export class KeylessChatGPTAuthDO extends ChatGPTAuthDO {
   constructor(ctx: DurableObjectState, env: Env) {super(ctx, {...env, CHATGPT_CREDENTIAL_KEY: undefined});}
 }
-export {default, WorkspaceDO, BotDO} from "../../apps/api/src/index";
-export {ComputerDO as RealComputerDO} from "../../packages/computer/src/index";
-export const computerFixtureControl: {gate?: Promise<void>; status?: ComputerResult["status"]; controlled?:boolean; failure?: {status: number; body: unknown};deleteFailure?:boolean;execSession?:{command?:string;pollsBeforeComplete?:number}} = {};
+export {default, BotDO} from "../../apps/api/src/index";
+/** Legacy scheduler fixtures remain shared; isolation cases opt into the production default. */
+export class WorkspaceDO extends ProductionWorkspaceDO {
+  protected newTaskComputerMode():"shared"|"isolated" {return computerFixtureControl.isolatedTasks?'isolated':'shared';}
+}
+export class RealComputerDO extends ProductionComputerDO {
+  constructor(ctx:DurableObjectState,env:Env&{REAL_COMPUTER:DurableObjectNamespace}) {super(ctx,{...env,COMPUTER:env.REAL_COMPUTER});}
+}
+export const computerFixtureControl: {isolatedTasks?:boolean;gate?: Promise<void>; status?: ComputerResult["status"]; controlled?:boolean; failure?: {status: number; body: unknown};deleteFailure?:boolean;execSession?:{command?:string;pollsBeforeComplete?:number}} = {};
 
 /** Test-only effects journal. This does not launch a container or implement tools. */
 export class ComputerDO extends DurableObject {
@@ -26,7 +34,7 @@ export class ComputerDO extends DurableObject {
       const botId=request.headers.get('x-timber-bot-id');
       if(!botId)return new Response('Missing private bot identity',{status:400});
       const binding=(this.env as {REAL_COMPUTER:DurableObjectNamespace}).REAL_COMPUTER;
-      return binding.get(binding.idFromName(botId)).fetch(request);
+      return binding.get(binding.idFromName(computerName(botId,request.headers.get('x-timber-task-computer')??undefined))).fetch(request);
     }
     // The real DesktopSessions RPC is a read-only GET; tests default to no
     // interactive GUI control unless a case explicitly configures it.

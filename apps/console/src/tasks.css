@@ -39,6 +39,8 @@
 .timber-task-queue{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--border);color:var(--muted);font-size:12px;line-height:1.4}
 .timber-task-queue>span{flex:1;min-width:0;overflow-wrap:anywhere}
 .timber-task-queue>button{flex-shrink:0}
+.timber-task-desktop-dialog{width:min(900px,calc(100vw - 24px));height:min(760px,calc(100dvh - 48px));display:flex;flex-direction:column}
+.timber-task-desktop{flex:1;min-height:0;min-width:0}
 .timber-tasks-error{margin:0;color:#b42318;font-size:12px;line-height:1.45;overflow-wrap:anywhere}
 .timber-tasks-link{border:0;background:transparent;color:inherit;text-decoration:underline;cursor:pointer;font:inherit}
 .timber-tasks-spinner{width:16px;height:16px;animation:timber-tasks-spin .9s linear infinite}

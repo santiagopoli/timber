@@ -41,6 +41,7 @@ async function withTasks(work,width=1440,colorScheme='light') {
     const [,id,tail='']=/^\/v1\/tasks\/([^/]+)(.*)$/.exec(path)||[],task=tasks.records.find(item=>item.id===id);
     if(!task)return fulfill(route,{error:{code:'not_found',message:'Task not found.'}},404);
     if(method==='GET'){
+      if(tail==='/computer')return fulfill(route,{computer:{id:task.botId,provider:'cloudflare',state:'stopped'}});
       if(tail==='/keychain')return fulfill(route,{entries:[],requests:[]});
       if(tail==='/connections')return fulfill(route,{connections:[]});
       if(tail==='/context')return fulfill(route,{context:{automatic:true,estimatedTokens:0,activeEntries:0,contextWindow:200000,compactions:[]}});
@@ -401,3 +402,35 @@ for(const width of [390,1440])test(`queued task keeps its composer writable at $
  await taskChat(page).getByText('Keep this correction for when the computer is available',{exact:true}).waitFor();
  assert.equal(tasks.calls.filter(call=>call.method==='POST'&&call.path==='/v1/tasks/task-queued/messages').length,1);
 },width));
+
+for(const width of [390,1440])test(`global tasks: desktop session stays scoped and closes without stopping work at ${width}px`,async()=>withTasks(async({page,tasks,login,open})=>{
+ const task=tasks.records.find(t=>t.id==='task-running');task.computerMode='isolated';const sessionId=randomUUID(),calls=[],sockets=[];
+ await page.route('**/v1/tasks/*/computer/live-session**',async route=>{
+  const req=route.request();calls.push({path:new URL(req.url()).pathname,method:req.method()});
+  return route.fulfill({json:req.method()==='POST'?{sessionId,protocols:['binary','timber-test-only-ticket'],expiresAt:new Date(Date.now()+60000).toISOString()}:{ok:true}});
+ });
+ await page.routeWebSocket('**/v1/tasks/*/computer/live',socket=>{sockets.push(new URL(socket.url()).pathname);socket.send(Buffer.from('RFB 003.008\n'));});
+ await login();await open(task.id);await page.getByRole('button',{name:'Task computer',exact:true}).click();
+ const dialog=page.getByRole('dialog',{name:'Task computer',exact:true});await dialog.locator('[data-desktop="observe"]').click();
+ for(let i=0;i<50&&!sockets.length;i++)await page.waitForTimeout(20);
+ assert.ok(sockets.length,JSON.stringify({calls,status:await dialog.locator('.desktop-status').textContent()}));
+ for(let i=0;i<50&&!sockets.length;i++)await page.waitForTimeout(20);
+ assert.deepEqual(sockets,[`/v1/tasks/${task.id}/computer/live`]);assert.equal(calls[0].path,`/v1/tasks/${task.id}/computer/live-session`);
+ const bounds=await dialog.evaluate(node=>({right:node.getBoundingClientRect().right,width:node.clientWidth,scroll:node.scrollWidth}));assert.ok(bounds.right<=width+1&&bounds.scroll<=bounds.width+1);
+ await dialog.getByRole('button',{name:'Close task computer'}).click();
+ for(let i=0;i<50&&!calls.some(c=>c.method==='DELETE');i++)await page.waitForTimeout(20);
+ assert.ok(calls.some(c=>c.method==='DELETE'&&c.path===`/v1/tasks/${task.id}/computer/live-session/${sessionId}`));
+ assert.ok(!tasks.calls.some(c=>c.method==='POST'&&c.path.endsWith('/cancel')));assert.equal(task.status,'running');
+},width));
+
+test('global tasks: registered task preview link opens with its own one-use ticket',async()=>withTasks(async({page,tasks,fixture,login,open})=>{
+ const task=tasks.records.find(t=>t.id==='task-running'),id=randomUUID(),appId=randomUUID(),old=task.id;
+ task.id=id;tasks.messages.delete(old);const path=`/apps/${task.botId}.${id}.${appId}/`,url=new URL(path,fixture.url).href;
+ tasks.messages.set(id,[{id:randomUUID(),role:'assistant',text:`[Task preview](${url})`}]);
+ await page.route(`**/v1/tasks/${id}/apps/${appId}/open`,route=>route.fulfill({json:{actionUrl:url+'__timber_open',ticket:'synthetic-task-ticket'}}));
+ let submitted;
+ await page.context().route('**/apps/**',route=>{const req=route.request();submitted={path:new URL(req.url()).pathname,method:req.method(),body:req.postData()};return route.fulfill({body:'Task preview'});});
+ await login();await open(id);const popup=page.waitForEvent('popup');await taskChat(page).getByRole('link',{name:'Task preview'}).click();const preview=await popup;await preview.waitForLoadState();
+ for(let i=0;i<50&&!submitted;i++)await page.waitForTimeout(20);
+ assert.deepEqual(submitted,{path:path+'__timber_open',method:'POST',body:'ticket=synthetic-task-ticket'});assert.ok(!preview.url().includes('synthetic-task-ticket'));await preview.close();
+}));

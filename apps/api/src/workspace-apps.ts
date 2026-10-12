@@ -1,5 +1,5 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
-import { ComputerProviderError, previewCloudComputer } from "@botspace/computer";
+import { ComputerProviderError, previewCloudComputer,type ComputerScopeResolver } from "@botspace/computer";
 import type { Bot } from "@botspace/contracts";
 import type { Env } from "./env";
 import { ApiError, errorResponse } from "./errors";
@@ -67,7 +67,7 @@ export function parseWorkspaceApp(value:unknown):{name:string;port:number;operat
 export class WorkspaceApps {
   private readonly origins:Origins;
   constructor(private readonly storage:DurableObjectStorage, private readonly computers:DurableObjectNamespace,
-    private readonly botId:string, origins:Origins) {
+    private readonly botId:string, origins:Origins,private readonly taskId?:string,private readonly computerScope?:ComputerScopeResolver) {
     this.origins={previewOrigin:origin(origins.previewOrigin),consoleOrigin:origin(origins.consoleOrigin)};
     if(this.origins.previewOrigin===this.origins.consoleOrigin) throw new ApiError(503,"apps_not_configured","Workspace apps require a separate preview origin.");
     if(!UUID.test(botId)) throw new ApiError(400,"invalid_request","Invalid bot identity.");
@@ -100,7 +100,7 @@ export class WorkspaceApps {
   private async probe(app:WorkspaceApp):Promise<WorkspaceApp> {
     const signal=AbortSignal.timeout(5_000);
     try {
-      const response=await previewCloudComputer(this.computers,this.botId,app.port,new Request(app.url,{signal}));
+      const response=await previewCloudComputer(this.computers,this.botId,app.port,new Request(app.url,{signal}),await this.computerScope?.(this.botId));
       await response.body?.cancel();
       const ready=response.status>=200 && response.status<400;
       return this.recordState(app,ready ? "ready":"unavailable",ready?undefined:httpReadiness(response.status));
@@ -121,7 +121,7 @@ export class WorkspaceApps {
       if(existing) {await tx.put(OPERATION+parsed.operationId,{id:existing.id,digest:hash});return existing;}
       if(apps.some(value=>value.port===parsed.port)) throw new ApiError(409,"app_port_in_use","This port already belongs to a named app.");
       if(apps.length>=MAX_APPS) throw new ApiError(409,"app_limit","Remove an unused app before adding another.");
-      const id=crypto.randomUUID(), now=new Date().toISOString(), basePath=`/apps/${this.botId}.${id}/`;
+      const id=crypto.randomUUID(), now=new Date().toISOString(), basePath=`/apps/${this.botId}.${this.taskId?`${this.taskId}.`:''}${id}/`;
       const created:WorkspaceApp={id,botId:this.botId,name:parsed.name,port:parsed.port,basePath,url:this.origins.previewOrigin+basePath,state:"unavailable",createdAt:now,updatedAt:now};
       await tx.put({[APP+id]:created,[OPERATION+parsed.operationId]:{id,digest:hash}});return created;
     });
@@ -187,7 +187,7 @@ export class WorkspaceApps {
     headers.set("x-forwarded-host",publicUrl.host);headers.set("x-forwarded-proto","https");
     const forwarded=new Request(publicUrl,{method:request.method,headers,body:["GET","HEAD"].includes(request.method)?undefined:request.body,redirect:"manual",signal:request.signal});
     let response:Response;
-    try {response=await previewCloudComputer(this.computers,this.botId,app.port,forwarded);}
+    try {response=await previewCloudComputer(this.computers,this.botId,app.port,forwarded,await this.computerScope?.(this.botId));}
     catch(error) {await this.recordState(app,"unavailable",probeFailure(error));return unavailable();}
     if(response.status===503) {await response.body?.cancel();await this.recordState(app,"unavailable",httpReadiness(503));return unavailable();}
     // A missing asset must not override the root readiness observation.
@@ -258,18 +258,20 @@ export class WorkspacePreviewGateway extends WorkerEntrypoint<Env> {
     try {
       const url=new URL(request.url), configured=origin(this.env.PREVIEW_ORIGIN??"");
       if(url.origin!==configured) missing();
-      const match=/^\/apps\/([0-9a-f-]{36})\.([0-9a-f-]{36})(\/.*)?$/i.exec(url.pathname);
-      if(!match || !UUID.test(match[1]) || !UUID.test(match[2])) missing();
-      const [,botId,appId]=match;
+      const match=/^\/apps\/([0-9a-f-]{36})\.(?:([0-9a-f-]{36})\.)?([0-9a-f-]{36})(\/.*)?$/i.exec(url.pathname);
+      if(!match || !UUID.test(match[1]) || !UUID.test(match[3]) || match[2]&&!UUID.test(match[2])) missing();
+      const [,botId,taskId,appId]=match;
       const registry=this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName("owner"));
       const record=await registry.fetch(`https://workspace/${botId}`);
       if(!record.ok) missing();
       const {bot}=await record.json<{bot:Bot}>();
       const headers=new Headers(request.headers);
       headers.set("x-botspace-config",encodeURIComponent(JSON.stringify(bot)));
+      if(taskId){const r=await registry.fetch(`https://workspace/tasks/${taskId}`);if(!r.ok)missing();const {task}=await r.json<{task:{botId:string}}>();if(task.botId!==botId)missing();headers.set('x-timber-task-id',taskId);}
+      else headers.delete('x-timber-task-id');
       headers.set("x-timber-preview-path",url.pathname);
       const target=`https://bot/workspace-app-preview/${appId}${url.search}`;
-      const stub=this.env.BOT.get(this.env.BOT.idFromName(`owner:${botId}`));
+      const stub=this.env.BOT.get(this.env.BOT.idFromName(taskId?`owner:task:${taskId}`:`owner:${botId}`));
       return await stub.fetch(new Request(target,{method:request.method,headers,body:["GET","HEAD"].includes(request.method)?undefined:request.body,redirect:"manual",signal:request.signal}));
     } catch(error) {return errorResponse(error);}
   }

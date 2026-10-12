@@ -74,3 +74,14 @@ test('malicious host stdout/extra fields never appear in response or durable jou
 test('cancellation after dispatch asks Computer to terminate and reports uncertain without replay',async()=>{
  let release;const gate=new Promise(resolve=>release=resolve),f=fakeHost({dispatchTrusted:async x=>{f.calls.dispatch.push(x);await gate;return{operationId:x.operationId,status:'completed',code:'deploy_accepted'}}}),journal=memorySecureDeployJournal(),c=coordinator(f.host,journal);const pending=c.deploy(request());for(let i=0;i<100&&f.calls.dispatch.length===0;i++)await new Promise(resolve=>setImmediate(resolve));assert.equal(await c.cancel('deploy-1'),'cancelled');release();assert.equal((await pending).state,'uncertain');assert.deepEqual(f.calls.cancel,['deploy-1']);assert.equal((await c.deploy(request())).state,'uncertain');assert.equal(f.calls.dispatch.length,1);
 });
+
+test('isolated task capabilities, dispatch and cancellation use the task computer with logical bot authority',async()=>{
+ const taskId='00000000-0000-4000-8000-000000000006',calls=[];
+ const binding={idFromName:id=>id,get:id=>({async fetch(req){calls.push({id,path:new URL(req.url).pathname,scope:req.headers.get('x-timber-task-computer'),bot:req.headers.get('x-timber-bot-id')});return Response.json(req.method==='GET'?caps:new URL(req.url).pathname.endsWith('/cancel')?{operationId:'deploy-1',result:'cancelled'}:{operationId:'deploy-1',status:'completed',code:'deploy_accepted'})}})};
+ const provider=createCloudSecureWorkerDeployProvider(binding,async()=>taskId);
+ await provider.capabilities(botId);
+ const input={operationId:'deploy-1',authorization:{...authorization(request()),taskId},pin:request().pin,refs:authorization(request()).refs,credentials,signal:new AbortController().signal};
+ await provider.dispatch(botId,input);await provider.cancel(botId,'deploy-1');
+ assert.deepEqual(calls.map(c=>[c.id,c.scope,c.bot]),Array.from({length:3},()=>[`task:${taskId}`,taskId,botId]));
+ const count=calls.length;await assert.rejects(provider.dispatch(botId,{...input,authorization:{...input.authorization,taskId:runId}}));assert.equal(calls.length,count,'mismatched signed task never sends credentials');
+});

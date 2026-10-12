@@ -9,7 +9,8 @@ import { maintenanceFixture } from "./maintenance-fixture";
 
 // Actual API, BotDO, registry, Pi lifecycle and SQLite. Only the external model
 // transport and computer effect provider are deterministic test doubles.
-export { default, WorkspaceDO } from "../../apps/api/src/index";
+export { default } from "../../apps/api/src/index";
+export { WorkspaceDO } from '../fixtures/worker';
 export { ComputerDO } from "../fixtures/worker";
 export const inferenceFixtureControl:{gate?:Promise<void>;matches?:string}={};
 export class BotDO extends ProductionBotDO {

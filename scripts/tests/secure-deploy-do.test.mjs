@@ -57,3 +57,16 @@ test('invalid destination/path schema is rejected before startup or private invo
 test('cancel is scoped to operation ID and returns only a fixed result without generic actions',async()=>{
  const f=makeComputer({running:true});f.state.set('botId',botId);const response=await secureDeployComputerRoute(f.computer,request('/secure-deploy/cancel',{operationId}),'/secure-deploy/cancel');assert.deepEqual(await response.json(),{operationId,result:'cancelled'});assert.deepEqual(f.paths,['/secure-deploy/cancel']);assert.equal(f.paths.includes('/actions'),false);
 });
+
+test('a signed isolated task deployment cannot be sent to the root or a sibling computer',async()=>{
+ const taskId='00000000-0000-4000-8000-000000000006',body=deployBody({authorization:authorization({taskId})});
+ const root=makeComputer();root.state.set('botId',botId);
+ root.computer.env.WORKSPACE={idFromName:x=>x,get:()=>({fetch:async()=>Response.json({task:{botId,computerMode:'isolated'}})})};
+ const rejected=await secureDeployComputerRoute(root.computer,request('/secure-deploy',body),'/secure-deploy');assert.equal((await rejected.json()).code,'invalid_authorization');assert.deepEqual(root.received,[]);assert.deepEqual(root.paths,[]);
+ const sibling=makeComputer();sibling.state.set('botId',botId);sibling.computer.bindScope=async()=>{};
+ const wrong=request('/secure-deploy',body);wrong.headers.set('x-timber-task-computer',runId);
+ const refused=await secureDeployComputerRoute(sibling.computer,wrong,'/secure-deploy');assert.equal((await refused.json()).code,'invalid_authorization');assert.deepEqual(sibling.received,[]);assert.deepEqual(sibling.events,[]);
+ const own=makeComputer();own.state.set('botId',botId);own.computer.bindScope=async()=>{};
+ const valid=request('/secure-deploy',body);valid.headers.set('x-timber-task-computer',taskId);
+ assert.equal((await (await secureDeployComputerRoute(own.computer,valid,'/secure-deploy')).json()).code,'deploy_accepted');assert.equal(own.received.length,1);
+});

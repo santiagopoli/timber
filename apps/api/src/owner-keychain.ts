@@ -26,7 +26,7 @@ export class OwnerKeychainCoordinator {
     if(taskId)this.assertTask(botId,taskId);
     return this.env.BOT.get(this.env.BOT.idFromName(taskId?`owner:task:${taskId}`:`owner:${botId}`)).fetch(`https://bot/_keychain/${path}`,{method:'POST',headers:{'content-type':'application/json','x-botspace-config':encodeURIComponent(JSON.stringify(bot)),...(taskId?{'x-timber-task-id':taskId}:{})},body:JSON.stringify(input)});
   }
-  private assertTask(botId:string,taskId:string):{status:string} {
+  private assertTask(botId:string,taskId:string):{status:string;computerMode?:string} {
     if(!UUID.test(taskId))throw new ApiError(400,'invalid_request','Invalid task identity.');
     const row=this.ctx.storage.sql.exec<{data:string}>('SELECT data FROM tasks WHERE id=?',taskId).toArray()[0];
     if(!row||JSON.parse(row.data).botId!==botId)throw new ApiError(403,'task_mismatch','This task belongs to another bot.');
@@ -130,7 +130,7 @@ export class OwnerKeychainCoordinator {
   private async secureWorkerDeployCapabilities(botId:string,taskId:string|undefined,runId:string,nativeOperationId:string,signal:AbortSignal):Promise<Response>{
     const current=()=>{this.bot(botId);if(taskId)this.assertTask(botId,taskId);signal.throwIfAborted();};
     current();await this.assertRun({botId,...(taskId?{taskId}:{}),runId,nativeOperationId} as SecureInputRequest);current();
-    const provider=createCloudComputerProvider(this.env.COMPUTER);
+    const provider=createCloudComputerProvider(this.env.COMPUTER,async()=>taskId&&this.assertTask(botId,taskId).computerMode==='isolated'?taskId:undefined);
     if(!provider.secureDeployCapabilities)throw new ApiError(503,'secure_deploy_host_unavailable','Computer deploy capability is unavailable.');
     const capability=await provider.secureDeployCapabilities(botId,signal);
     current();await this.assertRun({botId,...(taskId?{taskId}:{}),runId,nativeOperationId} as SecureInputRequest);current();
@@ -185,7 +185,7 @@ export class OwnerKeychainCoordinator {
           });
         }
       };
-      const provider=createCloudComputerProvider(this.env.COMPUTER);
+      const provider=createCloudComputerProvider(this.env.COMPUTER,async()=>taskId&&this.assertTask(botId,taskId).computerMode==='isolated'?taskId:undefined);
       if(!provider.secureDeploy||!provider.secureDeployCapabilities)throw new ApiError(503,'secure_deploy_host_unavailable','Computer deploy provider is unavailable.');
       const host:SecureDeployHost={capabilities:()=>provider.secureDeployCapabilities!(botId),dispatchTrusted:x=>provider.secureDeploy!(botId,x as Parameters<NonNullable<typeof provider.secureDeploy>>[1]),cancel:id=>provider.secureDeployCancel!(botId,id)};
       const journal={
