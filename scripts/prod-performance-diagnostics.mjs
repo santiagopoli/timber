@@ -59,6 +59,7 @@ export const PERFORMANCE_NATIVE = `SELECT json_extract(t.record,'$.kind') AS kin
 export const PERFORMANCE_DELIVERIES = `SELECT t.status AS delivery_status,
  json_extract(t.record,'$.state.checkpoint.phase') AS phase,s.status AS submission_status,
  s.conversation_id=1 AS is_root,
+ (SELECT COUNT(*) FROM pi_tasks a WHERE a.conversation_id=s.conversation_id AND a.status!='terminal') AS recipient_active_tasks,
  EXISTS(SELECT 1 FROM pi_tasks w JOIN pi_entries e ON e.id=json_extract(w.record,'$.input.assistant'),json_each(e.record,'$.model[0].content') c
  WHERE w.conversation_id=s.conversation_id AND w.status='running' AND json_extract(c.value,'$.id')=json_extract(w.record,'$.input.callId') AND json_extract(c.value,'$.name')='wait_subagent') AS recipient_waiting
  FROM pi_tasks t LEFT JOIN pi_submissions s ON s.request_id=json_quote(json_extract(t.record,'$.input.operationId'))
@@ -112,7 +113,7 @@ export function summarizePerformance({runs=[],tools:actions=[],native=[],usage=[
   nativeTasks:native.slice(0,60).map(row=>({kind:allow(kinds,row.kind),status:allow(states,row.status),phase:allow(phases,row.phase),tool:allow(tools,row.tool),replay:allow(new Set(['safe','unsafe']),row.replay),isRoot:row.is_root===1,attempt:count(row.attempt),outcome:allow(states,row.outcome),background:row.background===1})),
   recovery:recovery.slice(0,1).map(row=>({waitGraphs:count(row.wait_graphs),activeNativeTasks:count(row.active_native_tasks),queuedInputs:count(row.queued_inputs)})),
   wakes:wakes.slice(0,40).map(row=>({capability:allow(new Set(['pi-harness','botspace-subagents','botspace-admission']),row.capability),fn:allow(new Set(['wake','retry']),row.fn),at:count(row.time)===null?null:new Date(row.time).toISOString(),running:row.running===1,executionStartedAt:count(row.execution_started_at)===null?null:new Date(row.execution_started_at).toISOString(),recoveryLoop:row.recovery_loop===1})),
-  deliveries:deliveries.slice(0,20).map(row=>({status:allow(states,row.delivery_status),phase:allow(phases,row.phase),submissionStatus:allow(new Set(['queued','placed','done','unanswered']),row.submission_status),recipientWaiting:row.recipient_waiting===1})),
+  deliveries:deliveries.slice(0,20).map(row=>({status:allow(states,row.delivery_status),phase:allow(phases,row.phase),submissionStatus:allow(new Set(['queued','placed','done','unanswered']),row.submission_status),recipientIsRoot:row.is_root===1,recipientActiveTasks:count(row.recipient_active_tasks),recipientWaiting:row.recipient_waiting===1})),
   processes:processes.slice(0,40).map(row=>({status:allow(states,row.status),dispatchState:allow(new Set(['registered','dispatching','uncertain','acknowledged']),row.dispatch_state),resultStatus:allow(states,row.result_status),exitCode:Number.isSafeInteger(row.exit_code)?row.exit_code:null,cancelRequested:row.cancel_requested===1})),
   modelResponses:usage.slice(0,40).filter(row=>count(row.timestamp)!==null&&row.timestamp>=window.from&&row.timestamp<=window.to).map(row=>({at:new Date(row.timestamp).toISOString(),inputTokens:count(row.input_tokens),outputTokens:count(row.output_tokens),cachedTokens:count(row.cached_tokens),stopReason:allow(new Set(['stop','length','toolUse','error','aborted']),row.stop_reason)})),
  };

@@ -92,3 +92,16 @@ test('queued conversations without native wake tables remain inspectable without
  assert.deepEqual(result.tasks[0].execution.unavailable,['runs','wakes','recovery','processes','deliveries']);
  assert.doesNotMatch(JSON.stringify(result),new RegExp(`canary|${id}|${task}`));
 });
+
+test('queued child delivery diagnostics distinguish an idle recipient without disclosing its identity or inputs',()=>{
+ const db=new DatabaseSync(':memory:');
+ try{
+  db.exec('CREATE TABLE pi_tasks(id INTEGER,status TEXT,record TEXT,conversation_id INTEGER);CREATE TABLE pi_submissions(request_id TEXT,status TEXT,conversation_id INTEGER);CREATE TABLE pi_entries(id INTEGER,record TEXT)');
+  db.prepare('INSERT INTO pi_tasks VALUES(?,?,?,?)').run(1,'running',JSON.stringify({kind:'timber.subagent-delivery',input:{operationId:'private-canary'},state:{checkpoint:{phase:'deliver'}}}),1);
+  db.prepare('INSERT INTO pi_submissions VALUES(?,?,?)').run(JSON.stringify('private-canary'),'queued',2);
+  const idle=summarizePerformance({deliveries:db.prepare(PERFORMANCE_DELIVERIES).all()},window).deliveries[0];
+  assert.equal(idle.recipientActiveTasks,0);assert.equal(idle.recipientIsRoot,false);assert.equal(idle.submissionStatus,'queued');assert.doesNotMatch(JSON.stringify(idle),/canary/);
+  db.prepare('INSERT INTO pi_tasks VALUES(?,?,?,?)').run(2,'running',JSON.stringify({kind:'pi.generation'}),2);
+  const busy=summarizePerformance({deliveries:db.prepare(PERFORMANCE_DELIVERIES).all()},window).deliveries[0];assert.equal(busy.recipientActiveTasks,1);
+ }finally{db.close();}
+});
