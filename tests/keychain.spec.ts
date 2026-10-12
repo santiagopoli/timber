@@ -5,6 +5,7 @@ import type {OwnerKeychainCoordinator} from '../apps/api/src/owner-keychain';
 import type {Env} from '../apps/api/src/env';
 import type {Bot,Run,SecretMetadata,SecureInputRequest,ComputerResult} from '@botspace/contracts';
 import {OwnerKeychain,secretDestination} from '../apps/api/src/keychain';
+import {validateHostArguments} from '../apps/api/src/host-tools';
 import type {RuntimeHostToolRequest,RuntimeToolResult} from '../packages/runtime/src/types';
 const bindings=env as unknown as Env;
 const api=async(path:string,method='GET',body?:unknown)=>{const response=await exports.default.fetch(`https://timber.test/v1${path}`,{method,headers:{authorization:'Bearer test-only-botspace-owner-token-000000','content-type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})});return new Response(await response.text(),{status:response.status,headers:response.headers});};
@@ -28,6 +29,14 @@ beforeEach(async()=>{await api('/keychain');await runInDurableObject(owner(),(_i
 afterEach(()=>vi.restoreAllMocks());
 
 describe('owner keychain security and durable flow',()=>{
+  it('validates the bounded composite secret_request host schema',()=>{
+    const ids=[crypto.randomUUID(),crypto.randomUUID(),crypto.randomUUID(),crypto.randomUUID()];
+    expect(()=>validateHostArguments('secret_request',{secretId:ids[0],path:'/',additionalSecretIds:ids.slice(1)})).not.toThrow();
+    for(const additionalSecretIds of [[],[ids[1],ids[1]],[ids[1],ids[2],ids[3],crypto.randomUUID()],[ids[1],23]])
+      expect(()=>validateHostArguments('secret_request',{secretId:ids[0],path:'/',additionalSecretIds})).toThrow('Invalid additionalSecretIds');
+    expect(()=>validateHostArguments('name_secret',{secretId:ids[0],name:'Fixture',expectedRevision:1})).not.toThrow();
+    expect(()=>validateHostArguments('name_secret',{secretId:ids[0],name:'Fixture',expectedRevision:0})).toThrow('Invalid expectedRevision');
+  });
   it('renames without revealing or replacing a value and preserves both bot grants across restart',async()=>{
     const a=await bot(),b=await bot(),input=payload(),[entry]=await save(a,input);
     await api(`/keychain/${entry.id}/permissions`,'POST',{botId:b.id,allowed:true});
@@ -125,6 +134,113 @@ describe('owner keychain security and durable flow',()=>{
     expect(await sqlDump(b)).not.toContain(value);
     for(const path of ['//evil.example.com/x','/\\evil.example.com/x','https://evil.example.com/x','/x#fragment'])await expect(useSecret(b,{secretId:entry.id,path})).rejects.toThrow();
     expect(transport).toHaveBeenCalledTimes(1);
+  });
+  it('injects two permitted credentials with independent formats; validates every reference before dispatch and redacts variants',async()=>{
+    const b=await bot();
+    const saved=await save(b,payload({entries:[
+      {name:'Fixture API key',origin:'https://api.example.com',header:'X-API-Key',prefix:'',value:'fixture-key-not-real-123'},
+      {name:'Fixture account email',origin:'https://api.example.com',header:'X-Auth-Email',prefix:'',value:'fixture+mail@example.invalid'}
+    ]}));
+    const key=saved.find(entry=>entry.header==='X-API-Key')!,email=saved.find(entry=>entry.header==='X-Auth-Email')!;
+    const transport=vi.spyOn(globalThis,'fetch').mockImplementation(async(_url,init)=>{
+      const sent=new Headers(init?.headers);expect(sent.get('x-api-key')).toBe('fixture-key-not-real-123');expect(sent.get('x-auth-email')).toBe('fixture+mail@example.invalid');
+      return Response.json({echo:['fixture-key-not-real-123','fixture+mail@example.invalid'],encoded:btoa('fixture-key-not-real-123'),urlEncoded:'fixture%2bmail%40example.invalid',uppercaseHex:Array.from(new TextEncoder().encode('fixture-key-not-real-123'),byte=>byte.toString(16).padStart(2,'0')).join('').toUpperCase(),key:'fixture-key-not-real-123',access_token:'service-issued-fixture-token'});
+    });
+    const args={secretId:key.id,additionalSecretIds:[email.id],path:'/account',headers:{'API-Version':'2026-01'}};
+    const result=await useSecret(b,args);expect(result.status).toBe('completed');
+    for(const secret of ['fixture-key-not-real-123','fixture+mail@example.invalid',btoa('fixture-key-not-real-123'),'fixture%2bmail%40example.invalid',Array.from(new TextEncoder().encode('fixture-key-not-real-123'),byte=>byte.toString(16).padStart(2,'0')).join('').toUpperCase(),'service-issued-fixture-token'])expect(JSON.stringify(result)).not.toContain(secret);
+    expect(transport).toHaveBeenCalledTimes(1);expect(await sqlDump(b)).not.toContain('fixture-key-not-real-123');expect(await sqlDump(b)).not.toContain('fixture+mail@example.invalid');
+    const otherBot=await bot();const [unpermitted]=await save(otherBot,payload({entries:[{name:'Fixture third key',origin:'https://api.example.com',header:'X-Third-Key',prefix:'',value:'fixture-third-secret'}]}));
+    await expect(useSecret(b,{secretId:key.id,additionalSecretIds:[unpermitted.id],path:'/'})).rejects.toThrow('permission');
+    expect(transport).toHaveBeenCalledTimes(1);
+    const [otherOrigin]=await save(b,payload({entries:[{name:'Other origin',origin:'https://other.example.com',header:'X-Other-Key',prefix:'',value:'fixture-other'}]}));
+    const [sameHeaderDifferentCase]=await save(b,payload({entries:[{name:'Other header same case',origin:'https://api.example.com',header:'x-api-key',prefix:'',value:'fixture-other-header'}]}));
+    expect([key.header,sameHeaderDifferentCase.header]).toEqual(['X-API-Key','x-api-key']);
+    const invalidCases=[
+      {secretId:key.id,additionalSecretIds:[key.id],path:'/'},
+      {secretId:key.id,additionalSecretIds:[email.id],path:'/',headers:{'x-API-KEY':'public collision'}},
+      {secretId:key.id,additionalSecretIds:[email.id],path:'/',headers:{'API-Version':'one','api-version':'two'}},
+      {secretId:key.id,additionalSecretIds:[otherOrigin.id],path:'/'},
+      {secretId:key.id,additionalSecretIds:[email.id,sameHeaderDifferentCase.id],path:'/'},
+      {secretId:key.id,additionalSecretIds:[email.id,unpermitted.id,key.id],path:'/'}
+    ];
+    for(const [caseIndex,invalidArgs] of invalidCases.entries()) {
+      try { const dispatched=await useSecret(b,invalidArgs);throw new Error(`Invalid composite case ${caseIndex} dispatched (${dispatched.status}).`); }
+      catch(error) { if(error instanceof Error&&error.message.startsWith('Invalid composite case')) throw error; }
+    }
+    expect(transport).toHaveBeenCalledTimes(1);
+    const op=crypto.randomUUID();await expect(runInDurableObject(owner(),(_i,state)=>new OwnerKeychain(state.storage,'owner',bindings.CHATGPT_CREDENTIAL_KEY,()=>{}).call(op,args,new AbortController().signal,()=>{
+      const chain=new OwnerKeychain(state.storage,'owner',bindings.CHATGPT_CREDENTIAL_KEY,()=>{});chain.revoke(email.id);
+    },b.id))).rejects.toThrow('revoked');
+    expect(transport).toHaveBeenCalledTimes(1);
+  });
+  it('dispatches the full four-reference composite limit',async()=>{
+    const b=await bot(),saved=await save(b,payload({entries:[
+      {name:'Four A',origin:'https://api.example.com',header:'X-Four-A',prefix:'',value:'fixture-four-a'},
+      {name:'Four B',origin:'https://api.example.com',header:'X-Four-B',prefix:'',value:'fixture-four-b'},
+      {name:'Four C',origin:'https://api.example.com',header:'X-Four-C',prefix:'',value:'fixture-four-c'},
+      {name:'Four D',origin:'https://api.example.com',header:'X-Four-D',prefix:'',value:'fixture-four-d'}
+    ]})),references=['X-Four-A','X-Four-B','X-Four-C','X-Four-D'].map(header=>saved.find(entry=>entry.header===header)!);
+    const transport=vi.spyOn(globalThis,'fetch').mockImplementation(async(_url,init)=>{
+      const headers=new Headers(init?.headers);for(const [index,header] of ['X-Four-A','X-Four-B','X-Four-C','X-Four-D'].entries())expect(headers.get(header)).toBe(`fixture-four-${String.fromCharCode(97+index)}`);
+      return Response.json({ok:true});
+    });
+    const result=await useSecret(b,{secretId:references[0].id,additionalSecretIds:references.slice(1).map(entry=>entry.id),path:'/four'});
+    expect(result.status).toBe('completed');expect(transport).toHaveBeenCalledTimes(1);
+  });
+  it.each(['revoke','replace','rename','regrant'] as const)('fences composite dispatch when %s races either reference after decryption',async action=>{
+    for(const targetRole of ['primary','additional'] as const){
+      const b=await bot(),saved=await save(b,payload({entries:[
+        {name:'Private input',origin:'https://api.example.com',header:'X-Fence-A',prefix:'',value:'fixture-fence-first'},
+        {name:'Private input',origin:'https://api.example.com',header:'X-Fence-B',prefix:'',value:'fixture-fence-second'}
+      ]}));
+      const primary=saved.find(entry=>entry.header==='X-Fence-A')!,additional=saved.find(entry=>entry.header==='X-Fence-B')!,target=targetRole==='primary'?primary:additional;
+      const transport=vi.spyOn(globalThis,'fetch').mockImplementation(async()=>Response.json({ok:true}));transport.mockClear();
+      await expect(runInDurableObject(owner(),async(_i,state)=>{
+        const chain=new OwnerKeychain(state.storage,'owner',bindings.CHATGPT_CREDENTIAL_KEY,()=>{});
+        return chain.call(crypto.randomUUID(),{secretId:primary.id,additionalSecretIds:[additional.id],path:'/'},new AbortController().signal,async()=>{
+          if(action==='revoke')chain.revoke(target.id);
+          else if(action==='replace')await chain.save({operationId:crypto.randomUUID(),entries:[{id:target.id,expectedRevision:target.revision,name:target.name,origin:target.origin,header:target.header,prefix:target.prefix,value:'fixture-fence-replaced'}]},()=>{});
+          else if(action==='rename')await chain.rename(crypto.randomUUID(),target.id,{name:'Fenced rename',expectedRevision:target.revision},()=>{},b.id);
+          else {state.storage.sql.exec('DELETE FROM keychain_grants WHERE secret_id=? AND bot_id=?',target.id,b.id);await chain.grantAccess(target.id,b.id,true);}
+        },b.id);
+      })).rejects.toThrow();
+      expect(transport).not.toHaveBeenCalled();
+    }
+  });
+  it('rechecks task liveness after the awaited dispatch callback',async()=>{
+    const b=await bot(),saved=await save(b,payload({entries:[
+      {name:'Live first',origin:'https://api.example.com',header:'X-Live-A',prefix:'',value:'fixture-live-first'},
+      {name:'Live second',origin:'https://api.example.com',header:'X-Live-B',prefix:'',value:'fixture-live-second'}
+    ]})),primary=saved.find(entry=>entry.header==='X-Live-A')!,additional=saved.find(entry=>entry.header==='X-Live-B')!;
+    const transport=vi.spyOn(globalThis,'fetch').mockImplementation(async()=>Response.json({ok:true}));transport.mockClear();let live=true;
+    await expect(runInDurableObject(owner(),async(_i,state)=>{
+      const chain=new OwnerKeychain(state.storage,'owner',bindings.CHATGPT_CREDENTIAL_KEY,()=>{if(!live)throw new Error('Task stopped after callback');});
+      return chain.call(crypto.randomUUID(),{secretId:primary.id,additionalSecretIds:[additional.id],path:'/'},new AbortController().signal,async()=>{live=false;},b.id);
+    })).rejects.toThrow('Task stopped after callback');
+    expect(transport).not.toHaveBeenCalled();
+  });
+  it('blocks, redacts and deduplicates composite redirects; changed retries conflict',async()=>{
+    const b=await bot(),saved=await save(b,payload({entries:[
+      {name:'Redirect first',origin:'https://api.example.com',header:'X-Redirect-A',prefix:'',value:'fixture-redirect-first'},
+      {name:'Redirect second',origin:'https://api.example.com',header:'X-Redirect-B',prefix:'',value:'fixture-redirect-second'}
+    ]})),primary=saved.find(entry=>entry.header==='X-Redirect-A')!,additional=saved.find(entry=>entry.header==='X-Redirect-B')!;
+    const args={secretId:primary.id,additionalSecretIds:[additional.id],path:'/mutate',method:'POST',body:'{}'},op=crypto.randomUUID();
+    const transport=vi.spyOn(globalThis,'fetch').mockImplementation(async()=>new Response('fixture-redirect-first fixture-redirect-second',{status:302,headers:{location:'https://evil.example.com'}}));
+    const result=await useSecret(b,args,op);expect(result.status).toBe('failed');expect(JSON.stringify(result)).not.toContain('fixture-redirect');
+    expect(await useSecret(b,args,op)).toEqual(result);expect(transport).toHaveBeenCalledTimes(1);
+    await expect(useSecret(b,{...args,path:'/different'},op)).rejects.toThrow('changed');expect(transport).toHaveBeenCalledTimes(1);
+  });
+  it('journals composite dispatch idempotently without values or automatic uncertain retry',async()=>{
+    const b=await bot(),saved=await save(b,payload({entries:[
+      {name:'Fixture A',origin:'https://api.example.com',header:'X-Key-A',prefix:'Key ',value:'fixture-composite-a'},
+      {name:'Fixture B',origin:'https://api.example.com',header:'X-Key-B',prefix:'',value:'fixture-composite-b'}
+    ]})),a=saved.find(entry=>entry.header==='X-Key-A')!,c=saved.find(entry=>entry.header==='X-Key-B')!;
+    const args={secretId:a.id,additionalSecretIds:[c.id],path:'/mutate',method:'POST',body:'{}'},op=crypto.randomUUID();
+    const transport=vi.spyOn(globalThis,'fetch').mockRejectedValue(new Error('provider fixture failure'));
+    const first=await useSecret(b,args,op);expect(first.status).toBe('interrupted');
+    expect(await useSecret(b,args,op)).toEqual(first);expect(transport).toHaveBeenCalledTimes(1);
+    const stored=await sqlDump(b);expect(stored).not.toContain('fixture-composite-a');expect(stored).not.toContain('fixture-composite-b');expect(stored).not.toContain('provider fixture failure');
   });
   it('does not forward credentials on redirects or expose provider error bodies',async()=>{
     const b=await bot(),[entry]=await save(b);

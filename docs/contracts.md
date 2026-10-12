@@ -106,17 +106,25 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   work with public references only. request_secret is a durable pending_connection
   wait with provider keychain. list_secrets returns only permitted entries;
   temporary subagents must ask their parent to perform authenticated work.
-  secret_request accepts single-line ASCII header values up to 8192 characters,
-  injects one header at the approved origin, accepts bounded public API headers
-  that cannot override authentication, disallows redirects and journals dispatch
-  before network I/O. A recovered or uncertain call is never sent again
-  automatically. The host checks task liveness, permission and revocation before
-  dispatch. Only bounded response text is returned; exact, URL/base64/JSON-encoded
-  echoes and common JSON credential fields are redacted. Provider exceptions and
-  redirect bodies are hidden. This filter is defense in depth, not a guarantee
-  against a malicious authorized service encoding data in an arbitrary form.
-  This API supports header credentials, not browser-password filling, generated
-  .env files, shell injection or app-wide provider billing configuration.
+  secret_request accepts a required `secretId` and up to three distinct
+  `additionalSecretIds` (four references total), each already permitted to this
+  bot and configured for the exact same HTTPS origin. Every reference is checked
+  for permission, signed grant epoch, revision, envelope and valid header value
+  before dispatch; all saved headers/prefixes are injected independently. Managed
+  headers must be unique case-insensitively, and public headers are rejected if
+  they collide with any managed authentication header or protected transport
+  headers. Inputs, public headers, body and response are bounded. Redirects are
+  never followed. A keyed operation fingerprint (including reference IDs and
+  public request data, never plaintext) is journaled before network I/O. A
+  recovered or uncertain call is never sent again automatically. The host checks
+  task liveness, permission and revocation for every reference immediately before
+  dispatch. Only bounded response text is returned; each secret, its configured
+  header value/prefix, and common URL/base64/JSON-escaped variants plus common
+  JSON credential fields are redacted. Provider exceptions and redirect bodies
+  are hidden. This filter is defense in depth, not a guarantee against a malicious
+  authorized service encoding data in an arbitrary form. This API supports HTTP
+  header credentials, not browser-password filling, generated .env files, shell
+  injection or app-wide provider billing configuration.
 
   The console offers Add → Secure input and Secure input in the @ dropdown.
   The locked pill shows the value while its field is focused, growing to a bounded

@@ -15,7 +15,7 @@ export const hostTools:HostToolDefinition[] = [
   tool('configure_secret','Prepare how to use an existing private input reference. Choose a descriptive name, exact public HTTPS origin and authentication header/prefix for the intended service. The user sees a simple Allow use confirmation for that destination, never configuration fields. This pauses and resumes the task after approval. Never request or include the value.',{secretId:text,name:text,origin:text,header:text,prefix:text,purpose:text},['secretId','name','origin','purpose']),
   tool('list_secrets','List only the user’s private input references that this bot has permission to use. Values are never returned. A blank origin means you must prepare its use with configure_secret; configured references support secret_request.',{},[]),
   tool('name_secret','Give an unnamed private input a short descriptive name based on the conversation, such as Cloudflare API key. Do this proactively for references still named Private input. Use its revision from list_secrets. Existing nondefault names are preserved. This only changes the label, never the value, destination or permissions; it does not pause the task. Never include credential values or guess a service without context.',{secretId:text,name:{type:'string',minLength:1,maxLength:80},expectedRevision:{type:'integer',minimum:1}},['secretId','name','expectedRevision']),
-  tool('secret_request','Make an authenticated HTTPS request using a saved secretId. Supply a path on its user-authorized origin. Optional headers are public configuration, such as API version headers; never put credentials in arguments. The host injects the credential, blocks redirects, redacts credentials from output and journals the operation. No automatic retry after an uncertain result. Supports API keys in headers, not browser passwords or shell environment injection.',{secretId:text,path:text,method:{type:'string',enum:['GET','POST','PUT','PATCH','DELETE']},headers:{type:'object',additionalProperties:{type:'string'}},body:text},['secretId','path']),
+  tool('secret_request','Make an authenticated HTTPS request using a saved secretId and, optionally, up to three additionalSecretIds. Each reference must already be explicitly permitted to this bot and configured for the exact same HTTPS origin; the host injects every entry using its saved header/prefix. Supply only public request data, never credential values. Public headers cannot collide with any managed authentication header. Redirects are blocked, credential variants and credential fields are redacted, and the journal stores only a keyed fingerprint of references/configuration. No automatic retry after an uncertain result. Supports header credentials, not browser passwords or shell environment injection.',{secretId:text,additionalSecretIds:{type:'array',items:text,minItems:1,maxItems:3,uniqueItems:true},path:text,method:{type:'string',enum:['GET','POST','PUT','PATCH','DELETE']},headers:{type:'object',additionalProperties:{type:'string'}},body:text},['secretId','path']),
   tool('list_bots','List the owner’s persistent named bots and their IDs, so you can choose a recipient for send_to_bot.',{},[]),
   tool('create_bot','Create a persistent named bot. Requires this bot’s Allow named agents setting. The new bot starts with computer approval required and named-agent creation disabled. Use a temporary subagent for one-off work.',{name:text,instructions:text},['name']),
   tool('send_to_bot','Send a task or message asynchronously to another named bot. Returns a durable delegation receipt; its result is delivered to this conversation when ready. Use list_bots for IDs. Do not resend while waiting. Delegation paths cannot revisit a bot.',{botId:text,text},['botId','text']),
@@ -38,11 +38,17 @@ export const hostTools:HostToolDefinition[] = [
 export function validateHostArguments(name:string,args:Record<string,unknown>):void {
   const definition=hostTools.find(item=>item.name===name);
   if(!definition) throw new ApiError(400,'unknown_tool','The host does not provide this tool. Use list_tools.');
-  const schema=definition.inputSchema,properties=schema.properties as Record<string,{type:string;enum?:unknown[];minimum?:number;maximum?:number}>;
+  const schema=definition.inputSchema,properties=schema.properties as Record<string,{type:string;enum?:unknown[];minimum?:number;maximum?:number;minItems?:number;maxItems?:number;uniqueItems?:boolean}>;
   for(const key of schema.required as string[]) if(args[key]===undefined) throw new ApiError(400,'invalid_tool_arguments',`Missing ${key}.`);
   for(const [key,value] of Object.entries(args)) {
     const rule=properties[key];
-    if(!rule || (rule.type==='integer'?(!Number.isInteger(value) || Number(value)<rule.minimum! || Number(value)>rule.maximum!):typeof value!==rule.type) || (rule.enum&&!rule.enum.includes(value))) throw new ApiError(400,'invalid_tool_arguments',`Invalid ${key}.`);
+    if(!rule) throw new ApiError(400,'invalid_tool_arguments',`Invalid ${key}.`);
+    const validType=rule.type==='integer'
+      ? Number.isInteger(value)&&(rule.minimum===undefined||Number(value)>=rule.minimum)&&(rule.maximum===undefined||Number(value)<=rule.maximum)
+      : rule.type==='array'
+        ? Array.isArray(value)&&value.length>=(rule.minItems??0)&&value.length<=(rule.maxItems??Number.MAX_SAFE_INTEGER)&&value.every(item=>typeof item==='string')&&(!rule.uniqueItems||new Set(value).size===value.length)
+        : typeof value===rule.type;
+    if(!validType||(rule.enum&&!rule.enum.includes(value))) throw new ApiError(400,'invalid_tool_arguments',`Invalid ${key}.`);
     if(typeof value==='string' && value.length>20_000) throw new ApiError(400,'invalid_tool_arguments',`${key} is too long.`);
   }
 }
