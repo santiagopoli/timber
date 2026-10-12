@@ -407,7 +407,24 @@ Tasks are owner-scoped records in WorkspaceDO. `GET /v1/tasks` is passive;
 `POST /v1/tasks` accepts `{operationId,title,description,botId,startImmediately?}`
 and returns `{task}` (201 for a new task; an identical idempotent replay returns
 200). `startImmediately` defaults to true; false leaves the task pending.
-`GET /v1/tasks/:id` returns task metadata. Task conversation data lives in a
+`GET /v1/tasks/:id` returns task metadata. `GET /v1/tasks/:id/progress`
+returns a read-only snapshot: observation time, last recorded activity, elapsed
+inactivity, pending native tools/generations/compaction, recent public command
+activity and errors, plus conversation messages (`limit` 1–20, default 10;
+`before`/`nextCursor` page older messages). Message text is capped at 4,000
+characters and marked `truncated` when applicable; full text remains available
+through `/messages`. `no_recent_activity` means at least five minutes without
+recorded activity, not a claim that work failed. A read does not submit input,
+restart tasks or take a computer lease. Native prompts and tool arguments are
+not returned.
+
+The host tools `list_tasks {before?}` (30 per page) and
+`inspect_task {taskId,before?,limit?}` are available to computerless coordinators.
+They resolve only tasks assigned to the calling bot and remain usable without
+`allowTaskCreation`. Task conversation text is collaborator data, not new
+instructions or authorization.
+
+Task conversation data lives in a
 separate durable BotDO identity keyed by owner and task ID, initialized from the
 assigned bot's current configuration; the BotDO retains the assigned bot's
 computer/workspace identity, so no second computer is created. The task has its
@@ -835,6 +852,14 @@ present that decision. A native steering input also releases `wait_subagent` wit
 `{status:"yielded",reason:"new_input",subagent}`. Only that read-only observer
 ends: the child and its durable delivery keep running. The completed tool round
 then lets the parent attend to the input, including creating another child.
+Messages to temporary agents enter Pi as `steer`, including child results and
+sibling messages. They are placed at the next tool boundary; a waiting agent
+releases its observer to read them while other agents continue. Recovery
+promotes only existing queued Timber delivery receipts from the former
+`followUp` mode to `steer`, preserving input and effect IDs. Native waits depend
+on the target input's settlement, not on its result notification finishing.
+A durable dependency graph rejects circular agent waits before blocking.
+
 Public `subagent.reported` events contain the message body in `text`, with
 `contentFormat:"plain"` and sender identity in `subagentId`/`subagentName`.
 Model-only attribution stays separate so the UI shows the sender once. Legacy

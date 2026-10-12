@@ -10,6 +10,7 @@ on:
         options:
           - native
           - avatars
+          - performance
       hours:
         description: Hours of recent failure metadata to inspect (1 to 24)
         required: true
@@ -33,7 +34,7 @@ jobs:
         with:
           node-version: '24'
       - name: Verify durable diagnostic filtering
-        run: node --test scripts/tests/prod-durable-diagnostics.test.mjs
+        run: node --test scripts/tests/prod-durable-diagnostics.test.mjs scripts/tests/prod-performance-diagnostics.test.mjs
       - name: Read fixed durable failure signatures
         env:
           CLOUDFLARE_ACCOUNT_ID: '3acfff91febe1ba644c6358ae5612736'

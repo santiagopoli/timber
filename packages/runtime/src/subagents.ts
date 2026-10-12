@@ -17,6 +17,9 @@ type StoredAgent = RuntimeSubagent & { conversationId: string; depth: number; sp
 const Registry = defineDoc<{ agents: Record<string, StoredAgent>; deliveries: Record<string, { text: string; taskId: number }> }>({
   kind: 'timber.subagents', version: 1, scope: 'session', initial: () => ({ agents: {}, deliveries: {} }),
 });
+const Waits = defineDoc<{ edges: Record<string, { target: string; taskId: number }> }>({
+  kind: 'timber.subagent-waits', version: 1, scope: 'session', initial: () => ({ edges: {} }),
+});
 const active = new Set<RuntimeSubagent['status']>(['queued', 'running', 'waiting_approval', 'waiting_connection']);
 const MAX_AGENTS = 8;
 const MAX_DEPTH = 3;
@@ -217,7 +220,17 @@ export function createSubagents(host: SubagentHost) {
         // PiHarness schedules the durable wake before admission; raw Pi submit would not.
         try {
           const existing = await host.storage().submissionByRequest(Number(agent.conversationId) as ConversationId, task.input.operationId, context);
-          if (!existing) await host.harness().session(agent.conversationId).submit(task.input.text, { operationId: task.input.operationId });
+          if (!existing) await host.harness().session(agent.conversationId).submit(task.input.text, { operationId: task.input.operationId, whenBusy: 'steer' });
+          else if (existing.status === 'queued') {
+            // Older deliveries used Pi's default followUp mode. A child waiting
+            // for another child cannot reach that final boundary. Repair only
+            // this exact durable receipt; never resubmit its input or effects.
+            await host.native().commit(async tx => {
+              const inbox = await tx.doc(InboxDoc, Number(agent.conversationId) as ConversationId);
+              const item = inbox.items.find(item => item.id === existing.id);
+              if (item?.mode === 'followUp') item.mode = 'steer';
+            }, context);
+          }
         } catch (error) {
           context.abortSignal?.throwIfAborted();
           const attempt = (task.state.checkpoint.attempt ?? 0) + 1;
@@ -435,6 +448,23 @@ export function createSubagents(host: SubagentHost) {
           const agent = await find(input.subagentId);
           const sender = await forConversation(api.conversationId);
           if ((sender && agent.parentOperationId !== parentOperationId) || agent.conversationId === String(api.conversationId)) throw new Error('Invalid subagent wait');
+          // Register the dependency atomically, so simultaneous sibling waits
+          // cannot both accept a cycle. Ignore edges left by finished tools.
+          const caller = String(api.conversationId);
+          await host.native().commit(async tx => {
+            const waits = await tx.doc(Waits);
+            for (const [source, edge] of Object.entries(waits.edges)) {
+              if ((await tx.task(edge.taskId as TaskId))?.state.status === 'terminal') delete waits.edges[source];
+            }
+            const visited = new Set([caller]);
+            let target: string | undefined = agent.conversationId;
+            while (target) {
+              if (visited.has(target)) throw new Error('Circular subagent wait: send the needed information or continue independent work instead. No agent was cancelled.');
+              visited.add(target);
+              target = waits.edges[target]?.target;
+            }
+            waits.edges[caller] = {target: agent.conversationId, taskId: Number(api.taskId)};
+          }, context);
           const controller = new AbortController();
           const signal = context.abortSignal ? AbortSignal.any([context.abortSignal, controller.signal]) : controller.signal;
           const waitContext: Context = { abortSignal: signal, value: key => context.value(key), toString: () => context.toString() };
@@ -451,7 +481,10 @@ export function createSubagents(host: SubagentHost) {
             if (inbox) notice(inbox.value);
             const done = (async () => {
               const pending = (await state()).deliveries[`${agent.id}:${agent.operationId}`];
-              if (pending) await api.waitForTask(pending.taskId as TaskId, waitContext);
+              const submitted = await host.storage().submissionByRequest(Number(agent.conversationId) as ConversationId, agent.operationId, waitContext);
+              // A result is ready when the input settles, not when its report
+              // has also been delivered back to this waiting parent.
+              if (!submitted && pending) await api.waitForTask(pending.taskId as TaskId, waitContext);
               return host.harness().session(agent.conversationId).wait(agent.operationId, signal);
             })();
             const result = await Promise.race([done, incoming]);
@@ -462,6 +495,10 @@ export function createSubagents(host: SubagentHost) {
             // alive; ending this safe tool lets Pi place the incoming steer.
             controller.abort(new Error('Subagent wait observer finished'));
             await inbox?.stop();
+            await host.native().commit(async tx => {
+              const waits = await tx.doc(Waits);
+              if (waits.edges[caller]?.taskId === Number(api.taskId)) delete waits.edges[caller];
+            }, host.context());
           }
         }) }),
       defineTool({ name: 'cancel_subagent', description: 'Cancel a temporary agent and its descendants. Cancelled agents cannot be restarted; create a new agent for new work.', replay: 'unsafe',

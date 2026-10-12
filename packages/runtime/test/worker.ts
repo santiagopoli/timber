@@ -28,6 +28,7 @@ export class HarnessProbe extends DurableObject {
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS child_reports(id INTEGER PRIMARY KEY AUTOINCREMENT, input TEXT)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS child_report_attempts(id INTEGER PRIMARY KEY AUTOINCREMENT, input TEXT)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY,value TEXT)');
+    if (this.setting('holdComputerTools') === 'true') this.heldTool = new Promise(resolve => { this.releaseHeldTool = resolve; });
     const models=async():Promise<ModelCatalog>=>{
       const catalog=({connected:true,defaultModel:DEFAULT_MODEL,models:[
         {id:DEFAULT_MODEL,name:'Sol fixture',provider:'openai',reasoningEfforts:['low','medium','high'],defaultReasoningEffort:'medium',supportsFast:true,fastServiceTier:'fast',contextWindow:1_050_000,inputModalities:['text','image']},
@@ -86,13 +87,13 @@ export class HarnessProbe extends DurableObject {
         let toolRequest = text.includes('request-exec') || text.includes('request-loop') || (isSubagent && !hasTool) || childTool || (!!existingAction && !hasTool) || (!!peer && !hasTool);
         const readCall = { index: 0, id: 'call-read-1', type: 'function', function: { name: 'read_file', arguments: '{"path":"/workspace/test.txt"}' } };
         const execCall = { index: text.includes('mixed') ? 1 : 0, id: 'call-fixture-1', type: 'function', function: { name: 'exec', arguments: '{"command":"echo fixture"}' } };
-        const spawnCall = { index: 0, id: text.includes('second-task') ? 'call-spawn-second' : 'call-spawn-1', type: 'function', function: { name: 'spawn_subagent', arguments: JSON.stringify({ ...(text.includes('choose-astra')?{model:'gpt-6-astra',reasoningEffort:'ultra',fast:true}:{}), name: text.includes('second-task') ? 'Second reader' : 'Reader', task: text.includes('nested') ? 'request-subagent nested' : text.includes('child-exec') ? 'child-fixture-exec' : 'child-fixture-read' }) } };
+        const spawnCall = { index: 0, id: text.includes('second-task') ? 'call-spawn-second' : 'call-spawn-1', type: 'function', function: { name: 'spawn_subagent', arguments: JSON.stringify({ ...(text.includes('choose-astra')?{model:'gpt-6-astra',reasoningEffort:'ultra',fast:true}:{}), name: text.includes('second-task') ? 'Second reader' : 'Reader', task: text.includes('nested-steering') ? 'request-subagent-wait' : text.includes('nested') ? 'request-subagent nested' : text.includes('child-exec') ? 'child-fixture-exec' : 'child-fixture-read' }) } };
         let calls = isSubagent ? [spawnCall] : isChild ? text.includes('exec') ? [execCall] : [readCall] : text.includes('request-loop') ? [readCall] : text.includes('mixed') ? [readCall, execCall] : [execCall];
         if (text.includes('request-subagent-peers') && toolResults.length === 1) {
           const toolContent = toolResults[0]!.content;
           const result = JSON.parse(typeof toolContent === 'string' ? toolContent : (toolContent as {text:string}[]).map(part => part.text).join(''));
           toolRequest = true;
-          calls = [{ ...spawnCall, id: 'call-spawn-peer', function: { name: 'spawn_subagent', arguments: JSON.stringify({ name: 'Messenger', task: `child-fixture-peer:${result.subagent.id}` }) } }];
+          calls = [{ ...spawnCall, id: 'call-spawn-peer', function: { name: 'spawn_subagent', arguments: JSON.stringify({ name: 'Messenger', task: text.includes('wait-cycle') ? 'child-fixture-read' : `child-fixture-peer:${result.subagent.id}` }) } }];
         }
         if (text.includes('request-subagent-wait') && toolResults.length === 1) {
           const toolContent = toolResults[0]!.content;
