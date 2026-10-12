@@ -10,7 +10,7 @@ export interface AgentDelegation extends RunDelegation { sourceBotName: string; 
 export interface ImageAttachment { artifactId: string; mimeType: "image/png" | "image/jpeg"; size: number; }
 export interface Message { attachments?: ImageAttachment[]; id: string; botId: string; runId?: string; role: "user" | "assistant" | "tool" | "system"; kind?: "progress" | "final"; text: string; provenance?: MessageProvenance; mentions?: string[]; createdAt: string; }
 export interface RunCancellation { id: string; requestedRunId: string; }
-export interface Run { admissionRetryable?: boolean; model?: string; reasoningEffort?: string; fast?: boolean; id: string; botId: string; operationId: string; status: RunStatus; delegation?: RunDelegation; subagentId?: string; parentRunId?: string; cancellation?: RunCancellation; createdAt: string; updatedAt: string; error?: string; errorCode?: string; }
+export interface Run { coordinatorMode?:boolean; admissionRetryable?: boolean; model?: string; reasoningEffort?: string; fast?: boolean; id: string; botId: string; operationId: string; status: RunStatus; delegation?: RunDelegation; subagentId?: string; parentRunId?: string; cancellation?: RunCancellation; createdAt: string; updatedAt: string; error?: string; errorCode?: string; }
 export interface Subagent { model?: string; reasoningEffort?: string; fast?: boolean; id: string; name: string; task: string; parentOperationId: string; parentSubagentId?: string; operationId: string; status: "queued" | "running" | "waiting_approval" | "waiting_connection" | "completed" | "failed" | "cancelled"; createdAt: string; updatedAt: string; result?: string; error?: string; }
 
 /** A newest-first history page plus all currently active runs, independent of pagination. */
@@ -51,7 +51,8 @@ export interface CompactionReceipt {id:string;reason:"manual"|"threshold"|"overf
 export interface BotContextStatus {automatic:true;estimatedTokens:number;activeEntries:number;contextWindow:number;compactions:CompactionReceipt[];historyRetained:true;}
 
 export type TaskStatus = "pending" | "queued" | "running" | "waiting_approval" | "waiting_connection" | "cancelling" | "completed" | "failed" | "cancelled";
-export interface Task { id:string; title:string; description:string; botId:string; botName:string; creator:"owner"|"bot"; createdByBotId?:string; sourceRunId?:string; status:TaskStatus; startImmediately:boolean; createdAt:string; updatedAt:string; lastActivity?:string; }
+export interface Task { id:string; title:string; description:string; botId:string; botName:string; creator:"owner"|"bot"; createdByBotId?:string; sourceRunId?:string; sourceTaskId?:string; statusVersion?:number; status:TaskStatus; startImmediately:boolean; createdAt:string; updatedAt:string; lastActivity?:string; }
+export interface TaskUpdate {task:Task;notificationId:string;result?:string;}
 export interface TaskPage { tasks:Task[]; }
 export * from "./avatars";
 export * from "./avatar-presets";

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {after, test} from 'node:test';
 import {randomUUID} from 'node:crypto';
+import {mkdir} from 'node:fs/promises';
 import {chromium} from 'playwright';
 import {createConsoleFixture, TEST_TOKEN, BOT_A, BOT_B} from './console-fixture.mjs';
 
@@ -17,12 +18,12 @@ async function withTasks(work,width=1440) {
   });
   const fixture=await createConsoleFixture(),context=await browser.newContext({viewport:{width,height:900},colorScheme:'light'});
   const page=await context.newPage(),errors=[];page.on('pageerror',error=>errors.push(error.message));page.setDefaultTimeout(8000);
-  const tasks={records:statuses.map(status=>({id:`task-${status}`,title:`Task ${status}`,description:`Independent ${status} work`,botId:BOT_A,botName:'Ada',status,createdAt:'2026-10-05T10:00:00.000Z'})),messages:new Map(),approvals:new Map(),calls:[],readGates:new Map(),reads:[],sendGate:null,sendError:false};
+  const tasks={records:statuses.map(status=>({id:`task-${status}`,title:`Task ${status}`,description:`Independent ${status} work`,botId:BOT_A,botName:'Ada',status,createdAt:'2026-10-05T10:00:00.000Z'})),messages:new Map(),events:new Map(),approvals:new Map(),calls:[],readGates:new Map(),reads:[],sendGate:null,sendError:false};
   for(const task of tasks.records)tasks.messages.set(task.id,[{id:`${task.id}-reply`,role:'assistant',text:`Private conversation for ${task.id}`}]);
   const fulfill=(route,value,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify(value)});
   await page.route('**/v1/tasks**',async route=>{
-    const request=route.request(),path=new URL(request.url()).pathname,method=request.method(),body=method==='POST'?request.postDataJSON():undefined;
-    tasks.calls.push({path,method,body,headers:request.headers()});
+    const request=route.request(),url=new URL(request.url()),path=url.pathname,method=request.method(),body=method==='POST'?request.postDataJSON():undefined;
+    tasks.calls.push({path,method,body,query:url.searchParams.toString(),headers:request.headers()});
     if(path==='/v1/tasks'){
       if(method==='GET')return fulfill(route,{tasks:tasks.records});
       const task={id:randomUUID(),...body,status:body.startImmediately===false?'pending':'running',botName:'Ada'};tasks.records.push(task);tasks.messages.set(task.id,[]);
@@ -31,8 +32,16 @@ async function withTasks(work,width=1440) {
     const [,id,tail='']=/^\/v1\/tasks\/([^/]+)(.*)$/.exec(path)||[],task=tasks.records.find(item=>item.id===id);
     if(!task)return fulfill(route,{error:{code:'not_found',message:'Task not found.'}},404);
     if(method==='GET'){
+      if(tail==='/events'){
+        const source=tasks.events.get(id)||[];
+        if(url.searchParams.get('format')!=='json'){const after=Number(url.searchParams.get('after')||0),events=source.filter(event=>event.id>after);return route.fulfill({status:200,contentType:'text/event-stream',body:(after?events:events.slice(-100)).map(event=>`data: ${JSON.stringify(event)}\n\n`).join('')});}
+        const before=Number(url.searchParams.get('before')||Infinity),eligible=source.filter(event=>event.id<before),events=eligible.slice(-100);
+        return fulfill(route,{events,nextCursor:eligible.length>100?String(events[0].id):null});
+      }
+      if(tail==='/runs')return fulfill(route,{runs:[{id:`${id}-run`,status:task.status==='cancelled'?'cancelled':['completed','failed'].includes(task.status)?task.status:'running'}]});
       // Snapshot before the delayed response, as a real stale read would do.
-      const payload=structuredClone(tail==='/messages'?{messages:tasks.messages.get(id)||[]}:tail==='/approvals'?{approvals:tasks.approvals.get(id)||[]}:{task});
+      const source=tasks.messages.get(id)||[],before=Number(url.searchParams.get('before')||source.length+1),eligible=source.filter((message,index)=>(message.row||index+1)<before),messages=eligible.slice(-Number(url.searchParams.get('limit')||100));
+      const payload=structuredClone(tail==='/messages'?{messages,nextCursor:eligible.length>messages.length?String(messages[0].row||source.indexOf(messages[0])+1):null}:tail==='/approvals'?{approvals:tasks.approvals.get(id)||[]}:{task});
       const read={id,tail,finished:false};tasks.reads.push(read);
       if(tasks.readGates.has(id))await tasks.readGates.get(id).promise;
       try{return await fulfill(route,payload);}catch(error){if(!request.failure())throw error;}finally{read.finished=true;}
@@ -126,7 +135,7 @@ test('global tasks: retry identities include task ID and late sends cannot clear
   const dispatched=page.waitForRequest(request=>request.method()==='POST'&&new URL(request.url()).pathname.endsWith('/messages'));
   await page.getByRole('button',{name:'Send task message',exact:true}).click();await dispatched;
   await back();await open('task-running');await page.getByLabel('Message this task').fill('Keep this new draft');const sent=page.waitForResponse(response=>response.request().method()==='POST'&&new URL(response.url()).pathname.endsWith('/messages'));tasks.sendGate.resolve();await sent;
-  await page.getByRole('button',{name:'Refresh task'}).click();await page.locator('.timber-tasks-detail h2').filter({hasText:'Task running'}).waitFor();
+  await page.getByRole('button',{name:'Refresh task',exact:true}).click();await page.locator('.timber-tasks-detail h2').filter({hasText:'Task running'}).waitFor();
   assert.equal(await page.getByLabel('Message this task').inputValue(),'Keep this new draft');assert.equal(await page.locator('.timber-tasks-detail').getAttribute('data-task-id'),'task-running');
 }));
 
@@ -136,7 +145,7 @@ test('global tasks: a delayed polling response cannot replace a new task view',a
   const before=tasks.reads.length,polling=page.waitForRequest(request=>request.method()==='GET'&&new URL(request.url()).pathname==='/v1/tasks/task-running/messages');await page.clock.fastForward(8001);await polling;
   assert.ok(tasks.reads.slice(before).some(read=>read.id==='task-running'),'real task interval initiates polling');
   await back();await open('task-waiting_connection');gate.resolve();
-  await page.getByRole('button',{name:'Refresh task'}).click();
+  await page.getByRole('button',{name:'Refresh task',exact:true}).click();
   await page.getByLabel('Task conversation').getByText('Private conversation for task-waiting_connection',{exact:true}).waitFor();
   assert.equal(await page.locator('.timber-tasks-detail').getAttribute('data-task-id'),'task-waiting_connection');
   assert.equal(await page.getByLabel('Task conversation').getByText('Private conversation for task-running',{exact:true}).count(),0);
@@ -160,10 +169,11 @@ test('global tasks: assigned bot defaults recover when the catalogue arrives or 
   await login();await page.getByRole('button',{name:'New task',exact:true}).click();await page.getByLabel('Title',{exact:true}).fill('Catalogue arrival');
   assert.equal(await page.getByRole('combobox',{name:'Assigned bot',exact:true}).inputValue(),'');
   assert.equal(await page.getByRole('button',{name:'Create task',exact:true}).isDisabled(),true);
-  fixture.state.bots=bots;await page.getByRole('button',{name:'Refresh bots',exact:true}).click();
+  const refreshBots=async()=>{await page.locator('#bots-nav').click();await page.getByRole('button',{name:'Refresh bots',exact:true}).click();await page.locator('#tasks-nav').click();};
+  fixture.state.bots=bots;await refreshBots();
   await page.waitForFunction(id=>document.querySelector('.timber-tasks-create select')?.value===id,BOT_A);
   assert.equal(await page.getByRole('button',{name:'Create task',exact:true}).isEnabled(),true);
-  fixture.state.bots=bots.filter(bot=>bot.id===BOT_B);await page.getByRole('button',{name:'Refresh bots',exact:true}).click();
+  fixture.state.bots=bots.filter(bot=>bot.id===BOT_B);await refreshBots();
   await page.waitForFunction(id=>document.querySelector('.timber-tasks-create select')?.value===id,BOT_B);
   assert.equal(await page.getByRole('button',{name:'Create task',exact:true}).isEnabled(),true);
 }));
@@ -181,3 +191,75 @@ for(const status of ['completed','failed'])test(`global tasks: ${status} Continu
   assert.equal(fixture.state.calls.filter(call=>call.method==='POST'&&call.path===`/v1/bots/${BOT_A}/messages`).length,0);
   await back();await open('task-cancelled');assert.equal(await page.getByRole('button',{name:'Continue task',exact:true}).count(),0);assert.equal(await page.getByLabel('Message this task').count(),0);assert.equal(await page.getByText('Cancelled tasks stay stopped. Create a new task to work again.',{exact:true}).isVisible(),true);
 }));
+
+for(const width of [320,390,1440])test(`global tasks: pill views and task rows share bot styling at ${width}px`,async()=>withTasks(async({page,login,fixture})=>{
+  await login();assert.equal(await page.locator('#tasks-nav').getAttribute('aria-pressed'),'true');assert.equal(await page.locator('#bots-nav').getAttribute('aria-pressed'),'false');
+  if(width>=761){assert.equal(await page.locator('#bot-search').isVisible(),false,'Tasks replaces the bot list in the same desktop sidecolumn');assert.equal(await page.locator('#tasks-sidebar-root .timber-tasks-overview').isVisible(),true);}
+  const row=page.locator('.timber-tasks-card').first();assert.ok((await row.getAttribute('class')).includes('bot-item'));
+  const geometry=await page.evaluate(()=>{const box=selector=>document.querySelector(selector).getBoundingClientRect();return {title:box('.timber-tasks-overview h2').left,search:box('.timber-tasks-search').left,row:box('.timber-tasks-card').left,avatar:box('.timber-task-avatar').left,scroll:document.documentElement.scrollWidth,width:innerWidth}});
+  assert.ok(Math.max(geometry.title,geometry.search,geometry.row,geometry.avatar)-Math.min(geometry.title,geometry.search,geometry.row,geometry.avatar)<=1,'task title, search, rows and avatar share an axis');assert.ok(geometry.scroll<=geometry.width+1);
+  await page.getByRole('searchbox',{name:'Search tasks',exact:true}).fill('waiting connection');assert.equal(await page.locator('.timber-tasks-card').count(),0);
+  await page.getByRole('searchbox',{name:'Search tasks',exact:true}).fill('connection');assert.equal(await page.locator('.timber-tasks-card').count(),1);await page.getByRole('searchbox',{name:'Search tasks',exact:true}).fill('');
+  await mkdir('/tmp/timber-task-views',{recursive:true});await page.screenshot({path:`/tmp/timber-task-views/tasks-${width}.png`});
+  if(width<761)await page.locator('.timber-tasks-topbar').getByRole('button',{name:'Bots',exact:true}).click();else await page.locator('#bots-nav').click();
+  await page.locator('#bot-search').waitFor({state:'visible'});assert.equal(await page.locator('#bots-nav').getAttribute('aria-pressed'),'true');assert.equal(await page.locator('#tasks-nav').getAttribute('aria-pressed'),'false');
+  assert.ok(fixture.state.calls.every(call=>!call.path.includes('/computer/exec')),'view switching never starts computer work');
+},width));
+
+test('global tasks: long task history starts bounded and commands stay inspectable through archival pages and live updates',async()=>withTasks(async({page,tasks,login,open})=>{
+  const id='task-running',runId=`${id}-run`;
+  tasks.messages.set(id,Array.from({length:320},(_,index)=>({id:`history-${index+1}`,row:index+1,role:index%2?'assistant':'user',text:`Task message ${index+1}`})));
+  const events=Array.from({length:240},(_,index)=>({id:index+1,type:index%2?'tool.completed':'tool.started',botId:BOT_A,runId,createdAt:'2026-10-05T10:00:00.000Z',data:{operationId:`task-command-${Math.floor(index/2)}`,toolCallId:`native-command-${Math.floor(index/2)}`,actionType:'exec',input:{command:`printf command-${Math.floor(index/2)}`},...(index%2?{result:{status:'completed',output:`Output ${Math.floor(index/2)}`,exitCode:0}}:{})}}));tasks.events.set(id,events);
+  await login();await open(id);assert.equal(await page.locator('[data-task-message-id]').count(),100);
+  const activity=page.getByRole('region',{name:'Task activity'});await activity.locator('[data-activity-tool-operation-id="task-command-119"]').waitFor();
+  assert.equal(await activity.locator('[data-activity-tool-operation-id]').count(),50,'the newest 100 events render 50 merged commands');assert.equal(await activity.locator('[data-activity-tool-operation-id="task-command-0"]').count(),0);
+  await page.getByRole('button',{name:'Load older messages',exact:true}).click();await page.getByLabel('Task conversation').getByText('Task message 121',{exact:true}).waitFor();assert.equal(await page.locator('[data-task-message-id]').count(),200);
+  await activity.getByRole('button',{name:'Older activity',exact:true}).click();await activity.locator('[data-activity-tool-operation-id="task-command-20"]').waitFor();assert.equal(await activity.locator('[data-activity-tool-operation-id]').count(),50,'archive pages replace the activity viewport');
+  await activity.getByRole('button',{name:'Older activity',exact:true}).click();const original=activity.locator('[data-activity-tool-operation-id="task-command-0"]');await original.waitFor();await original.locator('summary').click();assert.ok((await original.innerText()).includes('printf command-0'));assert.ok((await original.innerText()).includes('Output 0'));
+  await activity.getByRole('button',{name:'Latest activity',exact:true}).click();await activity.locator('[data-activity-tool-operation-id="task-command-119"]').waitFor();assert.equal(await original.count(),0);
+  events.push({id:241,type:'tool.completed',botId:BOT_A,runId,createdAt:'2026-10-05T10:01:00.000Z',data:{operationId:'live-command',actionType:'exec',input:{command:'printf live-task'},result:{status:'completed',output:'Live task output',exitCode:0}}});await activity.locator('[data-activity-tool-operation-id="live-command"]').waitFor();
+  assert.ok((await activity.innerText()).includes('Live task output'));assert.equal(await activity.locator('[data-activity-tool-operation-id="task-command-119"]').count(),1,'live updates retain one merged effect');
+  assert.ok(tasks.calls.filter(call=>call.path.endsWith('/messages')&&call.method==='GET').every(call=>new URLSearchParams(call.query).get('limit')==='100'));
+  assert.ok(tasks.calls.filter(call=>call.path.endsWith('/events')&&new URLSearchParams(call.query).get('format')==='json').every(call=>new URLSearchParams(call.query).get('limit')==='100'));
+  await page.screenshot({path:'/tmp/timber-task-views/task-activity-1440.png'});
+}));
+
+test('global tasks: closing task view aborts its polling and opening a deep link restores the isolated task',async()=>withTasks(async({page,tasks,login,open})=>{
+  await page.clock.install();await login();await open('task-running');
+  assert.ok(page.url().endsWith('#tasks&task=task-running'),'selected tasks have a shareable fragment without credentials');
+  await page.locator('#bots-nav').click();const count=tasks.calls.length;await page.clock.fastForward(24001);await page.evaluate(()=>Promise.resolve());assert.equal(tasks.calls.length,count,'hidden task view has no polls or streams');
+  await page.evaluate(()=>{location.hash='tasks&task=task-waiting_connection'});await page.locator('.timber-tasks-detail h2').filter({hasText:'Task waiting_connection'}).waitFor();assert.equal(await page.locator('.timber-tasks-detail').getAttribute('data-task-id'),'task-waiting_connection');assert.equal(await page.getByLabel('Task conversation').getByText('Private conversation for task-running',{exact:true}).count(),0);
+}));
+
+test('global tasks: browser Back follows task history without inserting new navigation entries',async()=>withTasks(async({page,login,open})=>{
+  await login();const overview=page.url();await open('task-running');assert.ok(page.url().endsWith('#tasks&task=task-running'));
+  await page.goBack();await page.locator('.timber-tasks-overview').waitFor();await page.locator('.timber-tasks-detail').waitFor({state:'detached'});assert.equal(page.url(),overview);
+  await page.goForward();await page.locator('.timber-tasks-detail h2').filter({hasText:'Task running'}).waitFor();assert.ok(page.url().endsWith('#tasks&task=task-running'));
+  await page.goBack();await page.locator('.timber-tasks-detail').waitFor({state:'detached'});assert.equal(page.url(),overview);
+}));
+
+test('global tasks: new bots enable task creation by default and an explicit owner opt-out is submitted',async()=>withTasks(async({page,fixture,login})=>{
+  await login();await page.locator('#bots-nav').click();await page.locator('#new-bot').click();const permission=page.locator('#bot-dialog').getByLabel('Allow creating tasks',{exact:true});assert.equal(await permission.isChecked(),true);
+  await page.locator('#bot-name').fill('Small chat only');await permission.uncheck();await page.getByRole('button',{name:'Create bot',exact:true}).click();await page.locator('#bot-dialog').waitFor({state:'hidden'});
+  const creation=fixture.state.calls.find(call=>call.method==='POST'&&call.path==='/v1/bots'&&call.body.name==='Small chat only');assert.equal(creation.body.allowTaskCreation,false,'opt-out is preserved in server policy');
+  await page.locator('#new-bot').click();assert.equal(await permission.isChecked(),true,'the next new-bot form returns to its reviewed default');await page.getByRole('button',{name:'Close create bot',exact:true}).click();
+}));
+
+test('global tasks: live chat receives partial snapshots and final receipts without replaying the whole transcript',async()=>withTasks(async({page,tasks,login,open})=>{
+  const id='task-running',runId=`${id}-run`,events=[{id:4,botId:BOT_A,type:'stream.snapshot',createdAt:'2026-10-05T10:00:00.000Z',data:{latestEventId:4,partials:[{runId,text:'Working on '}]}},{id:5,botId:BOT_A,runId,type:'message.delta',createdAt:'2026-10-05T10:00:00.000Z',data:{delta:'this task.'}}];tasks.events.set(id,events);
+  await login();await open(id);const stream=page.locator(`[data-task-stream-run-id="${runId}"]`);await stream.getByText('Working on this task.',{exact:true}).waitFor();assert.equal(await page.locator('[data-task-message-id]').count(),1,'partial text does not rewrite archived messages');
+  events.push({id:6,botId:BOT_A,runId,type:'message.created',createdAt:'2026-10-05T10:00:01.000Z',data:{message:{id:'live-final-task-answer',botId:BOT_A,runId,role:'assistant',text:'Finished this task.',createdAt:'2026-10-05T10:00:01.000Z'}}});
+  await page.locator('[data-task-message-id="live-final-task-answer"]').getByText('Finished this task.',{exact:true}).waitFor();await stream.waitFor({state:'detached'});assert.equal(await page.locator('[data-task-message-id="live-final-task-answer"]').count(),1);
+  const firstLive=tasks.calls.find(call=>call.path.endsWith('/events')&&new URLSearchParams(call.query).get('format')!=='json');assert.equal(new URLSearchParams(firstLive.query).get('after'),'0');assert.equal(new URLSearchParams(firstLive.query).get('tail'),'100');
+}));
+
+for(const width of [390,1440])test(`global tasks: chat opens at newest, follows live answers, and preserves older readers at ${width}px`,async()=>withTasks(async({page,tasks,login,open})=>{
+  const id='task-running',runId=`${id}-run`;tasks.messages.set(id,Array.from({length:240},(_,index)=>({id:`scroll-message-${index+1}`,row:index+1,role:'assistant',text:`Task update ${index+1}\n\nSecond line for update ${index+1}.`})));tasks.events.set(id,[]);
+  await login();await open(id);const scroll=page.locator('[data-task-scroll]');await page.waitForFunction(()=>{const node=document.querySelector('[data-task-scroll]');return node&&node.scrollHeight>node.clientHeight&&node.scrollHeight-node.clientHeight-node.scrollTop<=4});
+  const events=tasks.events.get(id);events.push({id:1,botId:BOT_A,runId,type:'message.created',createdAt:'2026-10-05T10:00:01.000Z',data:{message:{id:'scroll-live-first',role:'assistant',text:'Newest streamed task answer.\n\nMore answer detail.'}}});await page.locator('[data-task-message-id="scroll-live-first"]').waitFor();await page.waitForFunction(()=>{const node=document.querySelector('[data-task-scroll]');return node&&node.scrollHeight-node.clientHeight-node.scrollTop<=4});
+  await scroll.hover();await page.mouse.wheel(0,-100000);await page.waitForFunction(()=>document.querySelector('[data-task-scroll]').scrollTop===0);
+  const anchor=page.locator('[data-task-message-id="scroll-message-141"]');const before=await anchor.evaluate(node=>node.getBoundingClientRect().top);await page.getByRole('button',{name:'Load older messages',exact:true}).click();await page.getByLabel('Task conversation').getByText('Task update 41',{exact:true}).waitFor();
+  await page.waitForFunction(top=>Math.abs(document.querySelector('[data-task-message-id="scroll-message-141"]').getBoundingClientRect().top-top)<3,before);
+  const retained=await scroll.evaluate(node=>node.scrollTop);events.push({id:2,botId:BOT_A,runId,type:'message.created',createdAt:'2026-10-05T10:00:02.000Z',data:{message:{id:'scroll-live-second',role:'assistant',text:'Another later task answer.'}}});await page.locator('[data-task-message-id="scroll-live-second"]').waitFor();assert.ok(Math.abs(await scroll.evaluate(node=>node.scrollTop)-retained)<=3,'later answers do not pull the reader away from older messages');
+  assert.ok(await scroll.evaluate(node=>node.scrollHeight-node.clientHeight-node.scrollTop)>100,'older reader stays away from latest');
+},width));

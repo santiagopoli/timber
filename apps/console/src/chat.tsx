@@ -14,6 +14,7 @@ import type { ChatApproval, ChatCallbacks, ChatModel, ChatConnection, MessageDel
 import {canRetryAdmission} from './run-recovery';
 import {failureRecovery} from './failure-recovery';
 import {ActivityCode, ActivityOutput, activityIdentity, outputFormat} from './activity-content';
+import {TaskPill} from './task-pill';
 import {ArtifactPreview, ArtifactProvider, type ArtifactLoader} from './artifact-preview';
 import './chat.css';
 import {hasBotMention} from './mentions';
@@ -36,7 +37,15 @@ const time = (value?: string) => value ? new Date(value).toLocaleTimeString([], 
 const label = (value: string) => value.replaceAll('_', ' ');
 const safeJSON = (value: unknown): string => JSON.stringify(value, (key, item) => /token|secret|password|authorization|credential/i.test(key) ? '[hidden]' : item, 2);
 const actionText = (approval: ChatApproval) => approval.action.type === 'type' ? 'Type text · input hidden' : approval.action.type === 'exec' ? approval.action.command : safeJSON(approval.action);
-const responseComponents = { img: () => null, code:({children,...props}:ComponentProps<'code'>)=>String(children)==='🔒 ••••••'?<SecurePill/>:<defaultComponents.code {...props}>{children}</defaultComponents.code> };
+function ResponseCode({children,...props}:ComponentProps<'code'> & {'data-block'?:string}) {
+  const code=String(children);
+  if(code==='🔒 ••••••')return <SecurePill/>;
+  // Streamdown normally wraps every code line. Large pasted files must not
+  // create thousands of permanent DOM nodes in the conversation history.
+  if(props['data-block']==='true' && (code.length>16_384 || code.split('\n',302).length>300))return <pre data-large-code><code>{code}</code></pre>;
+  return <defaultComponents.code {...props}>{children}</defaultComponents.code>;
+}
+const responseComponents = { img: () => null, code:ResponseCode };
 // Keep Streamdown's URL sanitization, but use native links instead of its
 // confirmation buttons so browser navigation and long-press actions work.
 const responseLinkSafety = { enabled: false };
@@ -44,6 +53,9 @@ const responsePlugins = {};
 const responseUrlTransform: UrlTransform = (url, key, node) => url === 'streamdown:incomplete-link' ? undefined : defaultUrlTransform(url, key, node);
 
 const Response = memo(function Response({ text, streaming = false }: { text: string; streaming?: boolean }) {
+  // Keep oversized receipts fully readable/copyable while bounding Markdown
+  // parsing and element expansion for huge generated tables or logs.
+  if(text.length>262_144)return <div className="timber-markdown timber-plain-response" data-large-message>{maskSecureReferences(text).replaceAll('`🔒 ••••••`','🔒 ••••••')}</div>;
   return <MessageResponse className="timber-markdown" mode={streaming ? 'streaming' : 'static'} isAnimating={streaming} parseIncompleteMarkdown skipHtml plugins={responsePlugins} components={responseComponents} linkSafety={responseLinkSafety} urlTransform={responseUrlTransform} controls={false}>{maskSecureReferences(text)}</MessageResponse>;
 });
 
@@ -166,7 +178,7 @@ const DeliveryEntry = memo(function DeliveryEntry({ delivery, busy, callbacks, o
 type TimelineEntry = { key: string; at: number; order: number; node: ReactNode; tool?: ToolActivity };
 type ToolActivity = { key: string; runId?: string; at: number; name: string; aliases: Set<string>; returned: boolean; status?: string; result?: {status?: string; processId?: string; checkpointStatus?: 'pending'|'saved'|'failed'; output?: string; error?: string; exitCode?: number; artifactId?: string}; process?: ChatModel['events'][number]; data: Record<string, unknown> };
 type ActivityStep = {at: number; key: string; tool: ToolActivity};
-type ActivityModel = Pick<ChatModel, 'bot' | 'events' | 'runs' | 'approvals' | 'runFilter' | 'subagents' | 'delegations' | 'mentionBots' | 'messages' | 'collaborationEvents'>;
+export type ActivityModel = Pick<ChatModel, 'bot' | 'events' | 'runs' | 'approvals' | 'runFilter' | 'subagents' | 'delegations' | 'mentionBots' | 'messages' | 'collaborationEvents'>;
 const activityFields = ['bot', 'events', 'runs', 'approvals', 'runFilter', 'subagents', 'delegations', 'mentionBots', 'messages', 'collaborationEvents'] as const;
 const sameActivityModel = (left: ActivityModel | null, right: ActivityModel) => Boolean(left && activityFields.every(key => left[key] === right[key]));
 
@@ -349,7 +361,7 @@ const ActivityGroup = memo(function ActivityGroup({botId, run, runId, steps, lat
   </section>;
 }, (previous, next) => previous.botId === next.botId && previous.run === next.run && previous.latest === next.latest && previous.retry === next.retry && sameValue(previous.steps, next.steps));
 
-function ActivityPanel({model,callbacks}: {model: ActivityModel;callbacks:Pick<ChatCallbacks,'onOpenBot'|'onOpenAgents'>}) {
+export function ActivityPanel({model,callbacks}: {model: ActivityModel;callbacks:Pick<ChatCallbacks,'onOpenBot'|'onOpenAgents'>}) {
   const indexes = useMemo(() => historyIndexes(model), [model]);
   const collaboration = useMemo(() => collectCollaboration(model), [model]);
   const tools = useMemo(() => collectTools(model, true, collaboration, indexes), [model, collaboration, indexes]);
@@ -464,7 +476,13 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks, secureRequests:Sec
   for(const item of collaboration.items)entries.push({key:`collaboration:${item.key}`,...afterRequest(item.runId,timestamp(item.createdAt)),node:<TimelineCollaboration item={item} callbacks={callbacks}/>});
   const compactions = collectCompactions(model), unpositionedCompactions = compactions.filter(item => item.unpositioned);
   for (const item of compactions) if (!item.unpositioned) entries.push({key:item.key,...afterRequest(item.runId,timestamp(item.createdAt)),node:<TimelineCompaction item={item}/>});
-  const tools = collectTools(model, false, collaboration, indexes);
+  const linkedTasks=(model.tasks || []).filter(task=>!model.runFilter||task.sourceRunId===model.runFilter);
+  for (const task of linkedTasks) {
+    const origin=task.sourceRunId?requests.get(task.sourceRunId)?.at || timestamp(indexes.runs.get(task.sourceRunId)?.createdAt):0;
+    entries.push({key:`task:${task.id}`,...afterRequest(task.sourceRunId,origin || timestamp(task.createdAt)),node:<TaskPill task={task} onOpenTask={callbacks.onOpenTask}/>});
+  }
+  const taskRuns=new Set(linkedTasks.map(task=>task.sourceRunId).filter(Boolean));
+  const tools = collectTools(model, false, collaboration, indexes).filter(tool=>!(tool.name==='create_task' && toolActivityState(tool,indexes.runs.get(tool.runId || '')).status==='completed' && taskRuns.has(tool.runId)));
   const toolRuns = new Set(tools.map(tool => tool.runId));
   for (const tool of tools) {
     entries.push({key:`activity:${tool.key}`, ...afterRequest(tool.runId,tool.at), node:null, tool});
@@ -523,17 +541,47 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
   useEffect(() => {
     const node = scrollRef.current;
     if (!node || model.runFilter || !model.historyHasMore || !callbacks.onHistoryNearTop) return;
-    const nearTop = () => {if (node.scrollTop <= Math.max(600, node.clientHeight * 2)) callbacks.onHistoryNearTop?.(model.bot.id);};
-    // Background archive loading normally has the page ready already; this
-    // also resumes after a transient failure without a user-facing load button.
-    node.addEventListener('scroll', nearTop, {passive:true});
-    nearTop();
-    return () => node.removeEventListener('scroll', nearTop);
+    // Follow/resizes and archive prepends also emit scroll. Only a reader's
+    // upward gesture requests an older page; short chats must not drain an
+    // entire archive just because their latest message is near the top.
+    let readingOlder = false, requested = false, touchY:number|undefined;
+    const nearTop = () => {
+      if (readingOlder && !requested && !model.historyLoading && node.scrollTop <= Math.max(600, node.clientHeight * 2)) {
+        requested = true; callbacks.onHistoryNearTop?.(model.bot.id);
+      }
+    };
+    const reachesHistory = (target:EventTarget|null) => {
+      for(let element=target instanceof Element?target:null;element&&element!==node;element=element.parentElement) {
+        if(/(auto|scroll)/.test(getComputedStyle(element).overflowY)&&element.scrollTop>0&&element.scrollHeight>element.clientHeight)return false;
+      }
+      return true;
+    };
+    const onWheel = (event:WheelEvent) => {if (event.deltaY < 0 && reachesHistory(event.target)) {readingOlder = true; requested=false; nearTop();}};
+    const onTouchStart = (event:TouchEvent) => {touchY=event.touches.length===1?event.touches[0].clientY:undefined;};
+    const onTouchMove = (event:TouchEvent) => {
+      if (touchY!==undefined && event.touches.length===1) {
+        const next=event.touches[0].clientY;
+        if (next>touchY+2 && reachesHistory(event.target)) {readingOlder=true;requested=false;nearTop();} touchY=next;
+      }
+    };
+    const onKey = (event:globalThis.KeyboardEvent) => {if (['Home','PageUp','ArrowUp'].includes(event.key)) {readingOlder=true;requested=false;nearTop();}};
+    const onPointer = (event:PointerEvent) => {if(event.target===node){readingOlder=true;requested=false;}};
+    node.addEventListener('scroll',nearTop,{passive:true});
+    node.addEventListener('wheel',onWheel,{passive:true});
+    node.addEventListener('touchstart',onTouchStart,{passive:true});
+    node.addEventListener('touchmove',onTouchMove,{passive:true});
+    node.addEventListener('keydown',onKey);
+    node.addEventListener('pointerdown',onPointer,{passive:true});
+    return () => {
+      node.removeEventListener('scroll',nearTop);node.removeEventListener('wheel',onWheel);
+      node.removeEventListener('touchstart',onTouchStart);node.removeEventListener('touchmove',onTouchMove);
+      node.removeEventListener('keydown',onKey);node.removeEventListener('pointerdown',onPointer);
+    };
   }, [model.bot.id, model.runFilter, model.historyHasMore, model.historyLoading, model.historyError, callbacks, scrollRef]);
   // Drafts and response chunks never invalidate the completed history. The
   // transport supplies immutable, referentially stable collection revisions.
   const {requests:secureRequests}=useKeychain();
-  const {entries, unpositionedCompactions, indexes, toolRuns, pendingApprovalRuns, pendingConnectionRuns} = useMemo(() => timeline(model, callbacks, secureRequests), [secureRequests,model.bot.id, model.bot.name, model.bot.model, model.bot.computerApprovalMode, model.messages, model.runs, model.approvals, model.connections, model.events, model.deliveries, model.subagents, model.delegations, model.mentionBots, model.collaborationEvents, model.compactions, model.runFilter, model.sending, callbacks]);
+  const {entries, unpositionedCompactions, indexes, toolRuns, pendingApprovalRuns, pendingConnectionRuns} = useMemo(() => timeline(model, callbacks, secureRequests), [secureRequests,model.bot.id, model.bot.name, model.bot.model, model.bot.computerApprovalMode, model.messages, model.runs, model.approvals, model.connections, model.events, model.deliveries, model.subagents, model.delegations, model.mentionBots, model.collaborationEvents, model.compactions, model.tasks, model.runFilter, model.sending, callbacks]);
   const visibleRun = model.currentRun && (!model.runFilter || model.runFilter === model.currentRun.id) ? model.currentRun : null;
   const hasInlineStatus = visibleRun && (
     pendingApprovalRuns.has(visibleRun.id) ||
@@ -543,7 +591,8 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
   );
   return <>
     <ConversationContent className="timber-conversation-content">
-      {!model.runFilter && (model.historyLoading || model.historyError) && <p className={`timber-history-caption${model.historyError ? ' timber-inline-error' : ''}`} data-conversation-history-status role="status">{model.historyError ? 'Reconnecting to older conversation history…' : 'Loading earlier conversation…'}</p>}
+      {!model.runFilter && model.historyHasMore && <Button variant="ghost" size="sm" data-load-earlier-history disabled={model.historyLoading} onClick={()=>callbacks.onHistoryNearTop?.(model.bot.id)}>{model.historyLoading?'Loading earlier history…':'Load earlier history'}</Button>}
+      {!model.runFilter && (model.historyLoading || model.historyError) && <p className={`timber-history-caption${model.historyError ? ' timber-inline-error' : ''}`} data-conversation-history-status role="status">{model.historyError ? 'Could not load earlier conversation. Try again.' : 'Loading earlier conversation…'}</p>}
       {!entries.length && !unpositionedCompactions.length && <ConversationEmptyState className="timber-chat-empty" title={model.loading ? 'Loading…' : `Ask ${model.bot.name}`} description="" />}
       <UnpositionedCompactionHistory items={unpositionedCompactions}/>
       <TimelineHistory entries={entries}/>

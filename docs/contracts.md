@@ -193,6 +193,10 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   read the next older page; null means no older page remains. Stable SQLite rowid
   pagination preserves older page boundaries while new messages arrive and does
   not depend on timestamps. No messages are deleted by context compaction.
+  The console initially reads at most 100 messages. Older pages load one at a
+  time on an explicit upward reading gesture or the earlier-history control;
+  opening, refreshing or returning to a tab never drains the archive. Already
+  loaded pages retain chronological order, copy and browser find behavior.
   Assistant messages may carry `kind: "progress" | "final"`. Progress is public
   assistant commentary accompanying native tool calls; it is durably deduplicated
   by its native message identity. Final answers are deduplicated by their native
@@ -294,6 +298,20 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
 - POST /v1/bots/:id/runs/:runId/cancel -> {run:Run}
 - GET /v1/bots/:id/events?after=cursor -> SSE id, event=event, JSON BotEvent.
   Reconnect fetches durable events >cursor; no credentials in URL.
+  Optional `tail=1..100` applies only to an initial `after=0` connection. It
+  replays that many newest events chronologically, then a synthetic
+  `stream.snapshot` with `latestEventId`, complete active `partials`,
+  `historyTruncated` and an older-history `nextCursor`. This snapshot has no SSE
+  id and does not create a durable event. Clients replace partials at its cursor
+  boundary before appending later deltas. Reconnects retain exact after-cursor
+  semantics. SSE pumps bound each queued chunk to 128 KiB, except a single
+  intact larger event, rather than batching many large outputs into one buffer.
+  `GET /events?format=json&limit=1..100&before=<positive cursor>` returns
+  `{events,nextCursor}` with a newest-first page delivered in chronological
+  order. Optional `view=activity` uses an indexed filter for task updates,
+  tools, processes, retries, failures and Stop, excluding text deltas. The
+  default JSON view retains every event type. Invalid views, limits or cursors
+  return 400; both views preserve owner/conversation isolation and full archives.
   Tool completion events can include both `operationId` (stable computer effect
   identity) and `toolCallId` (native call identity). Clients merge these explicit
   aliases for display; neither identical command text nor event names prove
@@ -317,10 +335,16 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   operation identity. File bodies and typed text are omitted; common command
   credential forms and URL credentials/query values are masked. This summary is
   presentation data and is never used to execute or retry an action.
-  The console renders started/completed events directly in both the conversation
+  The console renders started/completed events directly in their conversation
   and Activity, independent of transcript refresh. Command/parameters, status
   and a bounded output/error preview remain visible with details closed. Streaming
   text does not evict tool records from the separate bounded activity history.
+  Substantial work handed to a global task renders only a linked status pill in
+  the originating chat; its command activity remains in the task conversation.
+  Large code/output previews use a plain code node rather than thousands of
+  syntax spans. Messages above 256 KiB retain their exact text as plain text;
+  copying preserves the complete original Markdown, outputs and line endings.
+  Diagnostic JSON renders only when its disclosure is opened.
   The conversation header represents active work only. Terminal failures and
   cancellation appear once after that task's activity; they do not label the bot
   or the entire conversation. Continue submits a new explicit request using the
@@ -385,7 +409,7 @@ active runs and permanently fences subsequent starts and continuations. Cancelle
 `/agents/:agentId/cancel`, `/runs/:runId`, `/runs/:runId/cancel` and `/connections`
 reuse the isolated conversation’s decision/run APIs; decisions are never applied
 to the assigned bot’s ordinary chat. A per-assigned-bot durable slot blocks
-task starts while the ordinary bot has an active run; ordinary bot messages are durably receipted in the existing bounded backlog while a task holds the slot, but cannot enter Pi until their conversation atomically acquires an `@bot` execution lease. Expected contention uses the existing Lifecycle capacity wake without consuming delivery-failure attempts. Unadmitted backlog alone never prevents a future lease. Owner direct mutations retain exact validated queued intentions and return explicit 202 queued receipts; no task chat is admitted as ordinary bot steering while the shared computer is occupied. Other tasks remain durably `queued` and are admitted FIFO by the WorkspaceDO alarm
+task starts while the ordinary bot has an active run; ordinary bot messages are durably receipted in the existing bounded backlog while a task holds the slot, and ordinary computer-capable runs cannot enter Pi until their conversation atomically acquires an `@bot` execution lease. Task-enabled main chat can enter the computerless coordinator mode below without claiming that slot. Expected contention uses the existing Lifecycle capacity wake without consuming delivery-failure attempts. Unadmitted backlog alone never prevents a future lease. Owner direct mutations retain exact validated queued intentions and return explicit 202 queued receipts; no task chat is admitted as ordinary bot steering while the shared computer is occupied. Other tasks remain durably `queued` and are admitted FIFO by the WorkspaceDO alarm
 once run and managed-process termination is confirmed. No browser polling is
 needed to release an idle lease or start queued tasks. Snapshot-based release is
 fenced by lease token/generation, pending admissions, unacknowledged native
@@ -404,6 +428,32 @@ host run; model-supplied source IDs are ignored. Bot-created tasks accept `start
 behind their creating conversation and start through the durable scheduler when
 its shared computer is idle; false explicitly saves a pending task. Task list pagination, reassignment, and task
 user-deletion are not available.
+
+When allowed, the agent uses `create_task` for substantial multi-step work,
+finishes its brief handoff to release the shared computer, and keeps short
+answers in the main chat. Task runtimes are told to execute their assigned work
+rather than recursively handing it off. New console-created bots default to
+allowing task creation; existing explicit permissions remain unchanged.
+Bot-created tasks persist `sourceRunId`, optional `sourceTaskId`, and a monotonic
+`statusVersion`. A durable FIFO outbox sends `task.updated {task,notificationId}`
+to the originating bot or task conversation on real state changes. Exact IDs
+deduplicate notifications across retries and eviction. A terminal outcome can
+append one attributed assistant result without starting another inference run;
+a cancelled originating run never receives an implicit continuation.
+
+While a task owns its bot's computer slot, an allowed bot's new ordinary input
+can be admitted as a persisted `Run.coordinatorMode` turn. It may answer,
+inspect allowlisted metadata and create another task, but computer tools and
+service mutations fail before any effect. These turns do not claim/release the
+task's lease or count as computer execution holders. Their Stop fences their own
+work without cancelling the independent task. Ordinary execution admission and
+all task/computer effects retain exact lease fencing.
+
+The console's main segmented Bots/Tasks selector swaps the same list area and
+matching row presentation. Tasks have deep links `#tasks&task=<id>`, a dedicated
+chat, approvals and command activity, with bounded history pages and live SSE.
+Hidden task views stop polling and streaming. The parent chat restores the latest
+status pills from the passive registry and ignores stale status versions.
 
 ## Console sessions
 The cookie `__Host-timber_session` is Secure, HttpOnly, SameSite=Strict, host-only
@@ -552,6 +602,16 @@ ComputerAction is a discriminated union: exec, execPoll, execCancel, readFile, w
 screenshot, click, move, doubleClick, drag, type, key, scroll, navigate, checkpoint.
 Cloud provider and ComputerDO concrete implementation live under packages/computer. Container HTTP
 server and image live in infra/computer. Agree export names with API agent.
+
+ComputerDO stores compact durable work indexes alongside operation and exec
+receipts. Recovery, active-execution checks and checkpoint maintenance read
+unresolved work instead of hydrating all historical command outputs. Legacy
+journals migrate in pages of 32 with storage caching disabled. Each page saves
+its migration phase/cursor atomically so interrupted startup resumes without
+reading already indexed pages. Operation IDs,
+full outputs and saved checkpoint receipts remain intact. Bot recovery likewise
+uses indexed active approval queries, and cancellation traverses only the
+selected run's descendants rather than parsing the complete run archive.
 
 Mouse coordinates are integers in the 1280×800 desktop. `move` positions the pointer
 without clicking; `doubleClick` sends two clicks 100 ms apart. `drag` holds the chosen

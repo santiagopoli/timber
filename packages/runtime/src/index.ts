@@ -48,6 +48,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
   // every joined input can resolve the same answer after recovery.
   options.storage.sql.exec('CREATE TABLE IF NOT EXISTS botspace_runtime_generations (task_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL)');
   options.storage.sql.exec('CREATE TABLE IF NOT EXISTS timber_generation_models (task_id TEXT PRIMARY KEY, model_id TEXT NOT NULL)');
+  options.storage.sql.exec('CREATE TABLE IF NOT EXISTS timber_task_handoffs (operation_id TEXT PRIMARY KEY, task_id TEXT NOT NULL)');
   const stopped = async (operationId: string, tx?: Tx) => Boolean((tx ? await tx.doc(Stops) : await native.snapshot(Stops, background))?.operations[operationId]);
   const cancellation = async (operationId: string, reason?: string): Promise<{cancellationId?: string}> => {
     if (reason !== 'aborted') return {};
@@ -212,7 +213,15 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
           ...(options.tools.readImage ? { readImage: (artifactId: string) => { assertActive(); return options.tools.readImage!(artifactId); } } : {}),
           ...(options.tools.catalog && options.tools.call ? {
             catalog: () => { assertActive(); return options.tools.catalog!(); },
-            call: request => { assertActive(); return options.tools.call!(request); },
+            call: async request => {
+              assertActive();const result=await options.tools.call!(request);
+              if(request.name==='create_task'&&!request.subagentId&&result.status==='completed') {
+                try {const value=JSON.parse(result.output??'') as {task?:{id:string;startImmediately?:boolean;status?:string}};
+                  if(value.task?.id&&value.task.startImmediately!==false&&value.task.status!=='pending')options.storage.sql.exec('INSERT OR IGNORE INTO timber_task_handoffs(operation_id,task_id) VALUES(?,?)',request.runOperationId,value.task.id);
+                }catch{/* A malformed receipt is not a successful handoff. */}
+              }
+              return result;
+            },
           } satisfies Pick<NonNullable<ToolBridge['tools']>, 'catalog' | 'call'> : {}),
         }, operationForCall, consume, paused, pause,
         childForCall: async (api, context) => {
@@ -253,12 +262,13 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
           const live=await api.snapshot(LiveDoc,api.conversationId,context);
           const operationId=live?.run?await resolveInputs(live.run.inputs):undefined;
           if(operationId && !paused(operationId) && !await stopped(operationId)) {
-            const nudge=stopGate.onYield(operationId,String(api.taskId),textContent(answer.content));
+            const handedOff=options.storage.sql.exec('SELECT 1 FROM timber_task_handoffs WHERE operation_id=?',operationId).toArray().length>0;
+            const nudge=handedOff?undefined:stopGate.onYield(operationId,String(api.taskId),textContent(answer.content));
             if(nudge)return {continue:nudge};
           }
           await maintenance.onYield(api.conversationId,Number(api.taskId));
         }}),hook(CompactionTask,{beforeCompact:async(input,api,context)=>{await maintenance.recordCompaction(input,api,context);await maintenance.beforeCompact(api.conversationId,String(api.taskId));}})],
-        sections: [{key:'durable_memory',render:input=>maintenance.prompt(input.conversationId)}, { key: 'preamble', tag: false, render: async input => {
+        sections: [{key:'durable_memory',render:input=>maintenance.prompt(input.conversationId)}, {key:'persistent_tasks',render:()=>options.getTaskContext?.()??''}, { key: 'preamble', tag: false, render: async input => {
           const bot = await options.getBot();
           const child = await subagents.forConversation(input.conversationId);
           let approvalSnapshot = 'Current host approval status is unavailable. Do not infer current status from historical tool results.';
@@ -275,6 +285,11 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
             child ? `You are ${child.name}, a temporary subagent of ${bot.name}. Complete your assigned task and coordinate with your parent.` : `You are ${bot.name}, a persistent named bot in Botspace.`,
             bot.instructions,
             'You own one ongoing conversation. Preserve useful context across tasks.',
+            child ? undefined : options.getTaskId?.()
+              ? 'You are working inside a persistent task conversation. Perform this task here, including commands, progress, verification and the final deliverable. Do not create another global task for the same work. Your final answer is reported to the originating conversation automatically. Temporary subagents may help with independent parts of this task.'
+              : bot.allowTaskCreation === true
+                ? 'For substantial multi-step work, use list_tools to discover create_task and hand off to a persistent task BEFORE running its commands here. Keep this ordinary conversation concise and natural. Give the task a self-contained description with the user’s goal, relevant context, constraints, references and expected deliverable; it does not inherit this chat. After successful creation, acknowledge the handoff in one brief final answer and END this turn immediately: the task is queued until you release this bot’s shared computer. Do not wait, poll or continue its commands here. Its status and final result return automatically. Short answers or tiny specific actions can stay here. Task handoff is a completed routing action, not unfinished work in this conversation.'
+                : 'The owner has not enabled persistent task creation for this bot. Work in this conversation; do not claim to have created a task or ask repeatedly for permission to do so.',
             'Use list_models to inspect the connected account’s available models and supported reasoning/speed. spawn_subagent may select model, reasoningEffort and fast; omitted settings inherit your current configuration. Use spawn_subagent to delegate concrete tasks to temporary agents with separate contexts. They share your computer; assign separate files and coordinate edits. Use list_subagents, send_subagent_message, wait_subagent and cancel_subagent to coordinate. Temporary agents are visible to the user. Named persistent bots are separate host capabilities discoverable through list_tools.',
             'Remain available as an orchestrator while agents work. Delegate independent multi-step work so a new user request can be handled promptly and can create another subagent while earlier agents continue. New messages join at a safe tool boundary. When wait_subagent yields because a new input arrived, attend to that input and preserve existing agents; do not force unrelated tasks into a serial wait or cancel agents merely to answer a message.',
             'Your computer is a reusable cloud Linux desktop. Files belong under /workspace.',

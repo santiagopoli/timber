@@ -83,6 +83,46 @@ const sendMessage = page => page.locator('#message-form').getByRole('button', {n
 const deletedBots = state => state.calls.filter(call => call.method === 'DELETE' && /^\/v1\/bots\//.test(call.path));
 const openDelete = async page => {await openBotEditor(page); await page.locator('#delete-bot').click(); await page.locator('#delete-dialog').waitFor({state: 'visible'});};
 
+for(const width of [390,1440])test(`task handoff keeps live status in one original chat pill and commands in the task (${width}px)`,async()=>{
+  await withPage(async({page,state,login})=>{
+    const createdAt='2026-10-11T12:00:00Z',run={id:'task-parent',botId:BOT_A,operationId:'task-parent-op',status:'completed',createdAt,updatedAt:createdAt};
+    const task={id:'10000000-0000-4000-8000-000000000070',title:'Build the dashboard',description:'Implement and verify the dashboard',botId:BOT_A,botName:'Ada',creator:'bot',createdByBotId:BOT_A,sourceRunId:run.id,statusVersion:1,status:'queued',startImmediately:true,createdAt,updatedAt:createdAt};
+    state.runs.set(BOT_A,[run]);state.messages.set(BOT_A,[{id:'task-parent-user',botId:BOT_A,runId:run.id,role:'user',text:'Build the dashboard for me',createdAt},{id:'task-handoff',botId:BOT_A,runId:run.id,role:'assistant',kind:'final',text:'I started a task to build the dashboard.',createdAt}]);
+    await page.route('**/v1/tasks**',async route=>{
+      const path=new URL(route.request().url()).pathname,reply=value=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(value)});
+      if(path==='/v1/tasks')return reply({tasks:[task]});
+      if(path.endsWith('/messages'))return reply({messages:[{id:'task-work-user',botId:BOT_A,runId:'task-work',role:'user',text:task.description,createdAt}],nextCursor:null});
+      if(path.endsWith('/approvals'))return reply({approvals:[]});
+      if(path.endsWith('/runs'))return reply({runs:[{id:'task-work',botId:BOT_A,status:'running',operationId:'task-work-op',createdAt,updatedAt:createdAt}]});
+      if(path.endsWith('/events')){
+        if(new URL(route.request().url()).searchParams.get('format')==='json')return reply({events:[{id:1,botId:BOT_A,runId:'task-work',type:'tool.completed',createdAt,data:{toolCallId:'task-command',toolName:'exec',input:{command:'git clone dashboard-repo'},result:{status:'completed',output:'Dashboard workspace ready',exitCode:0}}}],nextCursor:null});
+        return route.fulfill({status:200,contentType:'text/event-stream',body:''});
+      }
+      return reply({task});
+    });
+    await login();const pill=page.locator(`[data-linked-task-id="${task.id}"]`);await pill.waitFor();
+    assert.equal(await pill.getAttribute('data-task-status'),'queued');assert.equal(await page.locator('[data-tool-operation-id="task-command"]').count(),0);
+    await page.evaluate(()=>globalThis.__taskMessage=document.querySelector('[data-message-id="task-parent-user"]'));
+    task.status='running';task.statusVersion=2;task.updatedAt='2026-10-11T12:01:00Z';state.emit(BOT_A,'task.updated',{task:{...task},notificationId:'task-update-2'},run.id);
+    await pill.filter({hasText:'Working'}).waitFor();
+    task.status='completed';task.statusVersion=3;task.updatedAt='2026-10-11T12:02:00Z';state.emit(BOT_A,'task.updated',{task:{...task},notificationId:'task-update-3'},run.id);
+    await pill.filter({hasText:'Completed'}).waitFor();
+    state.emit(BOT_A,'task.updated',{task:{...task,status:'queued',statusVersion:1},notificationId:'task-update-1'},run.id);
+    assert.equal(await pill.count(),1);assert.equal(await pill.getAttribute('data-task-status'),'completed');
+    assert.equal(await page.evaluate(()=>globalThis.__taskMessage===document.querySelector('[data-message-id="task-parent-user"]')),true,'status updates preserve original message DOM');
+    await pill.click();await page.locator('.timber-tasks-detail h2').filter({hasText:task.title}).waitFor();
+    assert.ok(page.url().endsWith(`#tasks&task=${task.id}`),'pill opens a durable deep link');
+    await page.locator('[data-activity-tool-operation-id="task-command"]').waitFor();
+    assert.match(await page.getByRole('region',{name:'Task activity'}).innerText(),/git clone dashboard-repo/);
+    await page.reload();await page.locator('.timber-tasks-detail h2').filter({hasText:task.title}).waitFor();
+    if(width<=760){await page.getByRole('button',{name:'Back to tasks',exact:true}).click();await page.locator('.timber-tasks-topbar').getByRole('button',{name:'Bots',exact:true}).click();}else await page.locator('#bots-nav').click();
+    await page.locator(`.bot-item[data-bot-id="${BOT_A}"]`).click();
+    await pill.filter({hasText:'Completed'}).waitFor();
+    assert.equal(await page.locator('#messages [data-tool-operation-id="task-command"]').count(),0,'task commands never fill the bot conversation');
+    assert.equal(sentMessages(state,BOT_A).length,0,'opening status or history does not submit inference or replay effects');
+  },{viewport:{width,height:1000},colorScheme:'dark'});
+});
+
 test('keyboard newlines never send; only Send enqueues follow-up messages', async () => {
   await withPage(async ({page, login, state}) => {
     const run = {id: 'active-send-run', botId: BOT_A, operationId: 'active-send-operation', status: 'running', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()};
@@ -119,7 +159,7 @@ test('explicitly stopping a run reports cancellation in the conversation without
     assert.deepEqual(state.calls.filter(call => call.path.endsWith('/cancel')).map(call => ({path: call.path, method: call.method})), [{path: `/v1/bots/${BOT_A}/runs/${run.id}/cancel`, method: 'POST'}]);
     state.emit(BOT_A, 'message.delta', {delta: 'Late text from a cancelled run'}, run.id);
     await openPanel(page, 'activity');
-    await Promise.all([page.waitForResponse(response => response.url().endsWith('/messages')), page.locator('#refresh-history').click()]);
+    await Promise.all([page.waitForResponse(response => new URL(response.url()).pathname.endsWith('/messages')), page.locator('#refresh-history').click()]);
     await openPanel(page, 'conversation');
     assert.equal(await page.locator('#streaming-message').isVisible(), false);
     assert.equal((await page.locator('#messages').innerText()).includes('Late text from a cancelled run'), false);
@@ -617,8 +657,8 @@ test('message acceptance is visible immediately and slow history refresh cannot 
     await until(page, '#messages [data-operation-id]', 'Sending');
     await page.locator('#message-form').dispatchEvent('submit');
     await page.locator('#message').fill('My next unsent draft');
-    const response = page.waitForResponse(item => item.request().method() === 'POST' && item.url().endsWith('/messages'));
-    const historyRequest = page.waitForRequest(item => item.method() === 'GET' && item.url().endsWith(`/bots/${BOT_A}/messages`));
+    const response = page.waitForResponse(item => item.request().method() === 'POST' && new URL(item.url()).pathname.endsWith('/messages'));
+    const historyRequest = page.waitForRequest(item => item.method() === 'GET' && new URL(item.url()).pathname.endsWith(`/bots/${BOT_A}/messages`));
     accept(); await response;
     assert.equal(sentMessages(state, BOT_A).length, 1, 'in-flight duplicate submission is ignored');
     await until(page, '#messages [data-operation-id]', 'Queued');
@@ -672,7 +712,7 @@ test('a pending send stays scoped to its bot while another bot sends and keeps a
     await page.locator('#message').fill('Independent task for Linus'); await sendMessage(page);
     await page.locator('[data-message-id]').filter({hasText: 'Independent task for Linus'}).waitFor();
     await page.locator('#message').fill('Linus next draft');
-    const completed = page.waitForResponse(item => item.request().method() === 'POST' && item.url().endsWith(`/bots/${BOT_A}/messages`));
+    const completed = page.waitForResponse(item => item.request().method() === 'POST' && new URL(item.url()).pathname.endsWith(`/bots/${BOT_A}/messages`));
     release(); await completed;
     assert.equal(await page.locator('#message').inputValue(), 'Linus next draft');
     assert.equal((await page.locator('#messages').innerText()).includes('Task captured for Ada'), false);
@@ -741,7 +781,7 @@ test('an accepted queued message can retry admission after reconnect without dup
     assert.equal(sentMessages(state, BOT_A).length, 0, 'restoring accepted work never resends automatically');
     await page.locator('#message').fill('Preserve my next unsent task');
     delete run.error;
-    const accepted = page.waitForResponse(response => response.request().method() === 'POST' && response.url().endsWith('/messages'));
+    const accepted = page.waitForResponse(response => response.request().method() === 'POST' && new URL(response.url()).pathname.endsWith('/messages'));
     await page.getByRole('button', {name: 'Retry sending', exact: true}).click(); await accepted;
     await page.getByRole('button', {name: 'Retry sending', exact: true}).waitFor({state: 'hidden'});
     assert.deepEqual(sentMessages(state, BOT_A).map(call => call.body), [{text, operationId: run.operationId}]);
@@ -794,7 +834,7 @@ test('runtime admission can be retried from a new accepted receipt before histor
     await until(page, '#messages [data-operation-id]', 'Queued');
     await page.getByRole('button', {name: 'Retry sending', exact: true}).waitFor();
     await page.locator('#message').fill('A new unsent draft stays mine');
-    const retried = page.waitForResponse(response => response.request().method() === 'POST' && response.url().endsWith('/messages'));
+    const retried = page.waitForResponse(response => response.request().method() === 'POST' && new URL(response.url()).pathname.endsWith('/messages'));
     await page.getByRole('button', {name: 'Retry sending', exact: true}).click(); await retried;
     assert.equal(sentMessages(state, BOT_A).length, 2);
     assert.deepEqual(sentMessages(state, BOT_A)[1].body, sentMessages(state, BOT_A)[0].body);
@@ -1501,7 +1541,7 @@ test('streamed requests and answers render immediately and survive an older in-f
     await login();const snapshot=structuredClone(state.messages.get(BOT_A));
     let release,started;const gate=new Promise(resolve=>release=resolve),readStarted=new Promise(resolve=>started=resolve);
     let held=false;
-    await page.route(`**/v1/bots/${BOT_A}/messages`,async route=>{
+    await page.route(`**/v1/bots/${BOT_A}/messages*`,async route=>{
       if(route.request().method()!=='GET')return route.continue();
       if(!held){held=true;started();await gate;}
       await route.fulfill({json:{messages:snapshot}});
@@ -1519,7 +1559,7 @@ test('streamed requests and answers render immediately and survive an older in-f
       const order=await page.locator('#messages').evaluate(node=>[...node.querySelectorAll('[data-message-id^="order-stream"], [data-run-activity]')].map(item=>item.dataset.messageId||item.dataset.runActivity));
       assert.ok(order.indexOf(message.id)<order.indexOf(run.id));
       assert.ok(order.indexOf(message.id)<order.indexOf(reply.id));
-      const read=page.waitForResponse(response=>response.url().endsWith('/messages'));release();await read;
+      const read=page.waitForResponse(response=>new URL(response.url()).pathname.endsWith('/messages'));release();await read;
       assert.equal(await page.locator('[data-message-id="order-stream-user"]').count(),1);
       assert.equal(await page.locator('[data-message-id="order-stream-answer"]').count(),1);
       state.emit(BOT_A,'message.created',{message:{...message,id:'foreign-stream-user',botId:BOT_B}},run.id);
@@ -2739,7 +2779,7 @@ for (const delayedReplay of [false, true]) test(`transient model failure continu
     await preserved.waitFor();
     assert.equal(await preserved.count(),1);
     assert.match(await preserved.textContent(),/Build passed\./);
-    const accepted=page.waitForResponse(response=>response.request().method()==='POST'&&response.url().endsWith('/messages'));await notice.getByRole('button',{name:'Continue',exact:true}).click();await accepted;const sent=sentMessages(state,BOT_A);assert.equal(sent.length,1);assert.notEqual(sent[0].body.operationId,run.operationId);assert.match(sent[0].body.text,/Inspect the saved build result/);assert.match(sent[0].body.text,/do not repeat completed work/);assert.equal(state.actions.length,0);
+    const accepted=page.waitForResponse(response=>response.request().method()==='POST'&&new URL(response.url()).pathname.endsWith('/messages'));await notice.getByRole('button',{name:'Continue',exact:true}).click();await accepted;const sent=sentMessages(state,BOT_A);assert.equal(sent.length,1);assert.notEqual(sent[0].body.operationId,run.operationId);assert.match(sent[0].body.text,/Inspect the saved build result/);assert.match(sent[0].body.text,/do not repeat completed work/);assert.equal(state.actions.length,0);
     assert.equal(await preserved.count(),1);
     assert.match(await preserved.textContent(),/Build passed\./);
   });

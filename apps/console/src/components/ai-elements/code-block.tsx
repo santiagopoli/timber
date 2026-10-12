@@ -113,6 +113,7 @@ type CodeBlockProps = HTMLAttributes<HTMLDivElement> & {
   copyText?: string;
   language: CodeLanguage;
   showLineNumbers?: boolean;
+  highlight?: boolean;
 };
 
 interface TokenizedCode {
@@ -135,6 +136,23 @@ const tokensCache = new Map<string, TokenizedCode>();
 
 // Subscribers for async token updates
 const subscribers = new Map<string, Set<(result: TokenizedCode) => void>>();
+const highlighting = new Set<string>();
+let cachedCharacters = 0, cachedTokens = 0;
+const cacheWeights = new Map<string, {characters:number;tokens:number}>();
+// A count cap alone can retain megabytes of token objects after switching bots.
+const retainTokens = (key:string, value:TokenizedCode, code:string) => {
+  const weight = {characters:code.length, tokens:value.tokens.reduce((sum,line)=>sum+line.length,0)};
+  if (weight.characters > 131_072 || weight.tokens > 16_000) return;
+  while (tokensCache.size >= 64 || cachedCharacters + weight.characters > 131_072 || cachedTokens + weight.tokens > 16_000) {
+    const oldest = tokensCache.keys().next().value;
+    if (!oldest) break;
+    const removed = cacheWeights.get(oldest)!;
+    cachedCharacters -= removed.characters; cachedTokens -= removed.tokens;
+    tokensCache.delete(oldest); cacheWeights.delete(oldest);
+  }
+  tokensCache.set(key,value); cacheWeights.set(key,weight);
+  cachedCharacters += weight.characters; cachedTokens += weight.tokens;
+};
 
 const getTokensCacheKey = (code: string, language: CodeLanguage) => {
   // Different files may share their length, prefix and suffix. The complete
@@ -171,8 +189,12 @@ export const highlightCode = (
   // Return cached result if available
   const cached = tokensCache.get(tokensCacheKey);
   if (cached) {
+    tokensCache.delete(tokensCacheKey); tokensCache.set(tokensCacheKey,cached);
     return cached;
   }
+  // A render only reads the cache. The mounted effect owns async work and
+  // its subscriber, so abandoned renders never start background tokenization.
+  if (!callback) return null;
 
   // Subscribe callback if provided
   if (callback) {
@@ -182,10 +204,14 @@ export const highlightCode = (
     subscribers.get(tokensCacheKey)?.add(callback);
   }
 
-  // Start highlighting in background - fire-and-forget async pattern
+  // Multiple previews of one command share a single tokenization job.
+  if (highlighting.has(tokensCacheKey)) return null;
+  highlighting.add(tokensCacheKey);
   syntaxHighlighter(language)
     // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-then)
     .then((highlighter) => {
+      // The user may have switched away while a language was loading.
+      if (!subscribers.get(tokensCacheKey)?.size) return;
       const availableLangs = highlighter.getLoadedLanguages();
       const langToUse = availableLangs.includes(language) ? language : "text";
 
@@ -204,8 +230,7 @@ export const highlightCode = (
       };
 
       // Cache the result
-      if (tokensCache.size >= 64) tokensCache.delete(tokensCache.keys().next().value!);
-      tokensCache.set(tokensCacheKey, tokenized);
+      retainTokens(tokensCacheKey, tokenized, code);
 
       // Notify all subscribers
       const subs = subscribers.get(tokensCacheKey);
@@ -219,8 +244,7 @@ export const highlightCode = (
     // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-then), eslint-plugin-promise(prefer-await-to-callbacks)
     .catch((error) => {
       console.error("Failed to highlight code:", error);
-      subscribers.delete(tokensCacheKey);
-    });
+    }).finally(() => {highlighting.delete(tokensCacheKey); subscribers.delete(tokensCacheKey);});
 
   return null;
 };
@@ -353,7 +377,7 @@ export const CodeBlockActions = ({
   </div>
 );
 
-export const CodeBlockContent = ({
+const HighlightedCodeContent = ({
   code,
   language,
   showLineNumbers = false,
@@ -387,14 +411,11 @@ export const CodeBlockContent = ({
   useEffect(() => {
     let cancelled = false;
 
-    highlightCode(code, language, (result) => {
-      if (!cancelled) {
-        setAsyncTokens(result);
-      }
-    });
-
+    const receive = (result:TokenizedCode) => {if (!cancelled) setAsyncTokens(result);};
+    highlightCode(code, language, receive);
     return () => {
       cancelled = true;
+      subscribers.get(getTokensCacheKey(code,language))?.delete(receive);
     };
   }, [code, language]);
 
@@ -407,11 +428,20 @@ export const CodeBlockContent = ({
   );
 };
 
+// Large logs/files stay fully selectable and copyable without one React
+// element per line/token or synchronous Shiki work on the UI thread.
+export const CodeBlockContent = ({code,language,showLineNumbers=false,highlight=true}: {code:string;language:CodeLanguage;showLineNumbers?:boolean;highlight?:boolean}) => {
+  const plain = !highlight || ['text','plaintext'].includes(language) || code.length > 16_384 || code.split('\n',302).length > 300;
+  return plain ? <div className="relative overflow-auto" data-code-content data-code-plain><pre className="m-0 p-4 text-sm"><code className="font-mono text-sm">{code}</code></pre></div>
+    : <HighlightedCodeContent code={code} language={language} showLineNumbers={showLineNumbers}/>;
+};
+
 export const CodeBlock = ({
   code,
   copyText,
   language,
   showLineNumbers = false,
+  highlight = true,
   className,
   children,
   ...props
@@ -426,6 +456,7 @@ export const CodeBlock = ({
           code={code}
           language={language}
           showLineNumbers={showLineNumbers}
+          highlight={highlight}
         />
       </CodeBlockContainer>
     </CodeBlockContext.Provider>

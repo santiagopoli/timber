@@ -9,6 +9,10 @@ export type MessageDelivery = {
   state: 'sending' | 'accepted' | 'unknown' | 'rejected';
   runId?: string; runStatus?: Run['status']; error?: string; canRetry?: boolean; mentions?: string[];
 };
+export type ChatTaskSummary = {
+  id:string; title:string; botId:string; status:string; sourceRunId?:string; sourceTaskId?:string;
+  createdAt?:string; updatedAt:string; statusVersion?:number; lastActivity?:string; result?:string;
+};
 export type ChatModel = {
   bot: Bot; messages: Message[]; runs: Run[]; approvals: ChatApproval[]; connections: ChatConnection[]; events: BotEvent[];
   acceptedImageIds?: string[]; deliveries: MessageDelivery[]; draft: string; sending: boolean; loading: boolean;
@@ -17,6 +21,7 @@ export type ChatModel = {
   subagents: Subagent[]; delegations: AgentDelegation[];
   collaborationEvents: BotEvent[];
   compactions?: readonly CompactionReceipt[];
+  tasks?: readonly ChatTaskSummary[];
   historyLoading?: boolean; historyHasMore?: boolean; historyError?: string;
   currentRun: Run | null; runFilter: string | null; focusApproval: number;
   stream: { runId: string; text: string } | null;
@@ -26,6 +31,7 @@ export type ChatCallbacks = {
   onDraft(botId: string, text: string, mentions?: string[]): void;
   onSend(botId: string, text: string, mentions?: string[], files?: {url:string;mediaType?:string;filename?:string}[]): void | Promise<void>;
   onOpenBot(botId: string): void;
+  onOpenTask?(taskId:string): void;
   onOpenAgents(agentId?: string): void;
   onModelSettings(botId:string,settings:ModelSelection):Promise<void>;
   onRefreshModels():void;

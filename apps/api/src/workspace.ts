@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import type { Bot, ModelSettings } from "@botspace/contracts";
+import type { Bot, ModelSettings,Task,TaskUpdate } from "@botspace/contracts";
 import type { Env } from "./env";
 import { ApiError, errorResponse, json } from "./errors";
 import { body, parseBotInput, parseAction, operationId, UUID } from "./validation";
@@ -19,6 +19,7 @@ export class WorkspaceDO extends DurableObject<Env> {
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS bots (id TEXT PRIMARY KEY, data TEXT NOT NULL)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY,data TEXT NOT NULL)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS task_operations (operation_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,fingerprint TEXT NOT NULL)");
+    ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS task_updates (id TEXT PRIMARY KEY,task_id TEXT NOT NULL,data TEXT NOT NULL)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS task_slots (bot_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,token TEXT,generation INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0,payload TEXT,direct_process_id TEXT)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS direct_intents (bot_id TEXT NOT NULL,operation_id TEXT NOT NULL,lease_key TEXT NOT NULL,payload TEXT NOT NULL,state TEXT NOT NULL,created_at INTEGER NOT NULL,receipt TEXT,receipt_status INTEGER NOT NULL DEFAULT 200,PRIMARY KEY(bot_id,operation_id))");
     if(!ctx.storage.sql.exec<{name:string}>("PRAGMA table_info(direct_intents)").toArray().some(c=>c.name==="receipt"))ctx.storage.sql.exec("ALTER TABLE direct_intents ADD COLUMN receipt TEXT");
@@ -53,7 +54,7 @@ export class WorkspaceDO extends DurableObject<Env> {
   private async rearmDeletion():Promise<void> {
     const next=this.ctx.storage.sql.exec<{next_at:number}>("SELECT next_at FROM bot_deletions WHERE completed=0 ORDER BY next_at LIMIT 1").toArray()[0];
     const agentTime=this.agents.nextAlarm();
-    const schedulerActive=this.ctx.storage.sql.exec("SELECT 1 FROM direct_intents WHERE state='pending' LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM task_slots LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM computer_admissions LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM tasks WHERE json_extract(data,'$.status')='queued' AND json_extract(data,'$.startImmediately')=1 LIMIT 1").toArray().length>0;
+    const schedulerActive=this.ctx.storage.sql.exec("SELECT 1 FROM task_updates LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM direct_intents WHERE state='pending' LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM task_slots LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM computer_admissions LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM tasks WHERE json_extract(data,'$.status')='queued' AND json_extract(data,'$.startImmediately')=1 LIMIT 1").toArray().length>0;
     const now=Date.now(),existingAlarm=await this.ctx.storage.getAlarm();
     const schedulerTime=schedulerActive?Math.min(existingAlarm&&existingAlarm>now?existingAlarm:Infinity,now+5000):Infinity;
     const nextAt=Math.min(next?.next_at??Infinity,agentTime??Infinity,schedulerTime,this.avatars?.nextAlarm()??Infinity,this.keychain?.nextAlarm()??Infinity);
@@ -81,6 +82,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         }
         this.ctx.storage.sql.exec("DELETE FROM task_slots WHERE bot_id=? AND task_id=?",id,item.task_id);
         this.ctx.storage.sql.exec("DELETE FROM task_operations WHERE task_id=?",item.task_id);
+        this.ctx.storage.sql.exec("DELETE FROM task_updates WHERE task_id=?",item.task_id);
         this.ctx.storage.sql.exec("DELETE FROM tasks WHERE id=?",item.task_id);
         this.ctx.storage.sql.exec("UPDATE bot_task_deletions SET completed=1 WHERE task_id=?",item.task_id);
       }
@@ -160,20 +162,61 @@ export class WorkspaceDO extends DurableObject<Env> {
     if(!response.ok){this.ctx.waitUntil(response.arrayBuffer().catch(()=>{}));throw new ApiError(503,"computer_state_unavailable","Could not verify interactive desktop control; mutation is blocked safely.");}
     return (await response.json<{computerControlled:boolean}>()).computerControlled;
   }
-  private async schedulerSnapshot(botId:string,bot:Bot,taskId?:string):Promise<{activeRuns:number;activeProcesses:number;pendingCancellations:number;computerControlled:boolean;latest?:string;activeStatus?:string}> {
+  private async schedulerSnapshot(botId:string,bot:Bot,taskId?:string):Promise<{activeRuns:number;activeProcesses:number;pendingCancellations:number;computerControlled:boolean;latest?:string;latestRunId?:string;activeStatus?:string}> {
     const identity=taskId?`owner:task:${taskId}`:`owner:${botId}`;
     const stub=this.env.BOT.get(this.env.BOT.idFromName(identity)),root=this.env.BOT.get(this.env.BOT.idFromName(`owner:${botId}`));
     const prefix=taskId?"task":"bot";
     const headers={"x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-internal":"scheduler",...(taskId?{"x-timber-task-id":taskId}:{})};
     const [r,s,c]=await Promise.all([stub.fetch(new Request(`https://${prefix}/runs`,{headers})),stub.fetch(new Request(`https://${prefix}/summary`,{headers})),root.fetch(new Request("https://bot/computer/lease-state",{headers:{"x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-internal":"scheduler"}}))]);
     if(!r.ok||!s.ok||!c.ok) {await Promise.all([r.arrayBuffer(),s.arrayBuffer(),c.arrayBuffer()]);throw new Error("Run reconciliation unavailable");}
-    const page=await r.json<{activeRuns:Array<{status:string;subagentId?:string}>;runs:Array<{status:string;subagentId?:string}>}>(),summary=await s.json<{summary:{activeRuns:number;activeProcesses:number;pendingCancellations?:number;executionRuns?:number}}>(),lease=await c.json<{computerControlled:boolean}>();
-    return {activeRuns:taskId?page.activeRuns.length:summary.summary.executionRuns??page.activeRuns.length,activeProcesses:summary.summary.activeProcesses,pendingCancellations:summary.summary.pendingCancellations??0,computerControlled:lease.computerControlled,latest:page.runs.find(run=>!run.subagentId)?.status,activeStatus:page.activeRuns.find(run=>!run.subagentId)?.status};
+    const page=await r.json<{activeRuns:Array<{status:string;subagentId?:string}>;runs:Array<{id:string;status:string;subagentId?:string}>}>(),summary=await s.json<{summary:{activeRuns:number;activeProcesses:number;pendingCancellations?:number;executionRuns?:number}}>(),lease=await c.json<{computerControlled:boolean}>();
+    const latest=page.runs.find(run=>!run.subagentId);
+    return {activeRuns:taskId?page.activeRuns.length:summary.summary.executionRuns??page.activeRuns.length,activeProcesses:summary.summary.activeProcesses,pendingCancellations:summary.summary.pendingCancellations??0,computerControlled:lease.computerControlled,latest:latest?.status,latestRunId:latest?.id,activeStatus:page.activeRuns.find(run=>!run.subagentId)?.status};
   }
   private hasTaskDelegation(taskId:string):boolean {
     return this.ctx.storage.sql.exec("SELECT 1 FROM agent_deliveries WHERE phase!='done' AND json_extract(data,'$.sourceTaskId')=? LIMIT 1",taskId).toArray().length>0;
   }
-  private finalizeTask(slot:{bot_id:string;task_id:string;token:string|null;generation:number;updated_at:number},status:string):void {
+  /** Called inside the same synchronous transaction as the status/lease change. */
+  private saveTask(task:{id:string;status:string},resultRunId?:string):void {
+    const value=task as Task,previous=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",value.id).toArray()[0];
+    const prior=previous?JSON.parse(previous.data) as Task:undefined,changed=!prior||prior.status!==value.status;
+    value.statusVersion=(prior?.statusVersion??0)+(changed?1:0);
+    this.ctx.storage.sql.exec("INSERT INTO tasks(id,data) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",value.id,JSON.stringify(value));
+    if(changed&&value.creator==="bot"&&value.sourceRunId) {
+      const update:TaskUpdate&{resultRunId?:string}={task:value,notificationId:`task-update:${value.id}:${value.statusVersion}`,...(resultRunId?{resultRunId}:{})};
+      this.ctx.storage.sql.exec("INSERT OR IGNORE INTO task_updates(id,task_id,data) VALUES(?,?,?)",update.notificationId,value.id,JSON.stringify(update));
+    }
+  }
+  private async deliverTaskUpdates():Promise<void> {
+    const blocked=new Set<string>();
+    for(const row of this.ctx.storage.sql.exec<{id:string;task_id:string;data:string}>("SELECT id,task_id,data FROM task_updates ORDER BY rowid LIMIT 32").toArray()) {
+      if(blocked.has(row.task_id))continue;
+      const update=JSON.parse(row.data) as TaskUpdate&{resultRunId?:string},task=update.task;
+      try {
+        const botRow=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",task.botId).toArray()[0];
+        if(!botRow){this.ctx.storage.sql.exec("DELETE FROM task_updates WHERE id=?",row.id);continue;}
+        const bot=JSON.parse(botRow.data) as Bot;
+        if(task.sourceTaskId&&!this.ctx.storage.sql.exec("SELECT 1 FROM tasks WHERE id=?",task.sourceTaskId).toArray().length){this.ctx.storage.sql.exec("DELETE FROM task_updates WHERE id=?",row.id);continue;}
+        if(["completed","failed"].includes(task.status)&&update.result===undefined) {
+          const stub=this.env.BOT.get(this.env.BOT.idFromName(`owner:task:${task.id}`));
+          const response=await stub.fetch("https://task/messages?limit=100",{headers:{"x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-task-id":task.id}});
+          if(!response.ok){await response.arrayBuffer();throw new Error("Task outcome unavailable");}
+          const page=await response.json<{messages:Array<{runId?:string;role:string;kind?:string;text:string}>}>();
+          update.result=(update.resultRunId?[...page.messages].reverse().find(message=>message.runId===update.resultRunId&&message.role==="assistant"&&message.kind==="final")?.text.slice(0,32000):undefined)??(task.status==="failed"?"The task could not finish. Open its conversation to review the error and continue safely.":"The task completed. Open its conversation to inspect the result.");
+          this.ctx.storage.sql.exec("UPDATE task_updates SET data=? WHERE id=?",JSON.stringify(update),row.id);
+        }
+        const target=this.env.BOT.get(this.env.BOT.idFromName(task.sourceTaskId?`owner:task:${task.sourceTaskId}`:`owner:${task.botId}`));
+        const response=await target.fetch("https://bot/task-updates",{method:"POST",headers:{"content-type":"application/json","x-timber-internal":"task","x-botspace-config":encodeURIComponent(JSON.stringify(bot)),...(task.sourceTaskId?{"x-timber-task-id":task.sourceTaskId}:{})},body:JSON.stringify(update)});
+        await response.arrayBuffer();
+        // A retained source run cannot appear later: it existed before creation.
+        // Older rows omitted sourceTaskId; never guess another conversation or
+        // keep the scheduler awake forever for an unresolvable/deleted origin.
+        if(!response.ok&&![404,410].includes(response.status))throw new Error("Task status delivery unavailable");
+        this.ctx.storage.sql.exec("DELETE FROM task_updates WHERE id=?",row.id);
+      }catch{blocked.add(row.task_id);}
+    }
+  }
+  private finalizeTask(slot:{bot_id:string;task_id:string;token:string|null;generation:number;updated_at:number},status:string,resultRunId?:string):void {
     this.ctx.storage.transactionSync(()=>{
       const currentSlot=this.slotFor(slot.bot_id);
       if(!currentSlot||currentSlot.task_id!==slot.task_id||currentSlot.token!==slot.token||currentSlot.generation!==slot.generation||currentSlot.updated_at!==slot.updated_at||this.hasPendingAdmission(slot.bot_id,slot.task_id)||this.hasTaskDelegation(slot.task_id))return;
@@ -183,7 +226,7 @@ export class WorkspaceDO extends DurableObject<Env> {
       if(status==="cancelled"&&!(task.cancelRequested||task.status==="cancelling"))return;
       if(["completed","failed","cancelled"].includes(task.status)&&task.status!==status)return;
       task.status=status;task.updatedAt=new Date().toISOString();
-      this.ctx.storage.sql.exec("UPDATE tasks SET data=? WHERE id=?",JSON.stringify(task),slot.task_id);
+      this.saveTask({...JSON.parse(row.data),...task},resultRunId);
       this.ctx.storage.sql.exec("DELETE FROM task_slots WHERE bot_id=? AND task_id=? AND token IS ? AND generation=? AND updated_at=?",slot.bot_id,slot.task_id,slot.token,slot.generation,slot.updated_at);
     });
   }
@@ -192,7 +235,8 @@ export class WorkspaceDO extends DurableObject<Env> {
     const task=JSON.parse(row.data) as {status:string;cancelRequested?:boolean;updatedAt:string};
     if(task.cancelRequested||task.status==="cancelling")return;
     if(["completed","failed","cancelled"].includes(task.status)&&status!==task.status)return;
-    task.status=status;task.updatedAt=new Date().toISOString();this.ctx.storage.sql.exec("UPDATE tasks SET data=? WHERE id=?",JSON.stringify(task),taskId);
+    if(task.status===status)return;
+    task.status=status;task.updatedAt=new Date().toISOString();this.ctx.storage.transactionSync(()=>this.saveTask({...JSON.parse(row.data),...task}));
   }
   private markTaskRunning(taskId:string):void {this.updateTaskStatus(taskId,"running");}
   private releaseFailedTaskSlot(taskId:string):void {
@@ -339,7 +383,7 @@ export class WorkspaceDO extends DurableObject<Env> {
           const fresh=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",task.id).toArray()[0];
           if(!fresh)continue;const current=JSON.parse(fresh.data) as typeof task;
           const terminal=current.cancelRequested||current.status==="cancelling"?"cancelled":(["completed","failed","cancelled"].includes(state.latest??"")?state.latest!:"failed");
-          this.finalizeTask(slot,terminal);
+          this.finalizeTask(slot,terminal,state.latestRunId);
         } else if(state.activeRuns===0&&state.activeProcesses===0&&state.pendingCancellations===0&&!state.computerControlled&&!this.hasPendingAdmission(slot.bot_id,task.id)&&!this.hasTaskDelegation(task.id)&&["completed","failed","cancelled"].includes(task.status)) this.releaseSlot(slot.bot_id,slot.task_id,slot.token,slot.updated_at);
       } catch { /* An uncertain holder stays fenced until a later reconciliation. */ }
     }
@@ -385,6 +429,7 @@ export class WorkspaceDO extends DurableObject<Env> {
     const due=this.ctx.storage.sql.exec<{id:string}>("SELECT id FROM bot_deletions WHERE completed=0 AND next_at<=? ORDER BY next_at LIMIT 8",Date.now()).toArray();
     await Promise.allSettled([...due.map(row=>this.cleanup(row.id)),this.agents.alarm(),this.avatars.alarm(),this.keychain.alarm()]);
     await this.reconcileComputerSlots();
+    await this.deliverTaskUpdates();
     await this.rearmDeletion();
   }
   private async deleteBot(id:string):Promise<Response> {
@@ -451,10 +496,10 @@ export class WorkspaceDO extends DurableObject<Env> {
         if(!currentSource||(JSON.parse(currentSource.data) as Bot).allowTaskCreation!==true)throw new ApiError(403,"task_creation_not_allowed","The owner has not allowed this bot to create tasks.");
         const raced=this.ctx.storage.sql.exec<{task_id:string;fingerprint:string}>("SELECT task_id,fingerprint FROM task_operations WHERE operation_id=?",`bot-task:${sourceId}:${input.operationId}`).toArray()[0];
         if(raced){if(raced.fingerprint!==fingerprint)throw new ApiError(409,"operation_id_conflict","operationId was already used for another task.");return json({task:JSON.parse(this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",raced.task_id).one().data)});}
-        const now=new Date().toISOString(),task={id:crypto.randomUUID(),title:input.title.trim(),description:input.description,botId:source.id,botName:source.name,creator:"bot",createdByBotId:source.id,sourceRunId:input.sourceRunId,status:"pending",startImmediately:input.startImmediately!==false,createdAt:now,updatedAt:now};
+        const now=new Date().toISOString(),task={id:crypto.randomUUID(),title:input.title.trim(),description:input.description,botId:source.id,botName:source.name,creator:"bot",createdByBotId:source.id,sourceRunId:input.sourceRunId,...(sourceTaskId?{sourceTaskId}:{}),status:"pending",startImmediately:input.startImmediately!==false,createdAt:now,updatedAt:now};
         if(task.startImmediately)task.status="queued";
-        this.ctx.storage.transactionSync(()=>{this.ctx.storage.sql.exec("INSERT INTO tasks(id,data) VALUES(?,?)",task.id,JSON.stringify(task));this.ctx.storage.sql.exec("INSERT INTO task_operations(operation_id,task_id,fingerprint) VALUES(?,?,?)",`bot-task:${sourceId}:${input.operationId}`,task.id,fingerprint);});
-        if(task.startImmediately)await this.rearmDeletion();
+        this.ctx.storage.transactionSync(()=>{this.saveTask(task);this.ctx.storage.sql.exec("INSERT INTO task_operations(operation_id,task_id,fingerprint) VALUES(?,?,?)",`bot-task:${sourceId}:${input.operationId}`,task.id,fingerprint);});
+        await this.rearmDeletion();
         return json({task},201);
       }
       if(path==="/tasks" && request.method==="POST") {
@@ -471,7 +516,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         if(!botRow) throw new ApiError(404,"not_found","Assigned bot not found.");
         const bot=JSON.parse(botRow.data) as Bot, now=new Date().toISOString();
         const task={id:crypto.randomUUID(),title:input.title.trim(),description:input.description,botId:bot.id,botName:bot.name,creator:"owner",status:input.startImmediately===false?"pending":"queued",startImmediately:input.startImmediately!==false,createdAt:now,updatedAt:now};
-        this.ctx.storage.transactionSync(()=>{this.ctx.storage.sql.exec("INSERT INTO tasks(id,data) VALUES(?,?)",task.id,JSON.stringify(task));this.ctx.storage.sql.exec("INSERT INTO task_operations(operation_id,task_id,fingerprint) VALUES(?,?,?)",input.operationId,task.id,fingerprint);});
+        this.ctx.storage.transactionSync(()=>{this.saveTask(task);this.ctx.storage.sql.exec("INSERT INTO task_operations(operation_id,task_id,fingerprint) VALUES(?,?,?)",input.operationId,task.id,fingerprint);});
         if(task.status==="queued"){await this.rearmDeletion();await this.reconcileComputerSlots();}
         const saved=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",task.id).toArray()[0];
         return json({task:JSON.parse(saved.data)},201);
@@ -655,7 +700,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         const task=JSON.parse(taskRow.data) as {id:string;status:string;startImmediately:boolean;updatedAt:string;cancelRequested?:boolean};
         if(["cancelled","completed","failed"].includes(task.status))throw new ApiError(409,"task_not_restartable","This task is already terminal.");
         if(task.cancelRequested||task.status==="cancelling")throw new ApiError(409,"task_cancelling","This task is being cancelled and cannot be restarted.");
-        if(task.status==="pending"){task.status="queued";task.startImmediately=true;task.updatedAt=new Date().toISOString();this.ctx.storage.sql.exec("UPDATE tasks SET data=? WHERE id=?",JSON.stringify(task),task.id);}
+        if(task.status==="pending"){task.status="queued";task.startImmediately=true;task.updatedAt=new Date().toISOString();this.ctx.storage.transactionSync(()=>this.saveTask(task));}
         await this.rearmDeletion();await this.reconcileComputerSlots();
         const latest=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",task.id).toArray()[0];return json({task:JSON.parse(latest.data)},202);
       }
@@ -671,7 +716,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         if(previous){if(previous.fingerprint!==fingerprint)throw new ApiError(409,"operation_id_conflict","Continue operationId was used with different instructions.");return json({task},202);}
         if(!["completed","failed"].includes(task.status))throw new ApiError(409,"task_not_terminal","Continue is only available for completed or failed tasks.");
         task.status="queued";task.startImmediately=true;task.startOperationId=`task-continue:${crypto.randomUUID()}`;task.startText=input.text;task.updatedAt=new Date().toISOString();
-        this.ctx.storage.transactionSync(()=>{this.ctx.storage.sql.exec("INSERT INTO task_operations(operation_id,task_id,fingerprint) VALUES(?,?,?)",op,id,fingerprint);this.ctx.storage.sql.exec("UPDATE tasks SET data=? WHERE id=?",JSON.stringify(task),id);});
+        this.ctx.storage.transactionSync(()=>{this.ctx.storage.sql.exec("INSERT INTO task_operations(operation_id,task_id,fingerprint) VALUES(?,?,?)",op,id,fingerprint);this.saveTask(task);});
         await this.rearmDeletion();await this.reconcileComputerSlots();
         return json({task:JSON.parse(this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",id).one().data)},202);
       }
@@ -680,7 +725,7 @@ export class WorkspaceDO extends DurableObject<Env> {
       if(taskMatch && request.method==="PATCH") {const input=await body(request);const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",taskMatch[1]).toArray()[0];if(!row) throw new ApiError(404,"not_found","Task not found.");const task=JSON.parse(row.data) as {id:string;botId:string;status:string;cancelRequested?:boolean;updatedAt?:string};if(!["pending","queued","running","waiting_approval","waiting_connection","cancelling","completed","failed","cancelled"].includes(input.status as string)) throw new ApiError(400,"invalid_request","Invalid task status.");if(["completed","failed","cancelled"].includes(task.status)&&input.status!==task.status)throw new ApiError(409,"task_terminal","A terminal task cannot be changed.");if((task.cancelRequested||task.status==="cancelling")&&!['cancelling','cancelled'].includes(input.status as string))throw new ApiError(409,"task_cancelling","A cancellation request cannot be rewound.");const firstStop=(input.status==="cancelling"||input.cancelRequested===true)&&!task.cancelRequested&&task.status!=="cancelling";task.status=input.status as string;if(input.cancelRequested===true) (task as {cancelRequested?:boolean}).cancelRequested=true;task.updatedAt=new Date().toISOString();
         if(task.status==="cancelling"&&!this.ctx.storage.sql.exec("SELECT 1 FROM task_slots WHERE bot_id=? AND task_id=?",task.botId,task.id).toArray().length) task.status="cancelled";
         this.ctx.storage.transactionSync(()=>{
-          this.ctx.storage.sql.exec("UPDATE tasks SET data=? WHERE id=?",JSON.stringify(task),taskMatch[1]);
+          this.saveTask(task);
           // Stop and lease invalidation are one durable change: observations
           // sampled before Stop cannot certify post-Stop cancellation drain.
           if(firstStop)this.ctx.storage.sql.exec("UPDATE task_slots SET token=?,generation=?,updated_at=? WHERE bot_id=? AND task_id=?",crypto.randomUUID(),this.nextSlotGeneration(task.botId),Date.now(),task.botId,task.id);

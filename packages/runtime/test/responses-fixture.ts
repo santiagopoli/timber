@@ -40,15 +40,16 @@ export function responsesFixture(payload: { input: Record<string, unknown>[] }, 
   const spawn=text.includes('request-model-child')&&!hasToolOutput;
   const vision = text.includes('request-vision') && !hasToolOutput;
   const exec = text.includes('request-exec') && !hasToolOutput;
-  const host = text.includes('request-host') && !hasToolOutput;
+  const handoff=text.includes('request-task-handoff');
+  const host = (text.includes('request-host')||handoff) && !hasToolOutput;
   const catalog = text.includes('request-catalog') && !hasToolOutput;
   const loop = text.includes('request-loop');
   const namespace = text.includes('bad-namespace') ? 'untrusted' : TOOL_NAMESPACE;
   const tool = spawn || vision || exec || loop || host || catalog || text.includes('bad-namespace');
   const name = spawn ? 'spawn_subagent' : host ? 'call_tool' : catalog ? 'list_tools' : vision ? 'desktop_screenshot' : loop ? 'read_file' : 'exec';
-  const args = spawn ? JSON.stringify({name:'Model child',task:'hello child',...(text.includes('override')?{model:'gpt-6-astra',reasoningEffort:'ultra',fast:true}:{})}) : host ? '{"name":"github_clone","arguments":{"repository":"owner/private","path":"project"}}' : vision || catalog ? '{}' : loop ? '{"path":"/workspace/test.txt"}' : '{"command":"echo fixture"}';
+  const args = spawn ? JSON.stringify({name:'Model child',task:'hello child',...(text.includes('override')?{model:'gpt-6-astra',reasoningEffort:'ultra',fast:true}:{})}) : host ? handoff ? '{"name":"create_task","arguments":{"title":"Repository investigation","description":"Inspect the repository and verify the requested improvement."}}' : '{"name":"github_clone","arguments":{"repository":"owner/private","path":"project"}}' : vision || catalog ? '{}' : loop ? '{"path":"/workspace/test.txt"}' : '{"command":"echo fixture"}';
   const failedTool = payload.input.slice(userIndex + 1).some(item=>item.type === 'function_call_output' && typeof item.output === 'string' && item.output.includes('"status":"failed"'));
-  const answer = text.includes('output-limit') ? 'x'.repeat(MAX_OUTPUT_CHARACTERS + 1) : failedTool ? 'The command failed with exit 1. The saved output explains the failure.' : 'Hello from ChatGPT via the real Pi harness.';
+  const answer = handoff&&hasToolOutput ? 'I will continue checking the repository in the task conversation.' : text.includes('output-limit') ? 'x'.repeat(MAX_OUTPUT_CHARACTERS + 1) : failedTool ? 'The command failed with exit 1. The saved output explains the failure.' : 'Hello from ChatGPT via the real Pi harness.';
   const finalItem = tool
     ? { type: 'function_call', id: 'fc_fixture_1', call_id: 'call_fixture_1', name, ...(paid?{}:{namespace}), arguments: args, status: 'completed' }
     : { type: 'message', id: 'msg_fixture_1', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: answer, annotations: [] }] };

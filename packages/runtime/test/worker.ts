@@ -115,15 +115,18 @@ export class HarnessProbe extends DurableObject {
         ];
         return new Response(chunks.map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
       } } as unknown as Ai,
-      getBot: async () => ({ name: 'Ada', instructions: 'Your private instruction is amber-lantern.', model: this.setting('model') ?? CF_MODEL, computerApprovalMode: this.setting('approvalMode') === 'automatic' ? 'automatic' : 'ask' }),
+      getBot: async () => ({ name: 'Ada', instructions: 'Your private instruction is amber-lantern.', model: this.setting('model') ?? CF_MODEL, allowTaskCreation:this.setting('allowTaskCreation')==='true', computerApprovalMode: this.setting('approvalMode') === 'automatic' ? 'automatic' : 'ask' }),
+      getTaskId:()=>this.setting('taskId'),
+      getTaskContext:()=>this.setting('taskContext')??'',
       getApprovalContext: async () => {
         if (this.setting('approvalContext') === 'unavailable') throw new Error('fixture host context unavailable');
         return JSON.parse(this.setting('approvalContext') ?? '{"active":[],"recent":[]}') as RuntimeApprovalContext;
       },
       tools: {
-        catalog: async () => [{ name: 'github_clone', description: 'Clone an authorized repository.', inputSchema: { type: 'object', properties: { repository: { type: 'string' }, path: { type: 'string' } }, required: ['repository', 'path'] } }],
+        catalog: async () => [...(this.setting('allowTaskCreation')==='true'?[{name:'create_task',description:'Create independent persistent work.',inputSchema:{type:'object',properties:{title:{type:'string'},description:{type:'string'}},required:['title','description']}}]:[]),{ name: 'github_clone', description: 'Clone an authorized repository.', inputSchema: { type: 'object', properties: { repository: { type: 'string' }, path: { type: 'string' } }, required: ['repository', 'path'] } }],
         call: async ({ operationId, runOperationId, toolCallId, name, arguments: args }) => {
           ctx.storage.sql.exec('INSERT INTO host_calls(input) VALUES(?)', JSON.stringify({ operationId, runOperationId, toolCallId, name, arguments: args }));
+          if(name==='create_task')return {operationId,status:'completed',output:JSON.stringify({task:{id:'11111111-1111-4111-8111-111111111111',status:'queued',startImmediately:true}})};
           return this.setting('githubConnected') === 'true'
             ? { operationId, status: 'completed', output: 'Repository cloned by the host.' }
             : { status: 'pending_connection', requestId: 'connection-fixture', provider: 'github', repository: 'owner/private', permission: 'write' };

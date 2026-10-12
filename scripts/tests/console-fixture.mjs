@@ -106,6 +106,7 @@ export async function createConsoleFixture({port = 0} = {}) {
         if (request.method === 'GET') return json({bots: state.bots.filter(bot => !state.deletingBots.has(bot.id))});
         const bot = {id: randomUUID(),model:state.modelCatalog.defaultModel, ...body, runtime: 'pi', createdAt: date, updatedAt: date}; state.bots.unshift(bot); state.messages.set(bot.id, []); state.runs.set(bot.id, []); state.approvals.set(bot.id, []); state.connections.set(bot.id, []); state.apps.set(bot.id, []); return json({bot}, 201);
       }
+      if(path==='/v1/tasks'&&request.method==='GET')return json({tasks:[]});
       const match = /^\/v1\/bots\/([^/]+)(.*)$/.exec(path); if (!match) return json({}, 404);
       const [, id, tail] = match, bot = state.bots.find(bot => bot.id === id);
       if (!tail && request.method === 'DELETE') {

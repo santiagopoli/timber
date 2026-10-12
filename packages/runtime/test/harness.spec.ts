@@ -1189,3 +1189,27 @@ it('native overflow compaction recovers a safe SSE context error without replayi
   for(let index=0;index<4;index++)expect(state.messages.some(message=>message.role==='user'&&message.text.startsWith(`Retained fact ${index}:`))).toBe(true);
   expect(JSON.stringify(state.calls.at(-1))).toContain('<summary>');
 });
+it('hands substantial work to one persistent task and releases the current turn without stop-gate resumption',async()=>{
+ const stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+ await runInDurableObject(stub,(_instance,state)=>state.storage.sql.exec("INSERT OR REPLACE INTO config(key,value) VALUES('allowTaskCreation','true')"));
+ await (await request('/submit',{text:'request-task-handoff',operationId:'persistent-handoff',chatgpt:true})).arrayBuffer();
+ await (await request('/wait?id=persistent-handoff')).arrayBuffer();
+ const state=await(await request('/inspect')).json<{calls:{input:string}[];hostCalls:{input:string}[];toolCalls:unknown[]}>();
+ expect(state.calls).toHaveLength(2);expect(state.hostCalls).toHaveLength(1);expect(JSON.parse(state.hostCalls[0]!.input)).toMatchObject({name:'create_task'});expect(state.toolCalls).toHaveLength(0);
+ expect(JSON.stringify(state.calls[0])).toContain('For substantial multi-step work');
+ await runInDurableObject(stub,(_instance,state)=>{
+  expect(state.storage.sql.exec("SELECT task_id FROM timber_task_handoffs WHERE operation_id='persistent-handoff'").one().task_id).toBe('11111111-1111-4111-8111-111111111111');
+  expect(state.storage.sql.exec('SELECT task_id FROM timber_stop_nudges').toArray()).toHaveLength(0);
+ });
+});
+it('task conversation instructions keep commands inside the task and expose bounded public task outcomes',async()=>{
+ const stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+ await runInDurableObject(stub,(_instance,state)=>{
+  state.storage.sql.exec("INSERT OR REPLACE INTO config(key,value) VALUES('allowTaskCreation','true')");
+  state.storage.sql.exec("INSERT OR REPLACE INTO config(key,value) VALUES('taskId','11111111-1111-4111-8111-111111111111')");
+  state.storage.sql.exec("INSERT OR REPLACE INTO config(key,value) VALUES('taskContext','Fixture existing task status: completed')");
+ });
+ await (await request('/submit',{text:'Hello task',operationId:'task-context',chatgpt:true})).arrayBuffer();await (await request('/wait?id=task-context')).arrayBuffer();
+ const state=await(await request('/inspect')).json<{calls:{input:string}[]}>();
+ expect(JSON.stringify(state.calls[0])).toContain('Do not create another global task');expect(JSON.stringify(state.calls[0])).toContain('Fixture existing task status: completed');expect(JSON.stringify(state.calls[0])).not.toContain('For substantial multi-step work');
+});
