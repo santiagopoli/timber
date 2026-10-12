@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
 import {PERFORMANCE_SCHEMA,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_PROCESSES,PERFORMANCE_DELIVERIES,PERFORMANCE_WAKES,PERFORMANCE_RECOVERY,PERFORMANCE_USAGE,summarizePerformance,performanceTaskMetadata} from '../prod-performance-diagnostics.mjs';
-import {collectDurable} from '../prod-durable-diagnostics.mjs';
+import {collectDurable,PRIVATE_PROGRESS_MESSAGES,PRIVATE_PROGRESS_FAILURES,PRIVATE_PROGRESS_GOAL} from '../prod-durable-diagnostics.mjs';
 import {PERFORMANCE_ACTIVITY,summarizeActivity} from '../prod-performance-diagnostics.mjs';
 
 const now=Date.parse('2026-10-12T10:00:00Z'),window={from:now-86_400_000,to:now};
@@ -37,6 +37,15 @@ test('performance queries measure real SQLite receipts without projecting conver
   const totals=summarizeActivity(db.prepare(PERFORMANCE_ACTIVITY).all(),window);
   assert.equal(totals.find(row=>row.tool==='writeFile').interrupted,1);assert.equal(totals.find(row=>row.tool==='key').actions,1);assert.equal(totals.find(row=>row.tool==='exec').durationMs,1_800_000);
   assert.doesNotMatch(JSON.stringify({actions,totals}),/canary/);
+  db.exec('CREATE TABLE messages(data TEXT)');
+  db.prepare('INSERT INTO messages VALUES(?)').run(JSON.stringify({role:'assistant',text:'public progress',createdAt:updated}));
+  db.prepare('INSERT INTO messages VALUES(?)').run(JSON.stringify({role:'system',text:'private reasoning canary'}));
+  assert.equal(JSON.parse(db.prepare(PRIVATE_PROGRESS_MESSAGES).get().detail)[0].text,'public progress');
+  assert.equal(JSON.parse(db.prepare(PRIVATE_PROGRESS_MESSAGES).get().detail).length,1);
+  assert.equal(JSON.parse(db.prepare(PRIVATE_PROGRESS_GOAL).get().detail).title,'private-canary');
+  event(8,'failed:start','tool.started',updated,{operationId:'failed-canary',actionType:'exec',input:{command:'false'}});
+  event(9,'tool:failed-canary','tool.completed',updated,{result:{status:'failed',exitCode:1,output:'bounded failure'}});
+  assert.equal(JSON.parse(db.prepare(PRIVATE_PROGRESS_FAILURES).get().detail)[0].command,'false');
  }finally{db.close();}
 });
 test('performance summary drops arbitrary labels, private fields and invalid timestamps',()=>{
