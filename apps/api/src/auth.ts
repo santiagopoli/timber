@@ -95,6 +95,19 @@ export async function authenticate(request: Request, configuredToken?: string): 
   return "owner";
 }
 
+/** Browser WS cannot set X-Timber-Client. This narrow adapter requires the
+ * real owner session AND exact Origin; the one-use shell grant is additional. */
+export async function authenticateShellWebSocket(request:Request,configuredToken?:string):Promise<"owner"> {
+  const token=configuredCredential(configuredToken);
+  const url=new URL(request.url),site=request.headers.get("sec-fetch-site"),mode=request.headers.get("sec-fetch-mode");
+  if(request.method!=="GET" || request.headers.get("upgrade")?.toLowerCase()!=="websocket" || request.headers.get("origin")!==url.origin || url.search
+    || (site!==null && site!=="same-origin") || (mode!==null && mode!=="websocket")) throw new ApiError(403,"shell_access_denied","Shell access denied.");
+  if(request.headers.has("authorization")) return authenticateBearer(request,token);
+  const headers=new Headers(request.headers);headers.set("x-timber-client","console");headers.delete("sec-fetch-mode");
+  await authenticateSession(new Request(request.url,{headers}),token);
+  return "owner";
+}
+
 /** No credential material is returned to JavaScript or stored in browser storage. */
 export async function consoleSession(request: Request, configuredToken?: string): Promise<Response> {
   const token = configuredCredential(configuredToken);

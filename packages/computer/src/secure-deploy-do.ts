@@ -3,8 +3,17 @@ const WRANGLER_VERSION='4.147.0',WRANGLER_BUILD_ID='wrangler-4.147.0-timber-no-r
 const CODE=new Set(['deploy_accepted','runner_failed','runner_interrupted','runner_unavailable','dispatch_already_seen','invalid_request','invalid_authorization','invalid_pin','invalid_refs','artifact_not_found','artifact_invalid','artifact_digest_mismatch']);
 const falseCaps=():SecureDeployCapabilities=>({secureDeploy:false,isolationVersion:'uid-ptrace-v1',privateCredentialChannel:false,noShellEnv:false,noBuildCredentialInheritance:false,outputRedaction:true,canaryVersion:'cross-uid-proc-env-v1'});
 const json=(value:unknown,status=200)=>Response.json(value,{status,headers:{'cache-control':'no-store'}});
+/** Holds the controller's effect/workspace gates through readiness and the entire private request.
+ * Admission must reject live/closing shell grants, desktop control and managed commands;
+ * cancellation is deliberately outside this callback so Stop can interrupt a held gate.
+ * The controller initializes the workspace inside its gate (not via nested ensureReady).
+ * An operationId reserves only public metadata durably before work. The callback
+ * confirms quiescence, not external-effect success; uncertain transport keeps the
+ * fence until authenticated private quiescence proof or container destruction.
+ */
+export type SecureDeployOperationLifecycle=(botId:string,work:(confirmQuiescent:()=>void)=>Promise<Response>,operationId?:string)=>Promise<Response>;
 /** Private ComputerDO dispatch boundary. This intentionally does not journal request bodies. */
-export async function secureDeployComputerRoute(computer:any,request:Request,path:string):Promise<Response>{
+export async function secureDeployComputerRoute(computer:any,request:Request,path:string,withPrivateOperation:SecureDeployOperationLifecycle|undefined=computer.withPrivateOperation?.bind(computer)):Promise<Response>{
  computer.active();const botId=request.headers.get('x-timber-bot-id')??'';
  if(!/^[A-Za-z0-9_-]{1,100}$/.test(botId))throw new Error('computer_invalid_request');
  const owner=await computer.ctx.storage.get('botId');
@@ -17,13 +26,17 @@ export async function secureDeployComputerRoute(computer:any,request:Request,pat
    if(!(await attest()))return json(falseCaps());
    if(owner&&owner!==botId)return json(falseCaps());
    if(!owner)await computer.ctx.storage.transaction(async(tx:any)=>{const current=await tx.get('botId');if(current&&current!==botId)throw new Error('computer_owner_mismatch');if(!current)await tx.put('botId',botId)});
-   // ensureReady serializes startup and restores the persisted workspace checkpoint before probing; capability admission still runs before API decrypts any reference.
-   await computer.ensureReady(botId);computer.active();
+   // The controller restores the checkpoint and excludes human/managed workspace
+   // owners before probing; capability admission still precedes any decryption.
+   if(!withPrivateOperation)return json(falseCaps());
+   return await withPrivateOperation(botId,async()=>{
+   computer.active();
    if(await computer.ctx.storage.get('botId')!==botId||!(await attest()))return json(falseCaps());
    request.signal.throwIfAborted();
    const response=await computer.call('/secure-deploy/capabilities',{signal:AbortSignal.any([request.signal,AbortSignal.timeout(15_000)])});if(!response.ok)return json(falseCaps());
    const raw=await response.json() as Record<string,unknown>,cliVersion=raw.cliVersion===WRANGLER_VERSION?WRANGLER_VERSION:undefined,cliBuildId=raw.cliBuildId===WRANGLER_BUILD_ID?WRANGLER_BUILD_ID:undefined,cliDigest=raw.cliDigest===WRANGLER_DIGEST?WRANGLER_DIGEST:undefined,noAutomaticRetry=raw.noAutomaticRetry===true,ok=raw.secureDeploy===true&&raw.isolationVersion==='uid-ptrace-v1'&&raw.privateCredentialChannel===true&&raw.noShellEnv===true&&raw.noBuildCredentialInheritance===true&&raw.outputRedaction===true&&raw.canaryVersion==='cross-uid-proc-env-v1'&&cliVersion===WRANGLER_VERSION&&cliBuildId===WRANGLER_BUILD_ID&&cliDigest===WRANGLER_DIGEST&&noAutomaticRetry;
    return json({secureDeploy:ok,isolationVersion:'uid-ptrace-v1',privateCredentialChannel:ok,noShellEnv:ok,noBuildCredentialInheritance:ok,outputRedaction:true,canaryVersion:'cross-uid-proc-env-v1',...(ok?{cliVersion,cliBuildId,cliDigest,noAutomaticRetry:true}:{})});
+   });
   }catch{return json(falseCaps())}
  }
  if(!owner||owner!==botId)throw new Error('computer_owner_mismatch');
@@ -51,13 +64,21 @@ export async function secureDeployComputerRoute(computer:any,request:Request,pat
  const credentials=input.credentials as Array<{header:string;prefix:string}>;const headers=credentials.map(x=>x.header.toLowerCase());
  const authFormat=(headers.length===1&&headers[0]==='authorization'&&credentials[0].prefix==='Bearer ')||(headers.length===2&&headers[0]==='x-auth-key'&&headers[1]==='x-auth-email'&&credentials.every(x=>x.prefix===''));
  if(!authFormat||!computer.env.WORKSPACE)return json({operationId:id,status:'rejected',code:'invalid_refs'});
- // Ensure/start is an awaited boundary. The signed Workspace authority check below binds the current plan, refs, run and native Stop fence.
- try{await computer.ensureReady(botId)}catch{return json({operationId:id,status:'unavailable',code:'runner_unavailable'})}
+ // Hold both controller gates across startup, fresh authority and the full runner
+ // receipt. A shell/control grant cannot enter while private dispatch is pending.
+ // Never fall back to an unguarded dispatch if the lifecycle hook is missing.
+ if(!withPrivateOperation)return json({operationId:id,status:'unavailable',code:'runner_unavailable'});
+ try{return await withPrivateOperation(botId,async confirmQuiescent=>{
+ let dispatchPossible=false;
+ try{
  computer.active();request.signal.throwIfAborted();if(auth.expiresAt<=Date.now())return json({operationId:id,status:'rejected',code:'invalid_authorization'});
  let authority:Response;try{authority=await computer.env.WORKSPACE.get(computer.env.WORKSPACE.idFromName('owner')).fetch(new Request('https://workspace/keychain/deploy-verify',{method:'POST',headers:{'content-type':'application/json','x-timber-internal':'computer'},body:JSON.stringify({authorization:auth})}))}catch{return json({operationId:id,status:'rejected',code:'invalid_authorization'})}
  const authorized=authority.ok;void authority.body?.cancel();
  // Linearization point: after fresh owner authority response, check local liveness and expiry; no await before private channel invocation.
  computer.active();request.signal.throwIfAborted();if(!authorized||auth.expiresAt<=Date.now())return json({operationId:id,status:'rejected',code:'invalid_authorization'});
- const dispatched=computer.call('/secure-deploy',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(input),signal:request.signal});
- try{const response=await dispatched;if(!response.ok)return json({operationId:id,status:'unavailable',code:'runner_unavailable'});const raw=await response.json() as Record<string,unknown>;const statuses=new Set(['completed','failed','interrupted','rejected','unavailable']);if(raw.operationId!==id||!statuses.has(String(raw.status))||typeof raw.code!=='string'||!CODE.has(raw.code))return json({operationId:id,status:'interrupted',code:'runner_interrupted'});const result:SecureDeployReceipt={operationId:id,status:raw.status as SecureDeployReceipt['status'],code:raw.code};return json(result)}catch{return json({operationId:id,status:'interrupted',code:'runner_interrupted'})}
+ dispatchPossible=true;
+ try{const dispatched=computer.call('/secure-deploy',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(input),signal:request.signal});
+ const response=await dispatched;if(!response.ok)return json({operationId:id,status:'unavailable',code:'runner_unavailable'});const raw=await response.json() as Record<string,unknown>;const statuses=new Set(['completed','failed','interrupted','rejected','unavailable']);if(raw.operationId!==id||!statuses.has(String(raw.status))||typeof raw.code!=='string'||!CODE.has(raw.code))return json({operationId:id,status:'interrupted',code:'runner_interrupted'});const result:SecureDeployReceipt={operationId:id,status:raw.status as SecureDeployReceipt['status'],code:raw.code};if(raw.quiescent===true&&raw.code!=='dispatch_already_seen')confirmQuiescent();return json(result)}catch{return json({operationId:id,status:'interrupted',code:'runner_interrupted'})}
+ }finally{if(!dispatchPossible)confirmQuiescent()}
+ },id);}catch{return json({operationId:id,status:'unavailable',code:'runner_unavailable'})}
 }

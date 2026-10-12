@@ -31,8 +31,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import TCPServer
 from urllib.parse import urlparse, parse_qs
 from workspace import WorkspaceInspector
-from secure_deploy import dispatch as secure_deploy_dispatch, cancel as secure_deploy_cancel
+from secure_deploy import dispatch as secure_deploy_dispatch, cancel as secure_deploy_cancel, close as secure_deploy_close
 import workspace_archive
+import shell_bridge
 import socket
 from patch_wrangler_cli import verify_installed_cli, VerificationError as WranglerVerificationError
 
@@ -429,6 +430,7 @@ class Computer:
         self.journal_lock = threading.RLock()
         self.sessions: dict[str, ExecutionSession] = {}
         self.snapshot_in_progress = False
+        self.shell = shell_bridge.ShellManager(self.workspace, self.journal_lock, lambda: self.snapshot_in_progress)
         self.db = sqlite3.connect(self.state / "operations.sqlite", check_same_thread=False)
         self.db.execute("CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, digest TEXT NOT NULL, result TEXT)")
         self.db.execute("CREATE TABLE IF NOT EXISTS execution_sessions (id TEXT PRIMARY KEY, pid INTEGER, identity TEXT, result TEXT NOT NULL)")
@@ -728,6 +730,7 @@ class Computer:
             session.done.set()
 
     def close(self):
+        self.shell.close()
         with self.journal_lock:
             sessions = list(self.sessions.values())
             for session in sessions:
@@ -743,7 +746,7 @@ class Computer:
 
     @contextmanager
     def workspace_snapshot(self):
-        with self.lock:
+        with self.shell.checkpoint_guard(), self.lock:
             with self.journal_lock:
                 if self.db.execute("SELECT id FROM execution_sessions WHERE json_extract(result,'$.status')='running' LIMIT 1").fetchone():
                     raise ValueError("Execution sessions are still running; wait for completion before checkpoint or restore")
@@ -1351,7 +1354,7 @@ def create_handler(computer: Computer, token: str):
             pass  # Never log request bodies, auth headers or screen contents.
 
         def authorized(self):
-            return hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + token)
+            return len(self.headers.get_all("Authorization", [])) == 1 and hmac.compare_digest(self.headers.get("Authorization", "").encode(), ("Bearer " + token).encode())
 
         def respond(self, status: int, value: dict):
             data = json.dumps(value).encode()
@@ -1392,7 +1395,7 @@ def create_handler(computer: Computer, token: str):
                 desktop = all(shutil.which(tool) for tool in ["scrot", "xdotool", "chromium", "xclip"])
                 if desktop:
                     desktop = subprocess.run([*workspace_prefix(), "xdotool", "getdisplaygeometry"], env=computer.child_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2).returncode == 0
-                return self.respond(200, {"ok": True, "bootId": computer.boot_id, "desktop": desktop, "capabilities": ["gitClone", "gitPush", "workspace", "execSessions", "preserveBrowserCheckpoint", "workspaceChangeTracking"] + (["move", "doubleClick", "drag"] if desktop else []) + (["liveDesktop"] if desktop and desktop_ready() else [])})
+                return self.respond(200, {"ok": True, "bootId": computer.boot_id, "desktop": desktop, "capabilities": ["gitClone", "gitPush", "workspace", "execSessions", "preserveBrowserCheckpoint", "workspaceChangeTracking", "shellPtySupported"] + (["move", "doubleClick", "drag"] if desktop else []) + (["liveDesktop"] if desktop and desktop_ready() else []) + (["shellPty"] if shell_bridge.ready(token) else [])})
             parsed = urlparse(self.path)
             if parsed.path.startswith("/workspace/"):
                 try:
@@ -1445,6 +1448,10 @@ def create_handler(computer: Computer, token: str):
                 if length > MAX_JSON or length < 0:
                     return self.respond(413, {"error": "Request too large"})
                 body = json.loads(self.rfile.read(length)) if length else {}
+                if self.path == "/secure-deploy/close":
+                    if not isinstance(body, dict) or set(body) != {"operationId"}:
+                        return self.respond(400, {"error": "Invalid private close request"})
+                    return self.respond(200, secure_deploy_close(body["operationId"]))
                 if self.path == "/secure-deploy/cancel":
                     operation = body.get("operationId")
                     return self.respond(200, secure_deploy_cancel(operation))
@@ -1453,6 +1460,16 @@ def create_handler(computer: Computer, token: str):
                         return self.respond(503, {"operationId": body.get("operationId"), "status": "unavailable", "code": "runner_unavailable"})
                     receipt = secure_deploy_dispatch(computer.workspace, body)
                     return self.respond(200, receipt)
+                if self.path.startswith("/shell/"):
+                    if not isinstance(body, dict):
+                        raise shell_bridge.ShellError("shell_invalid_message")
+                    if self.path == "/shell/renew" and set(body) == {"sessionId", "expiresAt"}:
+                        return self.respond(200, computer.shell.renew(body["sessionId"], body["expiresAt"]))
+                    if self.path == "/shell/close" and set(body) == {"sessionId"}:
+                        return self.respond(200, computer.shell.close(body["sessionId"]))
+                    if self.path == "/shell/close-all" and not body:
+                        return self.respond(200, computer.shell.close_all())
+                    raise shell_bridge.ShellError("shell_invalid_message")
                 if self.path == "/actions":
                     return self.respond(200, computer.execute(body["operationId"], body["action"], body.get("gitTransport")))
                 if self.path == "/checkpoint":
@@ -1462,6 +1479,8 @@ def create_handler(computer: Computer, token: str):
                     finally:
                         path.unlink(missing_ok=True)
                 return self.respond(404, {"error": "Not found"})
+            except shell_bridge.ShellError as exc:
+                return self.respond(exc.status, {"error": {"code": exc.code}})
             except IdempotencyConflict:
                 return self.respond(409, {"error": {"code": "computer_idempotency_conflict", "message": "operationId was already used with different arguments."}})
             except (ValueError, KeyError, TypeError, OSError, tarfile.TarError) as exc:
@@ -1474,4 +1493,11 @@ if __name__ == "__main__":
     if not token:
         raise SystemExit("BOTSPACE_COMPUTER_TOKEN must be configured")
     machine = Computer(Path(os.environ.get("BOTSPACE_WORKSPACE", "/workspace")), Path(os.environ.get("BOTSPACE_STATE", "/state")))
-    ComputerHTTPServer(("0.0.0.0", 8080), create_handler(machine, token)).serve_forever()
+    # 6082 stays private; only ComputerDO inserts the authenticated lease headers.
+    bridge = shell_bridge.start_bridge(machine.shell, token)
+    try:
+        ComputerHTTPServer(("0.0.0.0", 8080), create_handler(machine, token)).serve_forever()
+    finally:
+        machine.close()
+        bridge.shutdown()
+        bridge.server_close()

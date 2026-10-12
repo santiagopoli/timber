@@ -48,8 +48,8 @@ Official deployment guidance:
 
 Tools execute in a reusable `/workspace`. Paths supplied to file tools are relative
 to that directory; absolute paths, parent traversal and escaping symlinks fail.
-Terminal commands intentionally have full control of this bot's computer, and must
-be approved by host policy before model invocation.
+Terminal commands control this bot's workspace and its same-UID desktop processes,
+not root/private credential services. Model invocation requires host policy approval.
 
 The desktop is 1280×800. `navigate`, `screenshot`, `click`, `move`, `doubleClick`,
 `drag`, `type`, `key` and `scroll` operate the real X11 desktop. `move` does not
@@ -162,3 +162,176 @@ for credential leakage. The fixture requires local `git` and `openssl` binaries.
 
 The deployed smoke test must verify a screenshot is a PNG and run file write,
 checkpoint, suspend, restart/read and a duplicate shell action against cloud.
+
+## Private interactive shell transport
+
+`server.py` embeds the independent `shell_bridge.py` transport on **private
+6082** and shares its `ShellManager`. This is a real interactive bash controlling
+TTY (native Linux `forkpty`, job control and `TIOCSWINSZ`), not `exec` polling. The 8080
+control server remains internal. Neither port is a public app/console port;
+Docker `EXPOSE` is container metadata only. Authenticated health advertises
+`"shellPtySupported"` for this image implementation, and `"shellPty"` only after a successful authenticated bridge protocol probe.
+
+The upstream DO connects to `/shell` (or `/`) using all of:
+
+- `Authorization: Bearer <BOTSPACE_COMPUTER_TOKEN>` (never a URL parameter);
+- `Sec-WebSocket-Protocol: timber-shell.v1`;
+- `X-Timber-Shell-Session: <canonical UUID>`;
+- `X-Timber-Shell-Expires: <integer epoch milliseconds>` (future, at most 60s).
+
+Client frames are masked, unfragmented RFC6455 **text** frames containing exactly
+`{"type":"input","data":"..."}` or
+`{"type":"resize","cols":80,"rows":24}`. Dimensions are integer 1–500 columns
+and 1–200 rows. Binary frames, compression, continuation frames, unknown fields,
+and malformed messages terminate the session. Ping/pong/close are supported.
+Output frames are text JSON `{"type":"output","data":"..."}`;
+terminal status is `{"type":"exit","exitCode":7}` (null for signal death), and
+errors contain only fixed `{"type":"error","code":"shell_*"}` categories.
+Invalid PTY output UTF-8 is replaced incrementally, not allowed to break JSON.
+
+Internal authenticated HTTP controls on **6082** (also available on **8080**):
+
+- `POST /shell/renew {"sessionId":"<UUID>","expiresAt":<epoch-ms>}`;
+- `POST /shell/close {"sessionId":"<UUID>"}`;
+- `POST /shell/close-all {}`.
+
+Success is `{"ok":true}`. Session UUIDs are one-use within the boot. Close records
+an hour-long session fence **before** cleanup, including IDs whose upgrade has
+not arrived. At most 1024 unexpired fences are retained; capacity fails closed
+rather than evicting a live fence. `/shell/close-all` permanently fences new shell
+admission for this bridge boot (appropriate for suspend/delete); reopening requires
+a new bridge/manager. This prevents unknown delayed handshakes without relying on
+an absent generation header. Close is idempotent and returns only after cleanup;
+a mismatched session ID never closes another shell. Renew never revives an
+expired/closed session, shortens its lease, or extends the monotonic one-hour
+hard deadline. The lease continues to expire even when the client sends input.
+There is at most **one session**, and its entire life (including cleanup) blocks
+checkpoint/restore atomically. The DO must close it before suspend/delete and
+must arrange persistence after it closes; shell input/output is not journaled.
+
+Frames are capped at 16 KiB, queued input at 64 KiB, total input/output UTF-8 data at 16 MiB
+per session, and sends at two seconds. Slow/disconnected peers cannot retain an
+unbounded output queue. Incomplete upgrades have a five-second socket timeout
+and at most sixteen accepted connection handlers. Disconnect, lease/hard expiry,
+protocol/limit failure and explicit close kill/reap the PTY and all descendants.
+Each session starts a fresh-exec, single-threaded `shell_bridge.py --supervisor`
+helper with Linux `PR_SET_CHILD_SUBREAPER`; only that helper calls native Linux `os.forkpty`.
+The threaded HTTP server never runs Python child setup after fork. The private
+socketpair passes the PTY descriptor with `SCM_RIGHTS`, not terminal data.
+Detached descendants remain under the dedicated subreaper even after `env -i`,
+`setsid`, double-fork or reparenting. Cleanup freezes/kills only its current direct
+children using identity-fenced Linux pidfds; as ancestors die, surviving subtree
+roots are adopted and killed in turn. The helper reaps until kernel `ECHILD`
+confirms no remaining children before sending an acknowledged cleanup receipt.
+No environment marker, historical PID sample or unrelated process group is used.
+Linux child-subreaper and pidfd support are required; startup fails closed without
+them. A known pre-launch rejection sends an explicit acknowledged `not_started`
+receipt after confirming kernel `ECHILD`; the controller returns a fixed 503,
+reaps the helper and releases the guard, permitting a new grant after correction.
+EOF/exit status alone never proves no effects. If a child is observed during a
+startup failure, the helper must have established subreaping and complete normal
+descendant cleanup before any positive receipt; otherwise it remains uncertain.
+Ambiguous post-launch failures remain guarded. Native Linux
+`forkpty` avoids a Python fallback throwing partway through child terminal setup.
+The helper is included in the existing single-file Docker/bootstrap copy.
+
+A cleanup timeout/error retains the session and checkpoint/admission guard.
+Handler completion is separate from confirmed cleanup; authenticated close calls
+(including upstream maintenance retries) retry shutdown of the same helper,
+never launch a replacement shell. The helper also retries uncertain shutdown
+without surrendering subreaper ownership. A dead helper without a cleanup receipt
+is uncertainty, not evidence that its descendants stopped.
+Only an allowlisted minimal environment reaches bash: no inherited computer or
+provider tokens or shell startup hooks; bash uses `--noprofile --norc` and starts
+in `/workspace` (the configured workspace in tests). Automatic bash history is
+disabled (`HISTFILE=/dev/null`, `HISTSIZE=0`, `HISTFILESIZE=0`), so terminal input
+is not silently written into workspace checkpoints. The authorized owner can
+still explicitly write files or change history settings; this is not an attempt
+to suppress authorized filesystem effects.
+
+**Private-service boundary:** the root controller and fresh-exec cleanup
+supervisor are trusted, fixed root-owned code. Only the native-forkpty child execs
+`/usr/bin/setpriv` before bash: real/effective UID/GID **10001**, empty supplementary
+groups, empty inheritable/permitted/effective/bounding/ambient capability sets,
+and `NoNewPrivs=1`. The fixed launcher fails closed without a root supervisor or
+root-owned non-writable launcher; there is no root/local fallback. No workspace
+code runs before the irreversible drop. The child owns its PTY slave and starts
+with only the minimal allowlisted environment. Root supervisor ownership prevents
+workspace code from signalling/ptracing it or forging its private socket receipt;
+losing the helper without proof still blocks replacement/checkpoint.
+
+UID10002 is reserved for the private credential runner, distinct from the
+workspace/desktop UID. Workspace code cannot read root/private process env,
+memory or descriptors, read root-private `/state`, overwrite trusted controller
+code, or escalate via setuid binaries. The authenticated management HTTP/shell
+bridges reject missing/incorrect bearer tokens even from localhost: reachability
+is not authorization. The shell cannot obtain the controller token via its env
+or cross-UID `/proc`. There is no claim of network-namespace isolation. The shell
+and desktop deliberately share UID10001 and can inspect/signal each other;
+the VM remains the cross-bot boundary, not a separate sandbox per shell job.
+
+Private dispatch and shell admission are additionally arbitrated by the DO.
+A private dispatch response has an **internal-only** `quiescent` boolean: normal
+provider outcome status/code does not certify local cleanup. Authenticated
+`POST /secure-deploy/close {"operationId":"..."}` on 8080 returns
+`{"operationId":"...","quiescent":true}` only after tombstoning that ID against
+delayed dispatch and proving no active dispatch/private runner remains. False or
+missing proof retains the upstream shell exclusion guard; maintenance retries
+close the same operation. `/secure-deploy/cancel` retains its old outcome meaning
+and is not a quiescence receipt. Close waits up to ten seconds; prelaunch IO and
+spawn-publication races cannot release early. Dispatch cleanup reaps its direct
+runner and requires **kernel-atomic original-group emptiness** (`killpg(pgid,0)`
+returns ESRCH), never a sampled `/proc` table or direct-parent reap alone.
+Zombie processes, reused groups and errors retain the guard; image PID1 init must
+reap orphaned trusted CLI children. Signals use identity-checked pidfds collected
+only while the original leader is live, never late numeric `killpg` after reap.
+Observation/signal/proof uncertainty retains the tombstone and guard for retry.
+This private-runner proof relies on the pinned trusted runner/CLI not deliberately
+escaping its cancellation group; it is **not** the arbitrary detached descendant
+`ECHILD` containment guarantee of the dedicated shell subreaper.
+Real Linux tests cover environment-cleared, detached double-fork writers, complete
+reaping, unrelated process survival, and failed cleanup followed by explicit retry.
+They also inject a real helper-level pidfd signal failure while a detached writer
+remains live, verify pending receipts keep checkpoint/replacement guards, then
+restore the syscall and confirm the same helper kills/reaps before releasing.
+Fresh-helper capability failures exercise explicit pre-launch no-effects receipts;
+loss of control after a real PTY launch verifies ambiguous EOF stays guarded.
+The focused tests also exercise actual WebSocket auth,
+TTY/input, Ctrl-C, resizing, exit codes, lease renewal/expiry, limits, slow-reader
+backpressure, and internal HTTP/checkpoint exclusion:
+
+```
+python3 -m unittest discover -s infra/computer/tests -p test_shell_bridge.py -v
+```
+
+The privilege-boundary fixtures require a Linux root test controller plus
+`setpriv`; they explicitly model production workspace/root-code permissions and
+skip on hosts that cannot establish that boundary. They execute adversarial
+probes **inside the actual PTY**, including UID/GID/groups/all capability sets,
+no-new-privs, private process env/memory/pipe access, signals/ptrace, root-private
+paths, protected code writes, a genuine setuid-root executable, unauthenticated
+localhost management requests, and non-root supervisor rejection. Existing root
+trust expectations are preserved. Tests no longer read workspace-UID environments
+from a root fixture without CAP_SYS_PTRACE; the real detached writer records its
+own cleared-env observation instead, preserving the strengthened cross-UID boundary.
+
+`smoke_shell.py` is standalone built-image verification using only shipped modules:
+run `docker exec -i timber-image-smoke python3 - < infra/computer/smoke_shell.py`
+after `start.sh` is ready. It checks genuine identity/caps/no-new-privs, protected
+paths and setuid suppression, Unicode stdin, resize, Ctrl-C, detached descendant
+adoption/reaping, replacement/checkpoint exclusion, and unauthenticated localhost
+management denial. The detached writer creates and writes its output before
+atomically publishing its closed PID file; file existence alone must not expose
+a partially written PID. Native Desktop smoke waits for a visible X11 window
+before focus, using the same bounded readiness loop; the image supplies
+`xfonts-base` for xterm's default core font. A local Linux subprocess smoke is
+not a claimed Docker image run; actual image smoke must pass in CI before image
+delivery can be reported. The existing
+`smoke_desktop.py` image gate invokes the root-owned shipped `smoke_shell.py`,
+so both verification and desktop-release workflows exercise the actual built
+PTY image without changing workflow permissions. Root-only private lifecycle
+unit fixtures require a separate root test run; a nonroot `npm run check` may
+skip them and must not be presented as that root-isolation evidence.
+
+Automated Chromium/WebKit terminal coverage does not verify a physical device:
+**physical Safari/iPhone testing remains unverified**.

@@ -8,6 +8,8 @@ import desktopSource from "../../../infra/computer/desktop_bridge.py";
 import { DesktopSessions, DesktopError } from "./live";
 import { createCloudSecureWorkerDeployProvider } from "./secure-deploy";
 import { secureDeployComputerRoute } from "./secure-deploy-do";
+import shellSource from "../../../infra/computer/shell_bridge.py";
+import { ShellSessions, ShellError, SHELL_PROTOCOL } from "./shell";
 
 export interface ComputerEnv {
   FILES: R2Bucket;
@@ -132,6 +134,7 @@ async function stage<T>(code: ComputerErrorCode, work: () => Promise<T>): Promis
 /** There is one instance per bot. Never expose this DO directly without API auth. */
 export class ComputerDO extends DurableObject<ComputerEnv> {
   private live:DesktopSessions;
+  private shell:ShellSessions;
   private tail: Promise<unknown> = Promise.resolve();
   // Effects stay ordered on tail. Files only share the shorter lifecycle gate,
   // so inspecting a restored workspace never waits for a shell command to exit.
@@ -151,10 +154,17 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   constructor(ctx: DurableObjectState, env: ComputerEnv) {
     super(ctx, env);
     this.live=new DesktopSessions(ctx.storage,promise=>ctx.waitUntil(promise));
+    this.shell=new ShellSessions(ctx.storage,promise=>ctx.waitUntil(promise),
+      session=>this.shellControl('/shell/close',{sessionId:session.id}),
+      session=>this.shellControl('/shell/renew',{sessionId:session.id,expiresAt:session.expires}),
+      async()=>{if(!this.deleted){await this.noteToolActivity();await this.touch();}});
     void ctx.blockConcurrencyWhile(async () => {
       if(await ctx.storage.get<string>("deleted")) {this.deleted=true;this.shutdown.abort();return;}
       this.token = await ctx.storage.get<string>("internalToken") ?? crypto.randomUUID() + crypto.randomUUID();
       await ctx.storage.put("internalToken", this.token);
+      // A recovered DO never resumes an interactive PTY or revives its ticket.
+      // Cleanup-only retries remain fenced if the container cannot acknowledge.
+      try {await this.shell.closeAll();} catch {await ctx.storage.setAlarm(Date.now()+1_000);}
       // If the DO was evicted during an effect, its outcome is unknown. A retry
       // with the same id receives interrupted, never replays the effect.
       await this.initializeJournalIndexes();
@@ -187,7 +197,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         }
         executionPending ||= session.result.status==='running' || session.checkpoint==='pending';
       }
-      if(executionPending || (retry && !retry.blocked)) await ctx.storage.setAlarm(Date.now()+1_000);
+      if(executionPending || (retry && !retry.blocked) || await this.privateOperationActive()) await ctx.storage.setAlarm(Date.now()+1_000);
       if (this.container?.running) await stage("computer_lifecycle_failed", () => this.container!.setInactivityTimeout(SAFETY_TIMEOUT_MS));
     });
   }
@@ -258,11 +268,44 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     this.workspaceTail = result.catch(() => undefined);
     return result;
   }
+  /** Metadata-only reservation survives DO recovery and uncertain private HTTP delivery. */
+  private async privateOperationActive():Promise<boolean> {
+    return !!await this.ctx.storage.get("privateOperation");
+  }
+  private withPrivateOperation<T>(botId:string,work:(confirmQuiescent:()=>void)=>Promise<T>,operationId?:string):Promise<T> {
+    return this.serialize(()=>this.withWorkspace(async()=>{
+      if(await this.privateOperationActive() || await this.shell.active() || await this.live.controlled() || await this.hasManagedExecutions()) throw new ComputerProviderError("computer_execution_active");
+      const health=await this.initializeWorkspace(botId);
+      if(operationId) await this.ctx.storage.transaction(async txn=>{await txn.put("privateOperation",{operationId,bootId:health.bootId});await txn.setAlarm(Date.now()+EXEC_POLL_MS);});
+      let confirmed=false;
+      try {return await work(()=>{confirmed=true;});}
+      finally {
+        if(operationId) {
+          if(confirmed) await this.ctx.storage.delete("privateOperation");
+          else await this.ctx.storage.setAlarm(Date.now()+EXEC_POLL_MS);
+        }
+      }
+    }));
+  }
+  private async closePrivateOperation():Promise<boolean> {
+    const record=await this.ctx.storage.get<{operationId:string;bootId:string}>("privateOperation");
+    if(!record)return true;
+    // A stopped container cannot retain a private process or receive a delayed old request.
+    if(!this.container?.running) {await this.ctx.storage.delete("privateOperation");return true;}
+    try {
+      const response=await this.call("/secure-deploy/close",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId:record.operationId}),signal:AbortSignal.timeout(15_000)});
+      if(!response.ok) {void response.body?.cancel();return false;}
+      const value=await response.json<{operationId?:unknown;quiescent?:unknown}>();
+      if(value.operationId!==record.operationId || value.quiescent!==true)return false;
+      await this.ctx.storage.delete("privateOperation");return true;
+    } catch {return false;}
+  }
   private remove(botId:string):Promise<void> {
     if(this.deleting) return this.deleting;
     this.deleted=true;
     this.shutdown.abort();
     this.deleting=(async()=>{
+      await this.shell.closeAll();
       await this.live.closeAll();
       await this.ctx.storage.put("deleted",botId);
       await this.ctx.storage.deleteAlarm();
@@ -290,7 +333,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     const path = new URL(request.url).pathname;
     try {
       if(path.startsWith("/secure-deploy")) return await secureDeployComputerRoute(this,request,path);
-      if(path.startsWith("/workspace/") || path.startsWith("/desktop")) return await this.inspect(request);
+      if(path.startsWith("/workspace/") || path.startsWith("/desktop") || path.startsWith("/shell")) return await this.inspect(request);
       if(path.startsWith("/preview/")) return await this.preview(request);
       if (request.method !== "POST") throw new ComputerProviderError("computer_method_not_allowed");
       const body = await request.json<{botId:string; operationId?:string; processId?:string; action?:ComputerAction}>();
@@ -311,7 +354,8 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         await this.backgroundCheckpoint?.catch(()=>{});
         return Response.json(await this.serialize(() => this.withWorkspace(async () => {
           this.active();
-          if(await this.hasActiveExecutions()) throw new ComputerProviderError('computer_execution_active');
+          if(!(await this.closePrivateOperation()) || await this.hasManagedExecutions()) throw new ComputerProviderError('computer_execution_active');
+          await this.shell.closeAll();
           await this.live.closeAll();
           if (this.container?.running) {
             await this.initializeWorkspace(body.botId);
@@ -330,7 +374,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       if(!['execPoll','execCancel','checkpoint'].includes(body.action.type)) await this.noteToolActivity();
       return Response.json(await this.execute(body.botId, body.operationId, body.action));
     } catch (error) {
-      if(error instanceof DesktopError) return Response.json({error:{code:error.code,message:error.message}},{status:error.status});
+      if(error instanceof DesktopError || error instanceof ShellError) return Response.json({error:{code:error.code,message:error.message}},{status:error.status});
       const safe = safeError(error);
       console.error("computer.failure", {stage:"request",code:safe.code});
       return Response.json({error:{code:safe.code,message:safe.publicMessage}}, {status:safe.status});
@@ -348,7 +392,32 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       if(!this.container?.running) throw new ComputerProviderError("computer_app_not_running");
       return this.container.getTcpPort(port).fetch(new Request(`http://127.0.0.1:${port}/`,{headers:{Upgrade:"websocket",Authorization:`Bearer ${this.token}`,"Sec-WebSocket-Protocol":"binary"}}));
     },()=>this.touch());
-    if(url.pathname==="/desktop/control" && request.method==="GET") return Response.json({controlled:await this.live.controlled()});
+    if(url.pathname==="/desktop/control" && request.method==="GET") return Response.json({controlled:await this.live.controlled() || await this.shell.active() || await this.privateOperationActive()});
+    if(url.pathname==="/shell-ws") return this.shell.connect(botId,request,async session=>{
+      if(!this.container?.running) throw new ComputerProviderError("computer_app_not_running");
+      const abort=new AbortController(),timer=setTimeout(()=>abort.abort(),10_000);
+      try {
+        return await this.container.getTcpPort(6082).fetch(new Request("http://127.0.0.1:6082/",{headers:{Upgrade:"websocket",Authorization:`Bearer ${this.token}`,"Sec-WebSocket-Protocol":SHELL_PROTOCOL,"X-Timber-Shell-Session":session.id,"X-Timber-Shell-Expires":String(session.expires)},signal:AbortSignal.any([abort.signal,this.shutdown.signal])}));
+      } finally {clearTimeout(timer);}
+    },()=>this.markShellDirty(),()=>this.touch());
+    if(url.pathname==="/shell" && request.method==="POST") {
+      return this.serialize(()=>this.withWorkspace(async()=>{
+        if(await this.privateOperationActive() || await this.hasManagedExecutions()) throw new ComputerProviderError("computer_execution_active");
+        if(await this.live.controlled()) throw new ShellError("computer_controlled",409,"Release desktop control before opening a shell.");
+        let health=this.container?.running && this.workspaceHealth?this.workspaceHealth:await this.initializeWorkspace(botId);
+        for(let attempt=0;health.capabilities?.includes("shellPtySupported") && !health.capabilities.includes("shellPty") && attempt<10;attempt++) {
+          await new Promise(resolve=>setTimeout(resolve,200));this.active();health=await this.health();
+        }
+        if(health.capabilities?.includes("shellPtySupported") && !health.capabilities.includes("shellPty")) throw new ShellError("shell_unavailable",503,"The shell bridge is still starting. Try again shortly.");
+        if(!health.capabilities?.includes("shellPty")) throw new ComputerProviderError("computer_upgrade_required");
+        const value=await this.shell.create(botId);
+        try {await this.touch();} catch(error) {await this.shell.release(botId,value.sessionId);throw error;}
+        return Response.json(value,{headers:{"cache-control":"no-store"}});
+      }));
+    }
+    const shellSession=/^\/shell\/([a-f0-9-]{36})(\/renew)?$/.exec(url.pathname);
+    if(shellSession && request.method==="POST" && shellSession[2]) {const value=await this.shell.renew(botId,shellSession[1]);await this.touch();return Response.json(value,{headers:{"cache-control":"no-store"}});}
+    if(shellSession && request.method==="DELETE" && !shellSession[2]) {await this.shell.release(botId,shellSession[1]);return Response.json({released:true},{headers:{"cache-control":"no-store"}});}
     if(url.pathname==="/desktop" && request.method==="POST") {
       const input=await request.json<{mode?:unknown;replaces?:unknown}>();
       if(input.mode!=="view" && input.mode!=="control") throw new ComputerProviderError("computer_invalid_request");
@@ -417,7 +486,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     if (state !== "running") this.desktop = false;
     return {
       id:botId, provider:"cloudflare", state,
-      capabilities: container ? [...BASE_CAPABILITIES, ...(this.desktop ? [...DESKTOP_CAPABILITIES,...this.capabilities.filter(value=>EXTENDED_MOUSE_CAPABILITIES.includes(value))] : []), ...this.capabilities.filter(value=>value==="gitClone" || value==="gitPush" || value==='execSessions')] : [],
+      capabilities: container ? [...BASE_CAPABILITIES, ...(this.desktop ? [...DESKTOP_CAPABILITIES,...this.capabilities.filter(value=>EXTENDED_MOUSE_CAPABILITIES.includes(value))] : []), ...this.capabilities.filter(value=>value==="gitClone" || value==="gitPush" || value==='execSessions' || value==='shellPty')] : [],
       ...(checkpoint ? {lastCheckpointId:checkpoint.id} : {}),
       ...(error ? {error:{code:error.code,message:error.publicMessage}} : {}),
     };
@@ -446,6 +515,8 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         if (existingRecord.digest !== digest) return {operationId, status:"failed" as const, error:"operationId was already used with different arguments"};
         return existingRecord.result ?? {operationId, status:"interrupted" as const, error:"Operation outcome is unknown; it will not be replayed"};
       }
+      if(!["screenshot","readFile","listFiles"].includes(action.type) && await this.privateOperationActive()) return {operationId,status:"failed" as const,error:"A private computer operation is active or cleanup is unconfirmed. No action was executed."};
+      if(!["screenshot","readFile","listFiles"].includes(action.type) && await this.shell.active()) return {operationId,status:"failed" as const,error:"A person has an open shell. No action was executed. Close the shell before mutating or checkpointing the computer."};
       if(!["screenshot","readFile","listFiles"].includes(action.type) && await this.live.controlled()) return {operationId,status:"failed" as const,error:"A person has control of the desktop. No action was executed. Release desktop control before issuing a new action."};
       const health=await this.ensureReady(botId);
       if((action.type==="gitClone" || action.type==="gitPush") && !health.capabilities?.includes(action.type)) throw new ComputerProviderError("computer_upgrade_required");
@@ -538,6 +609,9 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   }
 
   private async hasActiveExecutions():Promise<boolean> {
+    return await this.privateOperationActive() || await this.shell.active() || await this.hasManagedExecutions();
+  }
+  private async hasManagedExecutions():Promise<boolean> {
     for await(const page of this.journalPages<ExecutionWork>('exec-work:'))if([...page.values()].some(work=>work.status==='running'))return true;
     return false;
   }
@@ -610,6 +684,8 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         return undefined;
       }
       if(await this.ctx.storage.get(`exec-cancelled:${processId}`)) return {operationId:processId,processId,status:'cancelled' as const,output:''};
+      if(await this.privateOperationActive()) return {operationId:processId,status:'failed' as const,error:'A private computer operation is active or cleanup is unconfirmed. No action was executed.'};
+      if(await this.shell.active()) return {operationId:processId,status:'failed' as const,error:'A person has an open shell. No action was executed. Close the shell before starting a managed command.'};
       if(await this.live.controlled()) return {operationId:processId,status:'failed' as const,error:'A person has control of the desktop. No action was executed. Release desktop control before issuing a new action.'};
       const health=await this.ensureReady(botId);
       if(!health.capabilities?.includes('execSessions')) throw new ComputerProviderError('computer_upgrade_required');
@@ -922,7 +998,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     const url=new URL(request.url);
     const match=/^\/preview\/([0-9]{1,5})(\/.*)$/.exec(url.pathname);
     const port=match?Number(match[1]):0;
-    if(!match || port<1024 || port>65535 || [PORT,5900,5901,6080,6081].includes(port)) throw new ComputerProviderError("computer_invalid_request");
+    if(!match || port<1024 || port>65535 || [PORT,5900,5901,6080,6081,6082].includes(port)) throw new ComputerProviderError("computer_invalid_request");
     const botId=request.headers.get("x-timber-bot-id");
     if(!botId || !/^[A-Za-z0-9_-]{1,100}$/.test(botId)) throw new ComputerProviderError("computer_invalid_request");
     const owner=await this.ctx.storage.get<string>("botId");
@@ -948,6 +1024,14 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   async alarm(): Promise<void> {
     if(this.deleted) {await this.ctx.storage.deleteAlarm();return;}
     const botId=await this.ctx.storage.get<string>('botId');
+    try {
+      await this.shell.sweep();
+      if(await this.shell.active()) {await this.touch();await this.scheduleComputerAlarm(Date.now()+EXEC_POLL_MS);return;}
+    } catch {await this.ctx.storage.setAlarm(Date.now()+EXEC_POLL_MS);return;}
+    if(await this.privateOperationActive()) {
+      const closed=await this.serialize(()=>this.withWorkspace(()=>this.closePrivateOperation()));
+      if(!closed) {await this.ctx.storage.setAlarm(Date.now()+EXEC_POLL_MS);return;}
+    }
     if(botId && await this.needsExecutionMaintenance()) {
       try {
         for await(const page of this.journalPages<ExecutionWork>('exec-work:')) for(const [key,work] of page) {
@@ -986,6 +1070,25 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         if(!this.deleted) await this.ctx.storage.setAlarm(Date.now() + 60_000);
       }
     }));
+  }
+
+  private async shellControl(path:string,body:object):Promise<void> {
+    // Stop must still work during bot deletion after shutdown was fenced.
+    if(!this.container?.running) return;
+    const response=await this.container.getTcpPort(PORT).fetch(`http://127.0.0.1:${PORT}${path}`,{method:"POST",headers:{Authorization:`Bearer ${this.token}`,"content-type":"application/json"},body:JSON.stringify(body),signal:AbortSignal.timeout(10_000)});
+    if(!response.ok || (await response.json<{ok?:boolean}>()).ok!==true) throw new ShellError("shell_cleanup_pending",503,"The shell has not confirmed shutdown. Retry closing it; checkpointing remains blocked.");
+  }
+
+  private async markShellDirty():Promise<void> {
+    this.active();
+    const bootId=await this.ctx.storage.get<string>('restoredBoot');
+    if(!bootId) throw new ComputerProviderError('computer_checkpoint_failed');
+    await this.ctx.storage.transaction(async tx=>{
+      const revision=(await tx.get<number>('checkpointRevision')??0)+1;
+      const previous=await tx.get<CheckpointRetry>('checkpointRetry');
+      const retry:CheckpointRetry=previous?.bootId===bootId?{...previous,revision,blocked:false}:{bootId,revision,attempts:0,nextAttemptAt:Date.now()};
+      await tx.put({checkpointRevision:revision,checkpointRetry:retry});await tx.setAlarm(Date.now()+EXEC_POLL_MS);
+    });
   }
 
   private call(path: string, init: RequestInit = {}): Promise<Response> {
@@ -1100,7 +1203,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       if (exitCode === 124) throw new ComputerProviderError("computer_start_timeout");
       if (exitCode !== 0) throw new ComputerProviderError("computer_provisioning_failed");
     });
-    for (const [path, source] of [["/opt/botspace/server.py",serverSource],["/opt/botspace/start.sh",startSource],["/opt/botspace/workspace.py",workspaceSource],["/opt/botspace/desktop_bridge.py",desktopSource]] as const) {
+    for (const [path, source] of [["/opt/botspace/server.py",serverSource],["/opt/botspace/start.sh",startSource],["/opt/botspace/workspace.py",workspaceSource],["/opt/botspace/desktop_bridge.py",desktopSource],["/opt/botspace/shell_bridge.py",shellSource]] as const) {
       this.active();
       await stage("computer_server_install_failed", async () => {
         const process = await container.exec(["timeout","--kill-after=5","30","python3","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())",path], {

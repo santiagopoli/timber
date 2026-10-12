@@ -238,7 +238,7 @@ def main():
     terminal = subprocess.Popen(["xterm", "-title", "Timber desktop smoke", "-geometry", "80x24+0+0"])
     try:
         for _ in range(30):
-            found = subprocess.run(["xdotool", "search", "--name", "Timber desktop smoke"], capture_output=True, text=True)
+            found = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", "Timber desktop smoke"], capture_output=True, text=True)
             if found.returncode == 0: break
             time.sleep(.1)
         assert found.returncode == 0, "Native terminal did not open"
@@ -256,6 +256,10 @@ def main():
         view.close()
         control.close()
     native_mouse_smoke(token)
+    # Existing image CI runs this root-owned fixture through docker exec/stdin.
+    # Keep the shipped native PTY proof in that same verified-image gate.
+    import runpy
+    runpy.run_path("/opt/botspace/smoke_shell.py", run_name="__main__")
     print("PASS desktop: authenticated live framebuffer, visible cursor, enforced observation, native pointer and keyboard, agent hover, double-click deduplication and drag/release")
 
 

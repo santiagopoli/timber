@@ -78,10 +78,11 @@
         <div id="workspace-app-empty" class="empty-state workspace-app-empty"><span class="workspace-app-empty-icon" aria-hidden="true">▦</span><strong>No apps yet</strong><button id="apps-prompt" class="quiet">Create an app</button></div>
         <div id="workspace-app-list" class="workspace-app-list"></div>
       </section>
-      <section id="panel-computer" class="panel" role="region" aria-labelledby="tab-computer" hidden>
+      <section id="panel-computer" data-view="desktop" class="panel" role="region" aria-labelledby="tab-computer" hidden>
         <div class="section-title computer-panel-header"><div><h2 class="sr-only">Computer</h2><p id="computer-status" class="hint"></p></div></div>
         <div id="computer-progress" class="progress-banner" role="status" hidden><span class="spinner" aria-hidden="true"></span><div><strong id="computer-progress-label"></strong><p id="computer-cold-hint" class="hint" hidden>Starting the computer…</p></div><span class="spacer"></span><span id="computer-elapsed"></span></div>
-        <div id="desktop-root"></div>
+        <div class="computer-view-switch" role="group" aria-label="Computer view"><button type="button" class="quiet" data-computer-view="desktop" aria-pressed="true" aria-controls="desktop-root">Desktop</button><button type="button" class="quiet" data-computer-view="shell" aria-pressed="false" aria-controls="shell-root">Shell</button></div>
+        <div id="desktop-root"></div><div id="shell-root" hidden></div>
         <div class="section-title computer-utilities"><div class="row"><button id="refresh-computer" class="text-button" aria-label="Refresh computer status">Refresh</button><button id="checkpoint" class="text-button" data-computer>Checkpoint</button><button id="suspend-computer" class="text-button" data-computer title="Save files and stop processes. The next action restores the workspace.">Suspend</button></div></div>
         <details id="computer-tools" class="tool-block"><summary>Manual tools</summary>
         <p class="hint">Actions here run directly as you. Commands and desktop input are never retried automatically.</p>

@@ -16,7 +16,8 @@ the assigned bot’s computer, never its ordinary chat transcript. v1 is cloud-o
 - ComputerDO owns one reusable Linux desktop container, lazily started.
 - Private single-owner MVP. BOTSPACE_API_TOKEN is a Worker secret; every /v1
   data API request requires Authorization: Bearer token or a valid same-origin
-  console session, except the scoped live desktop WebSocket upgrade below.
+  console session, except the scoped live desktop WebSocket upgrade below. Shell WebSocket upgrades
+  additionally require that current HTTP authentication, as specified below.
   Health is public and contains no account information. Never put credentials in
   URLs, localStorage or sessionStorage.
 - /console is a static unprivileged shell. Its persistent login exchanges an owner
@@ -395,6 +396,80 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   `action_already_claimed`; stop managed execution by its explicit process identity.
 - POST /v1/bots/:id/computer/suspend -> {computer:ComputerStatus}; checkpoint
   then stop. Rejects active runs or executing approvals and invalidates GUI approvals.
+- POST /v1/bots/:id/computer/shell-session ->
+  `{url,protocols,sessionId,expiresAt}`. This is an explicitly owner-authorized
+  real interactive bash PTY rooted at `/workspace`, not an exec/poll adapter.
+  Admission rejects active runs, executing approvals, managed commands and desktop
+  control. At most one shell grant/PTY exists per bot. A grant also reserves human
+  control before connecting; it expires after 60 seconds unless renewed, with an
+  absolute one-hour deadline. HTTP owner/session authentication and registry bot
+  membership apply to create, renew and delete. `shellPty` is exposed only by a
+  ready image/bridge; older images reject before effects with
+  `computer_upgrade_required` (409), and an unavailable transport returns a fixed
+  `shell_unavailable` (503). There is no exec-based fallback.
+- GET /v1/bots/:id/computer/shell upgrades WebSocket. The `url` uses ws/wss and
+  has no query or ticket. The caller supplies the returned protocols:
+  `timber-shell.v1` and `timber-shell-ticket.<one-use-opaque-ticket>`; only
+  `timber-shell.v1` is negotiated. The ticket is SHA-256 hashed in DO storage,
+  consumed transactionally, bot-scoped and cannot be replayed or resumed.
+  Unlike legacy desktop tickets, shell upgrades additionally validate the current
+  authenticated HTTP console cookie (or explicit owner bearer for non-browser
+  clients), so token rotation invalidates an unused grant. Exact `Origin` is
+  required even for bearer clients; inconsistent Fetch Metadata, missing Origin,
+  query parameters, malformed protocols and cross-bot access fail closed.
+  Browser upgrades do not require an impossible custom X-Timber-Client header;
+  this exception applies only to the exact authenticated shell WS route.
+- POST /v1/bots/:id/computer/shell-session/:sessionId/renew -> `{expiresAt}`.
+  Renews only an existing live lease, never starts/resumes a process. After the
+  ticket is used, renewal must be acknowledged by the private bridge. A failed
+  renewal closes the PTY rather than silently extending uncertain authorization.
+- DELETE /v1/bots/:id/computer/shell-session/:sessionId -> `{released:true}`.
+  Idempotently closes both transports and kills/reaps PTY processes before success.
+  Disconnect, lease expiry, explicit deletion, bot deletion and recovered DO
+  sessions use the same cleanup. Unknown/uncertain cleanup leaves a closing record,
+  rejects a replacement grant and blocks checkpointing until cleanup is confirmed;
+  maintenance retries only shutdown, never shell launch. The bridge also fences a
+  delayed upgrade for an already closed ID. Internal port 6082 and control port
+  8080 are never eligible for app preview/publication.
+
+  Shell wire messages are UTF-8 text JSON, at most 16 KiB encoded per frame:
+  client `{type:"input",data:string}` writes exact terminal input (including
+  `\u0003` for real terminal Ctrl-C), `{type:"resize",cols,rows}` applies
+  TIOCSWINSZ (integer cols 1..500, rows 1..200), and `{type:"ack",seq}`
+  acknowledges consumed/rendered output cumulatively. Server messages are
+  `{type:"output",data:string,seq}` (monotonically increasing from 1),
+  `{type:"exit",exitCode:number|null}`, or `{type:"error",code:string}` with a
+  fixed safe code. The DO keeps at most 32 pending input frames, accepts at most
+  64 KiB input/second, and closes a client whose unacknowledged output exceeds
+  256 KiB; total output is capped at 16 MiB/session. The private PTY bridge also
+  bounds input/output, frame buffers and socket send waits. No terminal contents
+  or tickets are journaled in transcripts, operation results, logs or checkpoints.
+
+  A live or closing shell counts as active execution and human control: model/direct
+  mutations, desktop control and explicit/background checkpoints are blocked;
+  passive reads, screenshot and desktop Watch remain available. Shell admission
+  and the shared task scheduler reuse the existing human-control lease boundary.
+  PTY commands run as the fixed workspace UID/GID 10001 with no supplementary
+  groups, no capabilities and no-new-privileges. The root cleanup supervisor is
+  trusted image code, not writable or signalable by that user; its environment
+  contains no controller token or credential. Private deploy UID 10002 and root
+  state/process memory remain outside the workspace user's access.
+  Private credential operations also hold the workspace/execution gate. A
+  metadata-only `privateOperation` reservation survives uncertain HTTP delivery;
+  it blocks Shell, desktop control, managed/mutating commands and checkpoints.
+  Cancellation remains responsive but is not cleanup proof. An authenticated
+  internal `POST /secure-deploy/close {operationId}` tombstones delayed dispatch
+  and returns `{operationId,quiescent:true}` only after local runner cleanup;
+  uncertain cleanup retains the reservation and maintenance retries shutdown,
+  never credential dispatch. Normal private receipts release the reservation
+  only with an explicit private quiescence proof (not duplicate-dispatch receipts).
+  Public receipts omit this internal proof and all credential material.
+  Save intent is durable **before** PTY launch. Closing the shell schedules a normal
+  quiet-period checkpoint, not a claim that its files are already saved. Suspend
+  rejects active runs/managed commands, then explicitly closes and confirms shell
+  cleanup **before** checkpointing current files/browser state and stopping the
+  container. Failure to close or save never intentionally discards the workspace.
+
 - GET /v1/bots/:id/approvals -> {approvals:Approval[]}
 - POST /v1/bots/:id/approvals/:approvalId {decision:"approve"|"deny"}
   -> {approval:Approval}; exact stored arguments executed only once on approval.
