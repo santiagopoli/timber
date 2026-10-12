@@ -22,10 +22,17 @@ export const PERFORMANCE_TOOLS = `WITH recent AS (
  json_extract(c.data,'$.data.result.checkpointStatus') AS checkpoint,
  length(json_extract(c.data,'$.data.result.output')) AS output_characters
  FROM recent s LEFT JOIN events c ON c.source_key='tool:'||json_extract(s.data,'$.data.operationId') ORDER BY s.id DESC`;
-export const PERFORMANCE_NATIVE = `SELECT json_extract(record,'$.kind') AS kind,status,
- json_extract(record,'$.state.checkpoint.phase') AS phase,json_extract(record,'$.state.checkpoint.attempt') AS attempt,
- json_extract(record,'$.state.outcome.status') AS outcome,json_extract(record,'$.background') AS background
- FROM pi_tasks ORDER BY id DESC LIMIT 60`;
+export const PERFORMANCE_NATIVE = `SELECT json_extract(t.record,'$.kind') AS kind,t.status,
+ (SELECT json_extract(c.value,'$.name') FROM pi_entries e,json_each(e.record,'$.model[0].content') c
+ WHERE e.id=json_extract(t.record,'$.input.assistant') AND json_extract(c.value,'$.id')=json_extract(t.record,'$.input.callId')) AS tool,
+ json_extract(t.record,'$.state.checkpoint.replay') AS replay,
+ json_extract(t.record,'$.conversationId')=1 AS is_root,
+ json_extract(t.record,'$.state.checkpoint.phase') AS phase,json_extract(t.record,'$.state.checkpoint.attempt') AS attempt,
+ json_extract(t.record,'$.state.outcome.status') AS outcome,json_extract(t.record,'$.background') AS background
+ FROM pi_tasks t ORDER BY t.id DESC LIMIT 60`;
+export const PERFORMANCE_PROCESSES = `SELECT status,dispatch_state,cancel_requested,
+ json_extract(result,'$.status') AS result_status,json_extract(result,'$.exitCode') AS exit_code
+ FROM run_processes ORDER BY rowid DESC LIMIT 40`;
 export const PERFORMANCE_USAGE = `SELECT json_extract(record,'$.model[0].timestamp') AS timestamp,
  json_extract(record,'$.model[0].usage.input') AS input_tokens,
  json_extract(record,'$.model[0].usage.output') AS output_tokens,
@@ -34,18 +41,19 @@ export const PERFORMANCE_USAGE = `SELECT json_extract(record,'$.model[0].timesta
  FROM pi_entries WHERE json_extract(record,'$.kind')='pi.assistant' ORDER BY id DESC LIMIT 40`;
 
 const states=new Set(['pending','queued','running','waiting','waiting_approval','waiting_connection','completed','failed','interrupted','cancelling','cancelled','completing','terminal','aborted','faulted','orphaned']);
-const tools=new Set(['exec','execPoll','execCancel','readFile','writeFile','listFiles','checkpoint','gitClone','gitPush','screenshot','navigate','click','type','key','scroll','list_tools','load_skill','github_clone','github_push','github_create_pull_request','github_list_pull_requests','github_list_repositories','publish_app','list_apps','create_task','list_tasks','update_task','request_secret','configure_secret','name_secret','list_secrets','secret_request']);
+const tools=new Set(['exec','exec_poll','exec_cancel','call_tool','spawn_subagent','send_subagent_message','wait_subagent','list_subagents','cancel_subagent','execPoll','execCancel','readFile','writeFile','listFiles','checkpoint','gitClone','gitPush','screenshot','navigate','click','type','key','scroll','list_tools','load_skill','github_clone','github_push','github_create_pull_request','github_list_pull_requests','github_list_repositories','publish_app','list_apps','create_task','list_tasks','update_task','request_secret','configure_secret','name_secret','list_secrets','secret_request']);
 const kinds=new Set(['pi.generation','pi.compaction','pi.tool','timber.memory-review','timber.subagent-delivery']);
 const phases=new Set(['prepare','request','retry','poll','tools','yield','wait','apply','deliver','report','execute','invoke']);
 const iso=value=>typeof value==='string'&&/^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(value)&&Number.isFinite(Date.parse(value))?new Date(value).toISOString():null;
 const count=value=>Number.isSafeInteger(value)&&value>=0&&value<=Number.MAX_SAFE_INTEGER?value:null;
 const allow=(set,value)=>set.has(value)?value:'unknown';
-export function summarizePerformance({runs=[],tools:actions=[],native=[],usage=[]},window) {
+export function summarizePerformance({runs=[],tools:actions=[],native=[],usage=[],processes=[]},window) {
  const inside=value=>{const at=Date.parse(value??'');return Number.isFinite(at)&&at>=window.from&&at<=window.to;};
  return {
   runs:runs.slice(0,12).filter(row=>inside(iso(row.updated_at))||inside(iso(row.created_at))).map(row=>({createdAt:iso(row.created_at),updatedAt:iso(row.updated_at),status:allow(states,row.status),generations:count(row.generations),tools:count(row.tools),retries:count(row.retries)})),
   tools:actions.slice(0,60).filter(row=>inside(iso(row.finished_at))||inside(iso(row.started_at))).map(row=>{const startedAt=iso(row.started_at),finishedAt=iso(row.finished_at);return {startedAt,finishedAt,tool:allow(tools,row.tool),status:allow(states,row.status),durationMs:startedAt&&finishedAt?count(Date.parse(finishedAt)-Date.parse(startedAt)):null,exitCode:Number.isSafeInteger(row.exit_code)?row.exit_code:null,checkpoint:allow(new Set(['pending','saved','failed']),row.checkpoint),outputCharacters:count(row.output_characters)};}),
-  nativeTasks:native.slice(0,60).map(row=>({kind:allow(kinds,row.kind),status:allow(states,row.status),phase:allow(phases,row.phase),attempt:count(row.attempt),outcome:allow(states,row.outcome),background:row.background===1})),
+  nativeTasks:native.slice(0,60).map(row=>({kind:allow(kinds,row.kind),status:allow(states,row.status),phase:allow(phases,row.phase),tool:allow(tools,row.tool),replay:allow(new Set(['safe','unsafe']),row.replay),isRoot:row.is_root===1,attempt:count(row.attempt),outcome:allow(states,row.outcome),background:row.background===1})),
+  processes:processes.slice(0,40).map(row=>({status:allow(states,row.status),dispatchState:allow(new Set(['registered','dispatching','uncertain','acknowledged']),row.dispatch_state),resultStatus:allow(states,row.result_status),exitCode:Number.isSafeInteger(row.exit_code)?row.exit_code:null,cancelRequested:row.cancel_requested===1})),
   modelResponses:usage.slice(0,40).filter(row=>count(row.timestamp)!==null&&row.timestamp>=window.from&&row.timestamp<=window.to).map(row=>({at:new Date(row.timestamp).toISOString(),inputTokens:count(row.input_tokens),outputTokens:count(row.output_tokens),cachedTokens:count(row.cached_tokens),stopReason:allow(new Set(['stop','length','toolUse','error','aborted']),row.stop_reason)})),
  };
 }

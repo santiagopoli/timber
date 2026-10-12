@@ -2,7 +2,7 @@
 import { pathToFileURL } from 'node:url';
 import {createCipheriv,createHash,createPublicKey,publicEncrypt,randomBytes,constants} from 'node:crypto';
 import { DIAGNOSTIC_CODES, timeframe } from './prod-diagnostics.mjs';
-import {PERFORMANCE_SCHEMA,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_USAGE,summarizePerformance,performanceTaskMetadata} from './prod-performance-diagnostics.mjs';
+import {PERFORMANCE_SCHEMA,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_PROCESSES,PERFORMANCE_USAGE,summarizePerformance,performanceTaskMetadata} from './prod-performance-diagnostics.mjs';
 
 // Cloudflare Data Studio's SQL API. These are fixed read-only statements;
 // neither SQL nor object names can be supplied by workflow dispatch inputs.
@@ -219,7 +219,7 @@ export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now
     const inspect=async name=>{
       const tables=await query(bot,name,PERFORMANCE_SCHEMA);
       if(tables.length!==6)return {initialized:false};
-      return summarizePerformance({runs:await query(bot,name,PERFORMANCE_RUNS),tools:await query(bot,name,PERFORMANCE_TOOLS),native:await query(bot,name,PERFORMANCE_NATIVE),usage:await query(bot,name,PERFORMANCE_USAGE)},window);
+      return summarizePerformance({runs:await query(bot,name,PERFORMANCE_RUNS),tools:await query(bot,name,PERFORMANCE_TOOLS),native:await query(bot,name,PERFORMANCE_NATIVE),processes:await query(bot,name,PERFORMANCE_PROCESSES),usage:await query(bot,name,PERFORMANCE_USAGE)},window);
     };
     const root=await inspect(name),tasks=[];
     for(const task of await query(workspace,'owner',PERFORMANCE_TASKS)){
