@@ -29,6 +29,8 @@ COPY secure_deploy_runner.py /opt/botspace/secure_deploy_runner.py
 COPY workspace_archive.py /opt/botspace/workspace_archive.py
 COPY start.sh /opt/botspace/start.sh
 COPY desktop_bridge.py /opt/botspace/desktop_bridge.py
+# Includes the fresh-exec per-session Linux subreaper helper (--supervisor).
+COPY shell_bridge.py /opt/botspace/shell_bridge.py
 COPY workspace.py /opt/botspace/workspace.py
 RUN chmod 755 /opt/botspace/start.sh /opt/botspace/server.py /opt/botspace/secure_deploy.py \
     && chmod 755 /opt/botspace/patch_wrangler_cli.py \
@@ -40,6 +42,8 @@ RUN mkdir -p /opt/timber-secure \
     && chmod 0755 /opt/timber-secure \
     && ln -s /dev/null /opt/timber-secure/wrangler.log
 ENV DISPLAY=:99 PYTHONUNBUFFERED=1 BOTSPACE_WORKSPACE=/workspace BOTSPACE_STATE=/state
-EXPOSE 8080 6080 6081
+# Control (8080) and shell (6082) remain private container ports.
+# EXPOSE is metadata, not an instruction to publish them.
+EXPOSE 8080 6080 6081 6082
 WORKDIR /workspace
 ENTRYPOINT ["/usr/bin/tini", "--", "/opt/botspace/start.sh"]

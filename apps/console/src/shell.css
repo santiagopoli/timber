@@ -1,0 +1,22 @@
+.computer-view-switch{display:flex;gap:4px;padding:8px 12px;border-bottom:1px solid var(--border,#333)}
+.computer-view-switch button{min-height:44px;min-width:88px}
+.computer-view-switch button[aria-pressed=true]{background:var(--foreground,#eee);color:var(--background,#111)}
+.workspace-inspector #desktop-root[hidden],.workspace-inspector #shell-root[hidden]{display:none}
+.shell-viewer{box-sizing:border-box;display:flex;flex-direction:column;gap:8px;padding:12px;min-width:0;min-height:240px;height:min(600px,var(--shell-available-height,600px));max-height:var(--shell-available-height,600px);flex:1 1 auto;overflow:hidden;padding-bottom:max(12px,env(safe-area-inset-bottom))}
+.shell-toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px;flex-shrink:0}
+.shell-status{font-size:12px;color:var(--muted-foreground,#999);margin-right:auto}
+.shell-toolbar button,.shell-keys button{min-height:44px;min-width:44px;padding:8px 12px}
+.shell-hint{font-size:12px;line-height:1.4;color:var(--muted-foreground,#999);margin:0;flex-shrink:0}
+.shell-terminal{min-width:0;min-height:80px;flex:1;overflow:hidden;background:#000;border-radius:6px;padding:8px}
+.shell-terminal .xterm{height:100%;padding:0}
+.shell-terminal .xterm-viewport{overscroll-behavior:contain;touch-action:pan-y}
+.shell-keys{display:flex;gap:4px;flex-wrap:wrap;flex-shrink:0}
+#panel-computer[data-view=shell]{overflow:hidden}
+#panel-computer[data-view=shell] .computer-utilities{flex-shrink:0}
+#panel-computer[data-view=shell] #computer-tools{display:none}
+@media(max-width:760px){.shell-keys{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none}.shell-viewer{padding:8px;padding-bottom:max(8px,env(safe-area-inset-bottom));gap:6px}.shell-terminal{padding:4px}.shell-keys button{padding:6px 9px}.computer-view-switch{padding:6px 8px}.shell-hint{font-size:11px}}
+
+.shell-viewer[data-viewport-constrained=true]{min-height:160px;padding:8px;gap:4px}
+.shell-viewer[data-viewport-constrained=true] .shell-hint{display:none}
+.shell-viewer[data-viewport-constrained=true] .shell-terminal{min-height:32px}
+.shell-viewer[data-viewport-constrained=true] .shell-keys{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none}

@@ -162,3 +162,95 @@ for credential leakage. The fixture requires local `git` and `openssl` binaries.
 
 The deployed smoke test must verify a screenshot is a PNG and run file write,
 checkpoint, suspend, restart/read and a duplicate shell action against cloud.
+
+## Private interactive shell transport
+
+`server.py` embeds the independent `shell_bridge.py` transport on **private
+6082** and shares its `ShellManager`. This is a real interactive bash controlling
+TTY (`pty.fork`, job control and `TIOCSWINSZ`), not `exec` polling. The 8080
+control server remains internal. Neither port is a public app/console port;
+Docker `EXPOSE` is container metadata only. Authenticated health advertises
+`"shellPtySupported"` for this image implementation, and `"shellPty"` only after a successful authenticated bridge protocol probe.
+
+The upstream DO connects to `/shell` (or `/`) using all of:
+
+- `Authorization: Bearer <BOTSPACE_COMPUTER_TOKEN>` (never a URL parameter);
+- `Sec-WebSocket-Protocol: timber-shell.v1`;
+- `X-Timber-Shell-Session: <canonical UUID>`;
+- `X-Timber-Shell-Expires: <integer epoch milliseconds>` (future, at most 60s).
+
+Client frames are masked, unfragmented RFC6455 **text** frames containing exactly
+`{"type":"input","data":"..."}` or
+`{"type":"resize","cols":80,"rows":24}`. Dimensions are integer 1–500 columns
+and 1–200 rows. Binary frames, compression, continuation frames, unknown fields,
+and malformed messages terminate the session. Ping/pong/close are supported.
+Output frames are text JSON `{"type":"output","data":"..."}`;
+terminal status is `{"type":"exit","exitCode":7}` (null for signal death), and
+errors contain only fixed `{"type":"error","code":"shell_*"}` categories.
+Invalid PTY output UTF-8 is replaced incrementally, not allowed to break JSON.
+
+Internal authenticated HTTP controls on **6082** (also available on **8080**):
+
+- `POST /shell/renew {"sessionId":"<UUID>","expiresAt":<epoch-ms>}`;
+- `POST /shell/close {"sessionId":"<UUID>"}`;
+- `POST /shell/close-all {}`.
+
+Success is `{"ok":true}`. Session UUIDs are one-use within the boot. Close records
+an hour-long session fence **before** cleanup, including IDs whose upgrade has
+not arrived. At most 1024 unexpired fences are retained; capacity fails closed
+rather than evicting a live fence. `/shell/close-all` permanently fences new shell
+admission for this bridge boot (appropriate for suspend/delete); reopening requires
+a new bridge/manager. This prevents unknown delayed handshakes without relying on
+an absent generation header. Close is idempotent and returns only after cleanup;
+a mismatched session ID never closes another shell. Renew never revives an
+expired/closed session, shortens its lease, or extends the monotonic one-hour
+hard deadline. The lease continues to expire even when the client sends input.
+There is at most **one session**, and its entire life (including cleanup) blocks
+checkpoint/restore atomically. The DO must close it before suspend/delete and
+must arrange persistence after it closes; shell input/output is not journaled.
+
+Frames are capped at 16 KiB, queued input at 64 KiB, total input/output UTF-8 data at 16 MiB
+per session, and sends at two seconds. Slow/disconnected peers cannot retain an
+unbounded output queue. Incomplete upgrades have a five-second socket timeout
+and at most sixteen accepted connection handlers. Disconnect, lease/hard expiry,
+protocol/limit failure and explicit close kill/reap the PTY and all descendants.
+Each session starts a fresh-exec, single-threaded `shell_bridge.py --supervisor`
+helper with Linux `PR_SET_CHILD_SUBREAPER`; only that helper calls `pty.fork`.
+The threaded HTTP server never runs Python child setup after fork. The private
+socketpair passes the PTY descriptor with `SCM_RIGHTS`, not terminal data.
+Detached descendants remain under the dedicated subreaper even after `env -i`,
+`setsid`, double-fork or reparenting. Cleanup freezes/kills only its current direct
+children using identity-fenced Linux pidfds; as ancestors die, surviving subtree
+roots are adopted and killed in turn. The helper reaps until kernel `ECHILD`
+confirms no remaining children before sending an acknowledged cleanup receipt.
+No environment marker, historical PID sample or unrelated process group is used.
+Linux child-subreaper and pidfd support are required; startup fails closed without
+them. The helper is included in the existing single-file Docker/bootstrap copy.
+
+A cleanup timeout/error retains the session and checkpoint/admission guard.
+Handler completion is separate from confirmed cleanup; authenticated close calls
+(including upstream maintenance retries) retry shutdown of the same helper,
+never launch a replacement shell. The helper also retries uncertain shutdown
+without surrendering subreaper ownership. A dead helper without a cleanup receipt
+is uncertainty, not evidence that its descendants stopped.
+Only an allowlisted minimal environment reaches bash: no inherited computer or
+provider tokens or shell startup hooks; bash uses `--noprofile --norc` and starts
+in `/workspace` (the configured workspace in tests). Automatic bash history is
+disabled (`HISTFILE=/dev/null`, `HISTSIZE=0`, `HISTFILESIZE=0`), so terminal input
+is not silently written into workspace checkpoints. The authorized owner can
+still explicitly write files or change history settings; this is not an attempt
+to suppress authorized filesystem effects.
+
+**Isolation caveat:** the VM remains the trust boundary. This is not a
+privilege-separating sandbox: hostile same-UID code can inspect other processes or
+kill the supervisor. Losing the supervisor without its cleanup receipt fails
+closed and blocks replacement/checkpoint rather than claiming successful cleanup.
+Real Linux tests cover environment-cleared, detached double-fork writers, complete
+reaping, unrelated process survival, and failed cleanup followed by explicit retry.
+The focused tests also exercise actual WebSocket auth,
+TTY/input, Ctrl-C, resizing, exit codes, lease renewal/expiry, limits, slow-reader
+backpressure, and internal HTTP/checkpoint exclusion:
+
+```
+python3 -m unittest discover -s infra/computer/tests -p test_shell_bridge.py -v
+```

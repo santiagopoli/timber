@@ -12,6 +12,7 @@ import {modelUsage,modelBillingView} from './src/model-billing.ts';
 import {canRetryAdmission} from './src/run-recovery.ts';
 import './src/agent-colors.css';
 import { createDesktopViewer } from './src/desktop.ts';
+import { createShellViewer } from './src/shell.ts';
 import { mountWorkspaceExplorer } from './src/workspace.tsx';
 import './src/layout.css';
 import { renderAvatarThemeGallery } from './src/avatar-theme-gallery.ts';
@@ -38,6 +39,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   let conversationTasks = [];
   let taskProjectionSource=null,taskProjectionMessages=null,renderedTasks=[];
   let sessionController = new AbortController(), streamController, refreshTimer, progressTimer, computerStatusTimer;
+  let computerView = 'desktop';
   let computerStatusRequest = 0, currentPanel = 'conversation', workspaceExpanded = false, desktopFullscreen = false;
   const wideLayout = matchMedia('(min-width: 761px)'), tabletLayout = matchMedia('(max-width: 1099px)');
   const panelNames = ['conversation', 'computer', 'files', 'apps', 'agents', 'runs', 'activity'];
@@ -327,7 +329,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   function taskBotUpdated(bot){if(!authenticated||removedBots.has(bot.id))return;const previous=bots.find(item=>item.id===bot.id);if(!previous||previous.updatedAt>bot.updatedAt)return;bots=bots.map(item=>item.id===bot.id?bot:item);if(selected?.id===bot.id){selected=bot;updateBotHeader();}renderBots();renderMessages();}
   function decorateTaskAvatar(node,botId){const bot=bots.find(item=>item.id===botId);if(bot){node.textContent=bot.name.slice(0,1).toUpperCase();node.dataset.agentColor=agentColor(bot.id);decorateModelAvatar(node,bot,node.classList.contains('large'));decorateGlobalAvatar(node,bot.id);}}
   function openTasks(updateHistory=true,taskId=null) {
-    if(!authenticated)return;showingTasks=true;selectedTaskId=taskId;chat.clear();setupTasksView();$('empty').hidden=true;$('bot-workspace').hidden=true;$('global-tasks-workspace').hidden=false;document.body.dataset.mobileView=taskId?'tasks':'bots';syncTaskToggle();
+    if(!authenticated)return;shell.setActive(false);showingTasks=true;selectedTaskId=taskId;chat.clear();setupTasksView();$('empty').hidden=true;$('bot-workspace').hidden=true;$('global-tasks-workspace').hidden=false;document.body.dataset.mobileView=taskId?'tasks':'bots';syncTaskToggle();
     if(wideLayout.matches&&!taskId){botsCollapsed=false;renderLayout();}
     desktop.setActive(false);stopComputerStatus();activity.setActive(false);agentsView.setActive(false);
     if(updateHistory)history.pushState(null,'',`${location.pathname}${location.search}#tasks${taskId?`&task=${encodeURIComponent(taskId)}`:''}`);
@@ -398,6 +400,41 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     desktopSessions.delete(sessionId);
     if (id && authenticated) await request(`${botPath(id)}/computer/live-session/${sessionId}`, {method: 'DELETE', keepalive: true, signal: AbortSignal.timeout(5000)});
   }
+  const shellSessions = new Map();
+  const shell = createShellViewer({
+    element: $('shell-root'),
+    async connect() {
+      const id = selected?.id, version = generation;
+      if (!id || !authenticated) throw new Error('Select a bot first.');
+      const session = await request(`${botPath(id)}/computer/shell-session`, {method:'POST', body:{}, signal:AbortSignal.timeout(90_000)});
+      shellSessions.set(session.sessionId, id);
+      if (!validView(version) || selected?.id !== id) {
+        await releaseShell(session.sessionId);
+        throw new DOMException('Bot selection changed.', 'AbortError');
+      }
+      return session;
+    },
+    async renew(sessionId) {
+      const id = shellSessions.get(sessionId);
+      if (!id) throw new Error('Shell session ended.');
+      return request(`${botPath(id)}/computer/shell-session/${encodeURIComponent(sessionId)}/renew`, {method:'POST', body:{}, signal:AbortSignal.timeout(8000)});
+    },
+    release:releaseShell,
+  });
+  async function releaseShell(sessionId) {
+    const id = shellSessions.get(sessionId); shellSessions.delete(sessionId);
+    // Starting fetch before logout ensures the originating cookie is still attached.
+    if (id && authenticated) await request(`${botPath(id)}/computer/shell-session/${encodeURIComponent(sessionId)}`, {method:'DELETE', keepalive:true, signal:AbortSignal.timeout(5000)});
+  }
+  function setComputerView(view) {
+    computerView = view;
+    $('panel-computer').dataset.view = view;
+    $('desktop-root').hidden = view !== 'desktop'; $('shell-root').hidden = view !== 'shell';
+    for (const button of document.querySelectorAll('[data-computer-view]')) button.setAttribute('aria-pressed', String(button.dataset.computerView === view));
+    if (view === 'shell') desktop.disconnect(); else shell.disconnect();
+    renderLayout();
+  }
+  for (const button of document.querySelectorAll('[data-computer-view]')) button.addEventListener('click', () => setComputerView(button.dataset.computerView));
   const workspace = mountWorkspaceExplorer($('workspace-root'), {
     request: (id, path, signal) => request(`${botPath(id)}${path}`, {signal}),
     download: (id, path, signal) => request(`${botPath(id)}${path}`, {raw: true, signal}),
@@ -415,7 +452,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     catch (error) { if (error.name === 'AbortError') throw error; throw new Error(method === 'GET' ? 'Connection lost. Check your network, then refresh or reconnect.' : 'The response was lost. The action may have been accepted. Inspect its state before retrying; nothing was retried automatically.'); }
     if (!response.ok) {
       const detail = await response.json().catch(() => ({}));
-      if (response.status === 401 && !/^(chatgpt_|github_|desktop_session_expired$)/.test(String(detail.error?.code || '')) && session === authSession) disconnect('Your session expired. Sign in again.');
+      if (response.status === 401 && !/^(chatgpt_|github_|desktop_session_expired$|shell_session_expired$)/.test(String(detail.error?.code || '')) && session === authSession) disconnect('Your session expired. Sign in again.');
       const error = new Error(detail.error?.message || `Request failed (${response.status}).`); error.status = response.status; error.code = detail.error?.code; throw error;
     }
     if (session !== authSession) throw new DOMException('The session ended.', 'AbortError');
@@ -644,7 +681,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     $('click-mode').checked = false; $('auto-screenshot').checked = false; document.querySelector('.screen').classList.remove('click-enabled');
   }
   function disconnect(message = '') {
-    desktop.disconnect(); workspace.clear();
+    desktop.disconnect(); shell.disconnect(); workspace.clear();
     clearTimeout(avatarPollTimer);avatarRequest++;avatarHistoryPage=0;avatarThemeDraft='';avatarReasoningDraft=null;avatarSettings={themes:[],selection:null,avatars:[],jobs:[]};avatarModels={connected:false,vectorModels:[],imageModels:[],imageAvailable:false};avatarLoading=false;avatarAdmissions.clear();revokeAvatarUrls();$('avatar-error').textContent='';$('avatar-status').textContent='Sign in to load avatar settings.';
 
     stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId=null; cancelStreamRender(); resetConversationHistory(); generation++; authSession++; authenticated = false; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
@@ -776,10 +813,10 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     if (selected?.id === bot.id) {
       if(wasShowingTasks){$('empty').hidden=true;$('bot-workspace').hidden=false;updateBotHeader();renderMessages();}
       history[replace ? 'replaceState' : 'pushState'](null, '', `${location.pathname}${location.search}#bot=${encodeURIComponent(bot.id)}`);
-      if (!$('panel-computer').hidden) {desktop.setActive(true); void guarded(computerStatus);}
+      if (!$('panel-computer').hidden) {desktop.setActive(computerView === 'desktop'); shell.setActive(computerView === 'shell'); void guarded(computerStatus);}
       return;
     }
-    desktop.disconnect(); workspace.clear();
+    desktop.disconnect(); shell.disconnect(); workspace.clear();
     if (!$('panel-files').hidden) workspace.setBot(bot.id);
     stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId = chosenHash() === bot.id ? new URLSearchParams(location.hash.slice(1)).get('agent') : null;agentsLoading=true;agentsError=''; cancelStreamRender(); resetConversationHistory(); generation++; const version = generation; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
     selected = bot; chatLoading = true; currentRun = null; stoppableRun = null; cursor = 0; boundary = ''; events = []; conversationTasks=[]; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs = new Map(); activeRunIds = new Set(); streamDrafts = new Map(); nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; runFilter = null; runRevision = 0;
@@ -1217,7 +1254,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
       renderMessages();return;
     }
     if (!validView(version) || !Number.isSafeInteger(event.id) || event.id <= cursor) return;
-    if (event.type === 'computer.suspended') desktop.disconnect();
+    if (event.type === 'computer.suspended') {desktop.disconnect(); shell.disconnect();}
     if (['computer.action', 'computer.suspended', 'tool.started', 'tool.completed', 'process.updated', 'approval.updated'].includes(event.type)) queueComputerStatus();
     cursor = event.id;
     // Actions belong to the conversation, including after a task completes.
@@ -1368,7 +1405,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   }
   async function suspendComputer() {
     if (!selected) return; const id = selected.id, version = generation, pending = beginComputer(id, 'Saving workspace and suspending computer'); if (!pending) return;
-    await desktop.disconnect();
+    await Promise.all([desktop.disconnect(), shell.disconnect()]);
     try { const { computer } = await request(`${botPath(id)}/computer/suspend`, { method: 'POST', body: {} }); if (!validView(version)) return; clearScreen(); renderResult({ status: 'completed', ...(computer.lastCheckpointId ? { checkpointId: computer.lastCheckpointId } : {}), output: 'Computer suspended. The next action restores its workspace.' }, { type: 'suspend' }); if (!computer.lastCheckpointId) warning('No checkpoint reference was returned. Durable storage is not confirmed.'); await computerStatus(); }
     finally { finishComputer(id, pending); }
   }
@@ -1400,7 +1437,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     $('edit-dialog').close(); renderDeleteControls(); $('delete-dialog').showModal(); $('cancel-delete-bot').focus();
   }
   function forgetBot(id) {
-    if (selected?.id === id) { desktop.disconnect(); workspace.clear();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId=null; }
+    if (selected?.id === id) { desktop.disconnect(); shell.disconnect(); workspace.clear();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId=null; }
     removedBots.add(id); bots = bots.filter(bot => bot.id !== id); drafts.delete(id); draftMentions.delete(id); sendBusy.delete(id); approvalFeedback.delete(id); computerPending.delete(id);
     for (const [key, message] of pendingMessages) if (message.botId === id) pendingMessages.delete(key);
     for (const map of [pendingActions, approvalWork, connectionWork, appWork]) for (const key of map.keys()) if (key.startsWith(`${id}:`)) map.delete(key);
@@ -1441,7 +1478,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     } finally {if (session === authSession) {deleteBusy = false; renderDeleteControls();}}
   }
   function syncChatDock() {
-    const docked = desktopFullscreen || (workspaceExpanded && currentPanel === 'computer');
+    const docked = computerView === 'desktop' && (desktopFullscreen || (workspaceExpanded && currentPanel === 'computer'));
     $('desktop-root').dataset.expanded = String(docked);
     chat.setDock(docked ? $('desktop-chat-dock') : null);
   }
@@ -1474,7 +1511,8 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     $('current-panel').textContent = ({computer:'Computer',files:'Files',apps:'Apps',agents:'Agents',runs:'Runs',activity:'Activity'})[currentPanel] || '';
     $('current-panel').hidden = !open || docked;
     $('back-to-chat').hidden = !open || docked;
-    desktop.setActive(!showingTasks && currentPanel === 'computer');
+    desktop.setActive(!showingTasks && currentPanel === 'computer' && computerView === 'desktop');
+    shell.setActive(authenticated && !showingTasks && currentPanel === 'computer' && computerView === 'shell' && (!matchMedia('(max-width: 760px)').matches || document.body.dataset.mobileView === 'bot'));
     activity.setActive(authenticated && !showingTasks && currentPanel === 'activity');
     agentsView.setActive(authenticated && !showingTasks && currentPanel === 'agents');
     syncChatDock();
@@ -1534,7 +1572,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     if(selected)renderMessages();
     activity.setActive(Boolean(selected)&&wideLayout.matches&&currentPanel==='activity');
     agentsView.setActive(Boolean(selected)&&wideLayout.matches&&currentPanel==='agents');
-    desktop.setActive(false); stopComputerStatus();
+    desktop.setActive(false); shell.setActive(false); stopComputerStatus();
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
     if (updateHistory) history.pushState(null, '', `${location.pathname}${location.search}#bots`);
   }
@@ -1558,7 +1596,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   });
   $('disconnect').addEventListener('click', async () => {
     const button = $('disconnect'); button.disabled = true;
-    try {await desktop.disconnect(); await sessionRequest('DELETE'); disconnect(); sessionChannel?.postMessage('signed-out');}
+    try {await Promise.all([desktop.disconnect(), shell.disconnect()]); await sessionRequest('DELETE'); disconnect(); sessionChannel?.postMessage('signed-out');}
     catch (error) {$('github-error').textContent = 'Sign out failed. Check your connection and try again.';}
     finally {button.disabled = false;}
   });
@@ -1639,7 +1677,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   $('refresh-github').addEventListener('click', () => {void loadGitHubStatus();});
   $('disconnect-github').addEventListener('click', () => {void disconnectGitHub();});
   window.addEventListener('focus', () => {if (authenticated && $('settings-dialog').open) void loadGitHubStatus(); if (authenticated && selected && connections.some(item => item.status === 'pending')) void guarded(() => Promise.all([loadConnections(), loadRuns()]));});
-  document.addEventListener('visibilitychange', () => { desktop.setActive(!$('panel-computer').hidden && (!matchMedia('(max-width: 760px)').matches || document.body.dataset.mobileView === 'bot')); });
+  document.addEventListener('visibilitychange', () => { desktop.setActive(computerView === 'desktop' && !$('panel-computer').hidden && (!matchMedia('(max-width: 760px)').matches || document.body.dataset.mobileView === 'bot')); });
   window.addEventListener('pagehide', () => {cancelStreamRender();clearTimeout(compactionsTimer);clearTimeout(historyRetryTimer);stopComputerStatus(); streamController?.abort();});
   window.addEventListener('pageshow', event => {if (event.persisted && authenticated) {startStream(); void guarded(loadBots);void loadCompactions();}});
   document.addEventListener('visibilitychange', () => {

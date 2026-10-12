@@ -40,6 +40,10 @@ export type ComputerAction =
 /** An exec receipt may still be running; processId remains stable across polls and cancellation. */
 export interface ComputerResult { operationId:string;status:"running"|"completed"|"failed"|"interrupted"|"cancelled";processId?:string;processKnown?:boolean;output?:string;exitCode?:number;artifactId?:string;mimeType?:string;checkpointId?:string;checkpointStatus?:"pending"|"saved"|"failed";workspaceChanged?:boolean;error?:string; }
 export interface ComputerStatus { id:string;provider:"cloudflare";state:"stopped"|"starting"|"running"|"unavailable";capabilities:string[];lastCheckpointId?:string;error?:{code:string;message:string}; }
+/** Owner-authenticated, one-use PTY grant; protocols contain a secret ephemeral ticket. */
+export interface ComputerShellSession {url:string;protocols:string[];sessionId:string;expiresAt:string;}
+export type ComputerShellInput = {type:"input";data:string} | {type:"resize";cols:number;rows:number} | {type:"ack";seq:number};
+export type ComputerShellOutput = {type:"output";data:string;seq:number} | {type:"exit";exitCode:number|null} | {type:"error";code:string};
 export interface Approval {id:string;botId:string;runId:string;operationId:string;toolCallId?:string;action:ComputerAction;status:"pending"|"approved"|"denied"|"executing"|"completed"|"failed"|"interrupted";createdAt:string;expiresAt:string;result?:ComputerResult;}
 export interface SecureDeployCapabilities {secureDeploy:boolean;isolationVersion?:string;privateCredentialChannel?:boolean;noShellEnv?:boolean;noBuildCredentialInheritance?:boolean;outputRedaction?:boolean;canaryVersion?:string;cliVersion?:string;cliBuildId?:string;cliDigest?:`sha256:${string}`;noAutomaticRetry?:boolean;}
 export interface SecureDeployPrivateRequest {operationId:string;authorization:unknown;pin:unknown;refs:ReadonlyArray<{id:string;revision:number;permissionEpoch:string;binding:string}>;credentials:ReadonlyArray<{refId:string;revision:number;header:string;prefix:string;value:string}>;signal?:AbortSignal;}

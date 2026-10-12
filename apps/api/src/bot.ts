@@ -1027,6 +1027,7 @@ export class BotDO extends DurableObject<Env> {
   private async claimExecution(operationId:string,runId:string):Promise<string|undefined> {
     const run=this.getRun(runId);
     if(run.coordinatorMode)return;
+    if(await this.computer.controlled?.(this.bot().id)) throw new ApiError(409,"computer_busy","A person has interactive computer control. Admission waits until it is released.");
     const registry=this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName("owner")),taskId=this.taskId();
     const response=await registry.fetch(`https://workspace/tasks/bot-slot/${this.bot().id}/admissions`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId,...(taskId?{taskId}:{})})});
     const data=await response.json<{token?:string;error?:{code?:string;message?:string}}>();
@@ -2128,6 +2129,21 @@ export class BotDO extends DurableObject<Env> {
           return response;
         } finally {this.takingControl=false;}
       }
+      if(path==="/computer/shell-session" && request.method==="POST") {
+        await consumeUnusedBody(request);
+        if(this.suspending || this.takingControl) throw new ApiError(409,"computer_busy","The computer is changing state. Try again shortly.");
+        const run=this.ctx.storage.sql.exec("SELECT id FROM runs WHERE json_extract(data,'$.status') IN ('queued','running') LIMIT 1").toArray()[0];
+        const approval=this.ctx.storage.sql.exec("SELECT id FROM approvals WHERE json_extract(data,'$.status')='executing' LIMIT 1").toArray()[0];
+        if(run || approval) throw new ApiError(409,"computer_busy","Stop the active run or wait for its action to finish before opening a shell.");
+        this.takingControl=true;
+        try {
+          const response=await this.computerView(new Request(request.url,{method:"POST"}),"/shell");
+          if(response.ok) this.invalidatePendingGui();
+          return response;
+        } finally {this.takingControl=false;}
+      }
+      const shellSession=/^\/computer\/shell-session\/([a-f0-9-]{36})(\/renew)?$/.exec(path);
+      if(shellSession && ((request.method==="POST" && shellSession[2]) || (request.method==="DELETE" && !shellSession[2]))) {requestBodyForwarded=true;return this.computerView(request,`/shell/${shellSession[1]}${shellSession[2]??""}`);}
       const desktopSession=/^\/computer\/live-session\/([a-f0-9-]{36})(\/renew)?$/.exec(path);
       if(desktopSession && ((request.method==="POST" && desktopSession[2]) || (request.method==="DELETE" && !desktopSession[2]))) {requestBodyForwarded=true;return this.computerView(request,`/desktop/${desktopSession[1]}${desktopSession[2]??""}`);}
       if(path==="/computer" && request.method==="GET") return json({computer:await this.computer.status(this.bot().id)});

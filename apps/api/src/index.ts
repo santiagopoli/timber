@@ -1,4 +1,4 @@
-import { authenticate, consoleSession } from "./auth";
+import { authenticate, authenticateShellWebSocket, consoleSession } from "./auth";
 import { ApiError, errorResponse, json } from "./errors";
 import type { Env } from "./env";
 import { UUID, operationId as validateOperationId, parseAction } from "./validation";
@@ -96,6 +96,16 @@ export default {
         const record=await registry.fetch(`https://workspace/${desktop[1]}`);
         if(!record.ok) return record;
         return env.COMPUTER.get(env.COMPUTER.idFromName(desktop[1])).fetch(new Request("https://computer.internal/desktop-ws",{headers:{"x-timber-bot-id":desktop[1],Upgrade:"websocket","sec-websocket-protocol":protocols}}));
+      }
+      const shell=/^\/v1\/bots\/([^/]+)\/computer\/shell$/.exec(url.pathname);
+      if(shell) {
+        const owner=await authenticateShellWebSocket(request,env.BOTSPACE_API_TOKEN);
+        if(!UUID.test(shell[1])) throw new ApiError(404,"not_found","Bot not found.");
+        const protocols=request.headers.get("sec-websocket-protocol")??"";
+        if(protocols.length>256) throw new ApiError(403,"shell_access_denied","Shell access denied.");
+        const record=await env.WORKSPACE.get(env.WORKSPACE.idFromName(owner)).fetch(`https://workspace/${shell[1]}`);
+        if(!record.ok) return record;
+        return env.COMPUTER.get(env.COMPUTER.idFromName(shell[1])).fetch(new Request("https://computer.internal/shell-ws",{headers:{"x-timber-bot-id":shell[1],Upgrade:"websocket","sec-websocket-protocol":protocols}}));
       }
       if(url.pathname==="/v1/session") return await consoleSession(request,env.BOTSPACE_API_TOKEN);
       const owner=await authenticate(request,env.BOTSPACE_API_TOKEN);
@@ -269,11 +279,16 @@ export default {
         }
         return response;
       }
-      const mutation=tail==="/computer/suspend" && request.method==="POST" || tail==="/computer/live-session" && request.method==="POST" || /^\/approvals\/[^/]+$/.test(tail) && request.method==="POST";
+      const mutation=tail==="/computer/suspend" && request.method==="POST" || tail==="/computer/live-session" && request.method==="POST" || tail==="/computer/shell-session" && request.method==="POST" || /^\/approvals\/[^/]+$/.test(tail) && request.method==="POST";
       if(mutation) admissionToken=await beginAdmission(env,botId,`mutation:${crypto.randomUUID()}`);
       requestBodyForwarded=true;
       const response=await stub.fetch(new Request(`https://bot${tail||"/"}${url.search}`,{method:request.method,headers,body:["GET","HEAD"].includes(request.method)?undefined:request.body,redirect:"manual",signal:request.signal}));
       if(admissionToken)await completeAdmission(env,botId,admissionToken);
+      if(tail==="/computer/shell-session" && request.method==="POST" && response.ok) {
+        const grant=await response.json<{sessionId:string;protocols:string[];expiresAt:string}>();
+        const wsUrl=new URL(`/v1/bots/${botId}/computer/shell`,url);wsUrl.protocol=url.protocol==="https:"?"wss:":"ws:";
+        return json({...grant,url:wsUrl.toString()});
+      }
       return response;
     } catch(error) {return errorResponse(error);} finally {if(!requestBodyForwarded)await discardRequestBody(request);}
   },

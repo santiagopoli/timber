@@ -248,6 +248,10 @@ os._exit(1)
 
     def test_output_is_bounded_in_utf8_bytes_even_for_invalid_binary_output(self):
         result = self.computer.execute("binary", {"type": "exec", "command": "python3 -c 'import os; os.write(1, bytes([255]) * 160000)'"})
+        # yieldMs bounds the receipt wait, not execution. CPU contention can
+        # legitimately return running; observe the same command, never rerun it.
+        if result["status"] == "running":
+            result = self.until("binary", lambda value: value["status"] != "running")
         self.assertEqual(result["status"], "completed")
         self.assertLessEqual(len(result["output"].encode("utf-8")), server.MAX_OUTPUT)
         self.assertIn("truncated", result["output"])

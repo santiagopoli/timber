@@ -29,4 +29,6 @@ setpriv --reuid=10001 --regid=10001 --clear-groups --bounding-set=-all --inh-cap
 # trusted root service with protected code, and never shares env/proc with UID10001.
 python3 /opt/botspace/desktop_bridge.py view > /state/desktop-view-bridge.log 2>&1 &
 python3 /opt/botspace/desktop_bridge.py control > /state/desktop-control-bridge.log 2>&1 &
+# server.py embeds shell_bridge.py on private 6082 with one shared manager,
+# so shell admission and checkpoint/restore exclusion are atomic.
 exec python3 /opt/botspace/server.py
