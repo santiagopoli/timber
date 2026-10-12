@@ -68,14 +68,14 @@ export default {
         const response=await env.ASSETS.fetch(new Request(assetUrl,request));
         const headers=new Headers(response.headers);
         const previewOrigin=env.PREVIEW_ORIGIN && /^https:\/\/[a-z0-9.-]+$/.test(env.PREVIEW_ORIGIN)?env.PREVIEW_ORIGIN:"";
-        headers.set("content-security-policy",`default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ${url.origin.replace(/^http/, 'ws')}; img-src 'self' blob: data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' ${previewOrigin}`);
+        headers.set("content-security-policy",`default-src 'self'; manifest-src 'self'; worker-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ${url.origin.replace(/^http/, 'ws')}; img-src 'self' blob: data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' ${previewOrigin}`);
         // A cross-origin form POST with no-referrer sends Origin: null. The
         // app ticket handoff requires our exact origin, without a path/query.
         headers.set("referrer-policy","strict-origin");
         headers.set("x-content-type-options","nosniff");
         // Always load the current shell; its fingerprinted JS/CSS retain their
         // own asset cache policy. This never reloads an active conversation.
-        if(assetUrl.pathname==="/" || headers.get("content-type")?.includes("text/html")) headers.set("cache-control","no-store");
+        if(assetUrl.pathname==="/" || assetUrl.pathname==="/sw.js" || assetUrl.pathname==="/manifest.webmanifest" || headers.get("content-type")?.includes("text/html")) headers.set("cache-control","no-store");
         return new Response(response.body,{status:response.status,headers});
       }
       // Provider callbacks are one-time, browser-bound flows. Git transport is
