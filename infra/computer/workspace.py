@@ -1,6 +1,7 @@
 """Bounded, read-only workspace inspection. No user supplied shell commands."""
 from __future__ import annotations
 import difflib
+import errno
 import mimetypes
 import os
 import re
@@ -9,6 +10,16 @@ import selectors
 import stat
 import subprocess
 import time
+
+def _workspace_prefix():
+    try:
+        import pwd
+        if pwd.getpwnam("timber-shell").pw_uid == 10001 and pwd.getpwnam("timber-deploy").pw_uid == 10002 and os.geteuid() == 0:
+            return ["/usr/bin/setpriv", "--reuid=10001", "--regid=10001", "--clear-groups", "--bounding-set=-all", "--inh-caps=-all", "--no-new-privs", "--"]
+    except (KeyError, ImportError):
+        pass
+    return []
+
 
 MAX_TEXT = 256 * 1024
 MAX_DOWNLOAD = 32 * 1024 * 1024
@@ -43,39 +54,84 @@ class WorkspaceInspector:
     def relative(self, path: Path) -> str:
         return path.relative_to(self.workspace).as_posix()
 
+    def _open_fd(self, relative, directory=False):
+        pure = PurePosixPath(relative)
+        if pure.is_absolute() or (not directory and not pure.parts) or any(part in {"", ".", ".."} for part in pure.parts):
+            raise ValueError('Invalid workspace path')
+        rootfd = os.open(self.workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        current = rootfd
+        try:
+            if directory and relative in {'', '.'}:
+                return os.dup(rootfd)
+            parents = pure.parts if directory else pure.parts[:-1]
+            for part in parents:
+                try:
+                    nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+                except OSError as exc:
+                    if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                        raise ValueError('Symbolic links and non-directory path components are not allowed') from exc
+                    raise
+                if current != rootfd:
+                    os.close(current)
+                current = nxt
+            if directory:
+                result = os.dup(current)
+            else:
+                try:
+                    result = os.open(pure.parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=current)
+                except OSError as exc:
+                    if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                        raise ValueError('Symbolic links and non-file path components are not allowed') from exc
+                    raise
+            return result
+        finally:
+            if current != rootfd:
+                os.close(current)
+            os.close(rootfd)
+
     def tree(self, path='.'):
-        directory = self.path(path)
-        if not directory.is_dir():
-            raise ValueError('Path is not a directory')
+        target = self.path(path)
+        fd = self._open_fd(path, directory=True)
         entries = []
         truncated = False
-        with os.scandir(directory) as scan:
-            for item in scan:
-                if len(entries) >= MAX_ENTRIES:
-                    truncated = True
-                    break
-                info = item.stat(follow_symlinks=False)
-                kind = 'symlink' if stat.S_ISLNK(info.st_mode) else 'directory' if stat.S_ISDIR(info.st_mode) else 'file'
-                entries.append({'name':item.name, 'path':self.relative(Path(item.path)), 'kind':kind, 'size':info.st_size, 'modifiedAt':info.st_mtime * 1000, 'accessible':kind != 'symlink' and (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode))})
+        try:
+            with os.scandir(fd) as scan:
+                for item in scan:
+                    if len(entries) >= MAX_ENTRIES:
+                        truncated = True
+                        break
+                    info = item.stat(follow_symlinks=False)
+                    kind = 'symlink' if stat.S_ISLNK(info.st_mode) else 'directory' if stat.S_ISDIR(info.st_mode) else 'file'
+                    entries.append({'name':item.name, 'path':self.relative(target / item.name), 'kind':kind, 'size':info.st_size, 'modifiedAt':info.st_mtime * 1000, 'accessible':kind != 'symlink' and (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode))})
+        finally:
+            os.close(fd)
         entries.sort(key=lambda e:(e['kind'] != 'directory', e['name'].casefold()))
-        return {'path':self.relative(directory), 'entries':entries, 'truncated':truncated}
+        return {'path':self.relative(target), 'entries':entries, 'truncated':truncated}
 
     def file(self, path):
-        target = self.path(path)
-        info = target.stat()
-        if not stat.S_ISREG(info.st_mode):
-            raise ValueError('Only regular files can be opened')
-        mime = mimetypes.guess_type(target.name)[0] or 'application/octet-stream'
-        with target.open('rb') as stream:
-            data = stream.read(MAX_TEXT + 1)
+        pure = PurePosixPath(path)
+        target_name = pure.name
+        fd = self._open_fd(path)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
+                raise ValueError('Only regular files can be opened')
+            mime = mimetypes.guess_type(target_name)[0] or 'application/octet-stream'
+            data = bytearray()
+            while len(data) <= MAX_TEXT:
+                block = os.read(fd, min(65536, MAX_TEXT + 1 - len(data)))
+                if not block:
+                    break
+                data.extend(block)
+        finally:
+            os.close(fd)
         truncated = len(data) > MAX_TEXT
-        data = data[:MAX_TEXT]
-        result = {'path':self.relative(target), 'name':target.name, 'size':info.st_size, 'mimeType':mime, 'kind':'binary', 'truncated':truncated, 'downloadable':info.st_size <= MAX_DOWNLOAD}
+        data = bytes(data[:MAX_TEXT])
+        result = {'path':PurePosixPath(path).as_posix(), 'name':target_name, 'size':info.st_size, 'mimeType':mime, 'kind':'binary', 'truncated':truncated, 'downloadable':info.st_size <= MAX_DOWNLOAD}
         if mime in IMAGE_TYPES:
             result['kind'] = 'image'
             return result
         try:
-            # A partial final UTF-8 sequence is allowed only at the preview limit.
             content = data.decode('utf-8', errors='strict')
         except UnicodeDecodeError as exc:
             if truncated and exc.end == len(data) and exc.reason == 'unexpected end of data':
@@ -84,15 +140,26 @@ class WorkspaceInspector:
                 return result
         if '\x00' in content or any(ord(char) < 9 or 13 < ord(char) < 32 for char in content[:8192]):
             return result
-        result.update(kind='text', content=content, language='dockerfile' if target.name.lower() == 'dockerfile' else LANGUAGES.get(target.suffix.lower(), 'text'))
+        result.update(kind='text', content=content, language='dockerfile' if target_name.lower() == 'dockerfile' else LANGUAGES.get(Path(target_name).suffix.lower(), 'text'))
         return result
 
     def download(self, path):
-        target = self.path(path)
-        info = target.stat()
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_DOWNLOAD:
-            raise ValueError('Downloads support regular files up to 32 MiB')
-        return target, mimetypes.guess_type(target.name)[0] or 'application/octet-stream'
+        fd = self._open_fd(path)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1 or info.st_size > MAX_DOWNLOAD:
+                raise ValueError('Downloads support regular files up to 32 MiB')
+            data = bytearray()
+            while len(data) <= MAX_DOWNLOAD:
+                block = os.read(fd, min(65536, MAX_DOWNLOAD + 1 - len(data)))
+                if not block:
+                    break
+                data.extend(block)
+            if len(data) > MAX_DOWNLOAD:
+                raise ValueError('Downloads support regular files up to 32 MiB')
+            return bytes(data), mimetypes.guess_type(PurePosixPath(path).name)[0] or 'application/octet-stream'
+        finally:
+            os.close(fd)
 
     def repository(self, project):
         root = self.path(project)
@@ -131,7 +198,7 @@ class WorkspaceInspector:
 
     def git(self, project, *args, limit=MAX_TEXT, allow_missing=False):
         root, gitdir = self.repository(project)
-        env = {'PATH':os.environ.get('PATH','/usr/bin:/bin'), 'HOME':'/nonexistent', 'GIT_CONFIG_NOSYSTEM':'1', 'GIT_CONFIG_GLOBAL':'/dev/null', 'GIT_OPTIONAL_LOCKS':'0', 'GIT_TERMINAL_PROMPT':'0', 'GIT_PAGER':'cat', 'LC_ALL':'C'}
+        env = {'PATH':'/usr/bin:/bin', 'HOME':'/tmp', 'GIT_CONFIG_NOSYSTEM':'1', 'GIT_CONFIG_GLOBAL':'/dev/null', 'GIT_OPTIONAL_LOCKS':'0', 'GIT_TERMINAL_PROMPT':'0', 'GIT_PAGER':'cat', 'LC_ALL':'C'}
         command = ['git', '--no-pager', '--git-dir='+str(gitdir), '--work-tree='+str(root), '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'diff.external=', '-c', 'core.quotePath=false', *args]
         # Even read-only status/diff can invoke repository clean/process filters.
         # Inspect keys without expanding includes before allowing any operation.
@@ -149,7 +216,7 @@ class WorkspaceInspector:
         return self._run(root, command, env, limit, allow_missing=allow_missing)
 
     def _run(self, root, command, env, limit, allow_missing=False):
-        process = subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        process = subprocess.Popen([*_workspace_prefix(), *command], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
         result = bytearray()
         started = time.monotonic()
         truncated = False

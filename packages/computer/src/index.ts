@@ -6,9 +6,12 @@ import startSource from "../../../infra/computer/start.sh";
 import workspaceSource from "../../../infra/computer/workspace.py";
 import desktopSource from "../../../infra/computer/desktop_bridge.py";
 import { DesktopSessions, DesktopError } from "./live";
+import { createCloudSecureWorkerDeployProvider } from "./secure-deploy";
+import { secureDeployComputerRoute } from "./secure-deploy-do";
 
 export interface ComputerEnv {
   FILES: R2Bucket;
+  WORKSPACE?: DurableObjectNamespace;
   GITHUB?: DurableObjectNamespace;
   /** Temporary deployment mode. Installs desktop packages at cold start. */
   COMPUTER_BOOTSTRAP?: string;
@@ -286,12 +289,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
     try {
-      if(path==="/secure-worker-deploy/capabilities" || path.startsWith("/secure-worker-deploy/")) {
-        // Shared VM/container has no isolation from workspace hooks or sibling processes.
-        // Stay unsupported regardless of any accidental service binding configuration.
-        this.active();
-        return Response.json({error:{code:"secure_deploy_host_unsupported",message:"No trusted isolated deploy host is available."},secureDeploy:false},{status:path.endsWith('/capabilities')?200:409});
-      }
+      if(path.startsWith("/secure-deploy")) return await secureDeployComputerRoute(this,request,path);
       if(path.startsWith("/workspace/") || path.startsWith("/desktop")) return await this.inspect(request);
       if(path.startsWith("/preview/")) return await this.preview(request);
       if (request.method !== "POST") throw new ComputerProviderError("computer_method_not_allowed");
@@ -1246,6 +1244,7 @@ async function rpc<T>(binding: DurableObjectNamespace, botId: string, path: stri
 }
 
 export function createCloudComputerProvider(binding: DurableObjectNamespace): ComputerProvider {
+  const deploy=createCloudSecureWorkerDeployProvider(binding);
   return {
     exec:(botId,operationId,action) => rpc<ComputerResult>(binding,botId,"/actions",{operationId,action}),
     status:botId => rpc<ComputerStatus>(binding,botId,"/status"),
@@ -1257,6 +1256,9 @@ export function createCloudComputerProvider(binding: DurableObjectNamespace): Co
       if(!response.ok)throw new ComputerProviderError("computer_unavailable");
       return (await response.json<{controlled:boolean}>()).controlled;
     },
+    secureDeployCapabilities:(botId,signal)=>deploy.capabilities(botId,signal),
+    secureDeploy:(botId,input)=>deploy.dispatch(botId,{...(input as unknown as Parameters<typeof deploy.dispatch>[1]),signal:input.signal??new AbortController().signal}),
+    secureDeployCancel:(botId,operationId)=>deploy.cancel(botId,operationId),
     cancel:(botId,processId)=>rpc<ComputerResult>(binding,botId,'/exec/cancel',{processId}),
   };
 }
@@ -1271,5 +1273,5 @@ export function previewCloudComputer(binding:DurableObjectNamespace,botId:string
   }));
 }
 
-export {secureDeployCanonical,SecureDeployCoordinator,unsupportedSecureDeployHost,memorySecureDeployJournal,createPrivateServiceDeployHost,createCloudSecureWorkerDeployProvider} from './secure-deploy';
-export type {SecretRef,DeployPin,DeployRequest,DeployOutput,DeployRecord,SecureDeployAuthorization,SecureDeployHost,SecureDeployAuthority,SecureDeployJournal,SecureWorkerDeployProvider,SecureDeployBinding} from './secure-deploy';
+export {secureDeployCanonical,SecureDeployCoordinator,memorySecureDeployJournal,createCloudSecureWorkerDeployProvider} from './secure-deploy';
+export type {SecretRef,DeployPin,DeployCredential,DeployRequest,DeployRecord,SecureDeployAuthorization,SecureDeployReceipt,SecureDeployCapabilities,SecureDeployHost,SecureDeployAuthority,SecureDeployJournal,SecureWorkerDeployProvider,SecureDeployBinding} from './secure-deploy';

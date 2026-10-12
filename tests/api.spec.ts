@@ -69,6 +69,16 @@ describe("Worker authentication and durable bot identities", () => {
     expect((await exports.default.fetch("https://botspace.test/v1/tasks")).status).toBe(401);
   });
 
+  it("publishes the deployed API version and schema-derived private tool contracts without owner data",async()=>{
+    const response=await exports.default.fetch("https://botspace.test/health/version");expect(response.status).toBe(200);
+    const value=await response.json<{service:string;versionId:string|null;keychainTools:{secret_request:{properties:Record<string,unknown>;additionalProperties:boolean};secure_worker_deploy:{properties:Record<string,unknown>;additionalProperties:boolean};secure_worker_deploy_capabilities:{type:string;properties:Record<string,unknown>;additionalProperties:boolean;required:string[]}}}>();
+    expect(value.service).toBe("botspace");expect(Object.hasOwn(value,"versionId")).toBe(true);
+    expect(value.keychainTools.secret_request.additionalProperties).toBe(false);expect(value.keychainTools.secret_request.properties).toHaveProperty("additionalSecretIds");
+    expect(value.keychainTools.secure_worker_deploy.additionalProperties).toBe(false);expect(value.keychainTools.secure_worker_deploy.properties).toHaveProperty("planId");expect(value.keychainTools.secure_worker_deploy.properties).toHaveProperty("expectedRevision");
+    expect(value.keychainTools.secure_worker_deploy_capabilities).toEqual({type:"object",properties:{},required:[],additionalProperties:false});
+    expect(JSON.stringify(value)).not.toMatch(/token|secretId|ownerId|botId/i);
+  });
+
   it("fails closed when the deployed API secret has not been configured", async () => {
     const response = await worker.fetch(new Request("https://botspace.test/v1/bots", {headers: {authorization: `Bearer ${token}`}}), {...bindings, BOTSPACE_API_TOKEN: undefined});
     expect(response.status).toBe(503);

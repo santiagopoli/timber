@@ -22,7 +22,7 @@ export class ComputerDO extends DurableObject {
   async fetch(request: Request) {
     const path = new URL(request.url).pathname;
     // Exercise the real fail-closed deploy gate rather than teaching the effect fixture to deploy.
-    if(path.startsWith('/secure-worker-deploy/')) {
+    if(path==='/secure-deploy'||path.startsWith('/secure-deploy/')) {
       const botId=request.headers.get('x-timber-bot-id');
       if(!botId)return new Response('Missing private bot identity',{status:400});
       const binding=(this.env as {REAL_COMPUTER:DurableObjectNamespace}).REAL_COMPUTER;

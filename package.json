@@ -34,7 +34,7 @@
     "deploy:build": "npm run build:console && wrangler deploy --config apps/api/wrangler.jsonc",
     "deploy:preview": "wrangler deploy --config apps/preview/wrangler.jsonc",
     "test:avatars": "vitest run --config tests/vitest.config.ts tests/avatars.spec.ts tests/avatar-provider.spec.ts tests/avatar-svg.spec.ts tests/avatar-png.spec.ts && node --test scripts/tests/avatar-deployment.test.mjs",
-    "test:secure-deploy": "node --test scripts/tests/secure-deploy.test.mjs"
+    "test:secure-deploy": "node --test scripts/tests/secure-deploy.test.mjs scripts/tests/secure-deploy-do.test.mjs"
   },
   "dependencies": {
     "@cloudflare/sandbox": "1.0.0",

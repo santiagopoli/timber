@@ -19,6 +19,13 @@ assert.equal(health?.desktop,true,'real X11 desktop is available');
 assert.ok(health?.capabilities?.includes('execSessions'),'queryable execution is available');
 assert.ok(health?.capabilities?.includes('preserveBrowserCheckpoint'),'file checkpoints can preserve Chromium');
 assert.equal((await fetch(origin+'/health')).status,401,'unauthenticated container request rejected');
+assert.equal((await fetch(origin+'/secure-deploy/capabilities')).status,401,'private deploy capability requires host auth');
+const privateCapsResponse=await request('/secure-deploy/capabilities');
+assert.equal(privateCapsResponse.status,200);
+const privateCaps=await privateCapsResponse.json();
+for(const field of ['secureDeploy','privateCredentialChannel','noShellEnv','noBuildCredentialInheritance','outputRedaction']) assert.equal(privateCaps[field],true,`real image private deploy ${field}: ${JSON.stringify(privateCaps)}`);
+assert.equal(privateCaps.isolationVersion,'uid-ptrace-v1');
+assert.equal(privateCaps.canaryVersion,'cross-uid-proc-env-v1');
 async function action(action, operationId = randomUUID()) {
   const response = await request('/actions',{method:'POST',body:JSON.stringify({operationId,action})});
   assert.equal(response.status,200);
@@ -31,6 +38,11 @@ async function action(action, operationId = randomUUID()) {
   }
   assert.equal(result.status,'completed',JSON.stringify(result));return result;
 }
+const isolation=await action({type:'exec',command:'id -u; printf "token=%s\\n" "${BOTSPACE_COMPUTER_TOKEN+visible}"; ps -eo uid,comm | grep openbox'});
+assert.equal(isolation.exitCode,0);
+assert.match(isolation.output,/^10001\ntoken=\n\s*10001 openbox\n$/,'shell/desktop unprivileged and controller token not inherited');
+const escalation=await action({type:'exec',command:'setpriv --reuid=0 -- /bin/true 2>/dev/null'});
+assert.notEqual(escalation.exitCode,0,'workspace shell cannot regain root');
 await action({type:'writeFile',path:'image-smoke.txt',content:'Timber image smoke\n'});
 assert.equal((await action({type:'readFile',path:'image-smoke.txt'})).output,'Timber image smoke\n');
 const operationId = randomUUID();
@@ -53,7 +65,7 @@ const cancelled = await cancellation.json();assert.equal(cancelled.status,'cance
 // A local page avoids internet/CDN timing and verifies text actually reaches an
 // application, rather than merely claiming xdotool returned successfully.
 await action({type:'writeFile',path:'desktop-smoke.html',content:'<!doctype html><meta charset="utf-8"><title>Timber desktop smoke</title><textarea autofocus style="width:800px;height:400px;font-size:24px"></textarea>'});
-await action({type:'exec',command:'python3 -m http.server 8765 --bind 127.0.0.1 > /state/smoke-http.log 2>&1 < /dev/null & echo $! > /state/smoke-http.pid',timeoutMs:10000});
+await action({type:'exec',command:'python3 -m http.server 8765 --bind 127.0.0.1 > /tmp/smoke-http.log 2>&1 < /dev/null & echo $! > /tmp/smoke-http.pid',timeoutMs:10000});
 await action({type:'navigate',url:'http://127.0.0.1:8765/desktop-smoke.html'});
 await pause(1000);
 const unicodeText = 'Hola, Poli. Café, λ y 👋';
@@ -79,7 +91,7 @@ for (let attempt=0;attempt<2;attempt++) {
 await action({type:'key',key:'ctrl+a'});
 await action({type:'key',key:'ctrl+c'});
 assert.equal((await action({type:'exec',command:'xclip -o -selection clipboard'})).output,unicodeText,'automatic checkpoints preserve live textarea state');
-await action({type:'exec',command:'kill "$(cat /state/smoke-http.pid)"',timeoutMs:10000});
+await action({type:'exec',command:'kill "$(cat /tmp/smoke-http.pid)"',timeoutMs:10000});
 const checkpoint = await request('/checkpoint',{method:'POST',body:JSON.stringify({quiesce:true})});
 assert.equal(checkpoint.status,200);
 const checksum = checkpoint.headers.get('x-content-sha256');assert.match(checksum||'',/^[a-f0-9]{64}$/);

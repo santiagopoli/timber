@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import ctypes
+import errno
 import hmac
 import io
 import json
@@ -20,6 +21,7 @@ import sqlite3
 import subprocess
 import struct
 import tarfile
+import stat
 import tempfile
 import threading
 import time
@@ -29,6 +31,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import TCPServer
 from urllib.parse import urlparse, parse_qs
 from workspace import WorkspaceInspector
+from secure_deploy import dispatch as secure_deploy_dispatch, cancel as secure_deploy_cancel
+import workspace_archive
 import socket
 
 MAX_JSON = 2 * 1024 * 1024
@@ -239,10 +243,184 @@ class ExecutionSession:
         self.background_writers = False
 
 
+def workspace_prefix() -> list[str]:
+    """Drop model-controlled tools to the fixed workspace UID in production."""
+    try:
+        import pwd
+        shell = pwd.getpwnam("timber-shell").pw_uid
+        deploy = pwd.getpwnam("timber-deploy").pw_uid
+    except (KeyError, ImportError):
+        return []
+    if shell != 10001 or deploy != 10002 or os.geteuid() != 0:
+        return []
+    return ["/usr/bin/setpriv", "--reuid=10001", "--regid=10001", "--clear-groups",
+            "--bounding-set=-all", "--inh-caps=-all", "--no-new-privs", "--"]
+
+
+
+def migrate_workspace_permissions(workspace: Path) -> None:
+    """Migrate legacy root-owned regular workspace entries without path races."""
+    try:
+        import pwd
+        if pwd.getpwnam("timber-shell").pw_uid != 10001 or os.geteuid() != 0:
+            return
+    except (KeyError, ImportError):
+        return
+
+    def migrate_dir(fd: int) -> None:
+        for name in os.listdir(fd):
+            try:
+                before = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISDIR(before.st_mode):
+                try:
+                    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                    try:
+                        actual = os.fstat(child)
+                        if (actual.st_dev, actual.st_ino) != (before.st_dev, before.st_ino):
+                            continue
+                        if actual.st_uid == 0:
+                            os.fchown(child, 10001, 10001)
+                            os.fchmod(child, stat.S_IMODE(actual.st_mode) | 0o070 | stat.S_ISGID)
+                        migrate_dir(child)
+                    finally:
+                        os.close(child)
+                except OSError:
+                    continue
+            elif stat.S_ISREG(before.st_mode) and before.st_uid == 0 and before.st_nlink == 1:
+                try:
+                    file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+                    try:
+                        actual = os.fstat(file_fd)
+                        if (actual.st_dev, actual.st_ino, actual.st_nlink) != (before.st_dev, before.st_ino, 1):
+                            continue
+                        os.fchown(file_fd, 10001, 10001)
+                        os.fchmod(file_fd, stat.S_IMODE(actual.st_mode) | 0o060)
+                    finally:
+                        os.close(file_fd)
+                except OSError:
+                    continue
+
+    root_fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        migrate_dir(root_fd)
+        os.fchown(root_fd, 10001, 10001)
+        os.fchmod(root_fd, 0o2770)
+    finally:
+        os.close(root_fd)
+
+
+
+def open_workspace_fd(workspace: Path, relative: str, *, directory: bool = False) -> int:
+    """Open a workspace entry using only no-follow dirfd traversal."""
+    if directory and relative in {"", "."}:
+        return os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    pure = PurePosixPath(relative)
+    if pure.is_absolute() or not pure.parts or any(part in {"", ".", ".."} for part in pure.parts):
+        raise ValueError("Invalid workspace path")
+    root_fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    current_fd = root_fd
+    try:
+        parts = pure.parts if directory else pure.parts[:-1]
+        for part in parts:
+            try:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current_fd)
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise ValueError("Symbolic links and non-directory path components are not allowed") from exc
+                raise
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = nxt
+        if directory:
+            result = current_fd
+            current_fd = root_fd
+            return result
+        try:
+            result = os.open(pure.parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=current_fd)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise ValueError("Symbolic links and non-file path components are not allowed") from exc
+            raise
+        return result
+    finally:
+        if current_fd != root_fd:
+            os.close(current_fd)
+        os.close(root_fd)
+
+def ensure_workspace_directory(workspace: Path, relative: str, mode: int = 0o2770) -> int:
+    pure = PurePosixPath(relative)
+    if pure.is_absolute() or not pure.parts or any(part in {"", ".", ".."} for part in pure.parts):
+        raise ValueError("Invalid workspace path")
+    root_fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    current_fd = root_fd
+    try:
+        for part in pure.parts:
+            try:
+                os.mkdir(part, mode=mode, dir_fd=current_fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current_fd)
+            if workspace_prefix():
+                os.fchown(next_fd, 10001, 10001)
+            os.fchmod(next_fd, mode)
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        result = current_fd
+        current_fd = root_fd
+        return result
+    finally:
+        if current_fd != root_fd:
+            os.close(current_fd)
+        os.close(root_fd)
+
+
+def write_workspace_file(workspace: Path, relative: str, content: bytes) -> None:
+    """Atomic root-controller write via no-follow dirfds; never follows user symlinks."""
+    pure = PurePosixPath(relative)
+    if pure.is_absolute() or not pure.parts or any(part in {"", ".", ".."} for part in pure.parts):
+        raise ValueError("Invalid workspace path")
+    root_fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    current_fd = root_fd
+    try:
+        for part in pure.parts[:-1]:
+            try:
+                os.mkdir(part, mode=0o2770, dir_fd=current_fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current_fd)
+            os.fchown(next_fd, 10001, 10001)
+            os.fchmod(next_fd, 0o2770)
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        temporary = ".timber-write-" + str(uuid.uuid4())
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=current_fd)
+        try:
+            if workspace_prefix():
+                os.fchown(fd, 10001, 10001)
+            os.fchmod(fd, 0o660)
+            view = memoryview(content)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temporary, pure.parts[-1], src_dir_fd=current_fd, dst_dir_fd=current_fd)
+    finally:
+        if current_fd != root_fd:
+            os.close(current_fd)
+        os.close(root_fd)
+
+
 class Computer:
     def __init__(self, workspace: Path, state: Path):
         self.workspace = workspace.resolve()
         self.workspace.mkdir(parents=True, exist_ok=True)
+        migrate_workspace_permissions(self.workspace)
         self.state = state.resolve()
         self.state.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
@@ -269,7 +447,7 @@ class Computer:
             boot_file.write_text(str(uuid.uuid4()))
         self.boot_id = boot_file.read_text()
         self.browser: subprocess.Popen | None = None
-        self.browser_checkpoint_profile = self.state / "browser-checkpoint-profile"
+        self.browser_checkpoint_profile = self.workspace / ".browser-profile-baseline"
         self.workspace_changes = WorkspaceChanges(self.workspace)
 
     def path(self, relative: str, *, allow_root: bool = False) -> Path:
@@ -454,7 +632,7 @@ class Computer:
             # is durable. If this server dies in the fork/journal window, stdin
             # closes and the wrapper exits without executing any command effect.
             gate = 'IFS= read -r _timber_exec_gate && [ "$_timber_exec_gate" = execute ] || exit 0; exec /bin/bash -lc "$1" </dev/null'
-            proc = subprocess.Popen(["/bin/bash", "-c", gate, "timber-exec-launch", command], cwd=self.workspace, env=self.child_env(),
+            proc = subprocess.Popen([*workspace_prefix(), "/bin/bash", "-c", gate, "timber-exec-launch", command], cwd=self.workspace, env=self.child_env(),
                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
             session.process = proc
             identity = self.process_identity(proc.pid)
@@ -579,38 +757,94 @@ class Computer:
         if kind in {"gitClone", "gitPush"}:
             return self.git_action(action, git_transport)
         if kind == "writeFile":
-            destination = self.path(action.get("path"))
+            relative = action.get("path")
+            destination = self.path(relative)
             content = action.get("content")
             if not isinstance(content, str) or len(content.encode()) > MAX_JSON:
                 raise ValueError("File content must be UTF-8 text up to 2 MiB")
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as tmp:
-                name = tmp.name
-                tmp.write(content.encode())
-                tmp.flush()
-                os.fsync(tmp.fileno())
-            os.replace(name, destination)
+            write_workspace_file(self.workspace, relative, content.encode())
             return {"status": "completed", "output": f"Wrote {destination.relative_to(self.workspace)}"}
         if kind == "readFile":
-            path = self.path(action.get("path"))
-            if path.stat().st_size > MAX_READ:
-                raise ValueError("File exceeds the 256 KiB text-read limit")
-            return {"status": "completed", "output": path.read_text(encoding="utf-8")}
+            relative = action.get("path")
+            path = self.path(relative)
+            fd = open_workspace_fd(self.workspace, relative)
+            try:
+                file_stat = os.fstat(fd)
+                if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink > 1 or file_stat.st_size > MAX_READ:
+                    raise ValueError("File exceeds the 256 KiB text-read limit")
+                data = bytearray()
+                while len(data) <= MAX_READ:
+                    block = os.read(fd, min(65536, MAX_READ + 1 - len(data)))
+                    if not block:
+                        break
+                    data.extend(block)
+                if len(data) > MAX_READ:
+                    raise ValueError("File exceeds the 256 KiB text-read limit")
+                output = bytes(data).decode("utf-8")
+            finally:
+                os.close(fd)
+            return {"status": "completed", "output": output}
         if kind == "listFiles":
-            directory = self.path(action.get("path", "."), allow_root=True)
+            relative = action.get("path", ".")
+            directory = self.path(relative, allow_root=True)
+            dirfd = open_workspace_fd(self.workspace, relative, directory=True)
             entries = []
-            for index, child in enumerate(sorted(directory.iterdir())):
-                if index >= MAX_FILES:
-                    raise ValueError("Directory has too many entries")
-                entries.append({"name": child.name, "kind": "symlink" if child.is_symlink() else "directory" if child.is_dir() else "file"})
+            try:
+                for index, name in enumerate(sorted(os.listdir(dirfd))):
+                    if index >= MAX_FILES:
+                        raise ValueError("Directory has too many entries")
+                    st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+                    entries.append({"name": name, "kind": "symlink" if stat.S_ISLNK(st.st_mode) else "directory" if stat.S_ISDIR(st.st_mode) else "file"})
+            finally:
+                os.close(dirfd)
             output = json.dumps(entries)
             if len(output.encode()) > MAX_READ:
                 raise ValueError("Directory listing exceeds 256 KiB; list a smaller directory")
             return {"status": "completed", "output": output}
         if kind == "screenshot":
+            name = ".timber-screenshot-" + str(uuid.uuid4()) + ".png"
+            relative = name
+            temporary = self.workspace / name
             target = self.state / (str(uuid.uuid4()) + ".png")
-            self.run(["scrot", "--overwrite", str(target)])
-            return {"status": "completed", "artifactName": target.name, "mimeType": "image/png"}
+            try:
+                self.run(["scrot", "--overwrite", str(temporary)])
+                fd = open_workspace_fd(self.workspace, relative)
+                try:
+                    image_stat = os.fstat(fd)
+                    if not stat.S_ISREG(image_stat.st_mode) or image_stat.st_nlink != 1 or not 0 < image_stat.st_size <= 8 * 1024 * 1024:
+                        raise ValueError("Screenshot is invalid or exceeds its size limit")
+                    payload = bytearray()
+                    while len(payload) <= 8 * 1024 * 1024:
+                        block = os.read(fd, min(65536, 8 * 1024 * 1024 + 1 - len(payload)))
+                        if not block:
+                            break
+                        payload.extend(block)
+                    if len(payload) != image_stat.st_size or not payload.startswith(b"\x89PNG\r\n\x1a\n"):
+                        raise ValueError("Screenshot is invalid or exceeds its size limit")
+                    artifact_fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                    try:
+                        view = memoryview(payload)
+                        while view:
+                            written = os.write(artifact_fd, view)
+                            view = view[written:]
+                        os.fsync(artifact_fd)
+                    finally:
+                        os.close(artifact_fd)
+                finally:
+                    os.close(fd)
+                return {"status": "completed", "artifactName": target.name, "mimeType": "image/png"}
+            except Exception:
+                target.unlink(missing_ok=True)
+                raise
+            finally:
+                root_fd = os.open(self.workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    try:
+                        os.unlink(name, dir_fd=root_fd)
+                    except FileNotFoundError:
+                        pass
+                finally:
+                    os.close(root_fd)
         if kind == "move":
             x, y = self.mouse_point(action)
             # --sync waits for motion on older xdotool builds and can hang if
@@ -702,7 +936,8 @@ class Computer:
         # xclip forks an owner process which retains stderr. A PIPE here would
         # make communicate() wait for clipboard ownership to end before paste.
         stderr = subprocess.DEVNULL if argv[0] == "xclip" else subprocess.PIPE
-        return subprocess.run(argv, check=True, stdout=subprocess.DEVNULL, stderr=stderr, timeout=15, **kwargs)
+        kwargs.setdefault("env", self.child_env())
+        return subprocess.run([*workspace_prefix(), *argv], check=True, stdout=subprocess.DEVNULL, stderr=stderr, timeout=15, **kwargs)
 
     def ensure_browser(self):
         if self.browser and self.browser.poll() is None:
@@ -711,20 +946,32 @@ class Computer:
         profile = self.workspace / ".browser-profile"
         if not profile.resolve().is_relative_to(self.workspace):
             raise ValueError("Browser profile must remain inside the workspace")
-        profile.mkdir(exist_ok=True)
-        # Capture only a closed profile. Automatic file checkpoints reuse this
-        # baseline rather than copying Chromium's live SQLite/session files.
-        stage = Path(tempfile.mkdtemp(prefix="browser-profile-", dir=self.state))
-        try:
-            shutil.copytree(profile, stage, dirs_exist_ok=True, symlinks=True,
-                            ignore=shutil.ignore_patterns("Singleton*", "Cache", "Code Cache", "GPUCache", "ShaderCache", "GrShaderCache", *EXCLUDED))
-            shutil.rmtree(self.browser_checkpoint_profile, ignore_errors=True)
-            os.replace(stage, self.browser_checkpoint_profile)
-        finally:
-            shutil.rmtree(stage, ignore_errors=True)
+        profile_fd = ensure_workspace_directory(self.workspace, ".browser-profile")
+        os.close(profile_fd)
+        # Snapshot only while Chromium is closed. Production copying runs as the
+        # workspace UID with no controller environment; local test mode remains
+        # disabled for secure deployment and uses the same workspace-only data.
+        if workspace_prefix():
+            code = "import os,shutil,sys,tempfile; src,dst,root=sys.argv[1:]; stage=tempfile.mkdtemp(prefix='.browser-baseline-',dir=root); target=os.path.join(stage,'profile'); shutil.copytree(src,target,symlinks=True,ignore=shutil.ignore_patterns('Singleton*','Cache','Code Cache','GPUCache','ShaderCache','GrShaderCache')); old=os.path.lexists(dst); shutil.rmtree(dst,ignore_errors=True) if old and os.path.isdir(dst) and not os.path.islink(dst) else (os.unlink(dst) if old else None); os.replace(target,dst); shutil.rmtree(stage,ignore_errors=True)"
+            proc = subprocess.run([*workspace_prefix(), "/usr/bin/python3", "-c", code,
+                                   str(profile), str(self.browser_checkpoint_profile), str(self.workspace)],
+                                  cwd=self.workspace, env=self.child_env(), stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            if proc.returncode != 0:
+                raise ValueError("A consistent browser profile is unavailable; use an explicit checkpoint")
+        else:
+            # Unconfigured developer/test images do not enable secure deployment.
+            stage = Path(tempfile.mkdtemp(prefix="browser-profile-", dir=self.workspace))
+            try:
+                shutil.copytree(profile, stage / "profile", symlinks=True,
+                                ignore=shutil.ignore_patterns("Singleton*", "Cache", "Code Cache", "GPUCache", "ShaderCache", "GrShaderCache", *EXCLUDED))
+                shutil.rmtree(self.browser_checkpoint_profile, ignore_errors=True)
+                os.replace(stage / "profile", self.browser_checkpoint_profile)
+            finally:
+                shutil.rmtree(stage, ignore_errors=True)
         log = open(self.state / "chromium.log", "ab")
         self.browser = subprocess.Popen([
-            "chromium", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-first-run",
+            *workspace_prefix(), "chromium", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-first-run",
             "--disable-session-crashed-bubble", "--restore-last-session", "--window-size=1280,800", f"--user-data-dir={profile}",
         ], stdout=log, stderr=log, start_new_session=True, env=self.child_env())
         log.close()
@@ -738,15 +985,19 @@ class Computer:
         raise ValueError("Chromium did not become ready")
 
     def activate_browser(self):
-        window = subprocess.check_output(["xdotool", "search", "--onlyvisible", "--class", "chromium"], timeout=1).splitlines()[0]
+        window = subprocess.check_output([*workspace_prefix(), "xdotool", "search", "--onlyvisible", "--class", "chromium"], env=self.child_env(), timeout=1).splitlines()[0]
         self.run(["xdotool", "windowactivate", "--sync", window.decode()])
 
     @staticmethod
     def child_env():
-        return {key: value for key, value in os.environ.items() if key != "BOTSPACE_COMPUTER_TOKEN"}
+        # Never propagate controller credentials or arbitrary container env to
+        # model-controlled shell, browser, PTY or workspace build processes.
+        return {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/workspace", "DISPLAY": os.environ.get("DISPLAY", ":99"), "LANG": "C.UTF-8", "PYTHONUNBUFFERED": "1"}
 
     def run_process(self, argv: list[str], timeout: float, cwd: Path, env: dict) -> dict:
-        proc = subprocess.Popen(argv, cwd=cwd, env=env,
+        safe_env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": str(cwd), "LANG": "C.UTF-8", **env}
+        prefix = workspace_prefix()
+        proc = subprocess.Popen([*prefix, *argv], cwd=cwd, env=safe_env,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
         selector = selectors.DefaultSelector()
         selector.register(proc.stdout, selectors.EVENT_READ)
@@ -848,7 +1099,9 @@ class Computer:
             if action["type"] == "gitClone":
                 if destination.exists():
                     raise ValueError("Clone destination already exists; inspect it before choosing another path")
-                destination.parent.mkdir(parents=True, exist_ok=True)
+                parent_relative = PurePosixPath(action["path"]).parent.as_posix()
+                parent_fd = ensure_workspace_directory(self.workspace, parent_relative) if parent_relative not in {"", "."} else os.open(self.workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                os.close(parent_fd)
                 result = git(["clone", "--no-local", "--no-checkout", "--depth", "1", "--single-branch", *(["--branch", branch] if branch else []), "--", url, str(destination)], self.workspace, True)
                 if (destination / ".git").is_dir():
                     clean = git(["remote", "set-url", "origin", canonical], destination)
@@ -880,69 +1133,59 @@ class Computer:
         except (OSError, subprocess.SubprocessError):
             return {"status": "failed", "error": "Git transport failed; inspect repository and remote state before retrying."}
 
-    def checkpoint(self, resume_browser: bool = True, preserve_browser: bool = False) -> Path:
-        """Archive portable files; automatic saves reuse a closed browser profile.
+    def _archive_helper(self, mode: str, descriptors: list[int], *, profile_fd: int | None = None) -> dict:
+        args = ["/usr/bin/python3", "-m", "workspace_archive", mode, *(str(fd) for fd in descriptors)]
+        pass_fds = tuple(descriptors)
+        if profile_fd is not None:
+            args.append(str(profile_fd))
+            pass_fds += (profile_fd,)
+        if not workspace_prefix():
+            if mode == "create":
+                result = workspace_archive.create_archive(descriptors[0], descriptors[1], profile_fd=profile_fd)
+            else:
+                result = workspace_archive.extract_archive(descriptors[0], descriptors[1])
+        else:
+            proc = subprocess.run([*workspace_prefix(), *args], cwd=self.workspace,
+                                  env={"PATH": "/usr/bin:/bin", "HOME": "/workspace",
+                                       "PYTHONPATH": str(Path(__file__).parent), "PYTHONUNBUFFERED": "1"},
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, pass_fds=pass_fds, check=False)
+            if proc.returncode != 0:
+                raise ValueError("Workspace archive operation failed safely")
+            try:
+                result = json.loads(proc.stdout)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                raise ValueError("Workspace archive operation failed safely")
+        if not isinstance(result, dict) or type(result.get("entries")) is not int or type(result.get("bytes")) is not int:
+            raise ValueError("Workspace archive operation failed safely")
+        if result["entries"] > MAX_FILES or result["bytes"] > MAX_ARCHIVE:
+            raise ValueError("Workspace exceeds checkpoint limit (256 MiB, 10000 entries)")
+        return result
 
-        Managed calls are serialized. External/background writers can still exist;
-        metadata checks reject detectable races rather than claim a live disk image.
-        """
+    def checkpoint(self, resume_browser: bool = True, preserve_browser: bool = False) -> Path:
+        """Create a dirfd-only portable archive in a protected state tempfile."""
         with self.workspace_snapshot():
             browser_was_running = self.browser is not None and self.browser.poll() is None
             live_browser = preserve_browser and resume_browser and browser_was_running
+            profile_fd = None
             if live_browser:
-                if self.browser_checkpoint_profile.is_symlink() or not self.browser_checkpoint_profile.is_dir():
-                    raise ValueError("A consistent browser profile is unavailable; use an explicit checkpoint")
+                try:
+                    profile_fd = open_workspace_fd(self.workspace, ".browser-profile-baseline", directory=True)
+                except (OSError, ValueError) as exc:
+                    raise ValueError("A consistent browser profile is unavailable; use an explicit checkpoint") from exc
             else:
                 self.close_browser()
             fd, name = tempfile.mkstemp(suffix=".tar.gz", dir=self.state)
-            os.close(fd)
             target = Path(name)
-            total = 0
-            root_stat = self.workspace.stat()
-            before = {self.workspace: (root_stat.st_size, root_stat.st_mtime_ns)}
             try:
-                with tarfile.open(target, "w:gz", dereference=False) as archive:
-                    sources = [(self.workspace, "")]
-                    if live_browser:
-                        sources.append((self.browser_checkpoint_profile, ".browser-profile"))
-                    for source, prefix in sources:
-                        if prefix:
-                            stamp = source.stat()
-                            before[source] = (stamp.st_size, stamp.st_mtime_ns)
-                            archive.add(source, arcname=prefix, recursive=False)
-                        for base, dirs, files in os.walk(source, followlinks=False):
-                            dirs[:] = sorted(d for d in dirs if d not in EXCLUDED)
-                            if live_browser and Path(base) == self.workspace:
-                                dirs[:] = [d for d in dirs if d != ".browser-profile"]
-                                files[:] = [f for f in files if f != ".browser-profile"]
-                            relative_base = Path(prefix) / Path(base).relative_to(source)
-                            if relative_base.parts[:1] == (".browser-profile",):
-                                dirs[:] = [d for d in dirs if d not in {"Cache", "Code Cache", "GPUCache", "ShaderCache", "GrShaderCache"}]
-                            for entry in sorted(dirs + files):
-                                path = Path(base) / entry
-                                rel = (relative_base / entry).as_posix()
-                                if path.is_symlink():
-                                    resolved = ((self.workspace / rel).parent / os.readlink(path)).resolve()
-                                    if not resolved.is_relative_to(self.workspace):
-                                        # Browser singleton sockets/locks are process-local.
-                                        if rel.startswith(".browser-profile/") and path.name.startswith("Singleton"):
-                                            continue
-                                        raise ValueError(f"Checkpoint contains an escaping symlink: {rel}")
-                                stat = path.lstat()
-                                if not (path.is_file() or path.is_dir() or path.is_symlink()):
-                                    raise ValueError(f"Checkpoint contains a nonportable special file: {rel}")
-                                total += stat.st_size
-                                if total > MAX_ARCHIVE or len(before) >= MAX_FILES:
-                                    raise ValueError("Workspace exceeds checkpoint limit (256 MiB, 10000 entries)")
-                                before[path] = (stat.st_size, stat.st_mtime_ns)
-                                # Store hardlinked files as independent regular files;
-                                # the portable restore deliberately rejects hardlinks.
-                                archive.inodes.clear()
-                                archive.add(path, arcname=rel, recursive=False)
-                for path, stamp in before.items():
-                    stat = path.lstat()
-                    if (stat.st_size, stat.st_mtime_ns) != stamp:
-                        raise ValueError("Workspace changed during checkpoint; stop background writers and retry")
+                workspace_fd = os.open(self.workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    os.ftruncate(fd, 0)
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    self._archive_helper("create", [workspace_fd, fd], profile_fd=profile_fd)
+                    os.fsync(fd)
+                finally:
+                    os.close(workspace_fd)
                 if target.stat().st_size > MAX_ARCHIVE:
                     raise ValueError("Compressed checkpoint exceeds limit")
                 return target
@@ -950,6 +1193,9 @@ class Computer:
                 target.unlink(missing_ok=True)
                 raise
             finally:
+                os.close(fd)
+                if profile_fd is not None:
+                    os.close(profile_fd)
                 if resume_browser and browser_was_running and not live_browser:
                     self.ensure_browser()
 
@@ -966,10 +1212,19 @@ class Computer:
     def restore(self, archive_path: Path):
         with self.workspace_snapshot():
             self.close_browser()
-            stage = Path(tempfile.mkdtemp(prefix="restore-", dir=self.workspace.parent))
+            archive_fd = os.open(archive_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            archive_stat = os.fstat(archive_fd)
+            if not stat.S_ISREG(archive_stat.st_mode) or archive_stat.st_nlink > 1 or archive_stat.st_size > MAX_ARCHIVE:
+                os.close(archive_fd)
+                raise ValueError("Invalid checkpoint archive")
+            stage = Path(tempfile.mkdtemp(prefix="restore-", dir=self.state))
+            if workspace_prefix():
+                os.chown(stage, 10001, 10001)
+            os.chmod(stage, 0o700)
+            stage_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             old = self.workspace.parent / ("previous-" + str(uuid.uuid4()))
             try:
-                safe_extract(archive_path, stage)
+                self._archive_helper("extract", [archive_fd, stage_fd])
                 os.replace(self.workspace, old)
                 try:
                     os.replace(stage, self.workspace)
@@ -978,58 +1233,10 @@ class Computer:
                     raise
                 shutil.rmtree(old)
             finally:
-                shutil.rmtree(stage, ignore_errors=True)
-
-
-def safe_extract(archive_path: Path, destination: Path):
-    """Extract validated regular files, directories and contained relative symlinks."""
-    with tarfile.open(archive_path, "r:gz") as archive:
-        members = []
-        total = 0
-        for member in archive:
-            total += member.size
-            if len(members) >= MAX_FILES or total > MAX_ARCHIVE or member.size < 0:
-                raise ValueError("Archive exceeds extraction limits")
-            members.append(member)
-        links = set()
-        seen = set()
-        for item in members:
-            path = PurePosixPath(item.name)
-            if path.is_absolute() or ".." in path.parts or not path.parts or item.name in seen:
-                raise ValueError("Invalid or duplicate archive member")
-            seen.add(item.name)
-            if not (item.isfile() or item.isdir() or item.issym()):
-                raise ValueError("Archive hardlinks and special files are forbidden")
-            if item.issym():
-                link = PurePosixPath(item.linkname)
-                target = (destination / item.name).parent / item.linkname
-                if link.is_absolute() or not target.resolve().is_relative_to(destination.resolve()):
-                    raise ValueError("Archive symlink escapes workspace")
-                links.add(path)
-        for item in members:
-            path = PurePosixPath(item.name)
-            if any(parent in links for parent in path.parents):
-                raise ValueError("Archive member traverses a symlink")
-        for item in sorted(members, key=lambda m: m.issym()):
-            target = destination / item.name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if item.isdir():
-                target.mkdir(exist_ok=True)
-            elif item.issym():
-                target.symlink_to(item.linkname)
-            else:
-                source = archive.extractfile(item)
-                if source is None:
-                    raise ValueError("Missing archive data")
-                with source, open(target, "xb") as output:
-                    shutil.copyfileobj(source, output, length=65536)
-                target.chmod(0o700 if item.mode & 0o111 else 0o600)
-        for link in links:
-            try:
-                if not (destination / link).resolve().is_relative_to(destination.resolve()):
-                    raise ValueError("Archive symlink chain escapes workspace")
-            except RuntimeError as exc:
-                raise ValueError("Archive contains a symlink cycle") from exc
+                os.close(archive_fd)
+                os.close(stage_fd)
+                if stage.exists():
+                    shutil.rmtree(stage, ignore_errors=True)
 
 
 def desktop_ready():
@@ -1040,6 +1247,99 @@ def desktop_ready():
         return True
     except OSError:
         return False
+
+
+def secure_deploy_capabilities() -> dict:
+    """Probe pinned image, UID separation, no-root escalation and a synthetic env canary."""
+    result = {"secureDeploy": False, "isolationVersion": "uid-ptrace-v1",
+              "privateCredentialChannel": False, "noShellEnv": False,
+              "noBuildCredentialInheritance": False, "outputRedaction": True,
+              "canaryVersion": "cross-uid-proc-env-v1"}
+    try:
+        import pwd
+        shell_uid = pwd.getpwnam("timber-shell").pw_uid
+        deploy_uid = pwd.getpwnam("timber-deploy").pw_uid
+        if shell_uid != 10001 or deploy_uid != 10002 or shell_uid == deploy_uid or os.geteuid() != 0:
+            return result
+        runner = Path("/opt/botspace/secure_deploy_runner.py")
+        wrangler = Path("/usr/local/bin/wrangler")
+        if not runner.is_file() or runner.stat().st_uid != 0 or runner.stat().st_mode & 0o022 or not Path("/usr/bin/setpriv").is_file():
+            return result
+        try:
+            resolved_cli = wrangler.resolve(strict=True)
+            cli_root = Path("/usr/local/lib/node_modules/wrangler")
+            if not resolved_cli.is_relative_to(cli_root) or resolved_cli.stat().st_uid != 0 or resolved_cli.stat().st_mode & 0o022:
+                return result
+        except OSError:
+            return result
+        log_alias = Path("/opt/timber-secure/wrangler.log")
+        try:
+            alias_stat = log_alias.lstat()
+            parent_stat = log_alias.parent.stat()
+            if (not stat.S_ISLNK(alias_stat.st_mode) or os.readlink(log_alias) != "/dev/null"
+                    or alias_stat.st_uid != 0 or parent_stat.st_uid != 0 or parent_stat.st_mode & 0o022):
+                return result
+        except OSError:
+            return result
+        version = subprocess.run(["/usr/local/bin/wrangler", "--version"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, env={"PATH": "/usr/local/bin:/usr/bin:/bin",
+                                                              "WRANGLER_SEND_METRICS": "false",
+                                                              "WRANGLER_LOG_PATH": str(log_alias)},
+                                 timeout=5, check=False)
+        if (version.returncode != 0 or version.stdout.strip() not in (b"4.147.0", b"wrangler 4.147.0")
+                or version.stderr.strip()):
+            return result
+        # The same non-root identity used by shell/PTY/browser must not setuid to root.
+        escalator = subprocess.run(["/usr/bin/setpriv", f"--reuid={shell_uid}",
+                                    f"--regid={shell_uid}", "--clear-groups",
+                                    "--bounding-set=-all", "--inh-caps=-all", "--no-new-privs", "--",
+                                    "/usr/bin/setpriv", "--reuid=0", "--", "/usr/bin/id", "-u"],
+                                   env={"PATH": "/usr/bin:/bin"}, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3, check=False)
+        if escalator.returncode == 0 and escalator.stdout.strip() == b"0":
+            return result
+        canary = b"timber-synthetic-isolation-check-only"
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, canary)
+        os.close(write_fd)
+        probe_env = {"PATH": "/usr/bin:/bin", "TIMBER_SYNTHETIC_CANARY": canary.decode()}
+        code = "import ctypes,sys,time; r=ctypes.CDLL(None).prctl(4,0,0,0,0); sys.exit(91) if r else time.sleep(3)"
+        child = subprocess.Popen(["/usr/bin/setpriv", f"--reuid={deploy_uid}",
+                                  f"--regid={deploy_uid}", "--clear-groups",
+                                  "--bounding-set=-all", "--inh-caps=-all", "--no-new-privs", "--",
+                                  "/usr/bin/python3", "-c", code, str(read_fd)],
+                                 env=probe_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True, pass_fds=(read_fd,))
+        os.close(read_fd)
+        try:
+            deadline = time.monotonic() + 1
+            hidden = None
+            probe = """import sys\ntry:\n open('/proc/'+sys.argv[1]+'/environ','rb').read()\nexcept PermissionError: pass\nexcept FileNotFoundError: sys.exit(2)\nelse: sys.exit(3)\ntry:\n open('/proc/'+sys.argv[1]+'/fd/'+sys.argv[2],'rb').read()\nexcept PermissionError: pass\nexcept FileNotFoundError: sys.exit(2)\nelse: sys.exit(3)\nsys.exit(0)"""
+            while time.monotonic() < deadline:
+                check = subprocess.run(["/usr/bin/setpriv", f"--reuid={shell_uid}",
+                                        f"--regid={shell_uid}", "--clear-groups",
+                                        "--bounding-set=-all", "--inh-caps=-all", "--no-new-privs", "--",
+                                        "/usr/bin/python3", "-c", probe, str(child.pid), str(read_fd)],
+                                       env={"PATH": "/usr/bin:/bin"}, stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2, check=False)
+                if check.returncode in (0, 3):
+                    hidden = check.returncode == 0
+                    break
+                time.sleep(0.02)
+            if hidden is not True or child.poll() is not None:
+                return result
+        finally:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait(timeout=3)
+        result.update({"secureDeploy": True, "privateCredentialChannel": True,
+                       "noShellEnv": True, "noBuildCredentialInheritance": True})
+        return result
+    except (KeyError, OSError, subprocess.SubprocessError, ImportError):
+        return result
 
 
 def create_handler(computer: Computer, token: str):
@@ -1056,6 +1356,15 @@ def create_handler(computer: Computer, token: str):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Content-SHA256", hashlib.sha256(data).hexdigest())
+            self.end_headers()
+            self.wfile.write(data)
+
+        def respond_bytes(self, data: bytes, content_type: str):
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Content-SHA256", hashlib.sha256(data).hexdigest())
             self.end_headers()
             self.wfile.write(data)
 
@@ -1075,10 +1384,12 @@ def create_handler(computer: Computer, token: str):
         def do_GET(self):
             if not self.authorized():
                 return self.respond(401, {"error": "Unauthorized"})
+            if self.path == "/secure-deploy/capabilities":
+                return self.respond(200, secure_deploy_capabilities())
             if self.path == "/health":
                 desktop = all(shutil.which(tool) for tool in ["scrot", "xdotool", "chromium", "xclip"])
                 if desktop:
-                    desktop = subprocess.run(["xdotool", "getdisplaygeometry"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2).returncode == 0
+                    desktop = subprocess.run([*workspace_prefix(), "xdotool", "getdisplaygeometry"], env=computer.child_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2).returncode == 0
                 return self.respond(200, {"ok": True, "bootId": computer.boot_id, "desktop": desktop, "capabilities": ["gitClone", "gitPush", "workspace", "execSessions", "preserveBrowserCheckpoint", "workspaceChangeTracking"] + (["move", "doubleClick", "drag"] if desktop else []) + (["liveDesktop"] if desktop and desktop_ready() else [])})
             parsed = urlparse(self.path)
             if parsed.path.startswith("/workspace/"):
@@ -1087,8 +1398,8 @@ def create_handler(computer: Computer, token: str):
                     arg = lambda name, default=".": params.get(name, [default])[0]
                     kind = parsed.path.removeprefix("/workspace/")
                     if kind == "download":
-                        target, mime = inspector.download(arg("path"))
-                        return self.stream(target, mime)
+                        data, mime = inspector.download(arg("path"))
+                        return self.respond_bytes(data, mime)
                     if kind == "tree": value = inspector.tree(arg("path"))
                     elif kind == "file": value = inspector.file(arg("path"))
                     elif kind == "projects": value = inspector.projects()
@@ -1132,6 +1443,14 @@ def create_handler(computer: Computer, token: str):
                 if length > MAX_JSON or length < 0:
                     return self.respond(413, {"error": "Request too large"})
                 body = json.loads(self.rfile.read(length)) if length else {}
+                if self.path == "/secure-deploy/cancel":
+                    operation = body.get("operationId")
+                    return self.respond(200, secure_deploy_cancel(operation))
+                if self.path == "/secure-deploy":
+                    if not secure_deploy_capabilities()["secureDeploy"]:
+                        return self.respond(503, {"operationId": body.get("operationId"), "status": "unavailable", "code": "runner_unavailable"})
+                    receipt = secure_deploy_dispatch(computer.workspace, body)
+                    return self.respond(200, receipt)
                 if self.path == "/actions":
                     return self.respond(200, computer.execute(body["operationId"], body["action"], body.get("gitTransport")))
                 if self.path == "/checkpoint":
@@ -1143,7 +1462,7 @@ def create_handler(computer: Computer, token: str):
                 return self.respond(404, {"error": "Not found"})
             except IdempotencyConflict:
                 return self.respond(409, {"error": {"code": "computer_idempotency_conflict", "message": "operationId was already used with different arguments."}})
-            except (ValueError, KeyError, OSError, tarfile.TarError) as exc:
+            except (ValueError, KeyError, TypeError, OSError, tarfile.TarError) as exc:
                 return self.respond(400, {"error": str(exc)[:1000]})
     return Handler
 

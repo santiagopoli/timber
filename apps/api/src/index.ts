@@ -4,6 +4,7 @@ import type { Env } from "./env";
 import { UUID, operationId as validateOperationId, parseAction } from "./validation";
 import type { Bot } from "@botspace/contracts";
 import {modelCatalog} from './model-catalog';
+import {hostTools} from './host-tools';
 export { WorkspaceDO } from "./workspace";
 export { BotDO } from "./bot";
 export { GitHubAuthDO } from "./github";
@@ -50,6 +51,10 @@ export default {
     try {
       const url=new URL(request.url);
       if(url.pathname==="/health" && request.method==="GET") return json({ok:true,service:"botspace"});
+      if(url.pathname==="/health/version" && request.method==="GET") {
+        const schema=(name:string)=>hostTools.find(tool=>tool.name===name)?.inputSchema??null;
+        return json({service:"botspace",versionId:env.VERSION_METADATA?.id??null,keychainTools:{secret_request:schema('secret_request'),secure_worker_deploy:schema('secure_worker_deploy'),secure_worker_deploy_capabilities:schema('secure_worker_deploy_capabilities')}});
+      }
       // Static developer console contains no account data or credentials.
       if((url.pathname==="/" || url.pathname==="/console" || url.pathname.startsWith("/console/")) && request.method==="GET") {
         if(!env.ASSETS) throw new ApiError(404,"not_found","Console not installed.");
@@ -117,7 +122,8 @@ export default {
         requestBodyForwarded=true;return env.GITHUB.get(env.GITHUB.idFromName(owner)).fetch(internalRequest(request,"https://github/status"));
       }
       const registry=env.WORKSPACE.get(env.WORKSPACE.idFromName(owner));
-      if(url.pathname==='/v1/keychain'||url.pathname.startsWith('/v1/keychain/'))return registry.fetch(internalRequest(request,`https://workspace${url.pathname.slice(3)}`));
+      if(url.pathname==='/v1/keychain/deploy-verify'||/^\/v1\/bots\/[^/]+\/keychain\/deploy-verify$/.test(url.pathname))throw new ApiError(404,'not_found','Endpoint not found.');
+      if(url.pathname==='/v1/keychain'||url.pathname.startsWith('/v1/keychain/'))return registry.fetch(internalRequest(request,`https://workspace${url.pathname.slice(3)}${url.search}`));
       if(url.pathname==="/v1/tasks") {
         if(request.method==="GET") return registry.fetch(new Request("https://workspace/tasks"));
         if(request.method!=="POST") throw new ApiError(405,"method_not_allowed","Method not allowed.");

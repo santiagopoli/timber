@@ -1,6 +1,6 @@
 import type { ComputerResult, SecretMetadata, SecureInputRequest } from '@botspace/contracts';
 export type {SecretMetadata,SecureInputRequest} from '@botspace/contracts';
-export type SecureWorkerDeployEnvelope={version:1;ownerId:string;botId:string;runId:string;operationId:string;pin:{repository:string;commit:string;artifactDigest:string;accountId:string;workerName:string;destination:string;planId?:string;planRevision?:number};planId:string;planRevision:number;refs:Array<{id:string;revision:number;permissionEpoch:string;binding:string}>;expiresAt:number;signature:string};
+export type SecureWorkerDeployEnvelope={version:1;ownerId:string;botId:string;runId:string;nativeOperationId:string;operationId:string;pin:{repository:string;commit:string;artifactDigest:`sha256:${string}`;artifactPath:string;accountId:string;workerName:string;destination:string;planId?:string;planRevision?:number};planId:string;planRevision:number;refs:Array<{id:string;revision:number;permissionEpoch:string;binding:string}>;expiresAt:number;signature:string};
 import {ApiError} from './errors';
 import {object, operationId, string, UUID} from './validation';
 
@@ -179,21 +179,21 @@ export class OwnerKeychain {
     };
     guard();return guard;
   }
-  async secureWorkerDeployEnvelope(input:{ownerId:string;botId:string;runId:string;operationId:string;pin:SecureWorkerDeployEnvelope['pin'];planId:string;planRevision:number;expiresAt:number;refs:readonly {id:string;revision:number}[]}):Promise<SecureWorkerDeployEnvelope>{
-    this.root();if(input.ownerId!==this.ownerId||!UUID.test(input.botId)||!UUID.test(input.runId)||!UUID.test(input.planId)||!Number.isSafeInteger(input.planRevision)||input.planRevision<1||!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.operationId))throw new ApiError(400,'deploy_invalid_request','Invalid deploy identity.');
-    const pin=Object.freeze({...input.pin});if(!/^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/.test(pin.repository)||pin.repository.split('/').some(x=>x==='.'||x==='..'||x.includes('..'))||!/^([a-f0-9]{40}|[a-f0-9]{64})$/.test(pin.commit)||!/^sha256:[a-f0-9]{64}$/.test(pin.artifactDigest)||!/^[a-f0-9]{32}$/.test(pin.accountId)||!/^[a-z0-9][a-z0-9-]{0,62}$/.test(pin.workerName)||pin.destination!==`https://api.cloudflare.com/client/v4/accounts/${pin.accountId}/workers/scripts/${pin.workerName}`)throw new ApiError(400,'deploy_invalid_pin','Invalid pinned Worker destination.');
+  async secureWorkerDeployEnvelope(input:{ownerId:string;botId:string;runId:string;nativeOperationId:string;operationId:string;pin:SecureWorkerDeployEnvelope['pin'];planId:string;planRevision:number;expiresAt:number;refs:readonly {id:string;revision:number}[]}):Promise<SecureWorkerDeployEnvelope>{
+    this.root();if(input.ownerId!==this.ownerId||!UUID.test(input.botId)||!UUID.test(input.runId)||typeof input.nativeOperationId!=='string'||!/^[A-Za-z0-9:_.-]{1,160}$/.test(input.nativeOperationId)||!UUID.test(input.planId)||!Number.isSafeInteger(input.planRevision)||input.planRevision<1||!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.operationId))throw new ApiError(400,'deploy_invalid_request','Invalid deploy identity.');
+    const pin=Object.freeze({...input.pin});if(!/^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/.test(pin.repository)||pin.repository.split('/').some(x=>x==='.'||x==='..'||x.includes('..'))||!/^([a-f0-9]{40}|[a-f0-9]{64})$/.test(pin.commit)||!/^([A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+$/.test(pin.artifactPath)||pin.artifactPath.startsWith('.')||pin.artifactPath.split('/').some(x=>!x||x==='.'||x==='..')||!/^sha256:[a-f0-9]{64}$/.test(pin.artifactDigest)||!/^[a-f0-9]{32}$/.test(pin.accountId)||!/^[a-z0-9][a-z0-9-]{0,62}$/.test(pin.workerName)||pin.destination!==`https://api.cloudflare.com/client/v4/accounts/${pin.accountId}/workers/scripts/${pin.workerName}`)throw new ApiError(400,'deploy_invalid_pin','Invalid pinned Worker destination.');
     if(!Array.isArray(input.refs)||input.refs.length<1||input.refs.length>4||new Set(input.refs.map(x=>x.id)).size!==input.refs.length)throw new ApiError(400,'deploy_invalid_request','Invalid deploy references.');
     const snapshots=input.refs.map(ref=>{if(!UUID.test(ref.id)||!Number.isSafeInteger(ref.revision)||ref.revision<1)throw new ApiError(400,'deploy_invalid_request','Invalid secret reference.');const row=this.row(ref.id);if(!row?.envelope)throw new ApiError(404,'credential_unavailable','A deploy reference is missing or revoked.');const metadata=JSON.parse(row.data) as SecretMetadata;if(metadata.revision!==ref.revision)throw new ApiError(409,'credential_changed','A deploy reference revision is stale.');const grant=this.grantRow(ref.id,input.botId);if(!grant)throw new ApiError(403,'credential_access_denied','A deploy reference is not permitted.');return{ref:{id:ref.id,revision:ref.revision},row,metadata,grant,grantData:JSON.parse(grant.data) as {epoch:string;origin:string;header:string;prefix:string}}});
     for(const x of snapshots){const epoch=await this.requireAccess(x.ref.id,input.botId);if(epoch!==x.grantData.epoch)throw new ApiError(409,'credential_changed','Deploy permission changed.');const allowed=x.metadata.origin==='https://api.cloudflare.com'&&((x.metadata.header.toLowerCase()==='authorization'&&x.metadata.prefix==='Bearer ')||(['x-auth-key','x-auth-email'].includes(x.metadata.header.toLowerCase())&&x.metadata.prefix===''));if(!allowed)throw new ApiError(409,'secure_deploy_credential_scope','Deploy reference is not configured for Cloudflare API authentication.');}
     const headers=snapshots.map(x=>x.metadata.header.toLowerCase());const valid=(headers.length===1&&headers[0]==='authorization'&&snapshots[0].metadata.prefix==='Bearer ')||(headers.length===2&&headers.includes('x-auth-key')&&headers.includes('x-auth-email')&&snapshots.every(x=>x.metadata.prefix===''));if(!valid)throw new ApiError(409,'secure_deploy_credential_scope','Use one Cloudflare bearer token or the legacy key and email pair.');
     const refs=await Promise.all(snapshots.map(async x=>({id:x.ref.id,revision:x.ref.revision,permissionEpoch:x.grantData.epoch,binding:await this.digest(['timber.deploy-entry-binding.v1',x.row.data,x.row.envelope,x.grant.data,x.grant.signature])})));const expiresAt=input.expiresAt;if(!Number.isSafeInteger(expiresAt)||expiresAt<=Date.now()||expiresAt>Date.now()+60_000)throw new ApiError(409,'deploy_authorization_changed','Deploy authorization expiry is invalid.');
-    const payload={version:1 as const,ownerId:input.ownerId,botId:input.botId,runId:input.runId,operationId:input.operationId,pin,planId:input.planId,planRevision:input.planRevision,refs,expiresAt};const signature=await this.digest(['timber.secure-worker-deploy.v1',payload]);
+    const payload={version:1 as const,ownerId:input.ownerId,botId:input.botId,runId:input.runId,nativeOperationId:input.nativeOperationId,operationId:input.operationId,pin,planId:input.planId,planRevision:input.planRevision,refs,expiresAt};const signature=await this.digest(['timber.secure-worker-deploy.v1',payload]);
     this.active();if(Date.now()>=expiresAt)throw new ApiError(409,'deploy_authorization_changed','Deploy authorization expired.');
     for(const x of snapshots){const row=this.row(x.ref.id),grant=this.grantRow(x.ref.id,input.botId);if(row?.envelope!==x.row.envelope||row?.data!==JSON.stringify(x.metadata)||!grant||grant.data!==x.grant.data||grant.signature!==x.grant.signature||this.permissionEpoch(x.ref.id,input.botId)!==x.grantData.epoch)throw new ApiError(409,'credential_changed','A signed deploy reference changed.');}
     return{...payload,refs,signature};
   }
   async assertSecureDeployEnvelopeCurrent(envelope:SecureWorkerDeployEnvelope):Promise<void> {
-    if(!envelope||envelope.expiresAt<=Date.now())throw new ApiError(409,'deploy_authorization_changed','Deploy authorization expired.');
+    if(!envelope||envelope.version!==1||envelope.ownerId!==this.ownerId||!UUID.test(envelope.botId)||!UUID.test(envelope.runId)||typeof envelope.nativeOperationId!=='string'||!/^[A-Za-z0-9:_.-]{1,160}$/.test(envelope.nativeOperationId)||!UUID.test(envelope.planId)||!Number.isSafeInteger(envelope.planRevision)||envelope.planRevision<1||typeof envelope.operationId!=='string'||!Array.isArray(envelope.refs)||envelope.expiresAt<=Date.now())throw new ApiError(409,'deploy_authorization_changed','Deploy authorization expired.');
     const snapshots=envelope.refs.map(ref=>{
       const row=this.row(ref.id),grant=this.grantRow(ref.id,envelope.botId);
       if(!row?.envelope||!grant||JSON.parse(row.data).revision!==ref.revision)throw new ApiError(409,'credential_changed','Deploy authorization changed.');
@@ -207,6 +207,25 @@ export class OwnerKeychain {
     this.active();
     if(envelope.expiresAt<=Date.now())throw new ApiError(409,'deploy_authorization_changed','Deploy authorization expired.');
     for(const x of snapshots){const row=this.row(x.ref.id),grant=this.grantRow(x.ref.id,envelope.botId);if(row?.data!==x.row.data||row?.envelope!==x.row.envelope||grant?.data!==x.grant.data||grant?.signature!==x.grant.signature)throw new ApiError(409,'credential_changed','Deploy authorization changed.');}
+  }
+  /** Resolve selected values only for the private Computer deploy request. Plaintext never returns to a tool result or journal. */
+  async withSecureWorkerDeployCredentials<T>(envelope:SecureWorkerDeployEnvelope,send:(credentials:Array<{refId:string;revision:number;header:string;prefix:string;value:string}>)=>Promise<T>):Promise<T>{
+    await this.assertSecureDeployEnvelopeCurrent(envelope);
+    const rows=envelope.refs.map(ref=>{const row=this.row(ref.id);if(!row?.envelope||!this.grantRow(ref.id,envelope.botId))throw new ApiError(409,'credential_changed','Deploy authorization changed.');const metadata=JSON.parse(row.data) as SecretMetadata;return{ref,row,metadata};});
+    const credentials:Array<{refId:string;revision:number;header:string;prefix:string;value:string}>=[];
+    try {
+      for(const item of rows){
+        const wrapped:Envelope=JSON.parse(item.row.envelope!);
+        const clear=new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:decode(wrapped.iv),additionalData:this.aad(item.metadata)},await this.encryptionKey(),decode(wrapped.ciphertext)));
+        let value:string;try{value=new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(clear);}finally{clear.fill(0);}
+        if(!value||value.length>8192||/[\x00-\x1f\x7f]/.test(value))throw new ApiError(422,'credential_format','A Cloudflare credential has an unsupported format.');
+        credentials.push({refId:item.ref.id,revision:item.ref.revision,header:item.metadata.header,prefix:item.metadata.prefix,value});
+      }
+      // Recheck after decryption awaits and immediately before crossing the private DO channel.
+      await this.assertSecureDeployEnvelopeCurrent(envelope);
+      this.active();
+      return await send(credentials);
+    } finally {for(const item of credentials)item.value='';}
   }
   async verifySecureWorkerDeployEnvelope(envelope:SecureWorkerDeployEnvelope):Promise<boolean>{try{await this.assertSecureDeployEnvelopeCurrent(envelope);return true;}catch{return false}}
   revoke(id:string):void {const stored=this.row(id);if(!stored)throw new ApiError(404,'not_found','Credential not found.');this.storage.sql.exec('UPDATE keychain_entries SET envelope=NULL WHERE id=?',id);this.storage.sql.exec('DELETE FROM keychain_grants WHERE secret_id=?',id);}

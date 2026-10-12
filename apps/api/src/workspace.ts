@@ -460,6 +460,7 @@ export class WorkspaceDO extends DurableObject<Env> {
     try {
       const path=new URL(request.url).pathname;
       if(path==='/keychain-tools')return await this.keychain.tool(await body(request),request.signal);
+      if(path==='/keychain/deploy-verify')return await this.keychain.verifySecureDeploy(request);
       if(path==='/keychain'||path.startsWith('/keychain/'))return await this.keychain.fetch(request);
       if(path.startsWith("/avatar")) return await this.avatars.fetch(request);
       if(path.startsWith("/agents/")) return await this.agents.fetch(request);
