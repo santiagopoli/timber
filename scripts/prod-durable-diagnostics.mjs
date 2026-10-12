@@ -215,6 +215,7 @@ export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now
   const selected=await query(workspace,'owner',BOT_LOOKUP);
   if(selected.length!==1||!uuid(selected[0]?.id))throw new Error('durable_diagnostics_bot_not_unique');
   const name=`owner:${selected[0].id}`;
+  if(env.DIAGNOSTIC_SCOPE==='queue')return {source:'durable_queue_fixed_select',tasks:(await query(workspace,'owner',PERFORMANCE_TASKS)).map(performanceTaskMetadata)};
   if(env.DIAGNOSTIC_SCOPE==='performance'){
     const inspect=async name=>{
       const tables=await query(bot,name,PERFORMANCE_SCHEMA);
