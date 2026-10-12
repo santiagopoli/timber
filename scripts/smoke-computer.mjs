@@ -35,7 +35,7 @@ const privateCaps=await privateCapsResponse.json();
 for(const field of ['secureDeploy','privateCredentialChannel','noShellEnv','noBuildCredentialInheritance','outputRedaction']) assert.equal(privateCaps[field],true,`real image private deploy ${field}: ${JSON.stringify(privateCaps)}`);
 assert.equal(privateCaps.isolationVersion,'uid-ptrace-v1');
 assert.equal(privateCaps.canaryVersion,'cross-uid-proc-env-v1');
-async function action(action, operationId = randomUUID()) {
+async function action(action, operationId = randomUUID(), expectedStatus = 'completed') {
   const response = await request('/actions',{method:'POST',body:JSON.stringify({operationId,action})});
   assert.equal(response.status,200);
   let result = await response.json();
@@ -45,13 +45,16 @@ async function action(action, operationId = randomUUID()) {
     const polled = await request('/actions',{method:'POST',body:JSON.stringify({operationId:randomUUID(),action:{type:'execPoll',processId:result.processId,yieldMs:1000}})});
     assert.equal(polled.status,200);result = {...await polled.json(),operationId};
   }
-  assert.equal(result.status,'completed',JSON.stringify(result));return result;
+  assert.equal(result.status,expectedStatus,JSON.stringify(result));return result;
 }
 const isolation=await action({type:'exec',command:'id -u; printf "token=%s\\n" "${BOTSPACE_COMPUTER_TOKEN+visible}"; ps -eo uid,comm | grep openbox'});
 assert.equal(isolation.exitCode,0);
 assert.match(isolation.output,/^10001\ntoken=\n\s*10001 openbox\n$/,'shell/desktop unprivileged and controller token not inherited');
-const escalation=await action({type:'exec',command:'setpriv --reuid=0 -- /bin/true 2>/dev/null'});
+// A privilege-denial probe must fail; treating it as a completed action would
+// reject the very isolation behavior this test is proving.
+const escalation=await action({type:'exec',command:'/usr/bin/setpriv --reuid=0 -- /bin/true'},randomUUID(),'failed');
 assert.notEqual(escalation.exitCode,0,'workspace shell cannot regain root');
+assert.match(escalation.output,/setpriv:.*Operation not permitted/,'failure is an actual privilege denial');
 await action({type:'writeFile',path:'image-smoke.txt',content:'Timber image smoke\n'});
 assert.equal((await action({type:'readFile',path:'image-smoke.txt'})).output,'Timber image smoke\n');
 const operationId = randomUUID();

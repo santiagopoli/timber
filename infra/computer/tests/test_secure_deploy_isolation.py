@@ -111,8 +111,12 @@ class SecureDeployIsolationTests(unittest.TestCase):
 
     def test_cli_nonzero_after_synthetic_upload_marker_is_uncertain(self):
         request, js = self._task_request("123e4567-e89b-42d3-a456-426614174004")
+        # The runner consumes the strict private envelope, not the backend's
+        # pre-dispatch object containing a duplicate top-level refs field.
+        del request["refs"]
         request["protocolVersion"] = 1
         request["artifact"] = {"sha256": request["pin"]["artifactDigest"], "javascript": js}
+        secure_deploy_runner._validate(request)
         with tempfile.TemporaryDirectory() as temp:
             marker = Path(temp) / "upload-marker"
             fake_cli = Path(temp) / "fake-wrangler"

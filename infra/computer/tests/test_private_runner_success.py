@@ -33,8 +33,9 @@ from pathlib import Path
 assert os.geteuid()==10002
 assert 'BOTSPACE_COMPUTER_TOKEN' not in os.environ
 assert 'NODE_OPTIONS' not in os.environ
-assert os.environ['WRANGLER_LOG_PATH']=='/dev/null'
+assert os.environ['WRANGLER_LOG_PATH']=='/opt/timber-secure/wrangler.log'
 assert os.environ['WRANGLER_SEND_METRICS']=='false'
+assert os.environ['WRANGLER_SEND_ERROR_REPORTS']=='false'
 assert os.environ['HOME']==os.getcwd()
 assert resource.getrlimit(resource.RLIMIT_CORE)==(0,0)
 assert sys.argv[1]=='deploy' and '--no-bundle' in sys.argv
@@ -80,11 +81,15 @@ time.sleep(2)
         pin = {'repository':'fixture/repository','commit':'a'*40,'artifactDigest':digest,
                'artifactPath':'dist/worker.js','accountId':'a'*32,'workerName':'fixture-worker',
                'destination':'https://api.cloudflare.com/client/v4/accounts/'+'a'*32+'/workers/scripts/fixture-worker',
-               'planId':'00000000-0000-4000-8000-000000000001','planRevision':1}
+               }
+        signed_pin = {**pin,'planId':'00000000-0000-4000-8000-000000000001','planRevision':1}
         values = ['synthetic-runner-key-not-real','synthetic-email@example.invalid'] if legacy else ['synthetic-runner-bearer-not-real']
-        creds = [{'refId':'reference-'+str(i),'revision':1,'header':(['X-Auth-Key','X-Auth-Email'][i] if legacy else 'Authorization'),
+        creds = [{'refId':'00000000-0000-4000-8000-'+str(i+10).zfill(12),'revision':1,'header':(['X-Auth-Key','X-Auth-Email'][i] if legacy else 'Authorization'),
                   'prefix':('' if legacy else 'Bearer '),'value':value} for i,value in enumerate(values)]
-        auth = {'version':1,'operationId':'fixture-operation','pin':pin,'signature':'fixture-signed-envelope-only',
+        auth = {'version':1,'ownerId':'owner','botId':'00000000-0000-4000-8000-000000000002',
+                'runId':'00000000-0000-4000-8000-000000000003','nativeOperationId':'fixture-native-operation',
+                'operationId':'fixture-operation','pin':signed_pin,'planId':signed_pin['planId'],'planRevision':1,
+                'expiresAt':int(time.time()*1000)+45000,'signature':'fixture-signed-envelope-only-32bytes',
                 'refs':[{'id':c['refId'],'revision':1,'permissionEpoch':'fixture-epoch','binding':'fixture-binding'} for c in creds]}
         return {'protocolVersion':1,'operationId':'fixture-operation','authorization':auth,'pin':pin,
                 'artifact':{'sha256':digest,'javascript':js},'credentials':creds}, values
