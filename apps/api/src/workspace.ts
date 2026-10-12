@@ -266,6 +266,22 @@ export class WorkspaceDO extends DurableObject<Env> {
     this.ctx.storage.sql.exec("UPDATE direct_intents SET receipt=?,receipt_status=?,state=CASE WHEN ?=1 THEN 'settled' ELSE state END WHERE bot_id=? AND operation_id=? AND state!='cancelled'",JSON.stringify(receipt),status,terminal?1:0,botId,operationId);
   }
   private taskStartOperation(task:{id:string;startOperationId?:string}):string {return task.startOperationId??`task-start:${task.id}`;}
+  /** Read-only projection of the current holder; never persisted in the task. */
+  private taskView(task:Task):Task {
+    const view={...task};delete view.queue;
+    if(task.status!=="queued")return view;
+    const slot=this.slotFor(task.botId);
+    if(!slot)view.queue={reason:"scheduled"};
+    else if(slot.task_id===task.id)view.queue={reason:"starting"};
+    else if(slot.task_id==="@bot")view.queue={reason:"bot"};
+    else if(slot.task_id.startsWith("@direct:"))view.queue={reason:"direct_action"};
+    else {
+      const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",slot.task_id).toArray()[0];
+      const blocker=row?JSON.parse(row.data) as Task:undefined;
+      view.queue=blocker?.botId===task.botId?{reason:"task",blockingTask:{id:blocker.id,title:blocker.title}}:{reason:"scheduled"};
+    }
+    return view;
+  }
   private async reconcileAdmissions():Promise<void> {
     const rows=this.ctx.storage.sql.exec<{token:string;bot_id:string;task_id:string;operation_id:string;created_at:number;payload:string|null}>("SELECT token,bot_id,task_id,operation_id,created_at,payload FROM computer_admissions WHERE created_at<=? AND payload IS NULL AND task_id NOT LIKE '@direct:%' ORDER BY created_at LIMIT 32",Date.now()-60_000).toArray();
     for(const row of rows) {
@@ -500,7 +516,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         for(const key of ['before','limit'])if(url.searchParams.has(key))query.set(key,url.searchParams.get(key)!);
         const response=await this.env.BOT.get(this.env.BOT.idFromName(`owner:task:${taskId}`)).fetch(`https://task/progress?${query}`,{headers:{'x-botspace-config':encodeURIComponent(JSON.stringify(bot)),'x-timber-task-id':taskId}});
         if(!response.ok)return response;
-        return json({task:{id:task.id,title:task.title,status:task.status},progress:await response.json()});
+        return json({task:{id:task.id,title:task.title,status:task.status,queue:this.taskView(task).queue},progress:await response.json()});
       }
       if(path==='/tasks/message'&&request.method==='POST') {
         if(request.headers.get('x-timber-internal')!=='task')throw new ApiError(403,'internal_only','Task messaging is internal.');
@@ -533,7 +549,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         return response;
       }
       if(path==="/tasks" && request.method==="GET") {
-        const tasks=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks ORDER BY rowid DESC").toArray().map(row=>JSON.parse(row.data));
+        const tasks=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks ORDER BY rowid DESC").toArray().map(row=>this.taskView(JSON.parse(row.data) as Task));
         return json({tasks});
       }
       if(path==="/tasks/bot" && request.method==="POST") {
@@ -790,7 +806,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         return json({task:JSON.parse(this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",id).one().data)},202);
       }
       const taskMatch=/^\/tasks\/([0-9a-f-]{36})$/.exec(path);
-      if(taskMatch && request.method==="GET") {const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",taskMatch[1]).toArray()[0];if(!row) throw new ApiError(404,"not_found","Task not found.");return json({task:JSON.parse(row.data)});}
+      if(taskMatch && request.method==="GET") {const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",taskMatch[1]).toArray()[0];if(!row) throw new ApiError(404,"not_found","Task not found.");return json({task:this.taskView(JSON.parse(row.data) as Task)});}
       if(taskMatch && request.method==="PATCH") {const input=await body(request);const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",taskMatch[1]).toArray()[0];if(!row) throw new ApiError(404,"not_found","Task not found.");const task=JSON.parse(row.data) as {id:string;botId:string;status:string;cancelRequested?:boolean;updatedAt?:string};if(!["pending","queued","running","waiting_approval","waiting_connection","cancelling","completed","failed","cancelled"].includes(input.status as string)) throw new ApiError(400,"invalid_request","Invalid task status.");if(["completed","failed","cancelled"].includes(task.status)&&input.status!==task.status)throw new ApiError(409,"task_terminal","A terminal task cannot be changed.");if((task.cancelRequested||task.status==="cancelling")&&!['cancelling','cancelled'].includes(input.status as string))throw new ApiError(409,"task_cancelling","A cancellation request cannot be rewound.");const firstStop=(input.status==="cancelling"||input.cancelRequested===true)&&!task.cancelRequested&&task.status!=="cancelling";task.status=input.status as string;if(input.cancelRequested===true) (task as {cancelRequested?:boolean}).cancelRequested=true;task.updatedAt=new Date().toISOString();
         if(task.status==="cancelling"&&!this.ctx.storage.sql.exec("SELECT 1 FROM task_slots WHERE bot_id=? AND task_id=?",task.botId,task.id).toArray().length) task.status="cancelled";
         this.ctx.storage.transactionSync(()=>{

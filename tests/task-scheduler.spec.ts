@@ -23,6 +23,20 @@ async function taskRuns(id:string){return (await (await api(`/v1/tasks/${id}/run
 async function settled(id:string,status:string){for(let i=0;i<100;i++){const result=await taskRuns(id);if(result.runs[0]?.status===status)return result.runs[0];await new Promise(resolve=>setTimeout(resolve,5));}throw new Error(`Task run did not become ${status}`);}
 async function slot(id:string){return runInDurableObject(registry(),(_instance,state)=>state.storage.sql.exec<{task_id:string;token:string;generation:number;updated_at:number}>("SELECT task_id,token,generation,updated_at FROM task_slots WHERE bot_id=?",id).toArray()[0]);}
 describe("durable task computer scheduler",()=>{
+ it("explains the live task blocker through passive reads and clears it after FIFO admission",async()=>{
+  const owner=await bot(),held=await task(owner),queued=await task(owner);
+  await settled(held.id,"waiting_approval");
+  const lease=await slot(owner.id);
+  const detail=await (await api(`/v1/tasks/${queued.id}`)).json<{task:Task}>();
+  expect(detail.task.queue).toEqual({reason:"task",blockingTask:{id:held.id,title:held.title}});
+  const page=await (await api('/v1/tasks')).json<{tasks:Task[]}>();
+  expect(page.tasks.find(item=>item.id===queued.id)?.queue).toEqual(detail.task.queue);
+  expect((await taskRuns(queued.id)).runs).toHaveLength(0);expect(await slot(owner.id)).toEqual(lease);
+  await runInDurableObject(registry(),(_,state)=>expect(JSON.parse(state.storage.sql.exec<{data:string}>('SELECT data FROM tasks WHERE id=?',queued.id).one().data).queue).toBeUndefined());
+  await api(`/v1/tasks/${held.id}/cancel`,{},"POST");await tick();await settled(queued.id,"waiting_approval");await tick();
+  const after=await (await api(`/v1/tasks/${queued.id}`)).json<{task:Task}>();
+  expect(after.task.queue).toBeUndefined();expect(after.task.status).toBe('waiting_approval');
+ },60000);
  it("does not finalize an idle task while an incoming chat receipt is in flight",async()=>{
   const owner=await bot(),record=await task(owner,"Finish this short task");await settled(record.id,"completed");
   const held=await slot(owner.id),operationId=crypto.randomUUID();

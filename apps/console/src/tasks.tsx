@@ -3,7 +3,7 @@ import {createRoot} from 'react-dom/client';
 import {createPortal} from 'react-dom';
 import {ArrowLeftIcon, ArrowUpIcon, CheckSquareIcon, InfoIcon, ListFilterIcon, LoaderCircleIcon, PlusIcon, RefreshCwIcon, SearchIcon, SquareIcon, XIcon} from 'lucide-react';
 import {Dialog,Popover} from 'radix-ui';
-import type {AgentDelegation,Approval, Bot, BotEvent, CompactionReceipt, Message, Run,Subagent} from '../../../packages/contracts/src/index';
+import type {AgentDelegation,Approval, Bot, BotEvent, CompactionReceipt, Message, Run,Subagent,TaskQueue} from '../../../packages/contracts/src/index';
 import {Agents} from './agents';
 import {ConversationChat} from './chat';
 import type {ArtifactLoader} from './artifact-preview';
@@ -31,7 +31,7 @@ export type TasksProps = {
   decorateAvatar?:(node:HTMLElement,botId:string)=>void;
 };
 type TaskStatus = 'pending'|'queued'|'running'|'waiting_approval'|'waiting_connection'|'cancelling'|'completed'|'failed'|'cancelled'|string;
-type Task = {id:string;title:string;description?:string;botId:string;botName?:string;status:TaskStatus;createdAt?:string;updatedAt?:string;lastActivity?:string};
+type Task = {id:string;title:string;description?:string;botId:string;botName?:string;status:TaskStatus;createdAt?:string;updatedAt?:string;lastActivity?:string;queue?:TaskQueue};
 type TaskFilter = 'all'|'active'|'pending'|'completed';
 type TaskApproval = Approval;
 type TaskMessage = Message;
@@ -44,9 +44,15 @@ const label = (value: string) => value.replaceAll('_',' ');
 const date = (value?: string) => value ? new Date(value).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
 const activeStatuses = new Set(['queued','running','waiting_approval','waiting_connection','cancelling']);
 const statusName = (status: string) => (({pending:'Pending',queued:'Queued',running:'Running',waiting_approval:'Needs approval',waiting_connection:'Needs connection',cancelling:'Cancelling',completed:'Completed',failed:'Failed',cancelled:'Cancelled'} as Record<string,string>)[status] || label(status));
+const queueName=(task:Task)=>task.queue?.reason==='task'?`Waiting for ${task.queue.blockingTask?.title||'another task'}`:task.queue?.reason==='bot'?`Waiting for ${task.botName||'the bot'} to finish its current work`:task.queue?.reason==='direct_action'?'Waiting for a computer action to finish':task.queue?.reason==='starting'?'Starting…':'Waiting to start';
+function queueValue(value:unknown):TaskQueue|undefined {
+  if(!isRecord(value)||!['task','bot','direct_action','starting','scheduled'].includes(text(value.reason)))return;
+  const blocker=isRecord(value.blockingTask)?value.blockingTask:undefined;
+  return {reason:value.reason as TaskQueue['reason'],...(blocker&&text(blocker.id)&&text(blocker.title)?{blockingTask:{id:text(blocker.id),title:text(blocker.title)}}:{})};
+}
 function taskList(value: unknown): Task[] {
   const source = Array.isArray(value) ? value : isRecord(value) && Array.isArray(value.tasks) ? value.tasks : [];
-  return source.filter(isRecord).map(item => ({id:text(item.id),title:text(item.title)||'Untitled task',description:text(item.description),botId:text(item.botId),botName:text(item.botName),status:text(item.status)||'pending',createdAt:text(item.createdAt),updatedAt:text(item.updatedAt),lastActivity:text(item.lastActivity)})).filter(item=>item.id);
+  return source.filter(isRecord).map(item => ({id:text(item.id),title:text(item.title)||'Untitled task',description:text(item.description),botId:text(item.botId),botName:text(item.botName),status:text(item.status)||'pending',createdAt:text(item.createdAt),updatedAt:text(item.updatedAt),lastActivity:text(item.lastActivity),queue:queueValue(item.queue)})).filter(item=>item.id);
 }
 function taskDetail(value: unknown): Task | undefined {
   const candidate = isRecord(value) && isRecord(value.task) ? value.task : value;
@@ -394,6 +400,7 @@ function TaskView({props}:{props:TasksProps}) {
       <Agents model={{botId:bot.id,botName:bot.name,botModel:bot.model,agents:subagents,namedAgents:props.bots.filter(item=>item.createdByBotId===bot.id) as Bot[],delegations,loading:loadingMessages,selectedAgentId:selectedAgent,revision:events.at(-1)?.id||0,events,runs,collaborationEvents:chatModel.collaborationEvents}} callbacks={{request:callbacks.onContextRequest,onSelect:setSelectedAgent,onRefresh:()=>{if(selected)void loadDetail(selected)},onOpenBot:callbacks.onOpenBot}}/>
     </Dialog.Content></Dialog.Portal></Dialog.Root>
     {(error||approvalError)&&<p className="error notice" role="alert">{error||approvalError}</p>}
+    {detail?.status==='queued'&&<div className="timber-task-queue" role="status"><span>{queueName(detail)}</span>{detail.queue?.blockingTask&&<button type="button" className="timber-tasks-link" onClick={()=>selectTask(detail.queue!.blockingTask!.id)}>Open task</button>}</div>}
     <div className="timber-chat"><ConversationChat key={selected} model={chatModel} callbacks={callbacks} loadArtifact={artifactLoader} headerTarget={headerTarget}/></div>
   </section>:null;
   const overviewContent=<section className="timber-tasks-overview" role={!selected&&!wide?'region':undefined} aria-label={!selected&&!wide?'Global tasks':undefined}>
@@ -404,7 +411,7 @@ function TaskView({props}:{props:TasksProps}) {
     {loadError&&<p className="timber-tasks-error" role="alert">{loadError} <button type="button" className="timber-tasks-link" onClick={refresh}>Retry</button></p>}
     {!tasks.length&&<div className="timber-tasks-empty">{loading?<><LoaderCircleIcon className="timber-tasks-spinner"/><span>Loading tasks…</span></>:<><strong>No tasks yet</strong><span>Create a global task and assign it to a bot. Its conversation stays separate from bot chat.</span></>}</div>}
     {!!tasks.length&&!visibleTasks.length&&<div className="timber-tasks-empty"><strong>No {filter} tasks</strong><span>Choose another filter to see other tasks.</span></div>}
-    {!!visibleTasks.length&&<div className="timber-tasks-list bot-list">{visibleTasks.map(task=>{const assignedBot=props.bots.find(bot=>bot.id===task.botId),model=assignedBot?.model,modelName=props.modelSettings?.choices.find(choice=>choice.id===model)?.label||model;return <button type="button" className={`timber-tasks-card bot-item${selected===task.id?' selected':''}`} aria-pressed={selected===task.id} key={task.id} data-task-id={task.id} onClick={()=>selectTask(task.id)}><TaskAvatar bot={assignedBot} decorate={props.decorateAvatar}/><span className="bot-info"><span className="bot-name-line"><span className="bot-name">{task.title}</span>{modelName&&<span className="bot-model-badge" data-model={model} title={model}>{modelName}</span>}</span><span className="bot-preview-line"><small className="bot-preview">{(task.description||'Start a conversation').replace(/\[private:[a-f0-9-]{36}\]/gi,'🔒 ••••••').replace(/\s+/g,' ').trim()}</small><span className="bot-activity-status" data-status={task.status}>{statusName(task.status)}</span></span></span></button>})}</div>}
+    {!!visibleTasks.length&&<div className="timber-tasks-list bot-list">{visibleTasks.map(task=>{const assignedBot=props.bots.find(bot=>bot.id===task.botId),model=assignedBot?.model,modelName=props.modelSettings?.choices.find(choice=>choice.id===model)?.label||model;return <button type="button" className={`timber-tasks-card bot-item${selected===task.id?' selected':''}`} aria-pressed={selected===task.id} key={task.id} data-task-id={task.id} onClick={()=>selectTask(task.id)}><TaskAvatar bot={assignedBot} decorate={props.decorateAvatar}/><span className="bot-info"><span className="bot-name-line"><span className="bot-name">{task.title}</span>{modelName&&<span className="bot-model-badge" data-model={model} title={model}>{modelName}</span>}</span><span className="bot-preview-line"><small className="bot-preview">{(task.status==='queued'?queueName(task):(task.description||'Start a conversation')).replace(/\[private:[a-f0-9-]{36}\]/gi,'🔒 ••••••').replace(/\s+/g,' ').trim()}</small><span className="bot-activity-status" data-status={task.status}>{statusName(task.status)}</span></span></span></button>})}</div>}
   </section>;
   const sidebar=props.listContainer&&active?props.listContainer:null;
   if(!active)return null;

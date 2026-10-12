@@ -415,7 +415,14 @@ Tasks are owner-scoped records in WorkspaceDO. `GET /v1/tasks` is passive;
 `POST /v1/tasks` accepts `{operationId,title,description,botId,startImmediately?}`
 and returns `{task}` (201 for a new task; an identical idempotent replay returns
 200). `startImmediately` defaults to true; false leaves the task pending.
-`GET /v1/tasks/:id` returns task metadata. `GET /v1/tasks/:id/progress`
+`GET /v1/tasks/:id` returns task metadata. Task list/detail reads include an
+ephemeral `queue` for queued tasks: `reason` is `task`, `bot`, `direct_action`,
+`starting` or `scheduled`. A task holder includes `blockingTask {id,title}` from
+the same assigned bot. This read-only lease observation does not start work or
+release reservations; it is omitted for nonqueued tasks and never persisted.
+The console shows the wait reason and links to the blocking task. Tasks still
+share their assigned bot's computer and execute one at a time.
+`GET /v1/tasks/:id/progress`
 returns a read-only snapshot: observation time, last recorded activity, elapsed
 inactivity, pending native tools/generations/compaction, recent public command
 activity and errors, plus conversation messages (`limit` 1–20, default 10;

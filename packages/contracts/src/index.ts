@@ -55,7 +55,8 @@ export interface CompactionReceipt {id:string;reason:"manual"|"threshold"|"overf
 export interface BotContextStatus {automatic:true;estimatedTokens:number;activeEntries:number;contextWindow:number;compactions:CompactionReceipt[];historyRetained:true;}
 
 export type TaskStatus = "pending" | "queued" | "running" | "waiting_approval" | "waiting_connection" | "cancelling" | "completed" | "failed" | "cancelled";
-export interface Task { id:string; title:string; description:string; botId:string; botName:string; creator:"owner"|"bot"; createdByBotId?:string; sourceRunId?:string; sourceTaskId?:string; statusVersion?:number; status:TaskStatus; startImmediately:boolean; createdAt:string; updatedAt:string; lastActivity?:string; }
+export interface TaskQueue { reason:"task"|"bot"|"direct_action"|"starting"|"scheduled"; blockingTask?:{id:string;title:string}; }
+export interface Task { id:string; title:string; description:string; botId:string; botName:string; creator:"owner"|"bot"; createdByBotId?:string; sourceRunId?:string; sourceTaskId?:string; statusVersion?:number; status:TaskStatus; startImmediately:boolean; createdAt:string; updatedAt:string; lastActivity?:string; queue?:TaskQueue; }
 export interface TaskUpdate {task:Task;notificationId:string;result?:string;}
 export interface TaskPage { tasks:Task[]; }
 export * from "./avatars";

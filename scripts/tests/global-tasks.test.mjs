@@ -90,6 +90,18 @@ async function withTasks(work,width=1440,colorScheme='light') {
   }finally{for(const gate of tasks.readGates.values())gate.resolve();tasks.sendGate?.resolve();await context.close();await fixture.close();}
 }
 
+for(const width of [390,1440])test(`global tasks: queued work identifies its blocker and opens that conversation at ${width}px`,async()=>withTasks(async({page,tasks,login,open})=>{
+  const queued=tasks.records.find(task=>task.id==='task-queued'),holder=tasks.records.find(task=>task.id==='task-running');
+  queued.queue={reason:'task',blockingTask:{id:holder.id,title:holder.title}};
+  await login();assert.match(await page.locator('.timber-tasks-card[data-task-id="task-queued"]').innerText(),/Waiting for Task running/);
+  await open(queued.id);const notice=page.locator('.timber-task-queue');assert.match(await notice.innerText(),/Waiting for Task running/);
+  const geometry=await notice.evaluate(node=>({scroll:node.scrollWidth,width:node.clientWidth}));assert.ok(geometry.scroll<=geometry.width);
+  await notice.getByRole('button',{name:'Open task',exact:true}).click();
+  await page.locator('.timber-tasks-detail h1').filter({hasText:holder.title}).waitFor();
+  assert.equal(await page.locator('.timber-tasks-detail').getAttribute('data-task-id'),holder.id);assert.equal(await page.locator('.timber-task-queue').count(),0);
+  assert.ok(tasks.calls.every(call=>call.method==='GET'),'inspection must not submit or cancel work');
+},width));
+
 for(const width of [390,1440])test(`global tasks: default auto-start, explicit pending override, filters behind an icon and dedicated chat at ${width}px`,async()=>withTasks(async({page,tasks,fixture,login,open,back})=>{
   await login();
   const filters=page.getByRole('group',{name:'Filter tasks by status'}),cards=page.locator('.timber-tasks-card');
