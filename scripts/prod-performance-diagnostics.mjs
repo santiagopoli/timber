@@ -1,10 +1,16 @@
 // Fixed read-only projections. Never select prompts, arguments, tool output or
 // credentials; identifiers used for routing stay inside collectDurable.
-export const PERFORMANCE_SCHEMA = "SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('runs','submissions','events','botspace_runtime_budget','pi_tasks','pi_entries') ORDER BY name";
+export const PERFORMANCE_SCHEMA = "SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('runs','submissions','events','botspace_runtime_budget','pi_tasks','pi_entries','timber_inference_requests') ORDER BY name";
 export const PERFORMANCE_TASKS = `SELECT t.id,json_extract(t.data,'$.status') AS status,
- json_extract(t.data,'$.createdAt') AS created_at,json_extract(t.data,'$.updatedAt') AS updated_at
- FROM tasks t JOIN bots b ON b.id=json_extract(t.data,'$.botId')
+ json_extract(t.data,'$.createdAt') AS created_at,json_extract(t.data,'$.updatedAt') AS updated_at,
+ CASE WHEN s.task_id IS NULL THEN 'none' WHEN s.task_id=t.id THEN 'self' WHEN s.task_id='@bot' THEN 'bot' WHEN s.task_id LIKE '@direct:%' THEN 'direct' ELSE 'other_task' END AS holder,
+ s.updated_at AS slot_updated_at,
+ (SELECT COUNT(*) FROM computer_admissions a WHERE a.bot_id=b.id) AS admissions,
+ (SELECT COUNT(*) FROM computer_admissions a WHERE a.bot_id=b.id AND a.payload IS NOT NULL) AS pinned_effects
+ FROM tasks t JOIN bots b ON b.id=json_extract(t.data,'$.botId') LEFT JOIN task_slots s ON s.bot_id=b.id
  WHERE lower(json_extract(b.data,'$.name'))='polibot' ORDER BY t.rowid DESC LIMIT 6`;
+export const PERFORMANCE_REQUESTS = `SELECT source,phase,started_at,last_progress_at,bytes,http_status,idle,estimated_tokens FROM timber_inference_requests ORDER BY id DESC LIMIT 20`;
+export function summarizeInferenceRequests(records){return records.slice(0,20).map(row=>({source:allow(new Set(['chatgpt','openai-api','openrouter']),row.source),phase:allow(new Set(['request','streaming','completed','failed','cancelled']),row.phase),startedAt:count(row.started_at)===null?null:new Date(row.started_at).toISOString(),lastProgressAt:count(row.last_progress_at)===null?null:new Date(row.last_progress_at).toISOString(),bytes:count(row.bytes),httpStatus:count(row.http_status),idleTimeout:row.idle===1,estimatedTokens:count(row.estimated_tokens)}));}
 export const PERFORMANCE_RUNS = `SELECT json_extract(data,'$.createdAt') AS created_at,
  json_extract(data,'$.updatedAt') AS updated_at,json_extract(data,'$.status') AS status,
  json_extract(data,'$.errorCode') AS error_code,
@@ -21,7 +27,26 @@ export const PERFORMANCE_TOOLS = `WITH recent AS (
  json_extract(c.data,'$.data.result.status') AS status,
  json_extract(c.data,'$.data.result.exitCode') AS exit_code,
  json_extract(c.data,'$.data.result.checkpointStatus') AS checkpoint,
- length(json_extract(c.data,'$.data.result.output')) AS output_characters
+ length(json_extract(c.data,'$.data.result.output')) AS output_characters,
+ json_extract(s.data,'$.data.input.timeoutMs') AS deadline_ms,
+ json_extract(s.data,'$.data.input.yieldMs') AS yield_ms,
+ length(json_extract(s.data,'$.data.input.content')) AS written_characters,
+ CASE WHEN json_extract(s.data,'$.data.actionType') IN ('readFile','writeFile') THEN
+ CASE WHEN json_extract(s.data,'$.data.input.path') LIKE '%.sh' THEN 'shell'
+ WHEN json_extract(s.data,'$.data.input.path') LIKE '%.py' THEN 'python'
+ WHEN json_extract(s.data,'$.data.input.path') LIKE '%.ts' OR json_extract(s.data,'$.data.input.path') LIKE '%.tsx' THEN 'typescript'
+ WHEN json_extract(s.data,'$.data.input.path') LIKE '%.js' OR json_extract(s.data,'$.data.input.path') LIKE '%.mjs' THEN 'javascript'
+ WHEN json_extract(s.data,'$.data.input.path') LIKE '%.log' OR json_extract(s.data,'$.data.input.path') LIKE '%.out' THEN 'log'
+ ELSE 'other' END ELSE NULL END AS file_kind,
+ CASE WHEN lower(json_extract(s.data,'$.data.input.key')) IN ('return','enter','ctrl+c','ctrl+d','ctrl+v','ctrl+l','alt+f2','ctrl+alt+t') THEN lower(json_extract(s.data,'$.data.input.key')) ELSE NULL END AS key_kind,
+ CASE WHEN instr(lower(json_extract(c.data,'$.data.result.error')),'timed out')>0 THEN 'timeout'
+ WHEN instr(lower(json_extract(c.data,'$.data.result.error')),'session is unavailable')>0 THEN 'session_unavailable'
+ WHEN instr(lower(json_extract(c.data,'$.data.result.error')),'restarted')>0 THEN 'computer_restarted'
+ WHEN instr(lower(json_extract(c.data,'$.data.result.error')),'checkpoint')>0 THEN 'checkpoint'
+ WHEN instr(lower(json_extract(c.data,'$.data.result.error')),'person has control')>0 THEN 'human_control'
+ WHEN instr(lower(json_extract(c.data,'$.data.result.error')),'connection')>0 THEN 'connection'
+ WHEN instr(lower(json_extract(c.data,'$.data.result.output')),'command not found')>0 THEN 'command_not_found'
+ WHEN json_extract(c.data,'$.data.result.error') IS NOT NULL THEN 'other' ELSE NULL END AS failure_kind
  FROM recent s LEFT JOIN events c ON c.source_key='tool:'||json_extract(s.data,'$.data.operationId') ORDER BY s.id DESC`;
 export const PERFORMANCE_NATIVE = `SELECT json_extract(t.record,'$.kind') AS kind,t.status,
  (SELECT json_extract(c.value,'$.name') FROM pi_entries e,json_each(e.record,'$.model[0].content') c
@@ -53,8 +78,27 @@ export const PERFORMANCE_USAGE = `SELECT json_extract(record,'$.model[0].timesta
  json_extract(record,'$.model[0].stopReason') AS stop_reason
  FROM pi_entries WHERE json_extract(record,'$.kind')='pi.assistant' ORDER BY id DESC LIMIT 40`;
 
+// Count real computer effects, rather than their duplicate native tool wrapper.
+// Arguments remain inside SQLite, including when grouping identical requests.
+export const PERFORMANCE_ACTIVITY = `WITH effects AS (
+ SELECT source_key,data,substr(json_extract(data,'$.createdAt'),1,13)||':00:00.000Z' AS hour,
+ json_extract(data,'$.data.actionType') AS tool FROM events
+ WHERE json_extract(data,'$.type')='tool.started' AND json_extract(data,'$.data.actionType') IS NOT NULL
+), grouped AS (
+ SELECT s.hour,s.tool,COUNT(*) AS actions,
+ SUM(json_extract(c.data,'$.data.result.status')='failed') AS failed,
+ SUM(json_extract(c.data,'$.data.result.status')='interrupted') AS interrupted,
+ SUM(COALESCE(instr(lower(json_extract(c.data,'$.data.result.error')),'timed out')>0,0)) AS timed_out,
+ SUM(CASE WHEN c.data IS NOT NULL THEN MAX(0,CAST((julianday(json_extract(c.data,'$.createdAt'))-julianday(json_extract(s.data,'$.createdAt')))*86400000 AS INTEGER)) ELSE 0 END) AS duration_ms,
+ SUM(length(json_extract(s.data,'$.data.input.content'))) AS written_characters
+ FROM effects s LEFT JOIN events c ON c.source_key='tool:'||json_extract(s.data,'$.data.operationId')
+ GROUP BY s.hour,s.tool
+) SELECT * FROM grouped ORDER BY hour DESC,actions DESC LIMIT 90`;
+
+export function summarizeActivity(records,window){return records.slice(0,90).filter(row=>{const at=Date.parse(iso(row.hour)??'');return at>=window.from&&at<=window.to;}).map(row=>({hour:iso(row.hour),tool:allow(tools,row.tool),actions:count(row.actions),failed:count(row.failed),interrupted:count(row.interrupted),timedOut:count(row.timed_out),durationMs:count(row.duration_ms),writtenCharacters:count(row.written_characters)}));}
+
 const states=new Set(['pending','queued','running','waiting','waiting_approval','waiting_connection','completed','failed','interrupted','cancelling','cancelled','completing','terminal','aborted','faulted','orphaned']);
-const tools=new Set(['exec','exec_poll','exec_cancel','call_tool','spawn_subagent','send_subagent_message','wait_subagent','list_subagents','cancel_subagent','execPoll','execCancel','readFile','writeFile','listFiles','checkpoint','gitClone','gitPush','screenshot','navigate','click','type','key','scroll','list_tools','load_skill','github_clone','github_push','github_create_pull_request','github_list_pull_requests','github_list_repositories','publish_app','list_apps','create_task','list_tasks','update_task','request_secret','configure_secret','name_secret','list_secrets','secret_request']);
+const tools=new Set(['exec','exec_poll','exec_cancel','call_tool','spawn_subagent','send_subagent_message','wait_subagent','list_subagents','cancel_subagent','execPoll','execCancel','readFile','writeFile','listFiles','checkpoint','gitClone','gitPush','screenshot','navigate','click','type','key','scroll','list_tools','load_skill','github_clone','github_push','github_create_pull_request','github_list_pull_requests','github_list_repositories','github_inspect_ci','publish_app','list_apps','create_task','list_tasks','update_task','request_secret','configure_secret','name_secret','list_secrets','secret_request']);
 const kinds=new Set(['pi.generation','pi.compaction','pi.tool','timber.memory-review','timber.subagent-delivery']);
 const phases=new Set(['prepare','request','retry','poll','tools','yield','wait','apply','deliver','report','execute','invoke']);
 const iso=value=>typeof value==='string'&&/^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(value)&&Number.isFinite(Date.parse(value))?new Date(value).toISOString():null;
@@ -64,7 +108,7 @@ export function summarizePerformance({runs=[],tools:actions=[],native=[],usage=[
  const inside=value=>{const at=Date.parse(value??'');return Number.isFinite(at)&&at>=window.from&&at<=window.to;};
  return {
   runs:runs.slice(0,12).filter(row=>inside(iso(row.updated_at))||inside(iso(row.created_at))).map(row=>({createdAt:iso(row.created_at),updatedAt:iso(row.updated_at),status:allow(states,row.status),source:allow(new Set(['user','internal']),row.source),generations:count(row.generations),tools:count(row.tools),retries:count(row.retries)})),
-  tools:actions.slice(0,60).filter(row=>inside(iso(row.finished_at))||inside(iso(row.started_at))).map(row=>{const startedAt=iso(row.started_at),finishedAt=iso(row.finished_at);return {startedAt,finishedAt,tool:allow(tools,row.tool),status:allow(states,row.status),durationMs:startedAt&&finishedAt?count(Date.parse(finishedAt)-Date.parse(startedAt)):null,exitCode:Number.isSafeInteger(row.exit_code)?row.exit_code:null,checkpoint:allow(new Set(['pending','saved','failed']),row.checkpoint),outputCharacters:count(row.output_characters)};}),
+  tools:actions.slice(0,60).filter(row=>inside(iso(row.finished_at))||inside(iso(row.started_at))).map(row=>{const startedAt=iso(row.started_at),finishedAt=iso(row.finished_at);return {startedAt,finishedAt,tool:allow(tools,row.tool),status:allow(states,row.status),durationMs:startedAt&&finishedAt?count(Date.parse(finishedAt)-Date.parse(startedAt)):null,exitCode:Number.isSafeInteger(row.exit_code)?row.exit_code:null,checkpoint:allow(new Set(['pending','saved','failed']),row.checkpoint),outputCharacters:count(row.output_characters),deadlineMs:count(row.deadline_ms),yieldMs:count(row.yield_ms),writtenCharacters:count(row.written_characters),fileKind:row.file_kind==null?null:allow(new Set(['shell','python','typescript','javascript','log','other']),row.file_kind),keyKind:row.key_kind==null?null:allow(new Set(['return','enter','ctrl+c','ctrl+d','ctrl+v','ctrl+l','alt+f2','ctrl+alt+t']),row.key_kind),failureKind:row.failure_kind==null?null:allow(new Set(['timeout','session_unavailable','computer_restarted','checkpoint','human_control','connection','command_not_found','other']),row.failure_kind)};}),
   nativeTasks:native.slice(0,60).map(row=>({kind:allow(kinds,row.kind),status:allow(states,row.status),phase:allow(phases,row.phase),tool:allow(tools,row.tool),replay:allow(new Set(['safe','unsafe']),row.replay),isRoot:row.is_root===1,attempt:count(row.attempt),outcome:allow(states,row.outcome),background:row.background===1})),
   recovery:recovery.slice(0,1).map(row=>({waitGraphs:count(row.wait_graphs),activeNativeTasks:count(row.active_native_tasks),queuedInputs:count(row.queued_inputs)})),
   wakes:wakes.slice(0,40).map(row=>({capability:allow(new Set(['pi-harness','botspace-subagents','botspace-admission']),row.capability),fn:allow(new Set(['wake','retry']),row.fn),at:count(row.time)===null?null:new Date(row.time).toISOString(),running:row.running===1,executionStartedAt:count(row.execution_started_at)===null?null:new Date(row.execution_started_at).toISOString(),recoveryLoop:row.recovery_loop===1})),
@@ -73,4 +117,4 @@ export function summarizePerformance({runs=[],tools:actions=[],native=[],usage=[
   modelResponses:usage.slice(0,40).filter(row=>count(row.timestamp)!==null&&row.timestamp>=window.from&&row.timestamp<=window.to).map(row=>({at:new Date(row.timestamp).toISOString(),inputTokens:count(row.input_tokens),outputTokens:count(row.output_tokens),cachedTokens:count(row.cached_tokens),stopReason:allow(new Set(['stop','length','toolUse','error','aborted']),row.stop_reason)})),
  };
 }
-export function performanceTaskMetadata(row){return {createdAt:iso(row.created_at),updatedAt:iso(row.updated_at),status:allow(states,row.status)};}
+export function performanceTaskMetadata(row){return {createdAt:iso(row.created_at),updatedAt:iso(row.updated_at),status:allow(states,row.status),scheduler:{holder:allow(new Set(['none','self','bot','direct','other_task']),row.holder),slotUpdatedAt:count(row.slot_updated_at)===null?null:new Date(row.slot_updated_at).toISOString(),admissions:count(row.admissions),pinnedEffects:count(row.pinned_effects)}};}

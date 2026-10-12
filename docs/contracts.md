@@ -401,6 +401,10 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
 - GET /v1/bots/:id/artifacts/:artifactId -> authenticated bytes. All file access
   scoped to bot prefix. Generated HTML/SVG are attachments, never same-origin code.
 
+## Secure Worker deployment
+
+The owner-managed `/v1/keychain/deploy-plans` API pins bot, repository/commit metadata, a relative `artifactPath`, exact SHA-256 bundle digest, Cloudflare account/Worker destination and one permitted bearer credential reference or the legacy key/email pair at exact revisions. `secure_worker_deploy` accepts only `{planId,expectedRevision}`. v1 deploys only an already-bundled JavaScript Worker module; it does not run repo build hooks/scripts, arbitrary Wrangler config/plugins/arguments, non-JS assets, Timber infrastructure or the production deployment pipeline. The ComputerProvider has a dedicated private deploy method, not a generic `ComputerAction` or shell path. It submits a short-lived signed metadata-only authorization and reference-bound credentials to the bot's ComputerDO private route. After any container startup await, ComputerDO asks the owner WorkspaceDO to verify that signed authorization against the live plan, grants, reference revisions and original run/native Stop fence; it then forwards to the private container channel without another await. The internal authority route is blocked at the public API gateway. Credential decryption happens only in a scoped callback just before that request; values never enter generic exec, storage, journal, transcript, events or logs. The trusted root controller snapshots the bounded regular workspace artifact, checks its digest, then sends that exact artifact and allowlisted auth values to a dedicated isolated deploy UID; ordinary workspace shell/PTY/browser processes cannot inspect its environment. A synthetic cross-UID process-environment canary gates readiness; an owner-only `/v1/keychain/deploy-capabilities?botId=...` reports the actual Computer image result without credentials. Durable operation reservations, owner/run/Stop/revision fences, one dispatch and uncertain-no-retry recovery apply. See [secure-deploy.md](secure-deploy.md); rollout and live validation remain separate.
+
 ## Global tasks
 
 Tasks are owner-scoped records in WorkspaceDO. `GET /v1/tasks` is passive;
@@ -420,6 +424,7 @@ not returned.
 
 The host tools `list_tasks {before?}` (30 per page) and
 `inspect_task {taskId,before?,limit?}` are available to computerless coordinators.
+`message_task {taskId,text}` lets the named parent send steering to those tasks, including durable messages while queued, or explicitly continue completed/failed work. It freezes message-versus-continuation routing before dispatch, so a lost acknowledgment cannot create a second continuation. Temporary agents and other task conversations cannot invoke it; cancelled tasks remain fenced.
 They resolve only tasks assigned to the calling bot and remain usable without
 `allowTaskCreation`. Task conversation text is collaborator data, not new
 instructions or authorization.
@@ -431,7 +436,8 @@ computer/workspace identity, so no second computer is created. The task has its
 own transcript and run/event IDs.
 
 `POST /v1/tasks/:id/start` admits the description under stable operation ID
-`task-start:<taskId>`. `POST /v1/tasks/:id/messages`, `GET /messages`, `GET
+`task-start:<taskId>`. Queued task chats accept messages into the durable bounded inbox without claiming the computer. Only the original start/continuation input can enter Pi while the task is queued; saved messages follow once it starts. Unadmitted messages cannot prevent the scheduler from starting that original input. Expected contention does not consume delivery retry attempts.
+`POST /v1/tasks/:id/messages`, `GET /messages`, `GET
 /runs`, and `GET /events` expose the task conversation. `POST /continue {operationId,text}` explicitly continues a completed or failed task in the same chat with a newly generated native input ID, never by replaying `task-start` or old computer actions. Identical continuation receipts deduplicate; different instructions under the same ID conflict. `POST /cancel` cancels its
 active runs and permanently fences subsequent starts and continuations. Cancelled tasks cannot Continue in this version; create a new task. Task-scoped `/approvals`,
 `/approvals/:approvalId`, `/agents`, `/agents/:agentId/messages`,
@@ -479,10 +485,34 @@ work without cancelling the independent task. Ordinary execution admission and
 all task/computer effects retain exact lease fencing.
 
 The console's main segmented Bots/Tasks selector swaps the same list area and
-matching row presentation. Tasks have deep links `#tasks&task=<id>`, a dedicated
-chat, approvals and command activity, with bounded history pages and live SSE.
+matching row presentation. Tasks have deep links `#tasks&task=<id>` and mount the
+same conversation/composer components as bot chat, including inline approvals,
+command activity, failures, image messages and task-scoped agent dialogs. The
+compact task state occupies the conversation-header status area; description,
+assignment, timestamps and pending Start stay behind the Task details button.
+Task chat has bounded history pages and live SSE. Archive pages merge with
+recent activity, and retries preserve each original message's receipt identity.
 Hidden task views stop polling and streaming. The parent chat restores the latest
 status pills from the passive registry and ignores stale status versions.
+
+Task conversations expose the same context and individual-memory routes under
+`/v1/tasks/:id/context` and `/v1/tasks/:id/memory`; these operate on the isolated
+task runtime, never the assigned bot's ordinary context or notes. Model selection
+continues to inherit the assigned bot's settings. Images upload and download
+through that bot's existing artifact routes; task messages validate the same
+image ownership and input limits. Explicit task continuation retains validated
+image IDs or mentions in its durable queued input and operation fingerprint;
+text-only receipts keep their prior fingerprint. As in ordinary chat, a single
+input cannot combine images and mentions. Delegation results return to the exact
+originating task conversation, with the existing cancellation fences.
+
+The `/v1/tasks/:id/keychain` aliases retain the owner's encrypted keychain and
+assigned-bot grants, while listing and fulfilling requests for that task only.
+Secure request receipts and GitHub consent flows carry an optional host-assigned
+`taskId`; check, resume and callback delivery validate the assigned bot and address
+that task's Durable Object. Legacy receipts without a task ID address ordinary
+bot chat. A sibling task cannot fulfill a request through its alias, and Stop,
+revocation and original run/native-operation checks still fence continuation.
 
 ## Console sessions
 The cookie `__Host-timber_session` is Secure, HttpOnly, SameSite=Strict, host-only
@@ -651,13 +681,28 @@ images reject before journaling and never report a simulated result. They share
 the usual GUI approval policy and human-control exclusion. Pi exposes
 `desktop_move`, `desktop_double_click` and `desktop_drag`.
 
+The secure Computer image runs generic shell/PTY/desktop operations as UID 10001,
+not root. Project dependencies/tools (npm and Python virtual environments/pip)
+remain installable under the current host approval policy; system packages are
+installed by the image build, never by regaining root from a workspace shell.
+The shipped image includes Node/npm, Python, virtual environments/pip, ripgrep,
+jq and patch. Shared development VMs may still run as root, but must report
+private credential execution unsupported. Python packages should use a virtual
+environment; dependency directories and caches are not durable workspace
+checkpoints, keeping project setup reproducible.
+
+
 Pi `exec {command,timeoutMs?,yieldMs?}` starts a managed process with no default
-execution deadline. `timeoutMs`, when explicitly supplied, is a positive safe
+execution deadline. Pi accepts an omitted or `null` timeout, normalized to no
+host deadline. Its provider-visible schema explicitly includes `null`, so a
+provider requiring every property does not force the model to invent a number.
+`timeoutMs`, when explicitly supplied as a number, is a positive safe
 integer; there is no 120-second maximum. Its expiry terminates the process group
 and retains output and the terminal outcome. `yieldMs` is an integer from 0 to
-30,000, default 1,000; it limits how long a request waits for output and never
-terminates a process. These values have the same meaning for direct computer API
-clients and Pi tools.
+30,000; it limits how long a request waits for output and never terminates a
+process. Pi waits 10,000 ms by default (also for `null`) to reduce unnecessary
+model/poll round trips; direct computer API clients retain their 1,000 ms default.
+The host still receives only validated integers and an absent deadline.
 
 A response with `status:"running"` includes `processId`, equal to the initial
 exec operation ID. It confirms the command continues in the computer. Pi exposes
@@ -977,6 +1022,22 @@ recipient; a plain `@` string never grants authority to choose a different bot.
 
 
 ## Host tools and GitHub connection
+`github_inspect_ci {repository,branch?,commit?,runId?,jobId?}` is a read-only
+host capability, including for computerless coordinating turns. Without a run
+ID it lists ten recent runs, optionally for a branch/full SHA. With a run ID it
+returns up to 30 job states, step details for the selected/first failed/current
+job, and a failed job's log tail; an
+explicit job ID must belong to that returned run. Log downloads retain at most
+16,000 characters, cap total bytes at 8 MB, and never forward GitHub credentials
+to a signed log redirect. Only HTTPS GitHub Actions/Azure log hosts are accepted.
+The source bot's installed repository grant is checked before reading and again
+before returning. Disconnect/deletion/reinstallation fences results. CI reads
+do not hold the integration mutation lock while fetching logs and never restart
+jobs or execute commands. Public repo CI uses unauthenticated reads after the
+connected account confirms repository visibility; private repo CI requires the
+existing GitHub App/user authorization to include Actions read permission.
+Verification success and deployment success are returned as separate job states.
+
 The host advertises a small catalog through runtime-independent `catalog` / `call`
 ports. Pi implements native `list_tools` and `call_tool`; neither engine nor skill
 owns provider credentials. Standard Agent Skills sources live in `skills/*/SKILL.md`
@@ -1315,3 +1376,31 @@ is rejected. Candidate identities precede PUT; pointer replacement and old-objec
 GC admission commit atomically. Deletion stops the target runtime before avatar
 drain, never awaiting another bot’s avatar. Receipts are compact and terminal
 private snapshots are cleared; status/next-time and GC scheduling are indexed.
+
+
+## Inference liveness and working context
+
+OpenAI Responses requests use stable opaque prompt cache affinity per durable
+conversation, isolated across bot and task computers and retained through eviction.
+The ChatGPT proxy derives its `session_id` header from that host hash; it does not
+forward arbitrary client headers or retain provider-side conversation history.
+Native Pi uses a working context window of at most 128,000 tokens, bounded by the
+model's actual smaller window. Threshold compaction preserves the full archive and
+recent verbatim context, and runs before a million-token catalogue limit is reached.
+
+Inference connections watch elapsed time without headers or stream bytes. The
+stream silence allowance is 180 seconds, 240 seconds over 50,000 estimated tokens,
+and 300 seconds over 100,000; named reasoning models and high reasoning settings
+have at least 600 seconds. Each received chunk resets this allowance, so active
+reasoning can exceed it. The existing 30-minute total inference ceiling remains.
+This applies only to model inference; command/process deadlines are unchanged.
+Expired connections fail through native Pi's inference retry policy, preserving
+recorded tool effects. Explicit Stop stays an abort.
+
+`timber_inference_requests` stores at most 201 recent connection records with
+source, stage, start/last-progress times, bytes, HTTP status, estimated input size
+and idle-expiry status; no prompts, model output, cache keys or credentials.
+Task progress and private production diagnostics expose those stages to distinguish
+a request waiting for headers from an active stream and a dead connection.
+The policy follows Hermes' separation of total and stale-stream budgets and Codex's
+per-session cache affinity.

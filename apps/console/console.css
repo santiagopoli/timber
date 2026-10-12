@@ -63,7 +63,7 @@ p{line-height:1.6}
 .sidebar-heading h2{margin:0;font-size:19px}
 .sidebar-heading .row{gap:2px}
 .new-bot{border-radius:50%;min-height:38px!important;width:38px!important;min-width:38px!important;height:38px!important}
-.search-field{display:flex;align-items:center;gap:8px;margin:0;padding:0 11px;border:1px solid var(--line);border-radius:12px;background:var(--surface);color:var(--muted)}
+.search-field{font-size:12px;font-weight:550;display:flex;align-items:center;gap:8px;margin:0;padding:0 11px;border:1px solid var(--line);border-radius:12px;background:var(--surface);color:var(--muted)}
 .search-field svg{width:17px;height:17px}
 .search-field:focus-within{border-color:var(--muted)}
 .search{font-size:13px;background:transparent;padding:11px 0;border:0;border-radius:0;font-weight:400;min-height:42px}

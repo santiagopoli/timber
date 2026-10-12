@@ -46,7 +46,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(self.inspector.file('data.bin')['kind'], 'binary')
         self.assertEqual(self.inspector.file('evil.html')['kind'], 'text')
         self.assertEqual(self.inspector.file('vector.svg')['kind'], 'text')
-        self.assertEqual(self.inspector.download('data.bin')[0], self.root/'data.bin')
+        self.assertEqual(self.inspector.download('data.bin')[0], b'\x00\xff')
 
     def test_path_escapes_links_and_special_files(self):
         (self.root / 'outside').symlink_to('/etc/passwd')

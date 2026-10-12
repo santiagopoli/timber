@@ -52,3 +52,24 @@ it('allows a computerless coordinator to inspect its own tasks and rejects anoth
  const unmarked=await registry.fetch(`https://workspace/tasks/inspect/${bot.id}`);expect(unmarked.status).toBe(403);await unmarked.text();
  await runInDurableObject(root,(_,state)=>{expect(state.storage.sql.exec('SELECT * FROM computer_operations').toArray()).toHaveLength(0);expect(state.storage.sql.exec('SELECT * FROM execution_claims').toArray()).toHaveLength(0);});
 });
+it('coordinates queued messages and completed-task continuations without duplicate inputs or cross-bot access',async()=>{
+ const {bot,task,stub}=await setup(),other=await setup(),registry=bindings.WORKSPACE.get(bindings.WORKSPACE.idFromName('owner'));
+ await api(`/v1/bots/${bot.id}/messages`);
+ const root=bindings.BOT.get(bindings.BOT.idFromName(`owner:${bot.id}`)),sourceOp=crypto.randomUUID();
+ const source=await api(`/v1/bots/${bot.id}/messages`,{operationId:sourceOp,text:'fixture:approval'}),runId=source.data.run.id;
+ for(let i=0;i<100;i++){const current=await api(`/v1/bots/${bot.id}/runs/${runId}`);if(current.data.run.status==='waiting_approval')break;await new Promise(resolve=>setTimeout(resolve,5));}
+ expect((await api(`/v1/bots/${bot.id}/runs/${runId}`)).data.run.status).toBe('waiting_approval');
+ await runInDurableObject(root,(_,state)=>{const row=state.storage.sql.exec<{data:string}>('SELECT data FROM runs WHERE id=?',runId).one();state.storage.sql.exec('UPDATE runs SET data=? WHERE id=?',JSON.stringify({...JSON.parse(row.data),coordinatorMode:true}),runId);});
+ const call=(taskId:string,text:string,op:string)=>runInDurableObject(root,async instance=>(instance as unknown as {executeHostTool(input:RuntimeHostToolRequest):Promise<ComputerResult>}).executeHostTool({name:'message_task',arguments:{taskId,text},operationId:op,runOperationId:sourceOp,signal:new AbortController().signal}));
+ const status=async(value:string)=>runInDurableObject(registry,(_,state)=>{const row=state.storage.sql.exec<{data:string}>('SELECT data FROM tasks WHERE id=?',task.id).one();state.storage.sql.exec('UPDATE tasks SET data=? WHERE id=?',JSON.stringify({...JSON.parse(row.data),status:value}),task.id);});
+ await status('queued');const op=crypto.randomUUID(),message='Apply this correction when you can';
+ const result=await call(task.id,message,op);expect(result.status).toBe('completed');const receipt=JSON.parse(result.output!);expect(receipt.run.status).toBe('queued');
+ await status('completed');const repeat=await call(task.id,message,op);expect(repeat).toMatchObject({status:'completed'});expect(JSON.parse(repeat.output!).run.id).toBe(receipt.run.id);
+ await expect(call(task.id,'Changed instructions',op)).rejects.toThrow('different instructions');
+ await expect(call(other.task.id,message,crypto.randomUUID())).rejects.toThrow('Task not found for this bot');
+ const next=crypto.randomUUID(),continued=await call(task.id,'Continue the remaining work',next);expect(JSON.parse(continued.output!).task.id).toBe(task.id);
+ const repeated=await call(task.id,'Continue the remaining work',next);expect(JSON.parse(repeated.output!).task.startOperationId).toBe(JSON.parse(continued.output!).task.startOperationId);
+ await runInDurableObject(stub,(_,state)=>expect(state.storage.sql.exec('SELECT 1 FROM submissions WHERE operation_id=?',op).toArray()).toHaveLength(1));
+ await status('cancelled');await expect(call(task.id,message,crypto.randomUUID())).rejects.toThrow('Cancelled tasks');
+ const unmarked=await registry.fetch('https://workspace/tasks/message',{method:'POST',headers:{'content-type':'application/json'},body:'{}'});expect(unmarked.status).toBe(403);await unmarked.text();
+});

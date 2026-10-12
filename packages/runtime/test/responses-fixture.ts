@@ -21,11 +21,12 @@ export function responsesFixture(payload: { input: Record<string, unknown>[] }, 
     const event={type:'response.failed',response:{id:'resp_error_fixture',object:'response',status:'failed',output:[],error}};
     return new Response(`data: ${JSON.stringify(event)}\n\n`,{headers:{'content-type':'text/event-stream'}});
   }
-  if (text.includes('request-resumable-exec') || text.includes('request-cancel-resumable-exec')) return resumableExecResponse(payload.input.slice(userIndex + 1), text.includes('request-cancel-resumable-exec'));
+  if (text.includes('request-resumable-exec') || text.includes('request-cancel-resumable-exec')) return resumableExecResponse(payload.input.slice(userIndex + 1), text.includes('request-cancel-resumable-exec'),text.includes('null-deadline'));
   if (text.includes('request-multistep-recovery')) return multistepResponse(payload.input.slice(userIndex + 1));
   if (text.includes('request-tool-budget')) return multistepResponse(payload.input.slice(userIndex + 1),'budget');
   if (text.includes('request-long-task')) return multistepResponse(payload.input.slice(userIndex + 1),'long');
   const hasToolOutput = payload.input.slice(userIndex + 1).some(item => item.type === 'function_call_output');
+  if(hasToolOutput&&text.includes('request-connection-error-once')&&requestNumber===2)throw new Error('fixture network failure');
   if (hasToolOutput && (text.includes('empty-final-after-exec') || text.includes('recover-empty-once') && requestNumber === 2)) {
     const item = { type: 'reasoning', id: 'rs_empty_final', summary: [{ type: 'summary_text', text: 'Private fixture reasoning must remain hidden.' }], encrypted_content: 'synthetic-fixture-ciphertext' };
     const response = { id: 'resp_empty_final', object: 'response', status: 'completed', output: [item], usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 } };
@@ -53,7 +54,8 @@ export function responsesFixture(payload: { input: Record<string, unknown>[] }, 
   const finalItem = tool
     ? { type: 'function_call', id: 'fc_fixture_1', call_id: 'call_fixture_1', name, ...(paid?{}:{namespace}), arguments: args, status: 'completed' }
     : { type: 'message', id: 'msg_fixture_1', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: answer, annotations: [] }] };
-  const response = { id: 'resp_fixture', object: 'response', status: 'completed', output: [finalItem], usage: { input_tokens: 10, output_tokens: 8, total_tokens: 18, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } } };
+  const inputTokens=JSON.stringify(payload.input).includes('Retained long turn')?Math.ceil(JSON.stringify(payload.input).length/4):10;
+  const response = { id: 'resp_fixture', object: 'response', status: 'completed', output: [finalItem], usage: { input_tokens: inputTokens, output_tokens: 8, total_tokens: inputTokens+8, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } } };
   const events: unknown[] = [
     { type: 'response.created', response: { ...response, output: [], status: 'in_progress' } },
     { type: 'response.output_item.added', output_index: 0, item: tool ? { ...finalItem, arguments: '', status: 'in_progress' } : { ...finalItem, content: [], status: 'in_progress' } },
@@ -89,11 +91,11 @@ function unfinishedStopResponse(history: Record<string, unknown>[]): Response {
 }
 
 /** The provider follows the process ID returned by the real runtime tool bridge. */
-function resumableExecResponse(history: Record<string, unknown>[], cancel: boolean): Response {
+function resumableExecResponse(history: Record<string, unknown>[], cancel: boolean,nullable=false): Response {
   const results = history.filter(item => item.type === 'function_call_output');
   const previous = results.at(-1);
   const process = previous && typeof previous.output === 'string' ? JSON.parse(previous.output) as {processId?: string; status?: string} : undefined;
-  const call = !process ? {name: 'exec', args: {command: 'fixture managed command'}}
+  const call = !process ? {name: 'exec', args: {command: 'fixture managed command',...(nullable?{timeoutMs:null,yieldMs:null}:{})}}
     : process.status === 'running' ? {name: cancel ? 'exec_cancel' : 'exec_poll', args: {processId: process.processId, ...(cancel ? {} : {yieldMs: 0})}} : undefined;
   const answer = cancel ? 'The managed command was cancelled.' : 'The managed command completed.';
   const index = results.length;

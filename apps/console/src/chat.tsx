@@ -459,7 +459,7 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks, secureRequests:Sec
   const inlineFailure = (runId:string|undefined, request:Pick<ChatModel['messages'][number],'text'>) => {
     const outcome=runId?failures.get(runId):undefined;if(!outcome)return undefined;
     const {run}=outcome;integratedFailures.add(run.id);
-    return <TaskOutcome inline botId={model.bot.id} run={run} request={request} failure={failureRecovery(run,indexes.eventsByRun.get(run.id)||[])} sending={model.sending} active={active} kind="failure" callbacks={callbacks}/>;
+    return <TaskOutcome inline botId={model.bot.id} run={run} request={request} failure={failureRecovery(run,indexes.eventsByRun.get(run.id)||[])} sending={model.sending||Boolean(model.composerDisabled)} active={active} kind="failure" callbacks={callbacks}/>;
   };
   const entries: TimelineEntry[] = [];
   messages.forEach((message, index) => {
@@ -491,7 +491,7 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks, secureRequests:Sec
     const {run} = outcome;
     if(outcome.kind==='failure'&&integratedFailures.has(run.id))continue;
     const at = Math.max(requests.get(run.id)?.at || 0, timestamp(run.updatedAt), timestamp(outcome.createdAt), indexes.latestAt.get(run.id) || 0);
-    entries.push({key:`outcome:${outcome.key}`,at,order:(messages.length + deliveries.length)*2+4,node:<TaskOutcome botId={model.bot.id} run={run} request={indexes.requests.get(run.id)} failure={failureRecovery(run, indexes.eventsByRun.get(run.id) || [])} sending={model.sending} active={active} kind={outcome.kind} cancellationId={outcome.cancellationId} callbacks={callbacks}/>});
+    entries.push({key:`outcome:${outcome.key}`,at,order:(messages.length + deliveries.length)*2+4,node:<TaskOutcome botId={model.bot.id} run={run} request={indexes.requests.get(run.id)} failure={failureRecovery(run, indexes.eventsByRun.get(run.id) || [])} sending={model.sending||Boolean(model.composerDisabled)} active={active} kind={outcome.kind} cancellationId={outcome.cancellationId} callbacks={callbacks}/>});
   }
   // Group only adjacent actions after ordering the complete conversation.
   // A single run can contain several replies; later actions must not be moved
@@ -613,7 +613,7 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
   </>;
 }
 
-function ImageControls({sending,hasText,acceptedIds,children,onSecureInput}: {sending:boolean;hasText:boolean;acceptedIds?:string[];children:ReactNode;onSecureInput:()=>void}) {
+function ImageControls({sending,disabled=false,hasText,acceptedIds,children,onSecureInput}: {sending:boolean;disabled?:boolean;hasText:boolean;acceptedIds?:string[];children:ReactNode;onSecureInput:()=>void}) {
   const attachments=usePromptInputAttachments();
   useEffect(()=>{
     for(const id of acceptedIds??[]) if(attachments.files.some(file=>file.id===id)) attachments.remove(id);
@@ -626,7 +626,7 @@ function ImageControls({sending,hasText,acceptedIds,children,onSecureInput}: {se
     </div>)}</div>}
     <div className="timber-composer-row">{children}
       <DropdownMenu.Root><DropdownMenu.Trigger asChild><Button className="timber-attach" type="button" variant="ghost" size="icon" disabled={sending} aria-label="Add" title="Add"><PlusIcon aria-hidden="true"/></Button></DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content className="timber-add-menu" side="top" align="end" sideOffset={8}><DropdownMenu.Item onSelect={onSecureInput}><LockKeyholeIcon/>Secure input</DropdownMenu.Item><DropdownMenu.Item disabled={full} onSelect={()=>attachments.openFileDialog()}><PaperclipIcon/>Attach images</DropdownMenu.Item></DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu.Root>
-      <PromptInputSubmit className="timber-send" aria-label="Send message" title="Send message" disabled={sending || (!hasText && !attachments.files.length)}>{sending ? <LoaderCircleIcon className="timber-spinner" aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}</PromptInputSubmit>
+      <PromptInputSubmit className="timber-send" aria-label="Send message" title="Send message" disabled={disabled || sending || (!hasText && !attachments.files.length)}>{sending ? <LoaderCircleIcon className="timber-spinner" aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}</PromptInputSubmit>
     </div>
     {attachments.files.length > 0 && <div className="timber-attachment-status" role="status">{sending ? 'Sending images…' : `${attachments.files.length} of 4 images · Ready to send`}</div>}
   </>;
@@ -703,13 +703,13 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
       {selection.current.end>selection.current.start&&<button type="button" className="timber-selection-secure quiet" onMouseDown={event=>event.preventDefault()} onClick={()=>addSecure()}>Make selection secure</button>}
       <div className="timber-composer-controls"><ModelSettings value={model.bot} state={model.modelSettings} disabled={model.sending} onChange={value=>callbacks.onModelSettings(model.bot.id,value)} onRefresh={callbacks.onRefreshModels}/><KeychainControl onInsert={insertSecure} onAdd={()=>addSecure()} onReplace={item=>addSecure(false,item)} bots={model.mentionBots}/><ContextMemoryControl botId={model.bot.id} request={callbacks.onContextRequest} refreshKey={model.events.at(-1)?.id}/></div>
       <PromptInput id="message-form" className="timber-composer" disabled={model.sending||securing} accept="image/png,image/jpeg" multiple maxFiles={4} maxFileSize={5_000_000} onError={error=>setAttachmentError(error.message)} onReset={event => event.preventDefault()} onSubmit={async ({text,files}) => {
-        if(model.sending || securing || (!text.trim() && !files.length)) throw new Error('Not ready');
+        if(model.composerDisabled || model.sending || securing || (!text.trim() && !files.length)) throw new Error('Not ready');
         if(securePrompt && selectedMentions.length){setAttachmentError('Send private inputs to one bot at a time; grant other bots access from your keychain.');throw new Error('Unsupported recipients');}
         if(files.length && selectedMentions.length) {setAttachmentError('Image messages cannot mention other bots yet.');throw new Error('Unsupported recipients');}
         setAttachmentError('');
         setSecuring(true);try {const secured=await secrets.flush(text);await callbacks.onSend(model.bot.id,secured,selectedMentions.map(bot=>bot.id),files);} catch(reason) {if(typeof record(reason).deliveryOperationId!=='string')setAttachmentError(reason instanceof Error?reason.message:'The message was not delivered. Retry sending.');throw new Error('Not delivered');}finally{setSecuring(false);}
       }}>
-        <PromptInputBody><ImageControls onSecureInput={()=>addSecure()} sending={model.sending||securing} hasText={!!model.draft.trim()} acceptedIds={model.acceptedImageIds}><>{securePrompt?<SecurePrompt value={model.draft} name={`Message ${model.bot.name}`} disabled={model.sending||securing} caret={caret} onCaret={setCaret} onRange={trackSelection} onKeyDown={mentionKeyDown} renderDraft={secrets.render} onChange={text=>{setMentionIndex(0);setDismissed(false);callbacks.onDraft(model.bot.id,text);}}/>:<PromptInputTextarea ref={textarea} id="message" rows={1} aria-label={`Message ${model.bot.name}`} placeholder={`Message ${model.bot.name}`} value={model.draft}
+        <PromptInputBody><ImageControls onSecureInput={()=>addSecure()} sending={model.sending||securing} disabled={model.composerDisabled} hasText={!!model.draft.trim()} acceptedIds={model.acceptedImageIds}><>{securePrompt?<SecurePrompt value={model.draft} name={`Message ${model.bot.name}`} disabled={model.composerDisabled||model.sending||securing} caret={caret} onCaret={setCaret} onRange={trackSelection} onKeyDown={mentionKeyDown} renderDraft={secrets.render} onChange={text=>{setMentionIndex(0);setDismissed(false);callbacks.onDraft(model.bot.id,text);}}/>:<PromptInputTextarea ref={textarea} id="message" rows={1} disabled={model.composerDisabled} aria-label={`Message ${model.bot.name}`} placeholder={`Message ${model.bot.name}`} value={model.draft}
           aria-autocomplete="list" aria-controls={choices.length ? 'bot-mentions' : undefined} aria-expanded={choices.length > 0} aria-activedescendant={choices.length ? `mention-${choices[Math.min(mentionIndex, choices.length - 1)].id}` : undefined}
           onChange={event => {selection.current={start:event.currentTarget.selectionStart,end:event.currentTarget.selectionEnd};pendingCaret.current=null;setCaret(event.currentTarget.selectionStart);setMentionIndex(0);setDismissed(false);callbacks.onDraft(model.bot.id, event.currentTarget.value);}}
           onSelect={event => trackSelection(event.currentTarget.selectionStart,event.currentTarget.selectionEnd)}
@@ -816,10 +816,15 @@ function Chat({ model, callbacks, dockTarget, headerTarget }: { model: ChatModel
   </div>;
 }
 
+/** One conversation surface for ordinary bot chat and persistent task chat. */
+export function ConversationChat({model,callbacks,loadArtifact,headerTarget=null,dockTarget=null}:{model:ChatModel;callbacks:ChatCallbacks;loadArtifact:ArtifactLoader;headerTarget?:HTMLElement|null;dockTarget?:HTMLElement|null}) {
+  return <ArtifactProvider load={loadArtifact}><KeychainProvider key={model.bot.id} botId={model.bot.id} botName={model.bot.name} request={callbacks.onContextRequest} refreshKey={model.events.filter(event=>event.type==='keychain.updated').at(-1)?.id}><Chat model={model} callbacks={callbacks} dockTarget={dockTarget} headerTarget={headerTarget}/></KeychainProvider></ArtifactProvider>;
+}
+
 export function mountChat(element: HTMLElement, callbacks: ChatCallbacks, loadArtifact: ArtifactLoader, headerTarget: HTMLElement | null) {
   const root = createRoot(element);
   let model: ChatModel | null = null, dockTarget: HTMLElement | null = null;
-  const render = () => root.render(model ? <ArtifactProvider load={loadArtifact}><KeychainProvider key={model.bot.id} botId={model.bot.id} botName={model.bot.name} request={callbacks.onContextRequest} refreshKey={model.events.filter(event=>event.type==='keychain.updated').at(-1)?.id}><Chat key={model.bot.id} model={model} callbacks={callbacks} dockTarget={dockTarget} headerTarget={headerTarget}/></KeychainProvider></ArtifactProvider> : null);
+  const render = () => root.render(model ? <ConversationChat key={model.bot.id} model={model} callbacks={callbacks} loadArtifact={loadArtifact} dockTarget={dockTarget} headerTarget={headerTarget}/> : null);
   return {
     update(value: ChatModel) {model = value; render();},
     setDock(target: HTMLElement | null) {if (dockTarget !== target) {dockTarget = target; render();}},

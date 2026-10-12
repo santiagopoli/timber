@@ -316,14 +316,17 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   }
   function taskSelected(id) {
     selectedTaskId=id;
+    document.body.dataset.mobileView=id?'tasks':'bots';
     history.pushState(null,'',`${location.pathname}${location.search}#tasks${id?`&task=${encodeURIComponent(id)}`:''}`);
   }
   function setupTasksView() {
-    const props={request:tasksRequest,bots,active:showingTasks,selectedTaskId,onSelectTask:taskSelected,onOpenBot:openAgentBot,onClose:showBotList,loadArtifact:loadTaskArtifact,listContainer:$('tasks-sidebar-root')};
+    const props={request:tasksRequest,bots,active:showingTasks,selectedTaskId,onSelectTask:taskSelected,onOpenBot:openAgentBot,loadArtifact:loadTaskArtifact,modelSettings:modelSettingsState(),onModelSettings:updateModelSettings,onRefreshModels:()=>void loadModelCatalog(),decorateAvatar:decorateTaskAvatar,onBotUpdated:taskBotUpdated,onOpenSettings:()=> $('settings-button').click(),listContainer:$('tasks-sidebar-root')};
     if(tasksView)tasksView.update(props);else tasksView=mountTasks($('global-tasks-root'),props);
   }
+  function taskBotUpdated(bot){if(!authenticated||removedBots.has(bot.id))return;const previous=bots.find(item=>item.id===bot.id);if(!previous||previous.updatedAt>bot.updatedAt)return;bots=bots.map(item=>item.id===bot.id?bot:item);if(selected?.id===bot.id){selected=bot;updateBotHeader();}renderBots();renderMessages();}
+  function decorateTaskAvatar(node,botId){const bot=bots.find(item=>item.id===botId);if(bot){node.textContent=bot.name.slice(0,1).toUpperCase();node.dataset.agentColor=agentColor(bot.id);decorateModelAvatar(node,bot,node.classList.contains('large'));decorateGlobalAvatar(node,bot.id);}}
   function openTasks(updateHistory=true,taskId=null) {
-    if(!authenticated)return;showingTasks=true;selectedTaskId=taskId;setupTasksView();$('empty').hidden=true;$('bot-workspace').hidden=true;$('global-tasks-workspace').hidden=false;document.body.dataset.mobileView='tasks';syncTaskToggle();
+    if(!authenticated)return;showingTasks=true;selectedTaskId=taskId;chat.clear();setupTasksView();$('empty').hidden=true;$('bot-workspace').hidden=true;$('global-tasks-workspace').hidden=false;document.body.dataset.mobileView=taskId?'tasks':'bots';syncTaskToggle();
     if(wideLayout.matches&&!taskId){botsCollapsed=false;renderLayout();}
     desktop.setActive(false);stopComputerStatus();activity.setActive(false);agentsView.setActive(false);
     if(updateHistory)history.pushState(null,'',`${location.pathname}${location.search}#tasks${taskId?`&task=${encodeURIComponent(taskId)}`:''}`);
@@ -474,7 +477,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     if(node.dataset.avatarArtifact!==avatar.artifactId)node.classList.add('avatar-stale');
     void loadAvatarImage(botId,avatar).then(url=>{if(!url||!node.isConnected||selectedAvatar(botId)?.artifactId!==avatar.artifactId)return;putAvatarImage(node,avatar,url);node.classList.toggle('avatar-stale',avatarIsStale(avatar));queueMicrotask(pruneAvatarUrls);}).catch(()=>{if(selectedAvatar(botId)?.artifactId!==avatar.artifactId)return;const key=avatarKey(avatar);if(avatarLoadErrors.has(key))return;avatarLoadErrors.set(key,true);renderAvatarSettings();});
   }
-  function renderGlobalAvatars(){document.querySelectorAll('.bot-item[data-bot-id]').forEach(button=>decorateGlobalAvatar(button.querySelector('.avatar'),button.dataset.botId));if(selected)decorateGlobalAvatar($('selected-avatar'),selected.id);}
+  function renderGlobalAvatars(){document.querySelectorAll('.bot-item[data-bot-id]').forEach(button=>decorateGlobalAvatar(button.querySelector('.avatar'),button.dataset.botId));document.querySelectorAll('.timber-task-avatar[data-bot-id]').forEach(avatar=>decorateGlobalAvatar(avatar,avatar.dataset.botId));if(selected)decorateGlobalAvatar($('selected-avatar'),selected.id);}
   function avatarModelOption(option){return {id:option.id,label:option.name||option.label||option.id};}
   function avatarReasoningOptions(select,modelId,value=''){
     const model=avatarModels.vectorModels.find(model=>model.id===modelId),efforts=model?.reasoningEfforts||[];
@@ -736,7 +739,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     finally{if(session===authSession&&sequence===modelCatalogRequest){modelCatalogLoading=false;refreshModelForms();renderBots();renderMessages();}}
   }
   async function updateModelSettings(botId,settings){
-    if(!authenticated||selected?.id!==botId||modelSettingsWork.has(botId)||sendBusy.has(botId))throw new Error('Wait for the current request to finish.');
+    if(!authenticated||(!showingTasks&&selected?.id!==botId)||!bots.some(bot=>bot.id===botId)||modelSettingsWork.has(botId)||sendBusy.has(botId))throw new Error('Wait for the current request to finish.');
     const session=authSession;modelSettingsWork.add(botId);renderMessages();
     try{const {bot}=await request(botPath(botId),{method:'PATCH',body:settings});if(session!==authSession)return;if(bot?.id!==botId||bot.model!==settings.model)throw new Error('The model settings were not confirmed. Refresh and try again.');bots=bots.map(item=>item.id===bot.id?bot:item);if(selected?.id===bot.id){selected=bot;updateBotHeader();renderAgents();}renderBots();}
     finally{if(session===authSession){modelSettingsWork.delete(botId);renderMessages();}}
@@ -770,6 +773,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     if(wasShowingTasks)renderLayout();
     if (wideLayout.matches && tabletLayout.matches) {botsCollapsed = true; renderLayout();}
     if (selected?.id === bot.id) {
+      if(wasShowingTasks){$('empty').hidden=true;$('bot-workspace').hidden=false;updateBotHeader();renderMessages();}
       history[replace ? 'replaceState' : 'pushState'](null, '', `${location.pathname}${location.search}#bot=${encodeURIComponent(bot.id)}`);
       if (!$('panel-computer').hidden) {desktop.setActive(true); void guarded(computerStatus);}
       return;
@@ -818,6 +822,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     }
   }
   function renderMessages() {
+    if(showingTasks){if(tasksView)setupTasksView();return;}
     if (deferStreamRender('messages')) return;
     if (!selected || !authenticated) return;
     renderBots();
@@ -1525,6 +1530,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     showingTasks=false;$('global-tasks-workspace').hidden=true;syncTaskToggle();if(tasksView)setupTasksView();
     $('bot-workspace').hidden=!selected;$('empty').hidden=Boolean(selected);
     document.body.dataset.mobileView = 'bots';
+    if(selected)renderMessages();
     activity.setActive(Boolean(selected)&&wideLayout.matches&&currentPanel==='activity');
     agentsView.setActive(Boolean(selected)&&wideLayout.matches&&currentPanel==='agents');
     desktop.setActive(false); stopComputerStatus();

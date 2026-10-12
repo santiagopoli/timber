@@ -117,6 +117,15 @@ class ComputerTests(unittest.TestCase):
         self.computer.restore(archive)
         self.assertEqual((self.computer.workspace / "two").read_text(), "same")
 
+    def test_nested_write_on_unsupported_host_does_not_attempt_privileged_chown(self):
+        with patch.object(server, "workspace_prefix", return_value=[]), patch.object(
+            server.os, "fchown", side_effect=PermissionError("synthetic non-root controller")
+        ) as chown:
+            result = self.action("nested-unprivileged", type="writeFile", path="nested/deeper/file.txt", content="synthetic fixture")
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual((self.computer.workspace / "nested/deeper/file.txt").read_text(), "synthetic fixture")
+            chown.assert_not_called()
+
     def test_text_files_and_directory_listing(self):
         self.action("write", type="writeFile", path="folder/á.txt", content="Hola, Poli 👋")
         self.assertEqual(self.action("read", type="readFile", path="folder/á.txt")["output"], "Hola, Poli 👋")
