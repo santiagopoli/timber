@@ -220,6 +220,7 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
   }
   private async provider(request:Request):Promise<Response> {
     const payload=await request.json<Record<string,unknown>>();
+    if(payload.prompt_cache_key!==undefined&&(typeof payload.prompt_cache_key!=='string'||!/^[a-f0-9]{64}$/.test(payload.prompt_cache_key)))throw new ApiError(400,'chatgpt_invalid_request','Invalid host cache affinity.');
     if(typeof payload.model!=="string" || payload.store!==false || payload.stream!==true || !Array.isArray(payload.input)) throw new ApiError(400,"chatgpt_invalid_request","The ChatGPT plan route requires an account-supported model with streaming and client-owned history.");
     const unsupported=["background","conversation","max_output_tokens","max_tool_calls","metadata","moderation","multi_agent","prompt","prompt_cache_retention","safety_identifier","temperature","top_logprobs","top_p","truncation","user","previous_response_id"];
     if(unsupported.some(key=>payload[key]!==undefined)) throw new ApiError(400,"chatgpt_invalid_request","Unsupported options on the ChatGPT subscription route.");
@@ -241,7 +242,7 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
     const signal=AbortSignal.any([request.signal,controller.signal]);
     const cleanup=()=>{clearTimeout(timer);this.active.delete(controller);};
     let response:Response;
-    try {response=await fetch(`${RESOURCE}/responses`,{method:"POST",headers:{Authorization:`Bearer ${token}`,"content-type":"application/json","User-Agent":"Timber/0.1.0"},body:JSON.stringify(payload),redirect:"manual",signal});}
+    try {response=await fetch(`${RESOURCE}/responses`,{method:"POST",headers:{Authorization:`Bearer ${token}`,"content-type":"application/json","User-Agent":"Timber/0.1.0",...(typeof payload.prompt_cache_key==='string'?{session_id:payload.prompt_cache_key}:{})},body:JSON.stringify(payload),redirect:"manual",signal});}
     catch {cleanup();throw new ApiError(502,"model_connection_interrupted","Connection lost while contacting ChatGPT. Try again later.");}
     if(!response.ok) {
       const data=await response.json<{error?:{code?:unknown;message?:unknown;param?:unknown}}>().catch(()=>({error:undefined}));

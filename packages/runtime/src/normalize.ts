@@ -97,6 +97,6 @@ export function classifyFailure(reason: string, detail: unknown): { errorCode: s
   if (/timeout|timed out|deadline/i.test(text)) {
     return { errorCode: 'model_timeout', publicMessage: 'The model request exceeded its time limit.' };
   }
-  if (reason !== 'aborted' && /chatgpt_incomplete_response|ended without|stream ended before|connection.?lost|socket hang up|fetch failed|terminated/i.test(text)) return { errorCode: 'model_connection_interrupted', publicMessage: 'The model connection was interrupted and could not recover. Your recorded tool results are preserved.' };
+  if (reason !== 'aborted' && /chatgpt_incomplete_response|ended without|stream ended before|connection.?lost|connection.?error|network.?error|ECONNRESET|socket hang up|fetch failed|terminated/i.test(text)) return modelFailure('model_connection_interrupted');
   return reason === 'aborted' ? {errorCode:'run_aborted',publicMessage:'The run was stopped before an answer completed.'} : modelFailure('model_request_failed');
 }

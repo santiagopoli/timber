@@ -9,7 +9,7 @@ const created='2026-10-12T09:00:00.000Z',updated='2026-10-12T09:30:00.000Z';
 test('performance queries measure real SQLite receipts without projecting conversation or tool content',()=>{
  const db=new DatabaseSync(':memory:');
  try{
-  db.exec('CREATE TABLE cf_agents_jobs(capability TEXT,fn TEXT,time INTEGER,running INTEGER,execution_started_at INTEGER,recovery_loop INTEGER);CREATE TABLE pi_documents(kind TEXT);CREATE TABLE bots(id TEXT,data TEXT);CREATE TABLE tasks(id TEXT,data TEXT);CREATE TABLE runs(id TEXT,data TEXT);CREATE TABLE admission_sources(run_id TEXT,kind TEXT);CREATE TABLE submissions(operation_id TEXT,run_id TEXT);CREATE TABLE botspace_runtime_budget(operation_id TEXT,kind TEXT,item_id TEXT);CREATE TABLE events(id INTEGER,source_key TEXT,data TEXT);CREATE TABLE pi_tasks(id INTEGER,status TEXT,record TEXT,conversation_id INTEGER);CREATE TABLE pi_submissions(request_id TEXT,status TEXT,conversation_id INTEGER);CREATE TABLE run_processes(status TEXT,dispatch_state TEXT,cancel_requested INTEGER,result TEXT);CREATE TABLE pi_entries(id INTEGER,record TEXT)');
+  db.exec('CREATE TABLE cf_agents_jobs(capability TEXT,fn TEXT,time INTEGER,running INTEGER,execution_started_at INTEGER,recovery_loop INTEGER);CREATE TABLE pi_documents(kind TEXT);CREATE TABLE bots(id TEXT,data TEXT);CREATE TABLE tasks(id TEXT,data TEXT); CREATE TABLE task_slots(bot_id TEXT,task_id TEXT,updated_at INTEGER); CREATE TABLE computer_admissions(bot_id TEXT,payload TEXT);CREATE TABLE runs(id TEXT,data TEXT);CREATE TABLE admission_sources(run_id TEXT,kind TEXT);CREATE TABLE submissions(operation_id TEXT,run_id TEXT);CREATE TABLE botspace_runtime_budget(operation_id TEXT,kind TEXT,item_id TEXT);CREATE TABLE events(id INTEGER,source_key TEXT,data TEXT);CREATE TABLE pi_tasks(id INTEGER,status TEXT,record TEXT,conversation_id INTEGER);CREATE TABLE pi_submissions(request_id TEXT,status TEXT,conversation_id INTEGER);CREATE TABLE run_processes(status TEXT,dispatch_state TEXT,cancel_requested INTEGER,result TEXT);CREATE TABLE pi_entries(id INTEGER,record TEXT)');
   for(const sql of [PERFORMANCE_SCHEMA,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_PROCESSES,PERFORMANCE_DELIVERIES,PERFORMANCE_WAKES,PERFORMANCE_RECOVERY,PERFORMANCE_USAGE]){assert.match(sql,/^(SELECT|WITH) /);assert.doesNotMatch(sql,/\b(INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE|ATTACH|PRAGMA)\b/i);assert.doesNotMatch(sql,/;/);}
   db.prepare('INSERT INTO pi_documents VALUES(?)').run(JSON.stringify('timber.subagent-waits'));
   db.prepare('INSERT INTO bots VALUES(?,?)').run('bot-canary',JSON.stringify({name:'Polibot'}));
@@ -45,4 +45,13 @@ test('performance inspection visits only selected registered task conversations 
   return Response.json({success:true,result:{results:[{columns,rows:records.map(row=>columns.map(name=>row[name])),meta:{rows_written:0}}]}});
  }});
  assert.equal(result.tasks[0].execution.initialized,false);assert.ok(calls.some(call=>call.durable_object_name===`owner:task:${task}`));assert.doesNotMatch(JSON.stringify(result),new RegExp(`canary|${id}|${task}`));
+});
+test('inference diagnostics retain progress timestamps without provider bodies or prompt material',async()=>{
+ const {PERFORMANCE_REQUESTS,summarizeInferenceRequests}=await import('../prod-performance-diagnostics.mjs');
+ const db=new DatabaseSync(':memory:');try{
+  db.exec('CREATE TABLE timber_inference_requests(id INTEGER,source TEXT,phase TEXT,started_at INTEGER,last_progress_at INTEGER,bytes INTEGER,http_status INTEGER,idle INTEGER,estimated_tokens INTEGER)');
+  db.prepare('INSERT INTO timber_inference_requests VALUES(1,?,?,?,?,?,?,?,?)').run('chatgpt','streaming',now-1000,now,500,200,0,110000);
+  const report=summarizeInferenceRequests(db.prepare(PERFORMANCE_REQUESTS).all());assert.equal(report[0].lastProgressAt,new Date(now).toISOString());assert.equal(report[0].estimatedTokens,110000);
+  assert.doesNotMatch(JSON.stringify(summarizeInferenceRequests([{source:'private-canary',phase:'private-canary',secret:'private-canary'}])),/private-canary/);
+ }finally{db.close();}
 });

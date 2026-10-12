@@ -14,6 +14,7 @@ import { createModelSettings, ModelConfigurationError } from './model-settings.j
 import { CHATGPT_MODEL, createChatGPTProvider } from './chatgpt.js';
 import {createOpenRouterProvider,withQuotaFallback} from './model-routing.js';
 import {createOpenAIProvider} from './openai-api.js';
+import {fetchInference,inferenceIdleMs,workingContextModel} from './inference-policy.js';
 import { createBudget } from './budget.js';
 import { createStopGate } from './stop-gate.js';
 import { createSubagents } from './subagents.js';
@@ -32,12 +33,30 @@ const Stops = defineDoc<{operations: Record<string, {cancellationId?: string}>; 
 
 export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<Env>): AgentRuntime {
   const ai = createAI({ binding: options.ai });
+  options.storage.sql.exec('CREATE TABLE IF NOT EXISTS timber_inference_requests(id INTEGER PRIMARY KEY,source TEXT NOT NULL,phase TEXT NOT NULL,started_at INTEGER NOT NULL,last_progress_at INTEGER NOT NULL,bytes INTEGER NOT NULL DEFAULT 0,http_status INTEGER,idle INTEGER NOT NULL DEFAULT 0,estimated_tokens INTEGER NOT NULL)');
+  const monitor=<T extends {fetch:(request:Request)=>Promise<Response>}>(transport:T|undefined,source:string):T|undefined=>transport?{...transport,fetch:async(request:Request)=>{
+    const payload=await request.clone().json<{model?:string;input?:unknown;messages?:unknown;reasoning?:{effort?:string}}>();
+    const estimatedTokens=Math.ceil(JSON.stringify(payload.input??payload.messages??[]).length/4);
+    const now=Date.now(),row=options.storage.sql.exec<{id:number}>('INSERT INTO timber_inference_requests(source,phase,started_at,last_progress_at,estimated_tokens) VALUES(?,?,?,?,?) RETURNING id',source,'request',now,now,estimatedTokens).one();
+    options.storage.sql.exec('DELETE FROM timber_inference_requests WHERE id<?',row.id-200);
+    let lastWrite=0;
+    return fetchInference(value=>transport.fetch(value),request,inferenceIdleMs(payload,estimatedTokens),value=>{
+      if(destroyed)return;
+      if(value.phase==='streaming'&&value.bytes>0&&value.at-lastWrite<5000)return;
+      lastWrite=value.at;
+      options.storage.sql.exec('UPDATE timber_inference_requests SET phase=?,last_progress_at=?,bytes=?,http_status=?,idle=? WHERE id=?',value.phase,value.at,value.bytes,value.httpStatus??null,value.idle?1:0,row.id);
+    });
+  }}:undefined;
   const modelSettings = createModelSettings(options.storage,options.chatgpt,id=>ai(id),options.models);
-  const chatgpt = createChatGPTProvider(options.chatgpt,modelSettings.models);
-  const openrouter=createOpenRouterProvider(options.openrouter,modelSettings.models);
-  const openai=createOpenAIProvider(options.openai,modelSettings.models);
+  options.storage.sql.exec('CREATE TABLE IF NOT EXISTS timber_inference_scope(id INTEGER PRIMARY KEY,scope TEXT NOT NULL)');
+  options.storage.sql.exec('INSERT OR IGNORE INTO timber_inference_scope(id,scope) VALUES(1,?)',crypto.randomUUID());
+  const scope=options.storage.sql.exec<{scope:string}>('SELECT scope FROM timber_inference_scope WHERE id=1').one().scope;
+  const cacheScope=async()=>scope;
+  const chatgpt = createChatGPTProvider(monitor(options.chatgpt,'chatgpt'),modelSettings.models,cacheScope);
+  const openrouter=createOpenRouterProvider(monitor(options.openrouter,'openrouter'),modelSettings.models);
+  const openai=createOpenAIProvider(monitor(options.openai,'openai-api'),modelSettings.models,cacheScope);
   const providers=new Map<string,Provider>([['chatgpt',chatgpt],['openai-api',openai],['openrouter',openrouter]]);
-  const resolveModel = modelSettings.resolve;
+  const resolveModel = (id:string)=>workingContextModel(modelSettings.resolve(id));
   const consume = createBudget(options.storage, {
     generation: options.maxGenerations,
     tool: options.maxToolCalls,
@@ -169,6 +188,8 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
       const models = createModels();
       for (const provider of [ai.provider, withQuotaFallback(chatgpt,providers),withQuotaFallback(openai,providers),withQuotaFallback(openrouter,providers)]) models.setProvider({
         ...provider,
+        getModels:()=>provider.getModels().map(workingContextModel),
+        ...(provider.getAllModels?{getAllModels:()=>provider.getAllModels!().map(workingContextModel)}:{}),
         streamSimple(model, context, streamOptions) {
           const output = createAssistantMessageEventStream();
           void (async () => {
@@ -294,7 +315,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
               : bot.allowTaskCreation === true
                 ? 'For substantial multi-step work, use list_tools to discover create_task and hand off to a persistent task BEFORE running its commands here. Keep this ordinary conversation concise and natural. Give the task a self-contained description with the user’s goal, relevant context, constraints, references and expected deliverable; it does not inherit this chat. After successful creation, acknowledge the handoff in one brief final answer and END this turn immediately: the task is queued until you release this bot’s shared computer. Do not wait, poll or continue its commands here. Its status and final result return automatically. Short answers or tiny specific actions can stay here. Task handoff is a completed routing action, not unfinished work in this conversation.'
                 : 'The owner has not enabled persistent task creation for this bot. Work in this conversation; do not claim to have created a task or ask repeatedly for permission to do so.',
-            'When asked about persistent task progress, discover list_tasks and inspect_task through list_tools. Inspect last activity, pending tools, errors and the task conversation before answering. A running status is not evidence of progress. Do not restart or duplicate tasks merely because they have been quiet.',
+            'When asked about persistent task progress, discover list_tasks and inspect_task through list_tools. Inspect last activity, pending tools, errors and the task conversation before answering. A running status is not evidence of progress. Use message_task to send requested corrections or continue completed/failed work in its existing conversation. A queued message is saved until the shared computer is available; finish your coordinating turn instead of waiting in a loop. Do not restart or duplicate tasks merely because they have been quiet.',
             'Use list_models to inspect the connected account’s available models and supported reasoning/speed. spawn_subagent may select model, reasoningEffort and fast; omitted settings inherit your current configuration. Use spawn_subagent to delegate concrete tasks to temporary agents with separate contexts. They share your computer; assign separate files and coordinate edits. Use list_subagents, send_subagent_message, wait_subagent and cancel_subagent to coordinate. Temporary agents are visible to the user. Named persistent bots are separate host capabilities discoverable through list_tools.',
             'Remain available as an orchestrator while agents work. Delegate independent multi-step work so a new user request can be handled promptly and can create another subagent while earlier agents continue. New messages join at a safe tool boundary. When wait_subagent yields because a new input arrived, attend to that input and preserve existing agents; do not force unrelated tasks into a serial wait or cancel agents merely to answer a message.',
             'Your computer is a reusable cloud Linux desktop. Files belong under /workspace.',

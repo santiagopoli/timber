@@ -70,13 +70,29 @@ describe("Worker authentication and durable bot identities", () => {
   });
 
   it("publishes the deployed API version and schema-derived private tool contracts without owner data",async()=>{
+    const privateBot=await createBot("private version fixture");
     const response=await exports.default.fetch("https://botspace.test/health/version");expect(response.status).toBe(200);
     const value=await response.json<{service:string;versionId:string|null;keychainTools:{secret_request:{properties:Record<string,unknown>;additionalProperties:boolean};secure_worker_deploy:{properties:Record<string,unknown>;additionalProperties:boolean};secure_worker_deploy_capabilities:{type:string;properties:Record<string,unknown>;additionalProperties:boolean;required:string[]}}}>();
     expect(value.service).toBe("botspace");expect(Object.hasOwn(value,"versionId")).toBe(true);
     expect(value.keychainTools.secret_request.additionalProperties).toBe(false);expect(value.keychainTools.secret_request.properties).toHaveProperty("additionalSecretIds");
     expect(value.keychainTools.secure_worker_deploy.additionalProperties).toBe(false);expect(value.keychainTools.secure_worker_deploy.properties).toHaveProperty("planId");expect(value.keychainTools.secure_worker_deploy.properties).toHaveProperty("expectedRevision");
     expect(value.keychainTools.secure_worker_deploy_capabilities).toEqual({type:"object",properties:{},required:[],additionalProperties:false});
-    expect(JSON.stringify(value)).not.toMatch(/token|secretId|ownerId|botId/i);
+    // Schema property names are public declarations, not credential/reference values.
+    expect(Object.keys(value).sort()).toEqual(["keychainTools", "service", "versionId"]);
+    expect(value.versionId).toBeNull();
+    expect(value.keychainTools).toEqual({
+      secret_request: {type:"object", properties:{
+        secretId:{type:"string"},
+        additionalSecretIds:{type:"array",items:{type:"string"},minItems:1,maxItems:3,uniqueItems:true},
+        path:{type:"string"},method:{type:"string",enum:["GET","POST","PUT","PATCH","DELETE"]},
+        headers:{type:"object",additionalProperties:{type:"string"}},body:{type:"string"},
+      },required:["secretId","path"],additionalProperties:false},
+      secure_worker_deploy:{type:"object",properties:{planId:{type:"string"},expectedRevision:{type:"integer",minimum:1}},required:["planId","expectedRevision"],additionalProperties:false},
+      secure_worker_deploy_capabilities:{type:"object",properties:{},required:[],additionalProperties:false},
+    });
+    expect(JSON.stringify(value)).not.toMatch(/token|ownerId|botId/i);
+    expect(JSON.stringify(value)).not.toContain(token);
+    expect(JSON.stringify(value)).not.toContain(privateBot.id);
   });
 
   it("fails closed when the deployed API secret has not been configured", async () => {

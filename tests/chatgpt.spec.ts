@@ -13,7 +13,7 @@ let keys: Awaited<ReturnType<typeof generateKeyPair>>;
 let jwk: Awaited<ReturnType<typeof exportJWK>>;
 let refreshedTokens: Record<string, unknown>;
 let refreshCalls: string[];
-let responseCalls: {authorization: string; payload: Record<string, unknown>; signal?: AbortSignal}[];
+let responseCalls: {authorization: string; payload: Record<string, unknown>; signal?: AbortSignal;sessionId?:string|null}[];
 let revocations: URLSearchParams[];
 let inference: () => Response;
 let refreshError: string | undefined;
@@ -84,7 +84,7 @@ beforeEach(() => {
     }
     if(url===`${RESOURCE}/models`) {modelCalls.push(new Headers(init?.headers).get("authorization")??"");return catalogResponse();}
     if (url === `${RESOURCE}/responses`) {
-      responseCalls.push({authorization: new Headers(init?.headers).get("authorization") ?? "", payload: JSON.parse(String(init?.body)), signal: init?.signal ?? undefined});
+      responseCalls.push({authorization: new Headers(init?.headers).get("authorization") ?? "", payload: JSON.parse(String(init?.body)), signal: init?.signal ?? undefined,sessionId:new Headers(init?.headers).get("session_id")});
       return inference();
     }
     if (url === `${ISSUER}/test-revoke`) {
@@ -216,6 +216,13 @@ describe("ChatGPT refresh ownership, billing route and verification", () => {
     expect(response.status).toBe(409);
     expect(responseCalls).toHaveLength(0);
     expect(refreshCalls).toHaveLength(0);
+  });
+
+  it('forwards only opaque host cache affinity to the ChatGPT session header',async()=>{
+    const stub=newStub();expect((await connect(stub)).status).toBe(200);
+    const key='a'.repeat(64),response=await infer(stub,{prompt_cache_key:key});expect(response.status).toBe(200);await response.text();
+    expect(responseCalls[0].payload.prompt_cache_key).toBe(key);expect(responseCalls[0].sessionId).toBe(key);
+    const rejected=await infer(stub,{prompt_cache_key:'private-user-text'});expect(rejected.status).toBe(400);await rejected.text();expect(responseCalls).toHaveLength(1);
   });
 
   it("rejects unsupported billing-route parameters before contacting inference", async () => {

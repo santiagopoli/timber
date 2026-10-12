@@ -16,6 +16,7 @@ import resource
 import signal
 import subprocess
 import sys
+import time
 import tempfile
 
 WRANGLER = "/usr/local/bin/wrangler"
@@ -39,11 +40,30 @@ def _validate(request: object) -> tuple[dict, bytes, dict[str, str]]:
     if request["protocolVersion"] != 1 or not isinstance(request["operationId"], str) or not ID.fullmatch(request["operationId"]):
         raise ValueError("invalid_request")
     auth, pin, artifact = request["authorization"], request["pin"], request["artifact"]
-    if not isinstance(auth, dict) or auth.get("operationId") != request["operationId"] or not isinstance(auth.get("signature"), str):
+    auth_fields = {"version", "ownerId", "botId", "runId", "nativeOperationId", "operationId", "pin", "planId", "planRevision", "refs", "expiresAt", "signature"}
+    if (not isinstance(auth, dict) or set(auth) not in (auth_fields, auth_fields | {"taskId"})
+            or auth.get("version") != 1 or auth.get("operationId") != request["operationId"]
+            or not isinstance(auth.get("signature"), str) or not 32 <= len(auth["signature"]) <= 4096):
+        raise ValueError("invalid_authorization")
+    uuid_re = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89ab][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\Z")
+    if (not isinstance(auth["ownerId"], str) or (auth["ownerId"] != "owner" and not uuid_re.fullmatch(auth["ownerId"]))
+            or not isinstance(auth["botId"], str) or not uuid_re.fullmatch(auth["botId"])
+            or not isinstance(auth["runId"], str) or not uuid_re.fullmatch(auth["runId"])
+            or not isinstance(auth["nativeOperationId"], str) or not ID.fullmatch(auth["nativeOperationId"])
+            or not isinstance(auth["planId"], str) or not uuid_re.fullmatch(auth["planId"])
+            or type(auth["planRevision"]) is not int or auth["planRevision"] < 1
+            or type(auth["expiresAt"]) is not int or auth["expiresAt"] <= int(time.time() * 1000)):
+        raise ValueError("invalid_authorization")
+    if "taskId" in auth and (not isinstance(auth["taskId"], str) or not uuid_re.fullmatch(auth["taskId"])):
+        raise ValueError("invalid_authorization")
+    if not isinstance(auth["refs"], list):
         raise ValueError("invalid_authorization")
     signed_pin = auth.get("pin")
     required_pin = ("repository", "commit", "artifactDigest", "artifactPath", "accountId", "workerName", "destination")
-    if not isinstance(pin, dict) or not isinstance(signed_pin, dict) or any(signed_pin.get(k) != pin.get(k) for k in required_pin):
+    if (not isinstance(pin, dict) or set(pin) != set(required_pin)
+            or not isinstance(signed_pin, dict) or set(signed_pin) != set(required_pin) | {"planId", "planRevision"}
+            or signed_pin.get("planId") != auth["planId"] or signed_pin.get("planRevision") != auth["planRevision"]
+            or any(signed_pin.get(k) != pin.get(k) for k in required_pin)):
         # Backend signs all effective target/path fields. Optional plan metadata
         # may also be present in the signed pin.
         raise ValueError("invalid_authorization")
@@ -61,7 +81,14 @@ def _validate(request: object) -> tuple[dict, bytes, dict[str, str]]:
     refs, creds = auth.get("refs"), request["credentials"]
     if not isinstance(refs, list) or len(refs) not in (1, 2) or not isinstance(creds, list) or len(creds) != len(refs):
         raise ValueError("invalid_credentials")
-    indexed = {ref.get("id"): ref for ref in refs if isinstance(ref, dict)}
+    ref_fields = {"id", "revision", "permissionEpoch", "binding"}
+    if any(not isinstance(ref, dict) or set(ref) != ref_fields
+           or not isinstance(ref.get("id"), str) or not uuid_re.fullmatch(ref["id"])
+           or type(ref.get("revision")) is not int or ref["revision"] < 1
+           or not isinstance(ref.get("permissionEpoch"), str) or not ref["permissionEpoch"]
+           or not isinstance(ref.get("binding"), str) or not ref["binding"] for ref in refs):
+        raise ValueError("invalid_credentials")
+    indexed = {ref["id"]: ref for ref in refs}
     if len(indexed) != len(refs):
         raise ValueError("invalid_credentials")
     env: dict[str, str] = {}
@@ -109,12 +136,14 @@ def main() -> int:
         "CI": "1", "CLOUDFLARE_ACCOUNT_ID": pin["accountId"], **credentials_env,
     })
     credentials_env.clear()
+    cli_started = False
     try:
         with tempfile.TemporaryDirectory(prefix="timber-deploy-") as folder:
             root = Path(folder)
             os.environ.update({"HOME": str(root), "XDG_CONFIG_HOME": str(root),
                                "XDG_CACHE_HOME": str(root / "cache"),
                                "WRANGLER_SEND_METRICS": "false",
+                               "WRANGLER_SEND_ERROR_REPORTS": "false",
                                "WRANGLER_LOG_PATH": "/opt/timber-secure/wrangler.log"})
             os.chmod(root, 0o700)
             (root / "worker.js").write_bytes(artifact)
@@ -124,12 +153,16 @@ def main() -> int:
                 "compatibility_date": "2025-01-01", "workers_dev": False,
             }, separators=(",", ":")))
             os.chmod(root / "wrangler.json", 0o600)
+            if request["authorization"]["expiresAt"] <= int(time.time() * 1000):
+                print('{"status":"rejected","code":"invalid_authorization"}')
+                return 0
             try:
                 child = subprocess.Popen(
                     [WRANGLER, "deploy", "--config", str(root / "wrangler.json"), "--no-bundle"],
                     cwd=root, env=dict(os.environ), stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
+                cli_started = True
                 try:
                     return_code = child.wait(timeout=180)
                 except subprocess.TimeoutExpired:
@@ -143,10 +176,15 @@ def main() -> int:
             if return_code == 0:
                 print('{"status":"completed","code":"deploy_accepted"}')
             else:
-                print('{"status":"failed","code":"provider_failed"}')
+                # The provider may have accepted the upload before the response
+                # was lost or the CLI failed. A nonzero exit is never a safe retry.
+                print('{"status":"interrupted","code":"runner_outcome_unknown"}')
             return 0
     except OSError:
-        print('{"status":"failed","code":"runner_failed"}')
+        if cli_started:
+            print('{"status":"interrupted","code":"runner_outcome_unknown"}')
+        else:
+            print('{"status":"failed","code":"runner_failed"}')
         return 0
 
 

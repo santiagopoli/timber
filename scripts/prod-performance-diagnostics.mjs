@@ -1,10 +1,16 @@
 // Fixed read-only projections. Never select prompts, arguments, tool output or
 // credentials; identifiers used for routing stay inside collectDurable.
-export const PERFORMANCE_SCHEMA = "SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('runs','submissions','events','botspace_runtime_budget','pi_tasks','pi_entries') ORDER BY name";
+export const PERFORMANCE_SCHEMA = "SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('runs','submissions','events','botspace_runtime_budget','pi_tasks','pi_entries','timber_inference_requests') ORDER BY name";
 export const PERFORMANCE_TASKS = `SELECT t.id,json_extract(t.data,'$.status') AS status,
- json_extract(t.data,'$.createdAt') AS created_at,json_extract(t.data,'$.updatedAt') AS updated_at
- FROM tasks t JOIN bots b ON b.id=json_extract(t.data,'$.botId')
+ json_extract(t.data,'$.createdAt') AS created_at,json_extract(t.data,'$.updatedAt') AS updated_at,
+ CASE WHEN s.task_id IS NULL THEN 'none' WHEN s.task_id=t.id THEN 'self' WHEN s.task_id='@bot' THEN 'bot' WHEN s.task_id LIKE '@direct:%' THEN 'direct' ELSE 'other_task' END AS holder,
+ s.updated_at AS slot_updated_at,
+ (SELECT COUNT(*) FROM computer_admissions a WHERE a.bot_id=b.id) AS admissions,
+ (SELECT COUNT(*) FROM computer_admissions a WHERE a.bot_id=b.id AND a.payload IS NOT NULL) AS pinned_effects
+ FROM tasks t JOIN bots b ON b.id=json_extract(t.data,'$.botId') LEFT JOIN task_slots s ON s.bot_id=b.id
  WHERE lower(json_extract(b.data,'$.name'))='polibot' ORDER BY t.rowid DESC LIMIT 6`;
+export const PERFORMANCE_REQUESTS = `SELECT source,phase,started_at,last_progress_at,bytes,http_status,idle,estimated_tokens FROM timber_inference_requests ORDER BY id DESC LIMIT 20`;
+export function summarizeInferenceRequests(records){return records.slice(0,20).map(row=>({source:allow(new Set(['chatgpt','openai-api','openrouter']),row.source),phase:allow(new Set(['request','streaming','completed','failed','cancelled']),row.phase),startedAt:count(row.started_at)===null?null:new Date(row.started_at).toISOString(),lastProgressAt:count(row.last_progress_at)===null?null:new Date(row.last_progress_at).toISOString(),bytes:count(row.bytes),httpStatus:count(row.http_status),idleTimeout:row.idle===1,estimatedTokens:count(row.estimated_tokens)}));}
 export const PERFORMANCE_RUNS = `SELECT json_extract(data,'$.createdAt') AS created_at,
  json_extract(data,'$.updatedAt') AS updated_at,json_extract(data,'$.status') AS status,
  json_extract(data,'$.errorCode') AS error_code,
@@ -73,4 +79,4 @@ export function summarizePerformance({runs=[],tools:actions=[],native=[],usage=[
   modelResponses:usage.slice(0,40).filter(row=>count(row.timestamp)!==null&&row.timestamp>=window.from&&row.timestamp<=window.to).map(row=>({at:new Date(row.timestamp).toISOString(),inputTokens:count(row.input_tokens),outputTokens:count(row.output_tokens),cachedTokens:count(row.cached_tokens),stopReason:allow(new Set(['stop','length','toolUse','error','aborted']),row.stop_reason)})),
  };
 }
-export function performanceTaskMetadata(row){return {createdAt:iso(row.created_at),updatedAt:iso(row.updated_at),status:allow(states,row.status)};}
+export function performanceTaskMetadata(row){return {createdAt:iso(row.created_at),updatedAt:iso(row.updated_at),status:allow(states,row.status),scheduler:{holder:allow(new Set(['none','self','bot','direct','other_task']),row.holder),slotUpdatedAt:count(row.slot_updated_at)===null?null:new Date(row.slot_updated_at).toISOString(),admissions:count(row.admissions),pinnedEffects:count(row.pinned_effects)}};}

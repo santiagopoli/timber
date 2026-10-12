@@ -19,14 +19,32 @@ The fixed response is:
   "noShellEnv": true,
   "noBuildCredentialInheritance": true,
   "outputRedaction": true,
-  "canaryVersion": "cross-uid-proc-env-v1"
+  "canaryVersion": "cross-uid-proc-env-v1",
+  "cliVersion": "4.147.0",
+  "cliBuildId": "wrangler-4.147.0-timber-no-retry-v1",
+  "cliDigest": "sha256:07f2d4392dbaa8944bd2a73dc1bcbef481840fddb65b6e6bd5c697e000163511",
+  "noAutomaticRetry": true
 }
 ```
 
 All capability bits are false (except the descriptive versions and output filter)
 unless the running image confirms distinct fixed UIDs, no-root escalation, the
-root-owned runner, the exact pinned Wrangler version and an actual synthetic
-cross-UID `/proc/<pid>/environ` denial canary. The canary contains no credential.
+root-owned runner, the exact pinned Wrangler version and digest, a verified
+no-retry CLI build, and an actual synthetic cross-UID `/proc/<pid>/environ`
+denial canary. The image build requires the compiled source CLI SHA-256
+`f2ec95b41d7f7665a42b75fc9631100e95ea6c0dbabc09eb65ae7f772dbc2fed`, exactly
+one `    MAX_ATTEMPTS = 3;` needle, then patches only that default to
+`    MAX_ATTEMPTS = 1;`. The patched CLI SHA-256 is
+`07f2d4392dbaa8944bd2a73dc1bcbef481840fddb65b6e6bd5c697e000163511`; drift or
+unexpected needle count fails the image build. Root capability checks resolve
+`/usr/local/bin/wrangler` through its package `bin` wrapper to
+`wrangler-dist/cli.js` and verify root ownership, non-writable parents, package
+version, and exact patched digest. Both readiness and every dispatch perform
+that check. `cliVersion`, `cliBuildId`, `cliDigest`, and
+`noAutomaticRetry:true` are returned only after verification. This pinned CLI
+patch lowers the shared default retry attempt count to one (including all
+mutating upload paths that use the default); no callers in the audited CLI
+supply an explicit attempts override above one. The canary contains no credential.
 The Worker must fail closed unless the complete schema matches its supported
 version; an advertisement alone is not a security boundary.
 
@@ -98,7 +116,13 @@ Response body is always allowlisted and has no CLI output:
 ```
 
 Status values: `completed`, `failed`, `interrupted`, `rejected`, `unavailable`.
-Code values: `deploy_accepted`, `provider_failed`, `runner_failed`,
+A nonzero Wrangler exit, timeout, post-launch cancellation, missing or malformed
+runner receipt, or runner-process failure is `interrupted` with
+`runner_interrupted`: the provider may have accepted the upload before the
+response was lost. Never infer no effect from CLI exit status or stderr, and
+never retry this outcome. Only validation/rejection and pre-CLI runner failures
+may report a definite no-effect failure. Code values: `deploy_accepted`,
+`runner_failed`,
 `runner_interrupted`, `runner_unavailable`, `dispatch_already_seen`,
 `invalid_request`, `invalid_authorization`, `invalid_pin`, `invalid_refs`,
 `artifact_not_found`, `artifact_invalid`, `artifact_digest_mismatch`.

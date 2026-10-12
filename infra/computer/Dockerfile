@@ -2,6 +2,8 @@
 # CI runners do not depend on Docker Hub's anonymous pull allowance.
 FROM mirror.gcr.io/library/node:24.14.0-bookworm-slim@sha256:d8e448a56fc63242f70026718378bd4b00f8c82e78d20eefb199224a4d8e33d8
 
+COPY patch_wrangler_cli.py /opt/botspace/patch_wrangler_cli.py
+
 # Versions of the image and application are fixed in git; Debian security updates
 # are intentionally taken at build time. Publish and deploy an immutable digest.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -9,6 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     x11vnc python3-websockify xterm \
     ca-certificates curl git procps tini util-linux \
     && npm install --global --no-audit --no-fund wrangler@4.147.0 \
+    && chmod 0755 /opt/botspace/patch_wrangler_cli.py \
+    && python3 /opt/botspace/patch_wrangler_cli.py --patch /usr/local/bin/wrangler \
     && groupadd --gid 10001 timber-shell \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin timber-shell \
     && groupadd --gid 10002 timber-deploy \
@@ -27,6 +31,7 @@ COPY start.sh /opt/botspace/start.sh
 COPY desktop_bridge.py /opt/botspace/desktop_bridge.py
 COPY workspace.py /opt/botspace/workspace.py
 RUN chmod 755 /opt/botspace/start.sh /opt/botspace/server.py /opt/botspace/secure_deploy.py \
+    && chmod 755 /opt/botspace/patch_wrangler_cli.py \
     && chmod 755 /opt/botspace/secure_deploy_runner.py /opt/botspace/workspace_archive.py \
     && chown -R root:root /opt/botspace \
     && chmod 0755 /opt/botspace

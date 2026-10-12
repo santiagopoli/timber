@@ -29,7 +29,7 @@ CODES = {
     "invalid_request", "invalid_authorization", "invalid_pin", "invalid_refs",
     "artifact_not_found", "artifact_invalid", "artifact_digest_mismatch",
     "runner_unavailable", "runner_interrupted", "runner_failed",
-    "deploy_accepted", "provider_failed", "dispatch_already_seen",
+    "deploy_accepted", "dispatch_already_seen",
 }
 
 
@@ -93,10 +93,12 @@ def _validate_request(request: object) -> tuple[dict, dict, list[dict]]:
     _need(pin["destination"] == expected_url, "invalid_pin")
     auth = request["authorization"]
     auth_fields = {"version", "ownerId", "botId", "runId", "nativeOperationId", "operationId", "pin", "planId", "planRevision", "refs", "expiresAt", "signature"}
-    _need(isinstance(auth, dict) and set(auth) == auth_fields and isinstance(auth.get("signature"), str) and 32 <= len(auth["signature"]) <= 4096, "invalid_authorization")
+    _need(isinstance(auth, dict) and (set(auth) == auth_fields or set(auth) == auth_fields | {"taskId"}) and isinstance(auth.get("signature"), str) and 32 <= len(auth["signature"]) <= 4096, "invalid_authorization")
     _need(auth.get("version") == 1 and auth.get("operationId") == operation_id, "invalid_authorization")
     _need(isinstance(auth["ownerId"], str) and (auth["ownerId"] == "owner" or re.fullmatch(r"[0-9a-fA-F-]{36}", auth["ownerId"])) and isinstance(auth["botId"], str) and re.fullmatch(r"[0-9a-fA-F-]{36}", auth["botId"]) and isinstance(auth["runId"], str) and re.fullmatch(r"[0-9a-fA-F-]{36}", auth["runId"]), "invalid_authorization")
     _need(isinstance(auth["nativeOperationId"], str) and OP.fullmatch(auth["nativeOperationId"]), "invalid_authorization")
+    if "taskId" in auth:
+        _need(isinstance(auth["taskId"], str) and re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89ab][0-9a-fA-F]{3}-[0-9a-fA-F]{12}", auth["taskId"]), "invalid_authorization")
     _need(isinstance(auth["planId"], str) and re.fullmatch(r"[0-9a-fA-F-]{36}", auth["planId"]) and type(auth["planRevision"]) is int and auth["planRevision"] > 0, "invalid_authorization")
     _need(type(auth["expiresAt"]) is int and auth["expiresAt"] > int(time.time() * 1000), "invalid_authorization")
     signed_pin = auth.get("pin")
@@ -170,6 +172,8 @@ def dispatch(workspace: Path, request: object, *, runner_path: str = "/opt/botsp
         artifact = _read_pinned_file(workspace.resolve(), pin["artifactPath"])
         digest = "sha256:" + hashlib.sha256(artifact).hexdigest()
         _need(digest == pin["artifactDigest"], "artifact_digest_mismatch")
+        # Artifact IO can be slow; reject authority that expired while snapshotting.
+        _need(type(auth["expiresAt"]) is int and auth["expiresAt"] > int(time.time() * 1000), "invalid_authorization")
         try:
             javascript = artifact.decode("utf-8", errors="strict")
         except UnicodeDecodeError as exc:
@@ -185,6 +189,7 @@ def dispatch(workspace: Path, request: object, *, runner_path: str = "/opt/botsp
         encoded = json.dumps(runner_request, separators=(",", ":"), ensure_ascii=True).encode()
         if len(encoded) > 8 * 1024 * 1024:
             return {"operationId": operation, "status": "rejected", "code": "invalid_request"}
+        _need(type(auth["expiresAt"]) is int and auth["expiresAt"] > int(time.time() * 1000), "invalid_authorization")
         with _ACTIVE_LOCK:
             if state["cancelled"]:
                 return {"operationId": operation, "status": "interrupted", "code": "runner_interrupted"}
@@ -222,8 +227,9 @@ def dispatch(workspace: Path, request: object, *, runner_path: str = "/opt/botsp
         if code == "runner_outcome_unknown":
             code = "runner_interrupted"
         allowed = {
-            ("completed", "deploy_accepted"), ("failed", "provider_failed"),
-            ("failed", "runner_failed"), ("rejected", "invalid_request"),
+            ("completed", "deploy_accepted"), ("failed", "runner_failed"),
+            ("rejected", "invalid_request"),
+            ("rejected", "invalid_authorization"),
             ("interrupted", "runner_interrupted"), ("interrupted", "dispatch_already_seen"),
         }
         if (status, code) not in allowed or process.returncode != 0:

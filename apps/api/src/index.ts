@@ -19,9 +19,9 @@ async function discardRequestBody(request:Request):Promise<void> {
   try { await request.body.cancel(); } catch { /* A forwarded/locked stream is already owned elsewhere. */ }
 }
 
-async function beginAdmission(env:Env,botId:string,operationId:string,taskId?:string):Promise<string> {
+async function beginAdmission(env:Env,botId:string,operationId:string,taskId?:string,inbox=false):Promise<string> {
   const path=`https://workspace/tasks/bot-slot/${botId}/admissions`;
-  const response=await env.WORKSPACE.get(env.WORKSPACE.idFromName("owner")).fetch(new Request(path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId,...taskId?{taskId}:{}})}));
+  const response=await env.WORKSPACE.get(env.WORKSPACE.idFromName("owner")).fetch(new Request(path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId,...taskId?{taskId}:{},...(inbox?{inbox:true}:{})})}));
   if(!response.ok)throw new ApiError(response.status,"computer_busy","The bot's shared computer is occupied; retry when its current work finishes.");
   return (await response.json<{token:string}>()).token;
 }
@@ -123,7 +123,7 @@ export default {
       }
       const registry=env.WORKSPACE.get(env.WORKSPACE.idFromName(owner));
       if(url.pathname==='/v1/keychain/deploy-verify'||/^\/v1\/bots\/[^/]+\/keychain\/deploy-verify$/.test(url.pathname))throw new ApiError(404,'not_found','Endpoint not found.');
-      if(url.pathname==='/v1/keychain'||url.pathname.startsWith('/v1/keychain/'))return registry.fetch(internalRequest(request,`https://workspace${url.pathname.slice(3)}${url.search}`));
+      if(url.pathname==='/v1/keychain'||url.pathname.startsWith('/v1/keychain/')){requestBodyForwarded=true;return registry.fetch(internalRequest(request,`https://workspace${url.pathname.slice(3)}${url.search}`));}
       if(url.pathname==="/v1/tasks") {
         if(request.method==="GET") return registry.fetch(new Request("https://workspace/tasks"));
         if(request.method!=="POST") throw new ApiError(405,"method_not_allowed","Method not allowed.");
@@ -131,7 +131,7 @@ export default {
         if(!created.ok) return created;
         return created;
       }
-      const taskRoute=/^\/v1\/tasks\/([0-9a-f-]{36})(?:\/(messages|progress|runs(?:\/[0-9a-f-]{36}(?:\/cancel)?)?|events|start|continue|cancel|approvals(?:\/[0-9a-f-]{36})?|agents(?:\/[^/]+\/(?:messages|cancel))?|connections(?:\/[^/]+\/connect)?))?$/.exec(url.pathname);
+      const taskRoute=/^\/v1\/tasks\/([0-9a-f-]{36})(?:\/(messages|progress|runs(?:\/[0-9a-f-]{36}(?:\/cancel)?)?|events|context(?:\/compact)?|memory(?:\/(?:search|review|entries(?:\/[A-Za-z0-9_-]{1,128}(?:\/(?:history|accept))?)?))?|keychain(?:\/(?:requests\/[0-9a-f-]{36}\/authorize|[0-9a-f-]{36}(?:\/permissions)?))?|start|continue|cancel|approvals(?:\/[0-9a-f-]{36})?|agents(?:\/[^/]+\/(?:messages|cancel))?|connections(?:\/[^/]+\/connect)?))?$/.exec(url.pathname);
       if(taskRoute) {
         const [,taskId,endpoint]=taskRoute;
         const taskResponse=await registry.fetch(`https://workspace/tasks/${taskId}`);
@@ -141,6 +141,11 @@ export default {
         if(!botResponse.ok) return botResponse;
         const {bot}=await botResponse.json<{bot:Bot}>();
         if(!endpoint) {if(request.method!=="GET")throw new ApiError(405,"method_not_allowed","Method not allowed.");return json({task});}
+        if(endpoint==='keychain'||endpoint.startsWith('keychain/')) {
+          const forwarded=internalRequest(request,`https://workspace/${endpoint}${url.search}`);
+          forwarded.headers.set('x-keychain-bot',task.botId);forwarded.headers.set('x-keychain-task',taskId);
+          requestBodyForwarded=true;return registry.fetch(forwarded);
+        }
         const stub=env.BOT.get(env.BOT.idFromName(`${owner}:task:${taskId}`));
         const headers=new Headers();headers.set("x-botspace-config",encodeURIComponent(JSON.stringify(bot)));
         headers.set("x-timber-task-id",taskId);
@@ -173,10 +178,12 @@ export default {
           return json({taskId,cancelRequested:true,confirmed:!failed&&processState.confirmed&&data.activeRuns.length===0,runCount:outcomes.length});
         }
         if(endpoint==="messages" && request.method==="POST" && task.status==="cancelled") {await discardRequestBody(request);throw new ApiError(409,"task_cancelled","Cancelled tasks cannot accept new messages.");}
-        if(endpoint==="messages" && request.method==="POST" && !["running","waiting_approval","waiting_connection"].includes(task.status)) {await discardRequestBody(request);throw new ApiError(409,"task_not_running","This task is not currently running; wait for it to start before messaging it.");}
+        if(endpoint==="messages" && request.method==="POST" && !["queued","running","waiting_approval","waiting_connection"].includes(task.status)) {await discardRequestBody(request);throw new ApiError(409,"task_not_running","Start or continue this task before messaging it.");}
         let admissionToken:string|undefined;
-        const taskInput=endpoint==="messages"||/^agents\/[^/]+\/messages$/.test(endpoint);
-        if(taskInput&&request.method==="POST")admissionToken=await beginAdmission(env,task.botId,await bodyOperationId(request),taskId);
+        // BotDO durably receipts chat input before claiming execution. A queued
+        // task must remain writable without acquiring the shared computer here.
+        const taskInput=endpoint==='messages'||/^agents\/[^/]+\/messages$/.test(endpoint);
+        if(taskInput&&request.method==="POST")admissionToken=await beginAdmission(env,task.botId,await bodyOperationId(request),taskId,endpoint==='messages');
         if(/^approvals\/[^/]+$/.test(endpoint)&&request.method==="POST")admissionToken=await beginAdmission(env,task.botId,`mutation:${crypto.randomUUID()}`,taskId);
         requestBodyForwarded=true;
         const response=await stub.fetch(new Request(`https://task/${endpoint}${url.search}`,{method:request.method,headers,body:["GET","HEAD"].includes(request.method)?undefined:request.body,redirect:"manual",signal:request.signal}));
@@ -202,7 +209,7 @@ export default {
       if(!record.ok) return record;
       const {bot}=await record.json<{bot:Bot}>();
       if(!tail && request.method==="GET") return json({bot});
-      if(tail==='/keychain'||tail.startsWith('/keychain/')){const forwarded=internalRequest(request,`https://workspace${tail}`);forwarded.headers.set('x-keychain-bot',botId);return registry.fetch(forwarded);}
+      if(tail==='/keychain'||tail.startsWith('/keychain/')){const forwarded=internalRequest(request,`https://workspace${tail}`);forwarded.headers.set('x-keychain-bot',botId);requestBodyForwarded=true;return registry.fetch(forwarded);}
       if(tail==="/avatar") return registry.fetch(internalRequest(request,`https://workspace/avatar/${botId}`,true));
       const artifact=/^\/artifacts\/([^/]+)$/.exec(tail);
       if(artifact && request.method==="GET") {

@@ -424,6 +424,7 @@ not returned.
 
 The host tools `list_tasks {before?}` (30 per page) and
 `inspect_task {taskId,before?,limit?}` are available to computerless coordinators.
+`message_task {taskId,text}` lets the named parent send steering to those tasks, including durable messages while queued, or explicitly continue completed/failed work. It freezes message-versus-continuation routing before dispatch, so a lost acknowledgment cannot create a second continuation. Temporary agents and other task conversations cannot invoke it; cancelled tasks remain fenced.
 They resolve only tasks assigned to the calling bot and remain usable without
 `allowTaskCreation`. Task conversation text is collaborator data, not new
 instructions or authorization.
@@ -435,7 +436,8 @@ computer/workspace identity, so no second computer is created. The task has its
 own transcript and run/event IDs.
 
 `POST /v1/tasks/:id/start` admits the description under stable operation ID
-`task-start:<taskId>`. `POST /v1/tasks/:id/messages`, `GET /messages`, `GET
+`task-start:<taskId>`. Queued task chats accept messages into the durable bounded inbox without claiming the computer. Only the original start/continuation input can enter Pi while the task is queued; saved messages follow once it starts. Unadmitted messages cannot prevent the scheduler from starting that original input. Expected contention does not consume delivery retry attempts.
+`POST /v1/tasks/:id/messages`, `GET /messages`, `GET
 /runs`, and `GET /events` expose the task conversation. `POST /continue {operationId,text}` explicitly continues a completed or failed task in the same chat with a newly generated native input ID, never by replaying `task-start` or old computer actions. Identical continuation receipts deduplicate; different instructions under the same ID conflict. `POST /cancel` cancels its
 active runs and permanently fences subsequent starts and continuations. Cancelled tasks cannot Continue in this version; create a new task. Task-scoped `/approvals`,
 `/approvals/:approvalId`, `/agents`, `/agents/:agentId/messages`,
@@ -483,10 +485,34 @@ work without cancelling the independent task. Ordinary execution admission and
 all task/computer effects retain exact lease fencing.
 
 The console's main segmented Bots/Tasks selector swaps the same list area and
-matching row presentation. Tasks have deep links `#tasks&task=<id>`, a dedicated
-chat, approvals and command activity, with bounded history pages and live SSE.
+matching row presentation. Tasks have deep links `#tasks&task=<id>` and mount the
+same conversation/composer components as bot chat, including inline approvals,
+command activity, failures, image messages and task-scoped agent dialogs. The
+compact task state occupies the conversation-header status area; description,
+assignment, timestamps and pending Start stay behind the Task details button.
+Task chat has bounded history pages and live SSE. Archive pages merge with
+recent activity, and retries preserve each original message's receipt identity.
 Hidden task views stop polling and streaming. The parent chat restores the latest
 status pills from the passive registry and ignores stale status versions.
+
+Task conversations expose the same context and individual-memory routes under
+`/v1/tasks/:id/context` and `/v1/tasks/:id/memory`; these operate on the isolated
+task runtime, never the assigned bot's ordinary context or notes. Model selection
+continues to inherit the assigned bot's settings. Images upload and download
+through that bot's existing artifact routes; task messages validate the same
+image ownership and input limits. Explicit task continuation retains validated
+image IDs or mentions in its durable queued input and operation fingerprint;
+text-only receipts keep their prior fingerprint. As in ordinary chat, a single
+input cannot combine images and mentions. Delegation results return to the exact
+originating task conversation, with the existing cancellation fences.
+
+The `/v1/tasks/:id/keychain` aliases retain the owner's encrypted keychain and
+assigned-bot grants, while listing and fulfilling requests for that task only.
+Secure request receipts and GitHub consent flows carry an optional host-assigned
+`taskId`; check, resume and callback delivery validate the assigned bot and address
+that task's Durable Object. Legacy receipts without a task ID address ordinary
+bot chat. A sibling task cannot fulfill a request through its alias, and Stop,
+revocation and original run/native-operation checks still fence continuation.
 
 ## Console sessions
 The cookie `__Host-timber_session` is Secure, HttpOnly, SameSite=Strict, host-only
@@ -1319,3 +1345,31 @@ is rejected. Candidate identities precede PUT; pointer replacement and old-objec
 GC admission commit atomically. Deletion stops the target runtime before avatar
 drain, never awaiting another bot’s avatar. Receipts are compact and terminal
 private snapshots are cleared; status/next-time and GC scheduling are indexed.
+
+
+## Inference liveness and working context
+
+OpenAI Responses requests use stable opaque prompt cache affinity per durable
+conversation, isolated across bot and task computers and retained through eviction.
+The ChatGPT proxy derives its `session_id` header from that host hash; it does not
+forward arbitrary client headers or retain provider-side conversation history.
+Native Pi uses a working context window of at most 128,000 tokens, bounded by the
+model's actual smaller window. Threshold compaction preserves the full archive and
+recent verbatim context, and runs before a million-token catalogue limit is reached.
+
+Inference connections watch elapsed time without headers or stream bytes. The
+stream silence allowance is 180 seconds, 240 seconds over 50,000 estimated tokens,
+and 300 seconds over 100,000; named reasoning models and high reasoning settings
+have at least 600 seconds. Each received chunk resets this allowance, so active
+reasoning can exceed it. The existing 30-minute total inference ceiling remains.
+This applies only to model inference; command/process deadlines are unchanged.
+Expired connections fail through native Pi's inference retry policy, preserving
+recorded tool effects. Explicit Stop stays an abort.
+
+`timber_inference_requests` stores at most 201 recent connection records with
+source, stage, start/last-progress times, bytes, HTTP status, estimated input size
+and idle-expiry status; no prompts, model output, cache keys or credentials.
+Task progress and private production diagnostics expose those stages to distinguish
+a request waiting for headers from an active stream and a dead connection.
+The policy follows Hermes' separation of total and stale-stream budgets and Codex's
+per-session cache affinity.

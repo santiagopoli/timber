@@ -34,6 +34,7 @@ from workspace import WorkspaceInspector
 from secure_deploy import dispatch as secure_deploy_dispatch, cancel as secure_deploy_cancel
 import workspace_archive
 import socket
+from patch_wrangler_cli import verify_installed_cli, VerificationError as WranglerVerificationError
 
 MAX_JSON = 2 * 1024 * 1024
 MAX_OUTPUT = 128 * 1024
@@ -1266,11 +1267,8 @@ def secure_deploy_capabilities() -> dict:
         if not runner.is_file() or runner.stat().st_uid != 0 or runner.stat().st_mode & 0o022 or not Path("/usr/bin/setpriv").is_file():
             return result
         try:
-            resolved_cli = wrangler.resolve(strict=True)
-            cli_root = Path("/usr/local/lib/node_modules/wrangler")
-            if not resolved_cli.is_relative_to(cli_root) or resolved_cli.stat().st_uid != 0 or resolved_cli.stat().st_mode & 0o022:
-                return result
-        except OSError:
+            cli_metadata = verify_installed_cli(wrangler)
+        except (OSError, WranglerVerificationError):
             return result
         log_alias = Path("/opt/timber-secure/wrangler.log")
         try:
@@ -1335,6 +1333,9 @@ def secure_deploy_capabilities() -> dict:
             except ProcessLookupError:
                 pass
             child.wait(timeout=3)
+        result.update(cli_metadata)
+        if cli_metadata.get("noAutomaticRetry") is not True:
+            return result
         result.update({"secureDeploy": True, "privateCredentialChannel": True,
                        "noShellEnv": True, "noBuildCredentialInheritance": True})
         return result

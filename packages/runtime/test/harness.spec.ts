@@ -1270,3 +1270,36 @@ it('task conversation instructions keep commands inside the task and expose boun
  const state=await(await request('/inspect')).json<{calls:{input:string}[]}>();
  expect(JSON.stringify(state.calls[0])).toContain('Do not create another global task');expect(JSON.stringify(state.calls[0])).toContain('Fixture existing task status: completed');expect(JSON.stringify(state.calls[0])).not.toContain('For substantial multi-step work');
 });
+
+it('keeps prompt cache affinity through eviction and scopes separate bot conversations independently',async()=>{
+ await request('/submit',{text:'Hello affinity',operationId:'affinity-one',chatgpt:true});await request('/wait?id=affinity-one');
+ await abortAllDurableObjects();
+ await request('/submit',{text:'Hello again',operationId:'affinity-two',chatgpt:true});await request('/wait?id=affinity-two');
+ const state=await(await request('/inspect')).json<{calls:{input:string}[]}>(),keys=state.calls.map(call=>JSON.parse(call.input).prompt_cache_key);
+ expect(keys).toHaveLength(2);expect(keys[0]).toMatch(/^[a-f0-9]{64}$/);expect(keys[1]).toBe(keys[0]);
+ const original=probeId;probeId=crypto.randomUUID();
+ await request('/submit',{text:'Hello another bot',operationId:'affinity-other',chatgpt:true});await request('/wait?id=affinity-other');
+ const other=await(await request('/inspect')).json<{calls:{input:string}[]}>();expect(JSON.parse(other.calls[0]!.input).prompt_cache_key).not.toBe(keys[0]);probeId=original;
+ const stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+ expect((await runInDurableObject(stub,instance=>instance.runtime.contextStatus())).contextWindow).toBe(128000);
+});
+it('compacts long retained conversations automatically before the advertised million-token maximum',async()=>{
+ for(let index=0;index<4;index++){
+  await request('/submit',{text:`Retained long turn ${index}: `+'verified historical context '.repeat(6500),operationId:`bounded-context-${index}`,chatgpt:true});
+  expect(await(await request(`/wait?id=bounded-context-${index}`)).json()).toMatchObject({status:'done'});
+ }
+ const stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+ await expect.poll(async()=>{const context=await runInDurableObject(stub,instance=>instance.runtime.contextStatus());return context.compactions.some(item=>item.status==='completed'&&item.reason==='threshold');}).toBe(true);
+ const state=await(await request('/inspect')).json<{messages:{role:string;text:string}[];calls:{input:string}[]}>();
+ for(let index=0;index<4;index++)expect(state.messages.some(message=>message.role==='user'&&message.text.startsWith(`Retained long turn ${index}:`))).toBe(true);
+ expect(JSON.stringify(state.calls.at(-1))).toContain('<summary>');
+});
+
+it('recovers an SDK connection loss automatically in the same run without repeating the completed command',async()=>{
+ await request('/host-context',{mode:'automatic'});
+ await request('/submit',{text:'request-exec request-connection-error-once',operationId:'recover-connection',chatgpt:true});
+ expect(await(await request('/wait?id=recover-connection')).json()).toMatchObject({status:'done'});
+ const state=await(await request('/inspect')).json<{calls:{input:string}[];toolCalls:unknown[];events:{event:string}[]}>();
+ expect(state.toolCalls).toHaveLength(1);expect(state.calls).toHaveLength(3);expect(JSON.stringify(state.calls.at(-1))).toContain('function_call_output');
+ expect(state.events.some(row=>JSON.parse(row.event).type==='run.retrying')).toBe(true);
+});

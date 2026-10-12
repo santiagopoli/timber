@@ -11,6 +11,7 @@ on:
           - native
           - avatars
           - performance
+          - queue
       hours:
         description: Hours of recent failure metadata to inspect (1 to 24)
         required: true

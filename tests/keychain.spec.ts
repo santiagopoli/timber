@@ -58,17 +58,17 @@ describe('owner keychain security and durable flow',()=>{
       const row=state.storage.sql.exec<{native_operation_id:string}>('SELECT native_operation_id FROM runs WHERE id=?',run.id).one();
       return (instance as unknown as {executeHostTool:(input:RuntimeHostToolRequest)=>Promise<RuntimeToolResult>}).executeHostTool({operationId:crypto.randomUUID(),runOperationId:row.native_operation_id,name:'secure_worker_deploy_capabilities',arguments:{},signal:new AbortController().signal});
     });
-    expect(result.status).toBe('failed');expect(result.error).toContain('Only the named bot');
+    expect(result).toMatchObject({status:'failed',error:expect.stringContaining('Only the named bot')});
   });
   it('probes only the scoped Computer canary with run fences and no keychain lookup',async()=>{
     const b={id:crypto.randomUUID(),name:'Capability probe'} as Bot;
     let computerCalls=0,checks=0,stopAfterProbe=false,probeFinished=false;
     const coordinator=Object.create(OwnerKeychainCoordinator.prototype) as any;
     coordinator.ctx={storage:{sql:{exec:(query:string)=>({toArray:()=>query.includes('SELECT data FROM bots')?[{data:JSON.stringify(b)}]:[]})}}};
-    coordinator.env={BOT:{idFromName:(id:string)=>id,get:()=>({fetch:async()=>{checks++;return new Response(null,{status:stopAfterProbe&&probeFinished?409:200})}})},COMPUTER:{idFromName:(id:string)=>id,get:(id:string)=>({fetch:async(request:Request)=>{computerCalls++;expect(id).toBe(b.id);expect(request.url).toContain('/secure-deploy/capabilities');expect(request.headers.get('x-timber-bot-id')).toBe(b.id);probeFinished=true;return Response.json({secureDeploy:true,isolationVersion:'uid-ptrace-v1',privateCredentialChannel:true,noShellEnv:true,noBuildCredentialInheritance:true,outputRedaction:true,canaryVersion:'cross-uid-proc-env-v1',credential:'must-not-escape'});}})}};
+    coordinator.env={BOT:{idFromName:(id:string)=>id,get:()=>({fetch:async()=>{checks++;return new Response(null,{status:stopAfterProbe&&probeFinished?409:200})}})},COMPUTER:{idFromName:(id:string)=>id,get:(id:string)=>({fetch:async(request:Request)=>{computerCalls++;expect(id).toBe(b.id);expect(request.url).toContain('/secure-deploy/capabilities');expect(request.headers.get('x-timber-bot-id')).toBe(b.id);probeFinished=true;return Response.json({secureDeploy:true,isolationVersion:'uid-ptrace-v1',privateCredentialChannel:true,noShellEnv:true,noBuildCredentialInheritance:true,outputRedaction:true,canaryVersion:'cross-uid-proc-env-v1',cliVersion:'4.147.0',cliBuildId:'wrangler-4.147.0-timber-no-retry-v1',cliDigest:'sha256:07f2d4392dbaa8944bd2a73dc1bcbef481840fddb65b6e6bd5c697e000163511',noAutomaticRetry:true,credential:'must-not-escape'});}})}};
     const input={name:'secure_worker_deploy_capabilities',arguments:{},botId:b.id,runId:crypto.randomUUID(),nativeOperationId:crypto.randomUUID(),operationId:crypto.randomUUID()};
     const response=await coordinator.tool(input,new AbortController().signal),value=await response.json();
-    expect(value).toEqual({capability:{secureDeploy:true,isolationVersion:'uid-ptrace-v1',privateCredentialChannel:true,noShellEnv:true,noBuildCredentialInheritance:true,outputRedaction:true,canaryVersion:'cross-uid-proc-env-v1'}});
+    expect(value).toEqual({capability:{secureDeploy:true,isolationVersion:'uid-ptrace-v1',privateCredentialChannel:true,noShellEnv:true,noBuildCredentialInheritance:true,outputRedaction:true,canaryVersion:'cross-uid-proc-env-v1',cliVersion:'4.147.0',cliBuildId:'wrangler-4.147.0-timber-no-retry-v1',cliDigest:'sha256:07f2d4392dbaa8944bd2a73dc1bcbef481840fddb65b6e6bd5c697e000163511',noAutomaticRetry:true}});
     expect(computerCalls).toBe(1);expect(checks).toBe(3);expect(JSON.stringify(value)).not.toContain('must-not-escape');
     stopAfterProbe=true;probeFinished=false;checks=0;computerCalls=0;
     await expect(coordinator.tool(input,new AbortController().signal)).rejects.toThrow('task is no longer active');
@@ -166,9 +166,9 @@ describe('owner keychain security and durable flow',()=>{
 
   it('exposes owner-authenticated live Computer deploy readiness without credentials',async()=>{
     const b=await bot(),called:string[]=[];
-    vi.spyOn(ComputerDO.prototype,'fetch').mockImplementation(async function(request:Request){called.push(new URL(request.url).pathname);return Response.json({secureDeploy:true,isolationVersion:'uid-ptrace-v1',privateCredentialChannel:true,noShellEnv:true,noBuildCredentialInheritance:true,outputRedaction:true,canaryVersion:'cross-uid-proc-env-v1'});});
+    vi.spyOn(ComputerDO.prototype,'fetch').mockImplementation(async function(request:Request){called.push(new URL(request.url).pathname);return Response.json({secureDeploy:true,isolationVersion:'uid-ptrace-v1',privateCredentialChannel:true,noShellEnv:true,noBuildCredentialInheritance:true,outputRedaction:true,canaryVersion:'cross-uid-proc-env-v1',cliVersion:'4.147.0',cliBuildId:'wrangler-4.147.0-timber-no-retry-v1',cliDigest:'sha256:07f2d4392dbaa8944bd2a73dc1bcbef481840fddb65b6e6bd5c697e000163511',noAutomaticRetry:true});});
     expect((await exports.default.fetch(`https://timber.test/v1/keychain/deploy-capabilities?botId=${b.id}`)).status).toBe(401);
-    const response=await api(`/keychain/deploy-capabilities?botId=${b.id}`);expect(response.status).toBe(200);expect(await response.json()).toEqual({capability:{secureDeploy:true,isolationVersion:'uid-ptrace-v1',privateCredentialChannel:true,noShellEnv:true,noBuildCredentialInheritance:true,outputRedaction:true,canaryVersion:'cross-uid-proc-env-v1'}});
+    const response=await api(`/keychain/deploy-capabilities?botId=${b.id}`);expect(response.status).toBe(200);expect(await response.json()).toEqual({capability:{secureDeploy:true,isolationVersion:'uid-ptrace-v1',privateCredentialChannel:true,noShellEnv:true,noBuildCredentialInheritance:true,outputRedaction:true,canaryVersion:'cross-uid-proc-env-v1',cliVersion:'4.147.0',cliBuildId:'wrangler-4.147.0-timber-no-retry-v1',cliDigest:'sha256:07f2d4392dbaa8944bd2a73dc1bcbef481840fddb65b6e6bd5c697e000163511',noAutomaticRetry:true}});
     expect(called).toEqual(['/secure-deploy/capabilities']);
     expect((await api(`/bots/${b.id}/keychain/deploy-capabilities?botId=${b.id}`)).status).toBe(403);
   });
@@ -178,7 +178,7 @@ describe('owner keychain security and durable flow',()=>{
     const paths:string[]=[],payloads:Record<string,unknown>[]=[];
     vi.spyOn(ComputerDO.prototype,'fetch').mockImplementation(async function(_request:Request){
       const path=new URL(_request.url).pathname;paths.push(path);
-      if(path==='/secure-deploy/capabilities')return Response.json({secureDeploy:true,isolationVersion:'uid-ptrace-v1',privateCredentialChannel:true,noShellEnv:true,noBuildCredentialInheritance:true,outputRedaction:true,canaryVersion:'cross-uid-proc-env-v1'});
+      if(path==='/secure-deploy/capabilities')return Response.json({secureDeploy:true,isolationVersion:'uid-ptrace-v1',privateCredentialChannel:true,noShellEnv:true,noBuildCredentialInheritance:true,outputRedaction:true,canaryVersion:'cross-uid-proc-env-v1',cliVersion:'4.147.0',cliBuildId:'wrangler-4.147.0-timber-no-retry-v1',cliDigest:'sha256:07f2d4392dbaa8944bd2a73dc1bcbef481840fddb65b6e6bd5c697e000163511',noAutomaticRetry:true});
       if(path==='/secure-deploy'){
         const body=await _request.clone().json() as Record<string,unknown>;payloads.push(body);
         const verified=await owner().fetch(new Request('https://workspace/keychain/deploy-verify',{method:'POST',headers:{'content-type':'application/json','x-timber-internal':'computer'},body:JSON.stringify({authorization:body.authorization})}));
@@ -224,6 +224,20 @@ describe('owner keychain security and durable flow',()=>{
     if(action==='stop')await api(`/bots/${b.id}/runs/${run.id}/cancel`,'POST');
     const computer=vi.spyOn(ComputerDO.prototype,'fetch'),decrypt=vi.spyOn(crypto.subtle,'decrypt');
     const result=await deployTool(b,run,plan);expect(result.status).not.toBe('completed');expect(computer).not.toHaveBeenCalled();expect(decrypt).not.toHaveBeenCalled();
+  });
+  it('maps a post-spawn runner interruption to an uncertain journal and never dispatches again',async()=>{
+    const {b,run,plan}=await deployFixture(),op=crypto.randomUUID(),paths:string[]=[];
+    vi.spyOn(ComputerDO.prototype,'fetch').mockImplementation(async request=>{
+      const path=new URL(request.url).pathname;paths.push(path);
+      if(path==='/secure-deploy/capabilities')return Response.json({secureDeploy:true,isolationVersion:'uid-ptrace-v1',privateCredentialChannel:true,noShellEnv:true,noBuildCredentialInheritance:true,outputRedaction:true,canaryVersion:'cross-uid-proc-env-v1',cliVersion:'4.147.0',cliBuildId:'wrangler-4.147.0-timber-no-retry-v1',cliDigest:'sha256:07f2d4392dbaa8944bd2a73dc1bcbef481840fddb65b6e6bd5c697e000163511',noAutomaticRetry:true});
+      if(path==='/secure-deploy'){const body=await request.json() as {operationId:string};return Response.json({operationId:body.operationId,status:'interrupted',code:'runner_interrupted'});}
+      return new Response(null,{status:404});
+    });
+    const first=await deployTool(b,run,plan,op);expect(first.status).toBe('interrupted');
+    expect(await deployTool(b,run,plan,op)).toEqual(first);
+    expect(paths).toEqual(['/secure-deploy/capabilities','/secure-deploy']);
+    const rows=await runInDurableObject(owner(),(_i,state)=>state.storage.sql.exec<{data:string}>('SELECT data FROM secure_worker_deployments WHERE bot_id=? AND operation_id=?',b.id,op).toArray());
+    expect(rows).toHaveLength(1);expect(JSON.parse(rows[0].data)).toMatchObject({state:'uncertain'});
   });
   it('recovers a lost CLI receipt as uncertain without a second provider call',async()=>{
     const {b,run,plan}=await deployFixture(),op=crypto.randomUUID(),computer=vi.spyOn(ComputerDO.prototype,'fetch');
