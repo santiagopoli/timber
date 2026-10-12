@@ -495,6 +495,50 @@ describe('owner keychain security and durable flow',()=>{
     await expect(runInDurableObject(owner(),(_i,state)=>{const store=new OwnerKeychain(state.storage,'owner',bindings.CHATGPT_CREDENTIAL_KEY,()=>{});return store.call(crypto.randomUUID(),{secretId:entry.id,path:'/'},new AbortController().signal,()=>store.grantAccess(entry.id,b.id,false),b.id);})).rejects.toThrow('revoked');
     expect(transport).toHaveBeenCalledTimes(1);expect((await list(a)).entries[0].botIds).toEqual([a.id]);
   });
+  it.each(['signature','bot-identity'] as const)('does not advertise an invalid %s grant as owner-visible access',async corruption=>{
+    const a=await bot(),b=await bot(),[entry]=await save(a);
+    if(corruption==='signature'){
+      await api(`/keychain/${entry.id}/permissions`,'POST',{botId:b.id,allowed:true});
+      await runInDurableObject(owner(),(_i,state)=>state.storage.sql.exec("UPDATE keychain_grants SET signature='forged' WHERE secret_id=? AND bot_id=?",entry.id,b.id));
+    }else{
+      await runInDurableObject(owner(),(_i,state)=>state.storage.sql.exec('INSERT INTO keychain_grants(secret_id,bot_id,data,signature) SELECT secret_id,?,data,signature FROM keychain_grants WHERE secret_id=? AND bot_id=?',b.id,entry.id,a.id));
+    }
+    const permitted=(target:Bot)=>runInDurableObject(owner(),(_i,state)=>new OwnerKeychain(state.storage,'owner',bindings.CHATGPT_CREDENTIAL_KEY,()=>{}).permitted(target.id));
+    expect(await permitted(b)).toEqual([]);
+    for(const path of ['/keychain',`/bots/${b.id}/keychain`]){
+      const response=await api(path);expect(response.status).toBe(200);
+      const metadata=await response.json<{entries:SecretMetadata[]}>();
+      expect(metadata.entries).toHaveLength(1);
+      expect(metadata.entries[0]).toMatchObject({id:entry.id,botIds:[a.id]});
+      expect(JSON.stringify(metadata)).not.toContain('test-fixture-private-value-42');
+    }
+    await evictDurableObject(owner());
+    expect((await list(b)).entries[0].botIds).toEqual([a.id]);
+    expect((await permitted(a)).map(item=>item.id)).toEqual([entry.id]);
+    await expect(useSecret(b,{secretId:entry.id,path:'/'})).rejects.toThrow('permission');
+  });
+  it.each(['signature','regrant','replacement'] as const)('fences owner access metadata when %s races the final awaited grant check',async action=>{
+    const a=await bot(),b=await bot(),[entry]=await save(a);
+    await api(`/keychain/${entry.id}/permissions`,'POST',{botId:b.id,allowed:true});
+    const result=await runInDurableObject(owner(),async(_i,state)=>{
+      const chain=new OwnerKeychain(state.storage,'owner',bindings.CHATGPT_CREDENTIAL_KEY,()=>{}),original=chain.requireAccess.bind(chain);let checked=0;
+      const verify=vi.spyOn(chain,'requireAccess').mockImplementation(async(id,target)=>{
+        const epoch=await original(id,target);
+        if(++checked===2){
+          if(action==='signature')state.storage.sql.exec("UPDATE keychain_grants SET signature='forged' WHERE secret_id=? AND bot_id=?",entry.id,a.id);
+          else if(action==='regrant')await chain.grantAccess(entry.id,a.id,true);
+          else await chain.save(payload({entries:[{id:entry.id,expectedRevision:entry.revision,value:'synthetic-replacement-only'}]}),()=>{});
+        }
+        return epoch;
+      });
+      try{return await chain.list();}finally{verify.mockRestore();}
+    });
+    expect(result).toHaveLength(1);expect(result[0].id).toBe(entry.id);
+    expect(result[0].botIds).toEqual(action==='replacement'?[]:[b.id]);
+    if(action==='replacement')expect(result[0].revision).toBe(2);
+    const fresh=(await list(a)).entries[0];
+    expect(fresh.botIds).toEqual(action==='signature'?[b.id]:expect.arrayContaining([a.id,b.id]));
+  });
   it('rejects forged permission metadata and public attempts to resume a private continuation',async()=>{
     const b=await bot(),[entry]=await save(b);await runInDurableObject(owner(),(_i,state)=>state.storage.sql.exec("UPDATE keychain_grants SET signature='forged' WHERE secret_id=?",entry.id));await expect(useSecret(b,{secretId:entry.id,path:'/'})).rejects.toThrow('permission');
     expect((await api(`/bots/${b.id}/_keychain/resume`,'POST',{})).status).toBe(404);

@@ -36,7 +36,11 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
 - GET /v1/keychain -> {entries:SecretMetadata[],requests:SecureInputRequest[]}.
   The keychain belongs to the authenticated owner, independently of bots. Metadata
   includes names, approved destinations, revisions, timestamps and permitted
-  botIds. There is no endpoint for reading a private value. The bot-context alias
+  botIds. Owner metadata and list_secrets verify the same signed grant identity
+  and format, and fence changes after awaited verification. Invalid grants are
+  not advertised as access; the owner still sees the saved entry. Listing does
+  not decrypt values or change grants. There is no endpoint for reading a private
+  value. The bot-context alias
   /v1/bots/:id/keychain returns the same owner entries and that bot's requests.
 - POST /v1/keychain {operationId,entries:[{value,name?,origin?,header?,prefix?,id?,expectedRevision?}],requestId?}
   -> {entries:SecretMetadata[]}. Accepts one to four opaque private text values,

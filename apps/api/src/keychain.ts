@@ -60,16 +60,30 @@ export class OwnerKeychain {
   private matches(entry:SecretMetadata,grant:Record<string,unknown>){return entry.origin===grant.origin&&entry.header===grant.header&&entry.prefix===grant.prefix;}
   private async prepareGrant(entry:SecretMetadata,botId:string){const data=JSON.stringify({secretId:entry.id,botId,origin:entry.origin,header:entry.header,prefix:entry.prefix,epoch:crypto.randomUUID()});return {data,signature:await this.digest(['permission',data])};}
   private writeGrant(id:string,botId:string,grant:{data:string;signature:string}){this.storage.sql.exec('INSERT INTO keychain_grants(secret_id,bot_id,data,signature) VALUES(?,?,?,?) ON CONFLICT(secret_id,bot_id) DO UPDATE SET data=excluded.data,signature=excluded.signature',id,botId,grant.data,grant.signature);}
-  list(botId?:string):SecretMetadata[] {
-    return this.storage.sql.exec<Row>('SELECT id,data,envelope FROM keychain_entries WHERE envelope IS NOT NULL ORDER BY rowid DESC').toArray().map(row=>{
-      const entry:SecretMetadata=JSON.parse(row.data),botIds=this.storage.sql.exec<{bot_id:string;data:string}>('SELECT bot_id,data FROM keychain_grants WHERE secret_id=?',entry.id).toArray().filter(grant=>this.matches(entry,JSON.parse(grant.data))).map(grant=>grant.bot_id);
-      return {...entry,botIds};
-    }).filter(entry=>!botId||entry.botIds.includes(botId));
+  /** Owner metadata and bot listings share the same signed-grant policy.
+   * Listing never decrypts a value or changes access. Recheck every snapshot
+   * after all awaited verification so an earlier grant cannot become stale. */
+  async list(botId?:string):Promise<SecretMetadata[]> {
+    const snapshots=this.storage.sql.exec<Row>('SELECT id,data,envelope FROM keychain_entries WHERE envelope IS NOT NULL ORDER BY rowid DESC').toArray().map(row=>({
+      row,
+      grants:this.storage.sql.exec<{bot_id:string;data:string;signature:string}>('SELECT bot_id,data,signature FROM keychain_grants WHERE secret_id=?',row.id).toArray(),
+    })).filter(snapshot=>!botId||snapshot.grants.some(grant=>grant.bot_id===botId));
+    const verified=await Promise.all(snapshots.map(async snapshot=>Promise.all(snapshot.grants.map(async grant=>{
+      try{await this.requireAccess(snapshot.row.id,grant.bot_id);return true;}catch{return false;}
+    }))));
+    this.active();
+    return snapshots.flatMap((snapshot,index)=>{
+      const current=this.row(snapshot.row.id);if(!current?.envelope)return [];
+      const unchanged=current.data===snapshot.row.data&&current.envelope===snapshot.row.envelope;
+      const botIds=unchanged?snapshot.grants.filter((grant,grantIndex)=>{
+        const latest=this.grantRow(snapshot.row.id,grant.bot_id);
+        return verified[index][grantIndex]&&latest?.data===grant.data&&latest.signature===grant.signature;
+      }).map(grant=>grant.bot_id):[];
+      const entry={...JSON.parse(current.data) as SecretMetadata,botIds};
+      return !botId||botIds.includes(botId)?[entry]:[];
+    });
   }
-  async permitted(botId:string):Promise<SecretMetadata[]> {
-    const entries=this.list(botId),allowed=await Promise.all(entries.map(async entry=>{try{await this.requireAccess(entry.id,botId);return true;}catch{return false;}}));
-    return entries.filter((_entry,index)=>allowed[index]);
-  }
+  async permitted(botId:string):Promise<SecretMetadata[]> {return this.list(botId);}
   async requireAccess(id:string,botId:string):Promise<string>{
     const stored=this.row(id),grant=this.grantRow(id,botId);
     if(!stored?.envelope||!grant||JSON.parse(grant.data).secretId!==id||JSON.parse(grant.data).botId!==botId||!this.matches(JSON.parse(stored.data),JSON.parse(grant.data))||grant.signature!==await this.digest(['permission',grant.data]))throw new ApiError(403,'credential_access_denied','This bot does not have permission to use that private input. Ask the owner to grant access from their keychain.');
@@ -125,7 +139,7 @@ export class OwnerKeychain {
     this.active();
     return this.storage.transactionSync(()=>{
       const again=replay();if(again)return again;
-      if(this.list().length+prepared.filter(item=>item.expectedRevision===undefined).length>100)throw new ApiError(429,'keychain_full','Your keychain can store up to 100 private inputs.');
+      if(this.storage.sql.exec<{n:number}>('SELECT COUNT(*) AS n FROM keychain_entries WHERE envelope IS NOT NULL').one().n+prepared.filter(item=>item.expectedRevision===undefined).length>100)throw new ApiError(429,'keychain_full','Your keychain can store up to 100 private inputs.');
       for(const {entry,expectedRevision} of prepared){const stored=this.row(entry.id);if(expectedRevision===undefined?Boolean(stored):!stored?.envelope||JSON.parse(stored.data).revision!==expectedRevision)throw new ApiError(409,'credential_changed','Credential changed or was revoked. Refresh the keychain.');}
       const result=prepared.map(item=>item.entry);
       // The caller must be able to reject stale requests before any write commits.
