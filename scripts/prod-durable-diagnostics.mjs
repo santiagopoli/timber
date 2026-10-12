@@ -2,6 +2,7 @@
 import { pathToFileURL } from 'node:url';
 import {createCipheriv,createHash,createPublicKey,publicEncrypt,randomBytes,constants} from 'node:crypto';
 import { DIAGNOSTIC_CODES, timeframe } from './prod-diagnostics.mjs';
+import {PERFORMANCE_SCHEMA,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_USAGE,summarizePerformance,performanceTaskMetadata} from './prod-performance-diagnostics.mjs';
 
 // Cloudflare Data Studio's SQL API. These are fixed read-only statements;
 // neither SQL nor object names can be supplied by workflow dispatch inputs.
@@ -214,6 +215,19 @@ export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now
   const selected=await query(workspace,'owner',BOT_LOOKUP);
   if(selected.length!==1||!uuid(selected[0]?.id))throw new Error('durable_diagnostics_bot_not_unique');
   const name=`owner:${selected[0].id}`;
+  if(env.DIAGNOSTIC_SCOPE==='performance'){
+    const inspect=async name=>{
+      const tables=await query(bot,name,PERFORMANCE_SCHEMA);
+      if(tables.length!==6)return {initialized:false};
+      return summarizePerformance({runs:await query(bot,name,PERFORMANCE_RUNS),tools:await query(bot,name,PERFORMANCE_TOOLS),native:await query(bot,name,PERFORMANCE_NATIVE),usage:await query(bot,name,PERFORMANCE_USAGE)},window);
+    };
+    const root=await inspect(name),tasks=[];
+    for(const task of await query(workspace,'owner',PERFORMANCE_TASKS)){
+      if(!uuid(task.id))throw new Error('durable_diagnostics_invalid_response');
+      tasks.push({...performanceTaskMetadata(task),execution:await inspect(`owner:task:${task.id}`)});
+    }
+    return {source:'durable_performance_fixed_select',window,root,tasks,limitation:'Latest 12 runs, 60 tools/native tasks and 40 model responses per conversation; Polibot chat and latest six dedicated tasks. No prompts, identifiers, arguments, output, credentials or raw errors.'};
+  }
   const schema=await query(bot,name,SCHEMA);
   if(schema.length!==SCHEMA_NAMES.size||!schema.every(row=>SCHEMA_NAMES.has(row.name)))throw new Error('durable_diagnostics_schema_mismatch');
   const summary=summarizeFailures(await query(bot,name,FAILURE_QUERY),window);
