@@ -286,6 +286,12 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
     try {
+      if(path==="/secure-worker-deploy/capabilities" || path.startsWith("/secure-worker-deploy/")) {
+        // Shared VM/container has no isolation from workspace hooks or sibling processes.
+        // Stay unsupported regardless of any accidental service binding configuration.
+        this.active();
+        return Response.json({error:{code:"secure_deploy_host_unsupported",message:"No trusted isolated deploy host is available."},secureDeploy:false},{status:path.endsWith('/capabilities')?200:409});
+      }
       if(path.startsWith("/workspace/") || path.startsWith("/desktop")) return await this.inspect(request);
       if(path.startsWith("/preview/")) return await this.preview(request);
       if (request.method !== "POST") throw new ComputerProviderError("computer_method_not_allowed");
@@ -1264,3 +1270,6 @@ export function previewCloudComputer(binding:DurableObjectNamespace,botId:string
     method:request.method,headers,...(["GET","HEAD"].includes(request.method)?{}:{body:request.body}),redirect:"manual",signal:request.signal,
   }));
 }
+
+export {secureDeployCanonical,SecureDeployCoordinator,unsupportedSecureDeployHost,memorySecureDeployJournal,createPrivateServiceDeployHost,createCloudSecureWorkerDeployProvider} from './secure-deploy';
+export type {SecretRef,DeployPin,DeployRequest,DeployOutput,DeployRecord,SecureDeployAuthorization,SecureDeployHost,SecureDeployAuthority,SecureDeployJournal,SecureWorkerDeployProvider,SecureDeployBinding} from './secure-deploy';

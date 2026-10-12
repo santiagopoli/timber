@@ -1639,7 +1639,7 @@ export class BotDO extends DurableObject<Env> {
     this.active();
     if(this.getRunRow(run.id).native_operation_id!==input.runOperationId || terminal.has(this.getRun(run.id).status) || this.taskStopped() || input.signal.aborted) return {operationId:input.operationId,status:'interrupted',error:'Run is no longer active.'};
     const args=input.arguments;
-    if(['request_secret','configure_secret','list_secrets','name_secret','secret_request'].includes(input.name) && (input.subagentId || run.subagentId)) return {operationId:input.operationId,status:'failed',error:'Only the named bot can use the owner’s permitted private inputs. Ask your parent to perform this authenticated operation.'};
+    if(['request_secret','configure_secret','list_secrets','name_secret','secret_request','secure_worker_deploy'].includes(input.name) && (input.subagentId || run.subagentId)) return {operationId:input.operationId,status:'failed',error:'Only the named bot can use the owner’s permitted private inputs. Ask your parent to perform this authenticated operation.'};
     if(typeof args.repository==='string') {
       const repository=args.repository.toLowerCase();
       if(!/^[a-z0-9][a-z0-9-]{0,38}\/[a-z0-9._-]{1,100}$/.test(repository) || repository.endsWith('/.') || repository.endsWith('/..')) throw new ApiError(400,'invalid_repository','Use a GitHub repository in owner/name format.');
@@ -1659,7 +1659,7 @@ export class BotDO extends DurableObject<Env> {
     } else if(input.name==='name_secret'){
       const named=await this.keychainTool(input.name,args,run.id,input.runOperationId,input.operationId,input.signal);result=completed(named);this.emit('keychain.updated',{renamed:named.secret},run.id);
     } else if(input.name==='list_secrets') result=completed(await this.keychainTool(input.name,args,run.id,input.runOperationId,input.operationId,input.signal));
-    else if(input.name==='secret_request') result=await this.keychainTool(input.name,args,run.id,input.runOperationId,input.operationId,input.signal) as unknown as ComputerResult;
+    else if(input.name==='secret_request' || input.name==='secure_worker_deploy') result=await this.keychainTool(input.name,args,run.id,input.runOperationId,input.operationId,input.signal) as unknown as ComputerResult;
     else if(input.name==='list_bots') {
       const registry=this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName("owner"));
       const response=await registry.fetch("https://workspace/");
