@@ -78,7 +78,7 @@ print('SMOKE_IDENTITY_OK',flush=True)
         until("INTERRUPTED:130\r\n")
         assert (workspace / "unicode-input").read_text() == "árbol 🌲\n"
         writer = workspace / "escape.py"
-        writer.write_text("import os,time\nif os.fork(): os._exit(0)\nos.setsid()\nif os.fork(): os._exit(0)\nopen('writer.pid','w').write(str(os.getpid()))\nf=open('writer-output','ab',buffering=0)\nwhile True: f.write(b'x');time.sleep(.01)\n")
+        writer.write_text("import os,time\nif os.fork(): os._exit(0)\nos.setsid()\nif os.fork(): os._exit(0)\nf=open('writer-output','ab',buffering=0)\nf.write(b'x')\nwith open('writer.pid.tmp','w') as pid_file: pid_file.write(str(os.getpid()))\nos.replace('writer.pid.tmp','writer.pid')\nwhile True: f.write(b'x');time.sleep(.01)\n")
         writer.chmod(0o644)
         os.write(session.fd, b"env -i /usr/bin/python3 escape.py >/dev/null 2>&1 &\n")
         deadline = time.monotonic() + 5

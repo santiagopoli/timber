@@ -320,9 +320,13 @@ run `docker exec -i timber-image-smoke python3 - < infra/computer/smoke_shell.py
 after `start.sh` is ready. It checks genuine identity/caps/no-new-privs, protected
 paths and setuid suppression, Unicode stdin, resize, Ctrl-C, detached descendant
 adoption/reaping, replacement/checkpoint exclusion, and unauthenticated localhost
-management denial. Docker is unavailable in the editing workspace, so a local
-Linux subprocess smoke is not a claimed Docker image run; actual image smoke
-must pass in CI before image delivery can be reported. The existing
+management denial. The detached writer creates and writes its output before
+atomically publishing its closed PID file; file existence alone must not expose
+a partially written PID. Native Desktop smoke waits for a visible X11 window
+before focus, using the same bounded readiness loop; the image supplies
+`xfonts-base` for xterm's default core font. A local Linux subprocess smoke is
+not a claimed Docker image run; actual image smoke must pass in CI before image
+delivery can be reported. The existing
 `smoke_desktop.py` image gate invokes the root-owned shipped `smoke_shell.py`,
 so both verification and desktop-release workflows exercise the actual built
 PTY image without changing workflow permissions. Root-only private lifecycle

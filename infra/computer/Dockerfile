@@ -23,6 +23,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && chmod 2770 /workspace \
     && chmod 0700 /state
 
+RUN apt-get update && apt-get install -y --no-install-recommends xfonts-base \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY server.py /opt/botspace/server.py
 COPY secure_deploy.py /opt/botspace/secure_deploy.py
 COPY secure_deploy_runner.py /opt/botspace/secure_deploy_runner.py

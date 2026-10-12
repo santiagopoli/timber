@@ -238,7 +238,7 @@ def main():
     terminal = subprocess.Popen(["xterm", "-title", "Timber desktop smoke", "-geometry", "80x24+0+0"])
     try:
         for _ in range(30):
-            found = subprocess.run(["xdotool", "search", "--name", "Timber desktop smoke"], capture_output=True, text=True)
+            found = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", "Timber desktop smoke"], capture_output=True, text=True)
             if found.returncode == 0: break
             time.sleep(.1)
         assert found.returncode == 0, "Native terminal did not open"
