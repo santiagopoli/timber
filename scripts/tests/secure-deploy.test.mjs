@@ -8,7 +8,7 @@ const value='synthetic-only-deploy-canary';
 const request=(operationId='deploy-1')=>({operationId,ownerId:'owner',botId,runId,expectedRevision:1,refs:[{id:secretId,revision:7}],pin:{repository:'acme/widget',commit:'a'.repeat(40),artifactDigest:`sha256:${'b'.repeat(64)}`,artifactPath:'dist/worker.js',accountId:'a'.repeat(32),workerName:'widget-prod',destination:`https://api.cloudflare.com/client/v4/accounts/${'a'.repeat(32)}/workers/scripts/widget-prod`,planId,planRevision:1}});
 const authorization=r=>({version:1,ownerId:'owner',botId,runId,nativeOperationId:'native-run-op',operationId:r.operationId,pin:r.pin,planId,planRevision:1,refs:[{id:secretId,revision:7,permissionEpoch:'epoch-canary',binding:'opaque-binding'}],expiresAt:Date.now()+60_000,signature:'synthetic-hmac-signature'});
 const credentials=[{refId:secretId,revision:7,header:'Authorization',prefix:'Bearer ',value}];
-const caps={secureDeploy:true,isolationVersion:'uid-ptrace-v1',privateCredentialChannel:true,noShellEnv:true,noBuildCredentialInheritance:true,outputRedaction:true,canaryVersion:'cross-uid-proc-env-v1'};
+const caps={secureDeploy:true,isolationVersion:'uid-ptrace-v1',privateCredentialChannel:true,noShellEnv:true,noBuildCredentialInheritance:true,outputRedaction:true,canaryVersion:'cross-uid-proc-env-v1',cliVersion:'4.147.0',cliBuildId:'wrangler-4.147.0-timber-no-retry-v1',cliDigest:'sha256:07f2d4392dbaa8944bd2a73dc1bcbef481840fddb65b6e6bd5c697e000163511',noAutomaticRetry:true};
 const fingerprint=async canonical=>createHmac('sha256','unit-test-only-deploy-fingerprint-key').update(canonical).digest('hex');
 function fakeHost(overrides={}){const calls={capabilities:0,dispatch:[],cancel:[]};return{calls,host:{capabilities:async()=>{calls.capabilities++;return caps},dispatchTrusted:async x=>{calls.dispatch.push(x);return{operationId:x.operationId,status:'completed',code:'deploy_accepted'}},cancel:async id=>{calls.cancel.push(id);return'cancelled'},...overrides}}}
 function authority(check=async()=>{}){return{assertCurrent:check,async withAuthorization(r,dispatch){await check(r);return dispatch(authorization(r),credentials,()=>{})}}}
@@ -23,6 +23,16 @@ test('successful dispatch sends only owner-pinned metadata and ephemeral refs to
 });
 test('no readiness capability means no credential resolution or dispatch',async()=>{
  const f=fakeHost({capabilities:async()=>({...caps,secureDeploy:false})}),used={n:0},auth={assertCurrent:async()=>{},withAuthorization:async()=>{used.n++;throw Error('must not resolve')}};const r=await coordinator(f.host,memorySecureDeployJournal(),auth).deploy(request());assert.equal(r.state,'failed');assert.equal(r.errorCode,'secure_deploy_host_unsupported');assert.equal(used.n,0);assert.equal(f.calls.dispatch.length,0);
+});
+test('missing or mismatched CLI integrity/no-retry capabilities reject before credential resolution',async()=>{
+ for(const [key,wrong] of [['cliVersion','4.146.0'],['cliBuildId','unpatched-build'],['cliDigest',`sha256:${'0'.repeat(64)}`],['noAutomaticRetry',false]]) {
+  for(const missing of [true,false]) {
+   const reported={...caps};if(missing)delete reported[key];else reported[key]=wrong;
+   const f=fakeHost({capabilities:async()=>reported}),used={n:0},auth={assertCurrent:async()=>{},withAuthorization:async()=>{used.n++;throw Error('must not resolve')}};
+   const result=await coordinator(f.host,memorySecureDeployJournal(),auth).deploy(request());
+   assert.equal(result.state,'failed',`${key} ${missing?'missing':'mismatched'}`);assert.equal(result.errorCode,'secure_deploy_host_unsupported');assert.equal(used.n,0);assert.equal(f.calls.dispatch.length,0);
+  }
+ }
 });
 test('permission/Stop fence after a capability await prevents dispatch',async()=>{
  const f=fakeHost();let checks=0;const auth=authority(async()=>{if(++checks===3)throw Object.assign(Error('stopped'),{code:'deploy_authorization_changed'})});const r=await coordinator(f.host,memorySecureDeployJournal(),auth).deploy(request());assert.equal(r.state,'failed');assert.equal(f.calls.dispatch.length,0);
