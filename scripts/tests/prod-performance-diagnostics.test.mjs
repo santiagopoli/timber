@@ -10,9 +10,9 @@ const created='2026-10-12T09:00:00.000Z',updated='2026-10-12T09:30:00.000Z';
 test('performance queries measure real SQLite receipts without projecting conversation or tool content',()=>{
  const db=new DatabaseSync(':memory:');
  try{
-  db.exec('CREATE TABLE cf_agents_jobs(capability TEXT,fn TEXT,time INTEGER,running INTEGER,execution_started_at INTEGER,recovery_loop INTEGER);CREATE TABLE pi_documents(kind TEXT);CREATE TABLE bots(id TEXT,data TEXT);CREATE TABLE tasks(id TEXT,data TEXT); CREATE TABLE task_slots(bot_id TEXT,task_id TEXT,updated_at INTEGER); CREATE TABLE computer_admissions(bot_id TEXT,payload TEXT);CREATE TABLE runs(id TEXT,data TEXT);CREATE TABLE admission_sources(run_id TEXT,kind TEXT);CREATE TABLE submissions(operation_id TEXT,run_id TEXT);CREATE TABLE botspace_runtime_budget(operation_id TEXT,kind TEXT,item_id TEXT);CREATE TABLE events(id INTEGER,source_key TEXT,data TEXT);CREATE TABLE pi_tasks(id INTEGER,status TEXT,record TEXT,conversation_id INTEGER);CREATE TABLE pi_submissions(request_id TEXT,status TEXT,conversation_id INTEGER);CREATE TABLE run_processes(status TEXT,dispatch_state TEXT,cancel_requested INTEGER,result TEXT);CREATE TABLE pi_entries(id INTEGER,record TEXT)');
+  db.exec('CREATE TABLE cf_agents_jobs(capability TEXT,fn TEXT,time INTEGER,running INTEGER,execution_started_at INTEGER,recovery_loop INTEGER);CREATE TABLE pi_documents(id INTEGER,kind TEXT,scope_kind TEXT,owner_id INTEGER,retired_at INTEGER);CREATE TABLE pi_document_revisions(document_id INTEGER,seq INTEGER,kind TEXT,content TEXT);CREATE TABLE bots(id TEXT,data TEXT);CREATE TABLE tasks(id TEXT,data TEXT); CREATE TABLE task_slots(bot_id TEXT,task_id TEXT,updated_at INTEGER); CREATE TABLE computer_admissions(bot_id TEXT,payload TEXT);CREATE TABLE runs(id TEXT,data TEXT);CREATE TABLE admission_sources(run_id TEXT,kind TEXT);CREATE TABLE submissions(operation_id TEXT,run_id TEXT);CREATE TABLE botspace_runtime_budget(operation_id TEXT,kind TEXT,item_id TEXT);CREATE TABLE events(id INTEGER,source_key TEXT,data TEXT);CREATE TABLE pi_tasks(id INTEGER,status TEXT,record TEXT,conversation_id INTEGER);CREATE TABLE pi_submissions(request_id TEXT,status TEXT,conversation_id INTEGER,id INTEGER);CREATE TABLE run_processes(status TEXT,dispatch_state TEXT,cancel_requested INTEGER,result TEXT);CREATE TABLE pi_entries(id INTEGER,record TEXT)');
   for(const sql of [PERFORMANCE_SCHEMA,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_PROCESSES,PERFORMANCE_DELIVERIES,PERFORMANCE_WAKES,PERFORMANCE_RECOVERY,PERFORMANCE_USAGE]){assert.match(sql,/^(SELECT|WITH) /);assert.doesNotMatch(sql,/\b(INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE|ATTACH|PRAGMA)\b/i);assert.doesNotMatch(sql,/;/);}
-  db.prepare('INSERT INTO pi_documents VALUES(?)').run(JSON.stringify('timber.subagent-waits'));
+  db.prepare('INSERT INTO pi_documents(kind) VALUES(?)').run(JSON.stringify('timber.subagent-waits'));
   db.prepare('INSERT INTO bots VALUES(?,?)').run('bot-canary',JSON.stringify({name:'Polibot'}));
   db.prepare('INSERT INTO tasks VALUES(?,?)').run('task-canary',JSON.stringify({botId:'bot-canary',title:'private-canary',status:'running',createdAt:created,updatedAt:updated}));
   db.prepare('INSERT INTO runs VALUES(?,?)').run('run-canary',JSON.stringify({status:'running',createdAt:created,updatedAt:updated,error:'private-canary'}));
@@ -96,11 +96,20 @@ test('queued conversations without native wake tables remain inspectable without
 test('queued child delivery diagnostics distinguish an idle recipient without disclosing its identity or inputs',()=>{
  const db=new DatabaseSync(':memory:');
  try{
-  db.exec('CREATE TABLE pi_tasks(id INTEGER,status TEXT,record TEXT,conversation_id INTEGER);CREATE TABLE pi_submissions(request_id TEXT,status TEXT,conversation_id INTEGER);CREATE TABLE pi_entries(id INTEGER,record TEXT)');
+  db.exec('CREATE TABLE pi_tasks(id INTEGER,status TEXT,record TEXT,conversation_id INTEGER);CREATE TABLE pi_submissions(request_id TEXT,status TEXT,conversation_id INTEGER,id INTEGER);CREATE TABLE pi_entries(id INTEGER,record TEXT);CREATE TABLE pi_documents(id INTEGER,kind TEXT,scope_kind TEXT,owner_id INTEGER,retired_at INTEGER);CREATE TABLE pi_document_revisions(document_id INTEGER,seq INTEGER,kind TEXT,content TEXT)');
   db.prepare('INSERT INTO pi_tasks VALUES(?,?,?,?)').run(1,'running',JSON.stringify({kind:'timber.subagent-delivery',input:{operationId:'private-canary'},state:{checkpoint:{phase:'deliver'}}}),1);
-  db.prepare('INSERT INTO pi_submissions VALUES(?,?,?)').run(JSON.stringify('private-canary'),'queued',2);
+  db.prepare('INSERT INTO pi_submissions(request_id,status,conversation_id,id) VALUES(?,?,?,?)').run(JSON.stringify('private-canary'),'queued',2,5);
   const idle=summarizePerformance({deliveries:db.prepare(PERFORMANCE_DELIVERIES).all()},window).deliveries[0];
   assert.equal(idle.recipientActiveTasks,0);assert.equal(idle.recipientIsRoot,false);assert.equal(idle.submissionStatus,'queued');assert.doesNotMatch(JSON.stringify(idle),/canary/);
+  db.prepare('INSERT INTO pi_documents VALUES(?,?,?,?,?)').run(10,JSON.stringify('pi.live'),'conversation',2,null);
+  db.prepare('INSERT INTO pi_documents VALUES(?,?,?,?,?)').run(11,JSON.stringify('pi.inbox'),'conversation',2,null);
+  db.prepare('INSERT INTO pi_document_revisions VALUES(?,?,?,?)').run(10,1,'base',JSON.stringify({run:{taskId:3,inputs:[77]}}));
+  db.prepare('INSERT INTO pi_document_revisions VALUES(?,?,?,?)').run(11,1,'base',JSON.stringify({items:[{id:5,mode:'steer',content:'private-canary'}]}));
+  db.prepare('INSERT INTO pi_tasks VALUES(?,?,?,?)').run(3,'terminal',JSON.stringify({kind:'pi.generation'}),2);
+  const orphan=summarizePerformance({deliveries:db.prepare(PERFORMANCE_DELIVERIES).all()},window).deliveries[0];
+  assert.equal(orphan.recipientLiveRun,true);assert.equal(orphan.recipientControllerStatus,'terminal');assert.equal(orphan.recipientInboxMatches,true);assert.doesNotMatch(JSON.stringify(orphan),/canary/);
+  db.prepare('INSERT INTO pi_document_revisions VALUES(?,?,?,?)').run(10,2,'delta',JSON.stringify([{op:'remove',path:'/run'}]));
+  assert.equal(summarizePerformance({deliveries:db.prepare(PERFORMANCE_DELIVERIES).all()},window).deliveries[0].recipientLiveRun,null,'a stored base cannot be mistaken for the current state after a delta');
   db.prepare('INSERT INTO pi_tasks VALUES(?,?,?,?)').run(2,'running',JSON.stringify({kind:'pi.generation'}),2);
   const busy=summarizePerformance({deliveries:db.prepare(PERFORMANCE_DELIVERIES).all()},window).deliveries[0];assert.equal(busy.recipientActiveTasks,1);
  }finally{db.close();}

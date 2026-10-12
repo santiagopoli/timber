@@ -1,6 +1,6 @@
 // Fixed read-only projections. Never select prompts, arguments, tool output or
 // credentials; identifiers used for routing stay inside collectDurable.
-export const PERFORMANCE_SCHEMA = "SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('runs','submissions','events','botspace_runtime_budget','pi_tasks','pi_entries','timber_inference_requests','admission_sources','cf_agents_jobs','pi_documents','pi_submissions','run_processes') ORDER BY name";
+export const PERFORMANCE_SCHEMA = "SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('runs','submissions','events','botspace_runtime_budget','pi_tasks','pi_entries','timber_inference_requests','admission_sources','cf_agents_jobs','pi_documents','pi_document_revisions','pi_submissions','run_processes','task_environment') ORDER BY name";
 export const PERFORMANCE_TASKS = `SELECT t.id,json_extract(t.data,'$.status') AS status,COALESCE(json_extract(t.data,'$.computerMode'),'shared') AS computer_mode,
  json_extract(t.data,'$.createdAt') AS created_at,json_extract(t.data,'$.updatedAt') AS updated_at,
  CASE WHEN s.task_id IS NULL THEN 'none' WHEN s.task_id=t.id THEN 'self' WHEN s.task_id='@bot' THEN 'bot' WHEN s.task_id LIKE '@direct:%' THEN 'direct' ELSE 'other_task' END AS holder,
@@ -60,6 +60,18 @@ export const PERFORMANCE_DELIVERIES = `SELECT t.status AS delivery_status,
  json_extract(t.record,'$.state.checkpoint.phase') AS phase,s.status AS submission_status,
  s.conversation_id=1 AS is_root,
  (SELECT COUNT(*) FROM pi_tasks a WHERE a.conversation_id=s.conversation_id AND a.status!='terminal') AS recipient_active_tasks,
+ EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='task_environment') AS isolated_task_runtime_loaded,
+ (SELECT COUNT(*) FROM pi_entries WHERE json_extract(record,'$.kind')='timber.queue-wake') AS queue_wake_markers,
+ (SELECT CASE WHEN r.kind='base' THEN json_extract(r.content,'$.run.taskId') IS NOT NULL END
+ FROM pi_documents d JOIN pi_document_revisions r ON r.document_id=d.id
+ WHERE d.kind=json_quote('pi.live') AND d.scope_kind='conversation' AND d.owner_id=s.conversation_id AND d.retired_at IS NULL ORDER BY r.seq DESC LIMIT 1) AS recipient_live_run,
+ (SELECT a.status FROM pi_tasks a WHERE a.id=(SELECT CASE WHEN r.kind='base' THEN json_extract(r.content,'$.run.taskId') END
+ FROM pi_documents d JOIN pi_document_revisions r ON r.document_id=d.id
+ WHERE d.kind=json_quote('pi.live') AND d.scope_kind='conversation' AND d.owner_id=s.conversation_id AND d.retired_at IS NULL ORDER BY r.seq DESC LIMIT 1)) AS recipient_controller_status,
+ (SELECT CASE WHEN r.kind='base' THEN EXISTS(SELECT 1 FROM json_each(r.content,'$.items') item WHERE json_extract(item.value,'$.id')=s.id) END
+ FROM pi_documents d JOIN pi_document_revisions r ON r.document_id=d.id
+ WHERE d.kind=json_quote('pi.inbox') AND d.scope_kind='conversation' AND d.owner_id=s.conversation_id AND d.retired_at IS NULL ORDER BY r.seq DESC LIMIT 1) AS recipient_inbox_matches,
+
  EXISTS(SELECT 1 FROM pi_tasks w JOIN pi_entries e ON e.id=json_extract(w.record,'$.input.assistant'),json_each(e.record,'$.model[0].content') c
  WHERE w.conversation_id=s.conversation_id AND w.status='running' AND json_extract(c.value,'$.id')=json_extract(w.record,'$.input.callId') AND json_extract(c.value,'$.name')='wait_subagent') AS recipient_waiting
  FROM pi_tasks t LEFT JOIN pi_submissions s ON s.request_id=json_quote(json_extract(t.record,'$.input.operationId'))
@@ -113,7 +125,7 @@ export function summarizePerformance({runs=[],tools:actions=[],native=[],usage=[
   nativeTasks:native.slice(0,60).map(row=>({kind:allow(kinds,row.kind),status:allow(states,row.status),phase:allow(phases,row.phase),tool:allow(tools,row.tool),replay:allow(new Set(['safe','unsafe']),row.replay),isRoot:row.is_root===1,attempt:count(row.attempt),outcome:allow(states,row.outcome),background:row.background===1})),
   recovery:recovery.slice(0,1).map(row=>({waitGraphs:count(row.wait_graphs),activeNativeTasks:count(row.active_native_tasks),queuedInputs:count(row.queued_inputs)})),
   wakes:wakes.slice(0,40).map(row=>({capability:allow(new Set(['pi-harness','botspace-subagents','botspace-admission']),row.capability),fn:allow(new Set(['wake','retry']),row.fn),at:count(row.time)===null?null:new Date(row.time).toISOString(),running:row.running===1,executionStartedAt:count(row.execution_started_at)===null?null:new Date(row.execution_started_at).toISOString(),recoveryLoop:row.recovery_loop===1})),
-  deliveries:deliveries.slice(0,20).map(row=>({status:allow(states,row.delivery_status),phase:allow(phases,row.phase),submissionStatus:allow(new Set(['queued','placed','done','unanswered']),row.submission_status),recipientIsRoot:row.is_root===1,recipientActiveTasks:count(row.recipient_active_tasks),recipientWaiting:row.recipient_waiting===1})),
+  deliveries:deliveries.slice(0,20).map(row=>({status:allow(states,row.delivery_status),phase:allow(phases,row.phase),submissionStatus:allow(new Set(['queued','placed','done','unanswered']),row.submission_status),recipientIsRoot:row.is_root===1,recipientActiveTasks:count(row.recipient_active_tasks),isolatedTaskRuntimeLoaded:row.isolated_task_runtime_loaded===1,queueWakeMarkers:count(row.queue_wake_markers),recipientLiveRun:row.recipient_live_run===null||row.recipient_live_run===undefined?null:row.recipient_live_run===1,recipientControllerStatus:allow(states,row.recipient_controller_status),recipientInboxMatches:row.recipient_inbox_matches===null||row.recipient_inbox_matches===undefined?null:row.recipient_inbox_matches===1,recipientWaiting:row.recipient_waiting===1})),
   processes:processes.slice(0,40).map(row=>({status:allow(states,row.status),dispatchState:allow(new Set(['registered','dispatching','uncertain','acknowledged']),row.dispatch_state),resultStatus:allow(states,row.result_status),exitCode:Number.isSafeInteger(row.exit_code)?row.exit_code:null,cancelRequested:row.cancel_requested===1})),
   modelResponses:usage.slice(0,40).filter(row=>count(row.timestamp)!==null&&row.timestamp>=window.from&&row.timestamp<=window.to).map(row=>({at:new Date(row.timestamp).toISOString(),inputTokens:count(row.input_tokens),outputTokens:count(row.output_tokens),cachedTokens:count(row.cached_tokens),stopReason:allow(new Set(['stop','length','toolUse','error','aborted']),row.stop_reason)})),
  };

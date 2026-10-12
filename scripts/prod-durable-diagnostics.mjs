@@ -246,7 +246,7 @@ export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now
       };
       const inference=tables.some(row=>row.name==='timber_inference_requests')?summarizeInferenceRequests(await query(bot,name,PERFORMANCE_REQUESTS)):[];
       const activity=summarizeActivity(await query(bot,name,PERFORMANCE_ACTIVITY),window);
-      return {...summarizePerformance({runs:await optional('runs',['admission_sources'],PERFORMANCE_RUNS),tools:await query(bot,name,PERFORMANCE_TOOLS),native:await query(bot,name,PERFORMANCE_NATIVE),wakes:await optional('wakes',['cf_agents_jobs'],PERFORMANCE_WAKES),recovery:await optional('recovery',['pi_documents','pi_submissions'],PERFORMANCE_RECOVERY),processes:await optional('processes',['run_processes'],PERFORMANCE_PROCESSES),deliveries:await optional('deliveries',['pi_submissions'],PERFORMANCE_DELIVERIES),usage:await query(bot,name,PERFORMANCE_USAGE)},window),inference,activity,...(unavailable.length?{unavailable}: {})};
+      return {...summarizePerformance({runs:await optional('runs',['admission_sources'],PERFORMANCE_RUNS),tools:await query(bot,name,PERFORMANCE_TOOLS),native:await query(bot,name,PERFORMANCE_NATIVE),wakes:await optional('wakes',['cf_agents_jobs'],PERFORMANCE_WAKES),recovery:await optional('recovery',['pi_documents','pi_submissions'],PERFORMANCE_RECOVERY),processes:await optional('processes',['run_processes'],PERFORMANCE_PROCESSES),deliveries:await optional('deliveries',['pi_submissions','pi_document_revisions'],PERFORMANCE_DELIVERIES),usage:await query(bot,name,PERFORMANCE_USAGE)},window),inference,activity,...(unavailable.length?{unavailable}: {})};
     };
     const root=await inspect(name),tasks=[];
     const selectedTasks=await query(workspace,'owner',PERFORMANCE_TASKS);
