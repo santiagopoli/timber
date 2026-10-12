@@ -1,8 +1,8 @@
 import {createElement, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent} from 'react';
 import {createRoot} from 'react-dom/client';
 import {createPortal} from 'react-dom';
-import {ArrowLeftIcon, ArrowUpIcon, CheckSquareIcon, InfoIcon, LoaderCircleIcon, PlusIcon, RefreshCwIcon, SearchIcon, SquareIcon, XIcon} from 'lucide-react';
-import {Dialog} from 'radix-ui';
+import {ArrowLeftIcon, ArrowUpIcon, CheckSquareIcon, InfoIcon, ListFilterIcon, LoaderCircleIcon, PlusIcon, RefreshCwIcon, SearchIcon, SquareIcon, XIcon} from 'lucide-react';
+import {Dialog,Popover} from 'radix-ui';
 import type {AgentDelegation,Approval, Bot, BotEvent, CompactionReceipt, Message, Run,Subagent} from '../../../packages/contracts/src/index';
 import {Agents} from './agents';
 import {ConversationChat} from './chat';
@@ -17,7 +17,6 @@ export type TasksBot = Pick<Bot,'id'|'name'> & Partial<Bot>;
 export type TasksProps = {
   request: TasksRequest;
   bots: TasksBot[];
-  onClose?: () => void;
   onOpenBot?: (botId: string) => void;
   selectedTaskId?: string|null;
   active?: boolean;
@@ -69,12 +68,19 @@ function approvalList(value: unknown): TaskApproval[] {
 }
 const approvalExpired = (approval:TaskApproval) => Boolean(approval.expiresAt && Date.parse(approval.expiresAt)<=Date.now());
 
+function TaskAvatar({bot,decorate}:{bot:TasksBot|undefined;decorate:TasksProps['decorateAvatar']}) {
+  const ref=useRef<HTMLSpanElement>(null);
+  useLayoutEffect(()=>{if(ref.current&&bot)decorate?.(ref.current,bot.id)},[bot,decorate]);
+  return <span ref={ref} className="avatar timber-task-avatar" data-bot-id={bot?.id} aria-hidden="true">{bot?.name.slice(0,1).toUpperCase()||'T'}</span>;
+}
+
 function TaskView({props}:{props:TasksProps}) {
   const [wide,setWide]=useState(()=>matchMedia('(min-width:761px)').matches);
   useEffect(()=>{const query=matchMedia('(min-width:761px)'),update=()=>setWide(query.matches);query.addEventListener('change',update);return()=>query.removeEventListener('change',update)},[]);
   const [tasks,setTasks]=useState<Task[]>([]),[selected,setSelected]=useState<string|null>(null),[detail,setDetail]=useState<Task|null>(null),[messages,setMessages]=useState<TaskMessage[]>([]);
   const [loading,setLoading]=useState(true),[loadingMessages,setLoadingMessages]=useState(false),[creating,setCreating]=useState(false),[busy,setBusy]=useState(false);
   const [error,setError]=useState(''),[loadError,setLoadError]=useState(''),[showCreate,setShowCreate]=useState(false),[filter,setFilter]=useState<TaskFilter>('all');
+  const [filtersOpen,setFiltersOpen]=useState(false);
   const [approvals,setApprovals]=useState<TaskApproval[]>([]),[approvalError,setApprovalError]=useState('');
   const [search,setSearch]=useState(''),[events,setEvents]=useState<BotEvent[]>([]),[runs,setRuns]=useState<Run[]>([]),[detailsOpen,setDetailsOpen]=useState(false);
   const [subagents,setSubagents]=useState<Subagent[]>([]),[delegations,setDelegations]=useState<AgentDelegation[]>([]),[agentsOpen,setAgentsOpen]=useState(false),[selectedAgent,setSelectedAgent]=useState<string|null>(null);
@@ -390,19 +396,19 @@ function TaskView({props}:{props:TasksProps}) {
     {(error||approvalError)&&<p className="error notice" role="alert">{error||approvalError}</p>}
     <div className="timber-chat"><ConversationChat key={selected} model={chatModel} callbacks={callbacks} loadArtifact={artifactLoader} headerTarget={headerTarget}/></div>
   </section>:null;
-  const overviewContent=<section className="timber-tasks-overview">
-    <header className="timber-tasks-overview-heading"><h2>Tasks <span className="counter">{tasks.length}</span></h2><div className="row"><button type="button" className="timber-tasks-icon-button" onClick={refresh} aria-label="Refresh tasks"><RefreshCwIcon/></button><button type="button" className="timber-tasks-icon-button new-bot" aria-label={showCreate?'Close create task':'New task'} onClick={()=>{setShowCreate(value=>!value);setError('')}}><PlusIcon/></button></div></header>
-    <label className="search-field timber-tasks-search"><SearchIcon/><span className="timber-tasks-sr-only">Search tasks</span><input className="search" type="search" placeholder="Search tasks" value={search} onChange={event=>setSearch(event.currentTarget.value)}/></label>
+  const overviewContent=<section className="timber-tasks-overview" role={!selected&&!wide?'region':undefined} aria-label={!selected&&!wide?'Global tasks':undefined}>
+    <header className="section-title sidebar-heading timber-tasks-overview-heading"><h2>Tasks <span className="counter">{tasks.length}</span></h2><div className="row">
+      <button type="button" className="icon-button quiet" onClick={refresh} aria-label="Refresh tasks" title="Refresh tasks"><RefreshCwIcon/></button><button type="button" className="new-bot icon-button" aria-label={showCreate?'Close create task':'New task'} title="New task" onClick={()=>{setShowCreate(value=>!value);setError('')}}><PlusIcon/></button></div></header>
+    <div className="search-field timber-tasks-search"><SearchIcon aria-hidden="true"/><input className="search" aria-label="Search tasks" type="search" placeholder="Search tasks" value={search} onChange={event=>setSearch(event.currentTarget.value)}/><Popover.Root open={filtersOpen&&active} onOpenChange={setFiltersOpen}><Popover.Trigger asChild><button type="button" className="icon-button quiet timber-tasks-filter-trigger" aria-label="Filter tasks" title={filter==='all'?'Filter tasks':`Filter tasks: ${filter}`} data-filtered={filter!=='all'}><ListFilterIcon/></button></Popover.Trigger><Popover.Portal><Popover.Content className="timber-tasks-filter-popover" align="end" sideOffset={8} collisionPadding={12} aria-label="Task filters"><div className="timber-tasks-filters" role="group" aria-label="Filter tasks by status">{(['all','active','pending','completed'] as TaskFilter[]).map(value=><button type="button" key={value} aria-pressed={filter===value} onClick={()=>{setFilter(value);setFiltersOpen(false)}}>{value==='all'?'All':value==='active'?'Active':statusName(value)}</button>)}</div></Popover.Content></Popover.Portal></Popover.Root></div>
     {showCreate&&<form className="timber-tasks-create" onSubmit={event=>void create(event)}><h3>Create a task</h3><label>Title<input autoFocus required maxLength={160} value={title} onChange={event=>setTitle(event.currentTarget.value)} placeholder="What needs to be done?"/></label><label>Description<textarea rows={3} maxLength={32000} value={description} onChange={event=>setDescription(event.currentTarget.value)} placeholder="Add context or instructions (optional)"/></label><label>Assigned bot<select required value={botId} onChange={event=>setBotId(event.currentTarget.value)}><option value="" disabled>Select a bot</option>{props.bots.map(bot=><option value={bot.id} key={bot.id}>{bot.name}</option>)}</select></label><label className="timber-tasks-checkbox"><input type="checkbox" checked={startImmediately} onChange={event=>setStartImmediately(event.currentTarget.checked)}/>Start immediately</label>{error&&<p className="timber-tasks-error" role="alert">{error}</p>}<div className="timber-tasks-form-actions"><button type="button" className="timber-tasks-quiet" onClick={()=>setShowCreate(false)}>Cancel</button><button type="submit" className="timber-tasks-action" disabled={creating||!props.bots.length||!title.trim()}>{creating&&<LoaderCircleIcon className="timber-tasks-spinner"/>}{creating?'Creating…':'Create task'}</button></div>{!props.bots.length&&<p className="timber-tasks-hint">Create a bot before assigning a task.</p>}</form>}
-    <div className="timber-tasks-filters" role="group" aria-label="Filter tasks by status">{(['all','active','pending','completed'] as TaskFilter[]).map(value=><button type="button" key={value} aria-pressed={filter===value} onClick={()=>setFilter(value)}>{value==='all'?'All':value==='active'?'Active':statusName(value)}</button>)}</div>
     {loadError&&<p className="timber-tasks-error" role="alert">{loadError} <button type="button" className="timber-tasks-link" onClick={refresh}>Retry</button></p>}
     {!tasks.length&&<div className="timber-tasks-empty">{loading?<><LoaderCircleIcon className="timber-tasks-spinner"/><span>Loading tasks…</span></>:<><strong>No tasks yet</strong><span>Create a global task and assign it to a bot. Its conversation stays separate from bot chat.</span></>}</div>}
     {!!tasks.length&&!visibleTasks.length&&<div className="timber-tasks-empty"><strong>No {filter} tasks</strong><span>Choose another filter to see other tasks.</span></div>}
-    {!!visibleTasks.length&&<div className="timber-tasks-list bot-list">{visibleTasks.map(task=><button type="button" className={`timber-tasks-card bot-item${selected===task.id?' selected':''}`} aria-pressed={selected===task.id} key={task.id} data-task-id={task.id} onClick={()=>selectTask(task.id)}><span className="avatar timber-task-avatar" aria-hidden="true"><CheckSquareIcon/></span><span className="bot-info"><span className="bot-name-line"><span className="bot-name">{task.title}</span><span className="timber-task-status" data-status={task.status}>{statusName(task.status)}</span></span><span className="bot-preview-line"><small className="bot-preview">{task.description||'No description'}</small></span><small className="timber-task-assignee">{task.botName||botNames.get(task.botId)||'Assigned bot'}{date(task.lastActivity||task.updatedAt||task.createdAt)&&<> · {date(task.lastActivity||task.updatedAt||task.createdAt)}</>}</small></span></button>)}</div>}
+    {!!visibleTasks.length&&<div className="timber-tasks-list bot-list">{visibleTasks.map(task=>{const assignedBot=props.bots.find(bot=>bot.id===task.botId),model=assignedBot?.model,modelName=props.modelSettings?.choices.find(choice=>choice.id===model)?.label||model;return <button type="button" className={`timber-tasks-card bot-item${selected===task.id?' selected':''}`} aria-pressed={selected===task.id} key={task.id} data-task-id={task.id} onClick={()=>selectTask(task.id)}><TaskAvatar bot={assignedBot} decorate={props.decorateAvatar}/><span className="bot-info"><span className="bot-name-line"><span className="bot-name">{task.title}</span>{modelName&&<span className="bot-model-badge" data-model={model} title={model}>{modelName}</span>}</span><span className="bot-preview-line"><small className="bot-preview">{(task.description||'Start a conversation').replace(/\[private:[a-f0-9-]{36}\]/gi,'🔒 ••••••').replace(/\s+/g,' ').trim()}</small><span className="bot-activity-status" data-status={task.status}>{statusName(task.status)}</span></span></span></button>})}</div>}
   </section>;
-  const sidebar=wide&&props.listContainer&&active?props.listContainer:null;
+  const sidebar=props.listContainer&&active?props.listContainer:null;
   if(!active)return null;
-  return <div className="timber-tasks" role="region" aria-label="Global tasks">{sidebar?createPortal(overviewContent,sidebar):!selected&&<div className="timber-tasks-topbar">{props.onClose&&<nav className="timber-view-toggle" aria-label="Main view"><button type="button" aria-pressed="false" onClick={props.onClose}>Bots</button><button type="button" aria-pressed="true" onClick={()=>selectTask(null)}>Tasks</button></nav>}</div>}{detailContent||(!sidebar?overviewContent:<div className="timber-tasks-empty timber-tasks-choose"><CheckSquareIcon aria-hidden="true"/><h2>Choose a task</h2><span>Its conversation and activity stay here.</span></div>)}</div>;
+  return <div className="timber-tasks" role={selected||wide?'region':undefined} aria-label={selected||wide?'Global tasks':undefined}>{sidebar?createPortal(overviewContent,sidebar):null}{detailContent||(!sidebar?overviewContent:<div className="timber-tasks-empty timber-tasks-choose"><CheckSquareIcon aria-hidden="true"/><h2>Choose a task</h2><span>Its conversation and activity stay here.</span></div>)}</div>;
 }
 
 export function mountTasks(container:HTMLElement,props:TasksProps) {

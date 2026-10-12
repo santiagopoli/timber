@@ -20,12 +20,12 @@ const normalizedRun=(task,run={})=>({id:`${task.id}-run`,botId:task.botId,operat
 const normalizedMessage=(task,message,index=0)=>({id:randomUUID(),botId:task.botId,role:'assistant',text:'',createdAt:new Date(Date.parse(fixtureDate)+(message.row||index+1)).toISOString(),...message});
 const normalizedEvent=(task,event)=>({...event,botId:task.botId,createdAt:event.createdAt||fixtureDate,data:{...event.data,...(event.data.message?{message:normalizedMessage(task,{runId:event.runId,createdAt:event.createdAt||fixtureDate,...event.data.message})}:{}),...(event.data.run?{run:normalizedRun(task,event.data.run)}:{})}});
 const taskDetails=async page=>{await page.locator('.timber-tasks-detail').getByRole('button',{name:'Task details',exact:true}).click();const dialog=page.getByRole('dialog',{name:'Task details',exact:true});await dialog.waitFor();return dialog;};
-async function withTasks(work,width=1440) {
+async function withTasks(work,width=1440,colorScheme='light') {
   browser??=await chromium.launch({headless:true,
     ...(process.env.CONSOLE_CHROMIUM_PATH?{executablePath:process.env.CONSOLE_CHROMIUM_PATH}:{}),
     ...(process.env.CONSOLE_CHROMIUM_ARGS?{args:JSON.parse(process.env.CONSOLE_CHROMIUM_ARGS)}:{}),
   });
-  const fixture=await createConsoleFixture(),context=await browser.newContext({viewport:{width,height:900},colorScheme:'light'});
+  const fixture=await createConsoleFixture(),context=await browser.newContext({viewport:{width,height:900},colorScheme});
   const page=await context.newPage(),errors=[];page.on('pageerror',error=>errors.push(error.message));page.setDefaultTimeout(8000);
   const tasks={records:statuses.map(status=>({id:`task-${status}`,title:`Task ${status}`,description:`Independent ${status} work`,botId:BOT_A,botName:'Ada',status,createdAt:'2026-10-05T10:00:00.000Z'})),messages:new Map(),events:new Map(),runs:new Map(),agents:new Map(),agentMessages:new Map(),approvals:new Map(),calls:[],readGates:new Map(),reads:[],sendGate:null,sendError:false};
   for(const task of tasks.records)tasks.messages.set(task.id,[{id:`${task.id}-reply`,role:'assistant',text:`Private conversation for ${task.id}`}]);
@@ -81,7 +81,7 @@ async function withTasks(work,width=1440) {
   });
   const login=async()=>{
     await page.goto(fixture.url);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('#app').waitFor({state:'visible'});
-    await page.locator('#tasks-nav').click();await page.getByRole('region',{name:'Global tasks'}).waitFor();await page.locator('.timber-tasks-card').first().waitFor();
+    if(!await page.locator('#tasks-nav').isVisible())await page.locator('#toggle-bots').click();await page.locator('#tasks-nav').click();await page.getByRole('region',{name:'Global tasks'}).waitFor();await page.locator('.timber-tasks-card').first().waitFor();
   };
   const open=async id=>{await page.locator(`.timber-tasks-card[data-task-id="${id}"]`).click();await page.locator('.timber-tasks-detail h1').filter({hasText:tasks.records.find(item=>item.id===id).title}).waitFor();await taskChat(page).waitFor();};
   const back=async()=>{const button=page.getByRole('button',{name:'Back to tasks',exact:true});if(await button.isVisible())await button.click();else await page.locator('#tasks-nav').click();};
@@ -90,15 +90,19 @@ async function withTasks(work,width=1440) {
   }finally{for(const gate of tasks.readGates.values())gate.resolve();tasks.sendGate?.resolve();await context.close();await fixture.close();}
 }
 
-for(const width of [390,1440])test(`global tasks: default auto-start, explicit pending override, status filters and dedicated chat at ${width}px`,async()=>withTasks(async({page,tasks,fixture,login,open,back})=>{
+for(const width of [390,1440])test(`global tasks: default auto-start, explicit pending override, filters behind an icon and dedicated chat at ${width}px`,async()=>withTasks(async({page,tasks,fixture,login,open,back})=>{
   await login();
   const filters=page.getByRole('group',{name:'Filter tasks by status'}),cards=page.locator('.timber-tasks-card');
   assert.equal(await cards.count(),9,'All retains completed, failed and cancelled');
-  await filters.getByRole('button',{name:'Active',exact:true}).click();assert.equal(await cards.count(),5);
-  assert.equal(await filters.getByRole('button',{name:'Active',exact:true}).getAttribute('aria-pressed'),'true');
+  const filterButton=page.getByRole('button',{name:'Filter tasks',exact:true});
+  assert.equal(await filters.count(),0,'filters do not occupy a separate row in the list');
+  await filterButton.click();await filters.getByRole('button',{name:'Active',exact:true}).click();assert.equal(await cards.count(),5);assert.equal(await filters.count(),0,'selection closes the popover');
+  assert.equal(await filterButton.getAttribute('data-filtered'),'true');
+  await filterButton.click();assert.equal(await filters.getByRole('button',{name:'Active',exact:true}).getAttribute('aria-pressed'),'true');
   await filters.getByRole('button',{name:'Pending',exact:true}).click();assert.deepEqual(await cards.evaluateAll(nodes=>nodes.map(node=>node.dataset.taskId)),['task-pending']);
-  await filters.getByRole('button',{name:'Completed',exact:true}).click();assert.deepEqual(await cards.evaluateAll(nodes=>nodes.map(node=>node.dataset.taskId)),['task-completed']);
-  await filters.getByRole('button',{name:'All',exact:true}).click();
+  await filterButton.click();await filters.getByRole('button',{name:'Completed',exact:true}).click();assert.deepEqual(await cards.evaluateAll(nodes=>nodes.map(node=>node.dataset.taskId)),['task-completed']);
+  await filterButton.click();await filters.getByRole('button',{name:'All',exact:true}).click();assert.equal(await filterButton.getAttribute('data-filtered'),'false');
+  await filterButton.click();await page.keyboard.press('Escape');assert.equal(await filters.count(),0);assert.equal(await filterButton.evaluate(node=>node===document.activeElement),true,'Escape returns focus to the icon');
   await open('task-running');
   assert.equal(await taskChat(page).innerText().then(value=>value.includes('Private conversation for task-running')),true);
   assert.equal(await taskChat(page).innerText().then(value=>value.includes('Organize the research notes')),false,'ordinary bot transcript is not copied into task chat');
@@ -217,10 +221,42 @@ for(const width of [320,390,1440])test(`global tasks: pill views and task rows s
   await page.getByRole('searchbox',{name:'Search tasks',exact:true}).fill('waiting connection');assert.equal(await page.locator('.timber-tasks-card').count(),0);
   await page.getByRole('searchbox',{name:'Search tasks',exact:true}).fill('connection');assert.equal(await page.locator('.timber-tasks-card').count(),1);await page.getByRole('searchbox',{name:'Search tasks',exact:true}).fill('');
   await mkdir('/tmp/timber-task-views',{recursive:true});await page.screenshot({path:`/tmp/timber-task-views/tasks-${width}.png`});
-  if(width<761)await page.locator('.timber-tasks-topbar').getByRole('button',{name:'Bots',exact:true}).click();else await page.locator('#bots-nav').click();
+  await page.locator('#bots-nav').click();
   await page.locator('#bot-search').waitFor({state:'visible'});assert.equal(await page.locator('#bots-nav').getAttribute('aria-pressed'),'true');assert.equal(await page.locator('#tasks-nav').getAttribute('aria-pressed'),'false');
   assert.ok(fixture.state.calls.every(call=>!call.path.includes('/computer/exec')),'view switching never starts computer work');
 },width));
+
+for(const [width,colorScheme] of [[320,'light'],[390,'light'],[1024,'light'],[1440,'light'],[390,'dark'],[1440,'dark']])test(`global tasks: the entire list keeps the Bots shell and geometry at ${width}px ${colorScheme}`,async()=>withTasks(async({page,tasks,login,open,back})=>{
+  const geometry=async selector=>page.locator(selector).evaluate(root=>{
+    const sample=node=>{const style=getComputedStyle(node),box=node.getBoundingClientRect();return {box:{left:box.left,top:box.top,width:box.width,height:box.height},style:Object.fromEntries(['backgroundColor','fontSize','fontWeight','lineHeight','borderRadius','paddingTop','paddingRight','paddingBottom','paddingLeft','gap'].map(key=>[key,style[key]]))}};
+    return {shell:sample(root),brand:sample(document.querySelector('.brand')),toggle:sample(root.querySelector('.timber-view-toggle')),heading:sample(root.querySelector('.sidebar-heading:not([style])')),search:sample(root.querySelector('.search-field')),row:sample(root.querySelector('.bot-item')),avatar:sample(root.querySelector('.bot-item .avatar')),name:sample(root.querySelector('.bot-item .bot-name')).style,preview:sample(root.querySelector('.bot-item .bot-preview')).style};
+  });
+  await login();await page.locator('#bots-nav').click();await page.locator('#bot-search').waitFor();
+  if(!await page.locator('#bot-search').isVisible())await page.locator('#toggle-bots').click();
+  await page.locator('#bot-list .bot-model-badge').first().filter({hasText:'GPT-6.1 Sol'}).waitFor();
+  await page.evaluate(()=>{globalThis.__listBrand=document.querySelector('.brand');globalThis.__listToggle=document.querySelector('.global-navigation')});
+  const bot=await geometry('#bot-sidebar');
+  await mkdir('/tmp/timber-list-parity',{recursive:true});await page.screenshot({path:`/tmp/timber-list-parity/bots-${width}-${colorScheme}.png`});
+  await page.locator('#tasks-nav').click();await page.locator('.timber-tasks-card').first().waitFor();if(width>=761){await open('task-pending');await page.locator('.timber-tasks-card').first().evaluate(node=>Promise.all(node.getAnimations().map(animation=>animation.finished)));}
+  const task=await page.locator('#bot-sidebar').evaluate(root=>{
+    // Only the content source changes: the shell and navigation are retained.
+    const sample=node=>{const style=getComputedStyle(node),box=node.getBoundingClientRect();return {box:{left:box.left,top:box.top,width:box.width,height:box.height},style:Object.fromEntries(['backgroundColor','fontSize','fontWeight','lineHeight','borderRadius','paddingTop','paddingRight','paddingBottom','paddingLeft','gap'].map(key=>[key,style[key]]))}};
+    const content=root.querySelector('.timber-tasks-overview');return {shell:sample(root),brand:sample(document.querySelector('.brand')),toggle:sample(root.querySelector('.timber-view-toggle')),heading:sample(content.querySelector('.sidebar-heading')),search:sample(content.querySelector('.search-field')),row:sample(content.querySelector('.bot-item')),avatar:sample(content.querySelector('.avatar')),name:sample(content.querySelector('.bot-name')).style,preview:sample(content.querySelector('.bot-preview')).style};
+  });
+  assert.deepEqual(task,bot,'brand, toggle, heading, search, rows and avatars match Bots in position and style');
+  assert.equal(await page.evaluate(()=>globalThis.__listBrand===document.querySelector('.brand')&&globalThis.__listToggle===document.querySelector('.global-navigation')),true,'same actual brand and navigation nodes');
+  assert.equal(await page.locator('.brand').isVisible(),true);assert.equal(await page.locator('#settings-button').isVisible(),true);
+  assert.equal(await page.getByRole('group',{name:'Filter tasks by status'}).count(),0);
+  assert.equal(await page.locator('.timber-tasks-topbar,.timber-task-assignee,.timber-task-status').count(),0,'no second navigation or extra metadata rows');
+  assert.equal(await page.locator('.timber-task-avatar .timber-model-badge').count(),0,'same uncluttered avatar as Bots');
+  await page.screenshot({path:`/tmp/timber-list-parity/tasks-${width}-${colorScheme}.png`});
+  await open('task-completed');if(width<761){assert.equal(await page.locator('.brand').isVisible(),false);await back();assert.equal(await page.locator('.brand').isVisible(),true);assert.equal(await page.locator('#tasks-nav').getAttribute('aria-pressed'),'true');}
+  else await back();
+  await page.getByRole('button',{name:'Filter tasks',exact:true}).click();await page.getByRole('group',{name:'Filter tasks by status'}).getByRole('button',{name:'Completed',exact:true}).click();
+  assert.equal(await page.locator('.timber-tasks-card').count(),1);await page.locator('#bots-nav').click();await page.locator('#tasks-nav').click();assert.equal(await page.locator('.timber-tasks-card').count(),1,'filter survives switching views');
+  await page.locator('#settings-button').click();await page.locator('#settings-dialog').waitFor();await page.locator('#settings-dialog').getByRole('button',{name:'Close settings',exact:true}).click();
+  assert.ok(tasks.calls.every(call=>call.method==='GET'),'navigation and filters do not execute tasks');
+},width,colorScheme));
 
 test('global tasks: long task history starts bounded and commands stay inspectable through archival pages and live updates',async()=>withTasks(async({page,tasks,login,open,back})=>{
   const id='task-running',runId=`${id}-run`;
@@ -312,7 +348,7 @@ for(const width of [390,1440])test(`global tasks: task messages, composer and he
     const box=selector=>{const rect=root.querySelector(selector).getBoundingClientRect();return {left:Math.round(rect.left),width:Math.round(rect.width)}};
     return {header:pick('.bot-header'),title:pick('.bot-header h1'),avatar:pick('.bot-header .avatar'),user:pick('.timber-message-user .timber-message-content'),assistant:pick('.timber-message-assistant .timber-message-content'),composer:pick('.timber-composer'),input:pick('#message'),send:pick('#message-form .timber-send'),layout:{header:box('.bot-header'),composer:box('.timber-composer'),conversation:box('#messages')}};
   });
-  await login();if(await page.locator('#bots-nav').isVisible())await page.locator('#bots-nav').click();else await page.locator('.timber-tasks-topbar').getByRole('button',{name:'Bots',exact:true}).click();await page.locator(`#bot-list [data-bot-id="${BOT_A}"]`).click();await page.locator('#bot-workspace [data-message-id="bot-parity-assistant"]').waitFor();const bot=await geometry('#bot-workspace');
+  await login();await page.locator('#bots-nav').click();await page.locator(`#bot-list [data-bot-id="${BOT_A}"]`).click();await page.locator('#bot-workspace [data-message-id="bot-parity-assistant"]').waitFor();const bot=await geometry('#bot-workspace');
   if(!await page.locator('#tasks-nav').isVisible())await page.locator('#mobile-back').click();await page.locator('#tasks-nav').click();await open('task-completed');await taskChat(page).locator('[data-message-id="task-parity-assistant"]').waitFor();const task=await geometry('.timber-tasks-detail');assert.deepEqual(task,bot,'task view uses identical computed conversation/header/composer styles');
   const description=page.locator('.timber-tasks-detail').getByText('Independent completed work',{exact:true});assert.ok(!await description.count()||!await description.isVisible(),'description does not occupy the conversation');assert.equal(await page.getByRole('dialog',{name:'Task details',exact:true}).count(),0);
   const state=page.locator('.timber-tasks-detail [data-task-state]');assert.equal(await state.innerText(),'Completed');const stateSize=await state.evaluate(node=>{const rect=node.getBoundingClientRect();return {width:rect.width,height:rect.height,font:parseFloat(getComputedStyle(node).fontSize)}});assert.ok(stateSize.width<=110&&stateSize.height<=30&&stateSize.font<=13,'task state stays compact in the header');

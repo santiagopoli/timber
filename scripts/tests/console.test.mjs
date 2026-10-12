@@ -115,7 +115,7 @@ for(const width of [390,1440])test(`task handoff keeps live status in one origin
     await page.locator('[data-tool-operation-id="task-command"]').waitFor();
     assert.match(await page.locator('.timber-tasks-detail #messages').innerText(),/git clone dashboard-repo/);
     await page.reload();await page.locator('.timber-tasks-detail h1').filter({hasText:task.title}).waitFor();
-    if(width<=760){await page.getByRole('button',{name:'Back to tasks',exact:true}).click();await page.locator('.timber-tasks-topbar').getByRole('button',{name:'Bots',exact:true}).click();}else await page.locator('#bots-nav').click();
+    if(width<=760)await page.getByRole('button',{name:'Back to tasks',exact:true}).click();await page.locator('#bots-nav').click();
     await page.locator(`.bot-item[data-bot-id="${BOT_A}"]`).click();
     await pill.filter({hasText:'Completed'}).waitFor();
     assert.equal(await page.locator('#messages [data-tool-operation-id="task-command"]').count(),0,'task commands never fill the bot conversation');
