@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
 import {PERFORMANCE_SCHEMA,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_PROCESSES,PERFORMANCE_DELIVERIES,PERFORMANCE_WAKES,PERFORMANCE_RECOVERY,PERFORMANCE_USAGE,summarizePerformance,performanceTaskMetadata} from '../prod-performance-diagnostics.mjs';
-import {collectDurable} from '../prod-durable-diagnostics.mjs';
+import {collectDurable,PRIVATE_PROGRESS_MESSAGES,PRIVATE_PROGRESS_FAILURES,PRIVATE_PROGRESS_GOAL} from '../prod-durable-diagnostics.mjs';
+import {PERFORMANCE_ACTIVITY,summarizeActivity} from '../prod-performance-diagnostics.mjs';
 
 const now=Date.parse('2026-10-12T10:00:00Z'),window={from:now-86_400_000,to:now};
 const created='2026-10-12T09:00:00.000Z',updated='2026-10-12T09:30:00.000Z';
@@ -27,10 +28,31 @@ test('performance queries measure real SQLite receipts without projecting conver
   assert.equal(report.recovery[0].waitGraphs,1);
   assert.equal(db.prepare(PERFORMANCE_SCHEMA).all().length,6);assert.equal(report.runs[0].retries,1);assert.equal(report.runs[0].generations,1);assert.equal(report.tools[0].durationMs,1_800_000);assert.equal(report.tools[0].tool,'exec');assert.equal(report.modelResponses[0].inputTokens,120000);assert.equal(report.nativeTasks[0].attempt,2);
   assert.doesNotMatch(JSON.stringify(report),/canary/);assert.doesNotMatch(JSON.stringify(performanceTaskMetadata(db.prepare(PERFORMANCE_TASKS).get())),/canary/);
+  event(4,'key:start','tool.started',updated,{operationId:'key-canary',actionType:'key',input:{key:'Ctrl+C'}});
+  event(5,'tool:key-canary','tool.completed',updated,{result:{status:'completed',output:'private-canary'}});
+  event(6,'write:start','tool.started',updated,{operationId:'write-canary',actionType:'writeFile',input:{path:'/workspace/private-canary.sh',content:'private-canary'}});
+  event(7,'tool:write-canary','tool.completed',updated,{result:{status:'interrupted',error:'Execution session is unavailable; private-canary'}});
+  const actions=summarizePerformance({tools:db.prepare(PERFORMANCE_TOOLS).all()},window).tools;
+  assert.equal(actions[0].fileKind,'shell');assert.equal(actions[0].writtenCharacters,14);assert.equal(actions[0].failureKind,'session_unavailable');assert.equal(actions[1].keyKind,'ctrl+c');
+  const totals=summarizeActivity(db.prepare(PERFORMANCE_ACTIVITY).all(),window);
+  assert.equal(totals.find(row=>row.tool==='writeFile').interrupted,1);assert.equal(totals.find(row=>row.tool==='key').actions,1);assert.equal(totals.find(row=>row.tool==='exec').durationMs,1_800_000);
+  assert.doesNotMatch(JSON.stringify({actions,totals}),/canary/);
+  db.exec('CREATE TABLE messages(data TEXT)');
+  db.prepare('INSERT INTO messages VALUES(?)').run(JSON.stringify({role:'assistant',text:'public progress',createdAt:updated}));
+  db.prepare('INSERT INTO messages VALUES(?)').run(JSON.stringify({role:'system',text:'private reasoning canary'}));
+  assert.equal(JSON.parse(db.prepare(PRIVATE_PROGRESS_MESSAGES).get().detail)[0].text,'public progress');
+  assert.equal(JSON.parse(db.prepare(PRIVATE_PROGRESS_MESSAGES).get().detail).length,1);
+  assert.equal(JSON.parse(db.prepare(PRIVATE_PROGRESS_GOAL).get().detail).title,'private-canary');
+  event(8,'failed:start','tool.started',updated,{operationId:'failed-canary',actionType:'exec',input:{command:'false',timeoutMs:10000,yieldMs:1000}});
+  event(9,'tool:failed-canary','tool.completed',updated,{result:{status:'failed',exitCode:1,output:'bounded failure',error:'Command timed out; its process group was terminated.'}});
+  assert.equal(JSON.parse(db.prepare(PRIVATE_PROGRESS_FAILURES).get().detail)[0].command,'false');
+  const deadlines=summarizePerformance({tools:db.prepare(PERFORMANCE_TOOLS).all()},window).tools;
+  assert.equal(deadlines[0].deadlineMs,10000);assert.equal(deadlines[0].yieldMs,1000);assert.equal(deadlines[0].failureKind,'timeout');
+  assert.equal(summarizeActivity(db.prepare(PERFORMANCE_ACTIVITY).all(),window).find(row=>row.tool==='exec').timedOut,1);
  }finally{db.close();}
 });
 test('performance summary drops arbitrary labels, private fields and invalid timestamps',()=>{
- const row={created_at:created,updated_at:updated,started_at:created,finished_at:updated,timestamp:now,status:'private-canary',tool:'private-canary',kind:'private-canary',phase:'private-canary',stop_reason:'private-canary',secret:'private-canary',generations:'private-canary',output_tokens:'private-canary'};
+ const row={created_at:created,updated_at:updated,started_at:created,finished_at:updated,timestamp:now,status:'private-canary',tool:'private-canary',kind:'private-canary',phase:'private-canary',stop_reason:'private-canary',secret:'private-canary',generations:'private-canary',output_tokens:'private-canary',file_kind:'private-canary',key_kind:'private-canary',failure_kind:'private-canary',written_characters:'private-canary'};
  const result=summarizePerformance({runs:[row],tools:[row],native:[row],usage:[row]},window);
  assert.doesNotMatch(JSON.stringify(result),/canary/);assert.equal(result.tools[0].tool,'unknown');
  assert.equal(summarizePerformance({runs:[{...row,created_at:'invalid',updated_at:'invalid'}]},window).runs.length,0);

@@ -95,8 +95,21 @@ class WorkspaceChangeTests(unittest.TestCase):
 
     def test_timeout_keeps_detected_writes_and_duplicate_receipt(self):
         action = {"type": "exec", "command": "printf x > report.txt; sleep 10", "timeoutMs": 100, "yieldMs": 30000}
-        result = self.computer.execute("timeout", action)
+        # Expire the clock after the real write, rather than assuming CI can
+        # schedule a fresh bash process within 100 ms. The contract under test
+        # is retaining effects and their receipt after timeout, not startup speed.
+        clock_started = False
+        def clock():
+            nonlocal clock_started
+            if not clock_started:
+                clock_started = True
+                return 0.0
+            return 1.0 if (self.computer.workspace / "report.txt").exists() else 0.0
+        with patch("server.time.monotonic", side_effect=clock):
+            result = self.computer.execute("timeout", action)
         self.assertEqual(result["status"], "failed")
+        self.assertIn("timed out", result["error"])
+        self.assertEqual((self.computer.workspace / "report.txt").read_text(), "x")
         self.assertTrue(result["workspaceChanged"])
         self.assertEqual(self.computer.execute("timeout", action), result)
 

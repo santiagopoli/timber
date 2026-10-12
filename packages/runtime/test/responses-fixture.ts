@@ -21,7 +21,7 @@ export function responsesFixture(payload: { input: Record<string, unknown>[] }, 
     const event={type:'response.failed',response:{id:'resp_error_fixture',object:'response',status:'failed',output:[],error}};
     return new Response(`data: ${JSON.stringify(event)}\n\n`,{headers:{'content-type':'text/event-stream'}});
   }
-  if (text.includes('request-resumable-exec') || text.includes('request-cancel-resumable-exec')) return resumableExecResponse(payload.input.slice(userIndex + 1), text.includes('request-cancel-resumable-exec'));
+  if (text.includes('request-resumable-exec') || text.includes('request-cancel-resumable-exec')) return resumableExecResponse(payload.input.slice(userIndex + 1), text.includes('request-cancel-resumable-exec'),text.includes('null-deadline'));
   if (text.includes('request-multistep-recovery')) return multistepResponse(payload.input.slice(userIndex + 1));
   if (text.includes('request-tool-budget')) return multistepResponse(payload.input.slice(userIndex + 1),'budget');
   if (text.includes('request-long-task')) return multistepResponse(payload.input.slice(userIndex + 1),'long');
@@ -91,11 +91,11 @@ function unfinishedStopResponse(history: Record<string, unknown>[]): Response {
 }
 
 /** The provider follows the process ID returned by the real runtime tool bridge. */
-function resumableExecResponse(history: Record<string, unknown>[], cancel: boolean): Response {
+function resumableExecResponse(history: Record<string, unknown>[], cancel: boolean,nullable=false): Response {
   const results = history.filter(item => item.type === 'function_call_output');
   const previous = results.at(-1);
   const process = previous && typeof previous.output === 'string' ? JSON.parse(previous.output) as {processId?: string; status?: string} : undefined;
-  const call = !process ? {name: 'exec', args: {command: 'fixture managed command'}}
+  const call = !process ? {name: 'exec', args: {command: 'fixture managed command',...(nullable?{timeoutMs:null,yieldMs:null}:{})}}
     : process.status === 'running' ? {name: cancel ? 'exec_cancel' : 'exec_poll', args: {processId: process.processId, ...(cancel ? {} : {yieldMs: 0})}} : undefined;
   const answer = cancel ? 'The managed command was cancelled.' : 'The managed command completed.';
   const index = results.length;

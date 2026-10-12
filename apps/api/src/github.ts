@@ -6,6 +6,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import type { Env } from "./env";
 import { ApiError, errorResponse, json } from "./errors";
 import { body, string, UUID } from "./validation";
+import {inspectGitHubCI} from './github-ci';
 
 type Permission = "read" | "write";
 interface Scope { botId:string; repository:string; permission:Permission; }
@@ -183,6 +184,16 @@ export class GitHubAuthDO extends DurableObject<Env> {
     return json({repositories,page,totalCount:data.total_count,nextPage:page*100<data.total_count && page<10000?page+1:null,scope:"Repositories selected in this GitHub installation; All bots use the permissions and repository selection authorized in GitHub."});
   }
   private async requireGrant(value:Scope):Promise<Grant> {const grant=await this.grant(value);if(!grant) throw new ApiError(403,"github_access_required","This repository or permission is not available through the Timber account’s GitHub integration. Check the repository selection and permissions in GitHub.");return grant;}
+  private async ci(request:Request):Promise<Response>{
+    const input=await body(request),access=scope({...input,permission:'read'});
+    const {grant,token}=await this.lock(async()=>({grant:await this.requireGrant(access),token:await this.userToken()}));
+    // No credentials are sent to the computer. Slow log downloads do not hold
+    // the integration mutation lock or delay another bot's repository access.
+    const data=await inspectGitHubCI(access.repository,{runId:input.runId,jobId:input.jobId,branch:input.branch,commit:input.commit},token);
+    const current=await this.requireGrant(access);
+    if(current.revision!==grant.revision)throw new ApiError(403,'github_access_revoked','GitHub access changed while reading CI.');
+    return json({status:'completed',data});
+  }
   private async installationToken(grant:Grant):Promise<string> {
     const {app}=await this.credentials();
     const data=await (await this.api(`/app/installations/${grant.installationId}/access_tokens`,await this.appJWT(app),"POST",{repositories:[grant.repository.split("/")[1]],permissions:{contents:grant.permission,pull_requests:grant.permission,metadata:"read"}})).json<{token:string}>();
@@ -419,6 +430,7 @@ export class GitHubAuthDO extends DurableObject<Env> {
         return json({authorized});
       }
       if(path.startsWith("/github/git/")) return await this.git(request);
+      if(path==='/ci'&&request.method==='POST')return await this.ci(request);
       return await this.lock(async()=>{
         if(path.startsWith("/github/setup/") && request.method==="GET") return this.setup(request);
         if(path==="/connect" && request.method==="POST") return this.startConnection(request);

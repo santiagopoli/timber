@@ -681,13 +681,28 @@ images reject before journaling and never report a simulated result. They share
 the usual GUI approval policy and human-control exclusion. Pi exposes
 `desktop_move`, `desktop_double_click` and `desktop_drag`.
 
+The secure Computer image runs generic shell/PTY/desktop operations as UID 10001,
+not root. Project dependencies/tools (npm and Python virtual environments/pip)
+remain installable under the current host approval policy; system packages are
+installed by the image build, never by regaining root from a workspace shell.
+The shipped image includes Node/npm, Python, virtual environments/pip, ripgrep,
+jq and patch. Shared development VMs may still run as root, but must report
+private credential execution unsupported. Python packages should use a virtual
+environment; dependency directories and caches are not durable workspace
+checkpoints, keeping project setup reproducible.
+
+
 Pi `exec {command,timeoutMs?,yieldMs?}` starts a managed process with no default
-execution deadline. `timeoutMs`, when explicitly supplied, is a positive safe
+execution deadline. Pi accepts an omitted or `null` timeout, normalized to no
+host deadline. Its provider-visible schema explicitly includes `null`, so a
+provider requiring every property does not force the model to invent a number.
+`timeoutMs`, when explicitly supplied as a number, is a positive safe
 integer; there is no 120-second maximum. Its expiry terminates the process group
 and retains output and the terminal outcome. `yieldMs` is an integer from 0 to
-30,000, default 1,000; it limits how long a request waits for output and never
-terminates a process. These values have the same meaning for direct computer API
-clients and Pi tools.
+30,000; it limits how long a request waits for output and never terminates a
+process. Pi waits 10,000 ms by default (also for `null`) to reduce unnecessary
+model/poll round trips; direct computer API clients retain their 1,000 ms default.
+The host still receives only validated integers and an absent deadline.
 
 A response with `status:"running"` includes `processId`, equal to the initial
 exec operation ID. It confirms the command continues in the computer. Pi exposes
@@ -1007,6 +1022,22 @@ recipient; a plain `@` string never grants authority to choose a different bot.
 
 
 ## Host tools and GitHub connection
+`github_inspect_ci {repository,branch?,commit?,runId?,jobId?}` is a read-only
+host capability, including for computerless coordinating turns. Without a run
+ID it lists ten recent runs, optionally for a branch/full SHA. With a run ID it
+returns up to 30 job states, step details for the selected/first failed/current
+job, and a failed job's log tail; an
+explicit job ID must belong to that returned run. Log downloads retain at most
+16,000 characters, cap total bytes at 8 MB, and never forward GitHub credentials
+to a signed log redirect. Only HTTPS GitHub Actions/Azure log hosts are accepted.
+The source bot's installed repository grant is checked before reading and again
+before returning. Disconnect/deletion/reinstallation fences results. CI reads
+do not hold the integration mutation lock while fetching logs and never restart
+jobs or execute commands. Public repo CI uses unauthenticated reads after the
+connected account confirms repository visibility; private repo CI requires the
+existing GitHub App/user authorization to include Actions read permission.
+Verification success and deployment success are returned as separate job states.
+
 The host advertises a small catalog through runtime-independent `catalog` / `call`
 ports. Pi implements native `list_tools` and `call_tool`; neither engine nor skill
 owns provider credentials. Standard Agent Skills sources live in `skills/*/SKILL.md`

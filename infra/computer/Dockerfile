@@ -9,7 +9,7 @@ COPY patch_wrangler_cli.py /opt/botspace/patch_wrangler_cli.py
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 chromium xvfb xdotool xclip scrot openbox fonts-liberation \
     x11vnc python3-websockify xterm \
-    ca-certificates curl git procps tini util-linux \
+    ca-certificates curl git procps tini util-linux ripgrep jq patch python3-pip python3-venv \
     && npm install --global --no-audit --no-fund wrangler@4.147.0 \
     && chmod 0755 /opt/botspace/patch_wrangler_cli.py \
     && python3 /opt/botspace/patch_wrangler_cli.py --patch /usr/local/bin/wrangler \

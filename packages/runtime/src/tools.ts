@@ -114,7 +114,7 @@ export function hostTools(bridge: ToolBridge) {
 export function computerTools(bridge: ToolBridge) {
   const path = Type.String({ minLength: 1, maxLength: 1024, description: 'Path within /workspace.' });
   const processId = Type.String({ minLength: 1, maxLength: 160, pattern: '^[A-Za-z0-9:_.-]+$', description: 'The processId returned by exec. Never substitute a new operation ID.' });
-  const yieldMs = Type.Optional(Type.Integer({ minimum: 0, maximum: 30000, default: 1000, description: 'How long this call waits for output; yielding does not stop the process.' }));
+  const yieldMs = Type.Optional(Type.Union([Type.Integer({ minimum: 0, maximum: 30000 }), Type.Null()], {default:10000,description:'How long this call waits for output. Omit or use null for 10 seconds. This never stops the process.'}));
   return [
     defineTool({ name: 'read_file', description: 'Read a text file in the bot workspace.', replay: 'safe',
       parameters: Type.Object({ path }), execute: ({ path }, api, context) => executeComputerTool(bridge, { type: 'readFile', path }, api, context) }),
@@ -123,11 +123,11 @@ export function computerTools(bridge: ToolBridge) {
     defineTool({ name: 'write_file', description: 'Write a complete text file in /workspace. Host approval policy applies.', replay: 'unsafe', executionMode: 'sequential',
       parameters: Type.Object({ path, content: Type.String({ maxLength: 200000 }) }), execute: ({ path, content }, api, context) => executeComputerTool(bridge, { type: 'writeFile', path, content }, api, context) }),
     defineTool({ name: 'exec', description: 'Start a shell command once in the reusable computer. There is no default execution deadline. yieldMs limits only how long this call waits; status running means the process is still alive. Use exec_poll with its processId for more output, and exec_cancel to stop it. Set timeoutMs only when the task requires a real deadline; expiry kills the process group. Long work does not require nohup or shell backgrounding. Host approval policy applies. Never place credentials in commands.', replay: 'unsafe', executionMode: 'sequential',
-      parameters: Type.Object({ command: Type.String({ minLength: 1, maxLength: 10000 }), timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER, description: 'Optional execution deadline in milliseconds. Omit unless a real deadline is needed.' })), yieldMs }),
-      execute: ({ command, timeoutMs, yieldMs }, api, context) => executeComputerTool(bridge, { type: 'exec', command, ...(timeoutMs === undefined ? {} : { timeoutMs }), yieldMs: yieldMs ?? 1000 }, api, context) }),
+      parameters: Type.Object({ command: Type.String({ minLength: 1, maxLength: 10000 }), timeoutMs: Type.Optional(Type.Union([Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }), Type.Null()], {description:'Omit or use null for NO execution deadline. A number kills the command after that many milliseconds. Do not choose an arbitrary deadline for builds or tests; use yieldMs to return promptly instead.'})), yieldMs }),
+      execute: ({ command, timeoutMs, yieldMs }, api, context) => executeComputerTool(bridge, { type: 'exec', command, ...(timeoutMs == null ? {} : { timeoutMs }), yieldMs: yieldMs ?? 10000 }, api, context) }),
     defineTool({ name: 'exec_poll', description: 'Read the current state and output of an existing command by processId. This never starts or reruns the command. status running means it is still alive; poll again when more output is needed. yieldMs is only the wait for this response.', replay: 'safe',
       parameters: Type.Object({ processId, yieldMs }),
-      execute: ({ processId, yieldMs }, api, context) => executeComputerTool(bridge, { type: 'execPoll', processId, yieldMs: yieldMs ?? 1000 }, api, context) }),
+      execute: ({ processId, yieldMs }, api, context) => executeComputerTool(bridge, { type: 'execPoll', processId, yieldMs: yieldMs ?? 10000 }, api, context) }),
     defineTool({ name: 'exec_cancel', description: 'Explicitly stop an existing command and its process group by processId. A cancelled result confirms it was stopped. Inspect retained output before deciding whether new work is needed; cancellation never restarts the command.', replay: 'unsafe', executionMode: 'sequential',
       parameters: Type.Object({ processId }),
       execute: ({ processId }, api, context) => executeComputerTool(bridge, { type: 'execCancel', processId }, api, context) }),

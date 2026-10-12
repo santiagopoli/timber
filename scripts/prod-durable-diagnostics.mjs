@@ -3,6 +3,7 @@ import { pathToFileURL } from 'node:url';
 import {createCipheriv,createHash,createPublicKey,publicEncrypt,randomBytes,constants} from 'node:crypto';
 import { DIAGNOSTIC_CODES, timeframe } from './prod-diagnostics.mjs';
 import {PERFORMANCE_SCHEMA,PERFORMANCE_REQUESTS,summarizeInferenceRequests,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_PROCESSES,PERFORMANCE_DELIVERIES,PERFORMANCE_WAKES,PERFORMANCE_RECOVERY,PERFORMANCE_USAGE,summarizePerformance,performanceTaskMetadata} from './prod-performance-diagnostics.mjs';
+import {PERFORMANCE_ACTIVITY,summarizeActivity} from './prod-performance-diagnostics.mjs';
 
 // Cloudflare Data Studio's SQL API. These are fixed read-only statements;
 // neither SQL nor object names can be supplied by workflow dispatch inputs.
@@ -91,6 +92,22 @@ SELECT json_extract(r.data,'$.createdAt') AS run_created_at,json_extract(r.data,
  CASE WHEN json_type(p.record,'$.detail')='text' THEN substr(json_extract(p.record,'$.detail'),1,8192) ELSE NULL END AS detail
 FROM recent p LEFT JOIN submissions s ON s.operation_id=json_extract(p.record,'$.requestId') LEFT JOIN runs r ON r.id=s.run_id ORDER BY p.id DESC`;
 const ENCRYPTION_CONTEXT='timber-api/native-failure-diagnostics/v1';
+
+// Opt-in operator evidence. Only reviewed public projections are selected;
+// native prompts, private reasoning, credentials and action payloads are not.
+// All three bounded strings are encrypted before any console output.
+export const PRIVATE_PROGRESS_MESSAGES = `SELECT json_group_array(json_object('at',at,'text',text)) AS detail,'text' AS detail_type FROM (
+ SELECT json_extract(data,'$.createdAt') AS at,substr(json_extract(data,'$.text'),1,1100) AS text FROM messages
+ WHERE json_extract(data,'$.role')='assistant' ORDER BY rowid DESC LIMIT 6)`;
+export const PRIVATE_PROGRESS_FAILURES = `SELECT json_group_array(json_object('at',at,'command',command,'error',error,'output',output,'exit',exit_code)) AS detail,'text' AS detail_type FROM (
+ SELECT json_extract(c.data,'$.createdAt') AS at,substr(json_extract(s.data,'$.data.input.command'),1,250) AS command,
+ substr(json_extract(c.data,'$.data.result.error'),1,300) AS error,substr(json_extract(c.data,'$.data.result.output'),1,500) AS output,
+ json_extract(c.data,'$.data.result.exitCode') AS exit_code
+ FROM events s JOIN events c ON c.source_key='tool:'||json_extract(s.data,'$.data.operationId')
+ WHERE json_extract(s.data,'$.type')='tool.started' AND json_extract(s.data,'$.data.actionType') IN ('exec','execPoll')
+ AND json_extract(c.data,'$.data.result.status') IN ('failed','interrupted') ORDER BY s.id DESC LIMIT 6)`;
+export const PRIVATE_PROGRESS_GOAL = `SELECT json_object('title',substr(json_extract(t.data,'$.title'),1,200),'description',substr(json_extract(t.data,'$.description'),1,6000)) AS detail,'text' AS detail_type
+ FROM tasks t JOIN bots b ON b.id=json_extract(t.data,'$.botId') WHERE lower(json_extract(b.data,'$.name'))='polibot' ORDER BY t.rowid DESC LIMIT 1`;
 
 const SCHEMA_NAMES = new Set(['pi_submissions','pi_tasks','runs','submissions','botspace_runtime_generations']);
 const SIGNATURES = new Set(['no_detail','non_string_detail','chatgpt_subscription_sharing_usage_limit','sanitized_model_request_failed','contains_fixed_model_request_failed','native_json_undefined','native_entry_visibility','sdk_unfinished_tool_call','sdk_unhandled_stop_reason','json_parse','missing_origin_operation','missing_conversation_identity','sqlite_error','javascript_type_error','chatgpt_connection_changed','chatgpt_invalid_tool_namespace','chatgpt_incomplete_response','chatgpt_output_limit','unclassified']);
@@ -223,14 +240,22 @@ export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now
       const tables=await query(bot,name,PERFORMANCE_SCHEMA);
       if(!['runs','submissions','events','botspace_runtime_budget','pi_tasks','pi_entries'].every(name=>tables.some(row=>row.name===name)))return {initialized:false};
       const inference=tables.some(row=>row.name==='timber_inference_requests')?summarizeInferenceRequests(await query(bot,name,PERFORMANCE_REQUESTS)):[];
-      return {...summarizePerformance({runs:await query(bot,name,PERFORMANCE_RUNS),tools:await query(bot,name,PERFORMANCE_TOOLS),native:await query(bot,name,PERFORMANCE_NATIVE),wakes:await query(bot,name,PERFORMANCE_WAKES),recovery:await query(bot,name,PERFORMANCE_RECOVERY),processes:await query(bot,name,PERFORMANCE_PROCESSES),deliveries:await query(bot,name,PERFORMANCE_DELIVERIES),usage:await query(bot,name,PERFORMANCE_USAGE)},window),inference};
+      const activity=summarizeActivity(await query(bot,name,PERFORMANCE_ACTIVITY),window);
+      return {...summarizePerformance({runs:await query(bot,name,PERFORMANCE_RUNS),tools:await query(bot,name,PERFORMANCE_TOOLS),native:await query(bot,name,PERFORMANCE_NATIVE),wakes:await query(bot,name,PERFORMANCE_WAKES),recovery:await query(bot,name,PERFORMANCE_RECOVERY),processes:await query(bot,name,PERFORMANCE_PROCESSES),deliveries:await query(bot,name,PERFORMANCE_DELIVERIES),usage:await query(bot,name,PERFORMANCE_USAGE)},window),inference,activity};
     };
     const root=await inspect(name),tasks=[];
-    for(const task of await query(workspace,'owner',PERFORMANCE_TASKS)){
+    const selectedTasks=await query(workspace,'owner',PERFORMANCE_TASKS);
+    for(const task of selectedTasks){
       if(!uuid(task.id))throw new Error('durable_diagnostics_invalid_response');
       tasks.push({...performanceTaskMetadata(task),execution:await inspect(`owner:task:${task.id}`)});
     }
-    return {source:'durable_performance_fixed_select',window,root,tasks,limitation:'Latest 12 runs, 60 tools/native tasks and 40 model responses per conversation; Polibot chat and latest six dedicated tasks. No prompts, identifiers, arguments, output, credentials or raw errors.'};
+    let encryptedDiagnostic;
+    if(recipient&&selectedTasks.length){
+      const selectedName=`owner:task:${selectedTasks[0].id}`;
+      const evidence=[...(await query(bot,selectedName,PRIVATE_PROGRESS_MESSAGES)),...(await query(bot,selectedName,PRIVATE_PROGRESS_FAILURES)),...(await query(workspace,'owner',PRIVATE_PROGRESS_GOAL))];
+      encryptedDiagnostic=encryptDetails(evidence,recipient,window);
+    }
+    return {source:'durable_performance_fixed_select',window,root,tasks,...(encryptedDiagnostic?{encryptedDiagnostic}:{}),limitation:'Latest 12 runs, 60 tools/native tasks and 40 model responses per conversation; Polibot chat and latest six dedicated tasks. Plaintext contains only allowlisted metadata. Optional task evidence is encrypted exclusively for the supplied recipient; no native prompts, private reasoning or secret storage is queried.'};
   }
   const schema=await query(bot,name,SCHEMA);
   if(schema.length!==SCHEMA_NAMES.size||!schema.every(row=>SCHEMA_NAMES.has(row.name)))throw new Error('durable_diagnostics_schema_mismatch');
