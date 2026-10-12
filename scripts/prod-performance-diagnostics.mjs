@@ -30,6 +30,13 @@ export const PERFORMANCE_NATIVE = `SELECT json_extract(t.record,'$.kind') AS kin
  json_extract(t.record,'$.state.checkpoint.phase') AS phase,json_extract(t.record,'$.state.checkpoint.attempt') AS attempt,
  json_extract(t.record,'$.state.outcome.status') AS outcome,json_extract(t.record,'$.background') AS background
  FROM pi_tasks t ORDER BY t.id DESC LIMIT 60`;
+export const PERFORMANCE_DELIVERIES = `SELECT t.status AS delivery_status,
+ json_extract(t.record,'$.state.checkpoint.phase') AS phase,s.status AS submission_status,
+ s.conversation_id=1 AS is_root,
+ EXISTS(SELECT 1 FROM pi_tasks w JOIN pi_entries e ON e.id=json_extract(w.record,'$.input.assistant'),json_each(e.record,'$.model[0].content') c
+ WHERE w.conversation_id=s.conversation_id AND w.status='running' AND json_extract(c.value,'$.id')=json_extract(w.record,'$.input.callId') AND json_extract(c.value,'$.name')='wait_subagent') AS recipient_waiting
+ FROM pi_tasks t LEFT JOIN pi_submissions s ON s.request_id=json_quote(json_extract(t.record,'$.input.operationId'))
+ WHERE json_extract(t.record,'$.kind')='timber.subagent-delivery' AND t.status!='terminal' ORDER BY t.id DESC LIMIT 20`;
 export const PERFORMANCE_PROCESSES = `SELECT status,dispatch_state,cancel_requested,
  json_extract(result,'$.status') AS result_status,json_extract(result,'$.exitCode') AS exit_code
  FROM run_processes ORDER BY rowid DESC LIMIT 40`;
@@ -47,12 +54,13 @@ const phases=new Set(['prepare','request','retry','poll','tools','yield','wait',
 const iso=value=>typeof value==='string'&&/^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(value)&&Number.isFinite(Date.parse(value))?new Date(value).toISOString():null;
 const count=value=>Number.isSafeInteger(value)&&value>=0&&value<=Number.MAX_SAFE_INTEGER?value:null;
 const allow=(set,value)=>set.has(value)?value:'unknown';
-export function summarizePerformance({runs=[],tools:actions=[],native=[],usage=[],processes=[]},window) {
+export function summarizePerformance({runs=[],tools:actions=[],native=[],usage=[],processes=[],deliveries=[]},window) {
  const inside=value=>{const at=Date.parse(value??'');return Number.isFinite(at)&&at>=window.from&&at<=window.to;};
  return {
   runs:runs.slice(0,12).filter(row=>inside(iso(row.updated_at))||inside(iso(row.created_at))).map(row=>({createdAt:iso(row.created_at),updatedAt:iso(row.updated_at),status:allow(states,row.status),generations:count(row.generations),tools:count(row.tools),retries:count(row.retries)})),
   tools:actions.slice(0,60).filter(row=>inside(iso(row.finished_at))||inside(iso(row.started_at))).map(row=>{const startedAt=iso(row.started_at),finishedAt=iso(row.finished_at);return {startedAt,finishedAt,tool:allow(tools,row.tool),status:allow(states,row.status),durationMs:startedAt&&finishedAt?count(Date.parse(finishedAt)-Date.parse(startedAt)):null,exitCode:Number.isSafeInteger(row.exit_code)?row.exit_code:null,checkpoint:allow(new Set(['pending','saved','failed']),row.checkpoint),outputCharacters:count(row.output_characters)};}),
   nativeTasks:native.slice(0,60).map(row=>({kind:allow(kinds,row.kind),status:allow(states,row.status),phase:allow(phases,row.phase),tool:allow(tools,row.tool),replay:allow(new Set(['safe','unsafe']),row.replay),isRoot:row.is_root===1,attempt:count(row.attempt),outcome:allow(states,row.outcome),background:row.background===1})),
+  deliveries:deliveries.slice(0,20).map(row=>({status:allow(states,row.delivery_status),phase:allow(phases,row.phase),submissionStatus:allow(new Set(['queued','placed','done','unanswered']),row.submission_status),recipientWaiting:row.recipient_waiting===1})),
   processes:processes.slice(0,40).map(row=>({status:allow(states,row.status),dispatchState:allow(new Set(['registered','dispatching','uncertain','acknowledged']),row.dispatch_state),resultStatus:allow(states,row.result_status),exitCode:Number.isSafeInteger(row.exit_code)?row.exit_code:null,cancelRequested:row.cancel_requested===1})),
   modelResponses:usage.slice(0,40).filter(row=>count(row.timestamp)!==null&&row.timestamp>=window.from&&row.timestamp<=window.to).map(row=>({at:new Date(row.timestamp).toISOString(),inputTokens:count(row.input_tokens),outputTokens:count(row.output_tokens),cachedTokens:count(row.cached_tokens),stopReason:allow(new Set(['stop','length','toolUse','error','aborted']),row.stop_reason)})),
  };
