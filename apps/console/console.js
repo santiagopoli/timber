@@ -777,37 +777,45 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   }
   async function sendAudioMessage(botId,file,ids) {
     if(!authenticated||selected?.id!==botId)throw new Error('Select a bot before sending audio.');
-    const version=generation;
-    await request(`${botPath(botId)}/audio/${encodeURIComponent(ids.audioId)}`,{method:'PUT',body:file});
-    if(!validView(version)||selected?.id!==botId)throw new DOMException('The bot changed.','AbortError');
-    let receipt;
-    try{receipt=await request(`${botPath(botId)}/audio-messages`,{method:'POST',body:{operationId:ids.operationId,audioId:ids.audioId,attemptId:ids.attemptId}});}
-    catch(submissionError){
-      // Resolve a lost admission receipt through the safe GET before asking the
-      // user to consider another submission. This endpoint never dispatches work.
-      try{receipt=await request(`${botPath(botId)}/audio-messages/${encodeURIComponent(ids.operationId)}`);}
-      catch{throw submissionError;}
-    }
-    if(!validView(version)||selected?.id!==botId)throw new DOMException('The bot changed.','AbortError');
-    if(!receipt?.message?.audio||receipt.message.audio.artifactId!==ids.audioId)throw new Error('The audio receipt was invalid. Refresh conversation history to inspect its status.');
-    mergeMessagePage([receipt.message]);
-    if(receipt.run){runs.set(receipt.run.id,receipt.run);runsValueRevision++;}
-    renderMessages();if(receipt.run)renderRuns();
+    if(sendBusy.has(botId)||modelSettingsWork.has(botId))throw new Error('A send is already pending for this bot. Inspect its status before sending again.');
+    const session=authSession,version=generation;
+    sendBusy.add(botId);renderMessages();
+    try {
+      await request(`${botPath(botId)}/audio/${encodeURIComponent(ids.audioId)}`,{method:'PUT',body:file});
+      if(!validView(version)||selected?.id!==botId)throw new DOMException('The bot changed.','AbortError');
+      let receipt;
+      try{receipt=await request(`${botPath(botId)}/audio-messages`,{method:'POST',body:{operationId:ids.operationId,audioId:ids.audioId,attemptId:ids.attemptId}});}
+      catch(submissionError){
+        // Resolve a lost admission receipt through the safe GET before asking the
+        // user to consider another submission. This endpoint never dispatches work.
+        try{receipt=await request(`${botPath(botId)}/audio-messages/${encodeURIComponent(ids.operationId)}`);}
+        catch{throw submissionError;}
+      }
+      if(!validView(version)||selected?.id!==botId)throw new DOMException('The bot changed.','AbortError');
+      if(!receipt?.message?.audio||receipt.message.audio.artifactId!==ids.audioId)throw new Error('The audio receipt was invalid. Refresh conversation history to inspect its status.');
+      mergeMessagePage([receipt.message]);
+      if(receipt.run){runs.set(receipt.run.id,receipt.run);runsValueRevision++;}
+      renderMessages();if(receipt.run)renderRuns();
+    } finally {if(session===authSession){sendBusy.delete(botId);if(selected?.id===botId)renderMessages();}}
   }
   async function retryAudioMessage(botId,operationId) {
     if(!authenticated||selected?.id!==botId)throw new Error('Select a bot before retrying audio.');
-    const version=generation,attemptId=crypto.randomUUID();
-    let receipt;
-    try{receipt=await request(`${botPath(botId)}/audio-messages/${encodeURIComponent(operationId)}/retry`,{method:'POST',body:{attemptId,acknowledgePaidRetry:true}});}
-    catch(submissionError){
-      // The retry's new attempt ID is already fixed; read status rather than
-      // risking a second paid attempt after an uncertain response.
-      try{receipt=await request(`${botPath(botId)}/audio-messages/${encodeURIComponent(operationId)}`);}
-      catch{throw submissionError;}
-    }
-    if(!validView(version)||selected?.id!==botId)throw new DOMException('The bot changed.','AbortError');
-    if(!receipt?.message?.audio||receipt.message.audio.operationId!==operationId)throw new Error('The audio retry receipt was invalid. Refresh conversation history to inspect its status.');
-    mergeMessagePage([receipt.message]);if(receipt.run){runs.set(receipt.run.id,receipt.run);runsValueRevision++;}renderMessages();if(receipt.run)renderRuns();
+    if(sendBusy.has(botId)||modelSettingsWork.has(botId))throw new Error('A send is already pending for this bot. Inspect its status before sending again.');
+    const session=authSession,version=generation,attemptId=crypto.randomUUID();
+    sendBusy.add(botId);renderMessages();
+    try {
+      let receipt;
+      try{receipt=await request(`${botPath(botId)}/audio-messages/${encodeURIComponent(operationId)}/retry`,{method:'POST',body:{attemptId,acknowledgePaidRetry:true}});}
+      catch(submissionError){
+        // The retry's new attempt ID is already fixed; read status rather than
+        // risking a second paid attempt after an uncertain response.
+        try{receipt=await request(`${botPath(botId)}/audio-messages/${encodeURIComponent(operationId)}`);}
+        catch{throw submissionError;}
+      }
+      if(!validView(version)||selected?.id!==botId)throw new DOMException('The bot changed.','AbortError');
+      if(!receipt?.message?.audio||receipt.message.audio.operationId!==operationId)throw new Error('The audio retry receipt was invalid. Refresh conversation history to inspect its status.');
+      mergeMessagePage([receipt.message]);if(receipt.run){runs.set(receipt.run.id,receipt.run);runsValueRevision++;}renderMessages();if(receipt.run)renderRuns();
+    } finally {if(session===authSession){sendBusy.delete(botId);if(selected?.id===botId)renderMessages();}}
   }
   async function sendMessage(botId, rawText, retryOperationId, mentions = [], files = []) {
     const text = rawText.trim(); if (!authenticated || selected?.id !== botId || (!text && !files.length && !retryOperationId) || sendBusy.has(botId)||modelSettingsWork.has(botId)) return;

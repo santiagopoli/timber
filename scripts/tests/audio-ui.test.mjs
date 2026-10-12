@@ -4,7 +4,7 @@ import {build} from 'esbuild';
 import {readFile,writeFile} from 'node:fs/promises';
 import {pathToFileURL} from 'node:url';
 import {createConsoleBrowser} from './console-browser.mjs';
-import {createConsoleFixture,BOT_A,TEST_TOKEN} from './console-fixture.mjs';
+import {createConsoleFixture,BOT_A,BOT_B,TEST_TOKEN} from './console-fixture.mjs';
 import {makeToneWav} from './audio-wav.mjs';
 
 const consoleBrowser=createConsoleBrowser(),date='2026-10-05T10:00:00.000Z',wav=makeToneWav(),longWav=makeToneWav({durationSeconds:31,sampleRate:8000,amplitudeModulationHz:0.1});
@@ -102,10 +102,85 @@ test('pending status leaves original audio message visible and playable',async()
   }finally{await context.close();await fixture.close();}
 });
 
+test('a pending audio send stays bot-scoped after switching conversations and preserves newer drafts',async()=>{
+  const {fixture,context,page}=await connectedPage();let release;
+  const gate=new Promise(resolve=>{release=resolve;});
+  try{
+    const calls=await installAudioMocks(page,{initialStatus:'pending'});
+    await page.route(`**/v1/bots/${BOT_A}/audio-messages`,async route=>{
+      const body=route.request().postDataJSON();calls.submissions.push(body);
+      const message=audioMessage({...body,status:'pending'});
+      fixture.state.messages.get(BOT_A).push(message);
+      await gate;
+      await route.fulfill({status:202,contentType:'application/json',body:JSON.stringify({message})});
+    });
+    await chooseTone(page);
+    const submitted=page.waitForRequest(request=>request.method()==='POST'&&request.url().endsWith('/audio-messages'));
+    await confirmSend(page);await submitted;
+    // Leaving the conversation unmounts its audio draft, not its pending send.
+    await page.locator(`[data-bot-id="${BOT_B}"]`).click();await page.locator('#selected-name').filter({hasText:'Linus'}).waitFor();
+    await page.locator('#message').fill('Independent text for Linus');await page.getByRole('button',{name:'Send message'}).click();
+    await page.locator('[data-message-id]').filter({hasText:'Independent text for Linus'}).waitFor();
+    await page.locator('#message').fill('Linus next draft');
+    await page.locator(`[data-bot-id="${BOT_A}"]`).click();await page.locator('#selected-name').filter({hasText:'Ada'}).waitFor();
+    await page.locator('#message').fill('Ada next draft');
+    assert.equal(await page.getByRole('button',{name:'Send message'}).isDisabled(),true);
+    assert.equal(await page.getByRole('button',{name:'Attach audio file'}).isDisabled(),true);
+    await page.locator('#message-form').dispatchEvent('submit');
+    assert.equal(calls.submissions.length,1,'returning to the bot cannot start a duplicate paid admission');
+    assert.equal(fixture.state.calls.filter(call=>call.method==='POST'&&call.path===`/v1/bots/${BOT_A}/messages`).length,0);
+    await page.locator(`[data-bot-id="${BOT_B}"]`).click();await page.locator('#selected-name').filter({hasText:'Linus'}).waitFor();
+    const completed=page.waitForResponse(response=>response.request().method()==='POST'&&response.url().endsWith('/audio-messages'));
+    release();await completed;
+    assert.equal(await page.locator('#message').inputValue(),'Linus next draft');
+    assert.equal(await page.locator('.timber-audio-message').count(),0,'late receipt never appears in another bot conversation');
+    await page.locator(`[data-bot-id="${BOT_A}"]`).click();await page.locator('#selected-name').filter({hasText:'Ada'}).waitFor();
+    await page.locator('.timber-audio-message[data-transcription-status="pending"]').waitFor();
+    assert.equal(await page.locator('#message').inputValue(),'Ada next draft');
+    assert.equal(await page.getByRole('button',{name:'Send message'}).isDisabled(),false);
+    assert.equal(calls.uploads.length,1);assert.equal(calls.submissions.length,1);
+  }finally{release();await context.close();await fixture.close();}
+});
+
+test('a pending paid retry remains fenced after its message is remounted',async()=>{
+  const {fixture,context,page}=await connectedPage();let release;
+  const gate=new Promise(resolve=>{release=resolve;});
+  try{
+    const calls=await installAudioMocks(page);await chooseTone(page);await confirmSend(page);
+    await page.locator('.timber-audio-message[data-transcription-status="failed"]').waitFor();
+    const original=audioMessage({...calls.submissions[0]});fixture.state.messages.get(BOT_A).push(original);
+    await page.route(`**/v1/bots/${BOT_A}/audio-messages/*/retry`,async route=>{
+      const body=route.request().postDataJSON();calls.retries.push(body);await gate;
+      await route.fulfill({status:202,contentType:'application/json',body:JSON.stringify({message:original})});
+    });
+    await page.getByRole('button',{name:'Retry transcription'}).click();
+    const submitted=page.waitForRequest(request=>request.method()==='POST'&&request.url().endsWith('/retry'));
+    await page.getByRole('dialog').getByRole('button',{name:'Confirm paid retry'}).click();await submitted;
+    await page.locator(`[data-bot-id="${BOT_B}"]`).click();await page.locator('#selected-name').filter({hasText:'Linus'}).waitFor();
+    await page.locator('#message').fill('Linus draft during Ada retry');
+    await page.locator(`[data-bot-id="${BOT_A}"]`).click();await page.locator('#selected-name').filter({hasText:'Ada'}).waitFor();
+    const retry=page.getByRole('button',{name:'Retry transcription'});await retry.waitFor();
+    assert.equal(await retry.isDisabled(),true,'the bot-level fence survives the local retry state being unmounted');
+    await retry.evaluate(node=>node.click());
+    assert.equal(calls.retries.length,1,'no second paid attempt is dispatched');
+    await page.locator('#message').fill('Ada next draft during retry');
+    assert.equal(await page.getByRole('button',{name:'Send message'}).isDisabled(),true);
+    const completed=page.waitForResponse(response=>response.request().method()==='POST'&&response.url().endsWith('/retry'));
+    release();await completed;
+    await page.getByRole('button',{name:'Send message'}).waitFor();
+    await page.waitForFunction(()=>!document.querySelector('button[aria-label="Send message"]')?.disabled);
+    assert.equal(await page.locator('#message').inputValue(),'Ada next draft during retry');
+    assert.equal(calls.retries.length,1);assert.notEqual(calls.retries[0].attemptId,calls.submissions[0].attemptId);
+  }finally{release();await context.close();await fixture.close();}
+});
+
 test('regular text chat still submits through existing messages API',async()=>{
   const {fixture,context,page}=await connectedPage({width:390,height:844});
   try{
-    await page.locator('#message').fill('Text chat regression remains intact.');await page.getByRole('button',{name:'Send message'}).click();
+    await page.locator('#message').fill('Text chat regression remains intact.');
+    assert.equal(await page.locator('.timber-audio-format-note').count(),0,'audio details do not expand an ordinary text composer');
+    assert.ok((await page.locator('.timber-audio-tools').boundingBox()).height<=52,'disabled audio controls stay on one compact row');
+    await page.getByRole('button',{name:'Send message'}).click();
     await page.waitForFunction(()=>document.querySelectorAll('[data-message-id]').length>=3);
     assert.ok(fixture.state.calls.some(call=>call.path.endsWith('/messages')&&call.method==='POST'&&call.body.text==='Text chat regression remains intact.'));
     assert.equal(await page.locator('.timber-audio-draft').count(),0);
