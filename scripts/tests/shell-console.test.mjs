@@ -12,20 +12,21 @@ const panel=async(page,name)=>{if(!await page.locator(`#tab-${name}`).isVisible(
 const creates=state=>state.calls.filter(c=>c.method==='POST'&&c.path.endsWith('/shell-session'));
 const deletes=state=>state.calls.filter(c=>c.method==='DELETE');
 async function withShell(work,{width=1440,height=900}={}) {
- const fixture=await createConsoleFixture(),context=await browser.newContext({viewport:{width,height},colorScheme:'dark'}),page=await context.newPage();
+ const fixture=await createConsoleFixture(),context=await browser.newContext({viewport:{width,height},colorScheme:'dark',...(width<=760?{isMobile:true,hasTouch:true,deviceScaleFactor:3}:{})}),page=await context.newPage();
  const errors=[],violations=[],state={calls:[],sockets:[],gate:null,releases:[],lifetime:60000,createError:false,renewError:false,renewGate:null,releaseError:false};
  page.setDefaultTimeout(30000);page.on('pageerror',e=>errors.push(e.message));
  await page.exposeFunction('__shellCsp',v=>violations.push(v));
  await page.addInitScript(()=>document.addEventListener('securitypolicyviolation',e=>globalThis.__shellCsp({directive:e.effectiveDirective,resource:e.blockedURI})));
  const proxy=createServer((req,res)=>{const upstream=forward(new URL(req.url,fixture.url),{method:req.method,headers:req.headers},reply=>{res.writeHead(reply.statusCode,reply.headers);reply.pipe(res);});upstream.on('error',()=>res.end());req.pipe(upstream);res.on('close',()=>upstream.destroy());});
  const ws=new WebSocketServer({noServer:true,handleProtocols:protocols=>protocols.has('timber-shell.v1')?'timber-shell.v1':false});
- proxy.on('upgrade',(req,socket,head)=>{assert.match(req.url,/^\/v1\/bots\/[a-f0-9-]+\/computer\/shell$/);assert.match(req.headers['sec-websocket-protocol'],/timber-shell-ticket\./);assert.equal(new URL(req.url,'http://fixture').search,'');ws.handleUpgrade(req,socket,head,client=>ws.emit('connection',client,req));});
+ proxy.on('upgrade',(req,socket,head)=>{assert.match(req.url,/^\/v1\/bots\/[a-f0-9-]+\/computer\/shell$/);assert.match(req.headers['sec-websocket-protocol'],/timber-shell-ticket\./);assert.match(req.headers.cookie||'',/timber_fixture_session=/);assert.equal(new URL(req.url,'http://fixture').search,'');ws.handleUpgrade(req,socket,head,client=>ws.emit('connection',client,req));});
  ws.on('connection',(client,req)=>{const record={url:req.url,inputs:[],controls:[],closed:false,drop:()=>client.close(),send:data=>client.send(data)};state.sockets.push(record);client.on('close',()=>record.closed=true);client.on('message',(data,binary)=>{assert.equal(binary,false);const message=JSON.parse(data.toString());if(message.type==='input')record.inputs.push(Buffer.from(message.data));else record.controls.push(message);});client.send(JSON.stringify({type:'output',data:'\x1b[32mfixture ready\x1b[0m\r\n/workspace $ ',seq:1}));});
  await new Promise(r=>proxy.listen(0,'127.0.0.1',r));
  const origin=`http://127.0.0.1:${proxy.address().port}`;
  await page.route('**/v1/bots/*/computer/shell-session**',async route=>{
   const req=route.request(),headers=await req.allHeaders(),path=new URL(req.url()).pathname;
-  assert.equal(headers.authorization,undefined);assert.equal(headers['x-timber-client'],'console');assert.match(headers.cookie||'',/timber_fixture_session=/);
+  assert.equal(headers.authorization,undefined);assert.equal(headers['x-timber-client'],'console');// WebKit interception omits Cookie from allHeaders; inspect its actual cookie jar instead.
+  const cookieHeader=headers.cookie||(process.env.CONSOLE_BROWSER==='webkit'?(await context.cookies(origin)).map(cookie=>`${cookie.name}=${cookie.value}`).join('; '):'');assert.match(cookieHeader,/timber_fixture_session=/);
   state.calls.push({method:req.method(),path,body:req.method()==='POST'?req.postDataJSON():null});
   if(req.method()==='POST'&&path.endsWith('/shell-session')){
    const id=`shell-${creates(state).length}`;
@@ -95,6 +96,13 @@ test('shell renews lease then handles transport close without reconnection',asyn
   state.sockets[0].drop();await page.locator('#shell-root[data-state="disconnected"]').waitFor();await until(()=>deletes(state).length===1);await page.waitForTimeout(200);assert.equal(creates(state).length,1);
  });
 });
+test('touchscreen virtual keyboard input events reach the PTY unchanged',async()=>{
+ await withShell(async({page,state,login,open,connect})=>{
+  await login();await open();await connect();assert.equal(await page.evaluate(()=>matchMedia('(pointer:coarse)').matches),true);
+  await page.evaluate(()=>{document.querySelector('.xterm-helper-textarea').dispatchEvent(new InputEvent('input',{data:'virtual café 👋',inputType:'insertText',bubbles:true,composed:true}));});
+  await until(()=>Buffer.concat(state.sockets[0].inputs).includes(Buffer.from('virtual café 👋')));
+ },{width:390});
+});
 test('an unconfirmed cleanup is visible and does not silently reconnect',async()=>{
  await withShell(async({page,state,login,open,connect})=>{
   await login();await open();await connect();state.releaseError=true;await page.locator('[data-shell="disconnect"]').click();
@@ -125,7 +133,7 @@ test('shell exit releases the reservation, stops renewal, and preserves the tran
  await withShell(async({page,state,login,open,connect})=>{
   state.lifetime=5000;await login();await open();await connect();state.sockets[0].send(JSON.stringify({type:'exit',exitCode:7}));
   await page.locator('#shell-root[data-state="disconnected"]').waitFor();await until(()=>state.sockets[0].closed&&deletes(state).length===1);
-  assert.equal(state.calls.some(c=>c.path.endsWith('/renew')),false);assert.equal(await page.locator('.xterm-rows').filter({hasText:'Shell exited with code 7'}).count(),1);
+  assert.equal(state.calls.some(c=>c.path.endsWith('/renew')),false);await page.locator('.xterm-rows').filter({hasText:'Shell exited with code 7'}).waitFor();
   await connect();assert.equal(creates(state).length,2);
  });
 });

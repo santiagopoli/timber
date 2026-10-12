@@ -167,7 +167,7 @@ checkpoint, suspend, restart/read and a duplicate shell action against cloud.
 
 `server.py` embeds the independent `shell_bridge.py` transport on **private
 6082** and shares its `ShellManager`. This is a real interactive bash controlling
-TTY (`pty.fork`, job control and `TIOCSWINSZ`), not `exec` polling. The 8080
+TTY (native Linux `forkpty`, job control and `TIOCSWINSZ`), not `exec` polling. The 8080
 control server remains internal. Neither port is a public app/console port;
 Docker `EXPOSE` is container metadata only. Authenticated health advertises
 `"shellPtySupported"` for this image implementation, and `"shellPty"` only after a successful authenticated bridge protocol probe.
@@ -215,7 +215,7 @@ unbounded output queue. Incomplete upgrades have a five-second socket timeout
 and at most sixteen accepted connection handlers. Disconnect, lease/hard expiry,
 protocol/limit failure and explicit close kill/reap the PTY and all descendants.
 Each session starts a fresh-exec, single-threaded `shell_bridge.py --supervisor`
-helper with Linux `PR_SET_CHILD_SUBREAPER`; only that helper calls `pty.fork`.
+helper with Linux `PR_SET_CHILD_SUBREAPER`; only that helper calls native Linux `os.forkpty`.
 The threaded HTTP server never runs Python child setup after fork. The private
 socketpair passes the PTY descriptor with `SCM_RIGHTS`, not terminal data.
 Detached descendants remain under the dedicated subreaper even after `env -i`,
@@ -225,7 +225,15 @@ roots are adopted and killed in turn. The helper reaps until kernel `ECHILD`
 confirms no remaining children before sending an acknowledged cleanup receipt.
 No environment marker, historical PID sample or unrelated process group is used.
 Linux child-subreaper and pidfd support are required; startup fails closed without
-them. The helper is included in the existing single-file Docker/bootstrap copy.
+them. A known pre-launch rejection sends an explicit acknowledged `not_started`
+receipt after confirming kernel `ECHILD`; the controller returns a fixed 503,
+reaps the helper and releases the guard, permitting a new grant after correction.
+EOF/exit status alone never proves no effects. If a child is observed during a
+startup failure, the helper must have established subreaping and complete normal
+descendant cleanup before any positive receipt; otherwise it remains uncertain.
+Ambiguous post-launch failures remain guarded. Native Linux
+`forkpty` avoids a Python fallback throwing partway through child terminal setup.
+The helper is included in the existing single-file Docker/bootstrap copy.
 
 A cleanup timeout/error retains the session and checkpoint/admission guard.
 Handler completion is separate from confirmed cleanup; authenticated close calls
@@ -247,6 +255,11 @@ kill the supervisor. Losing the supervisor without its cleanup receipt fails
 closed and blocks replacement/checkpoint rather than claiming successful cleanup.
 Real Linux tests cover environment-cleared, detached double-fork writers, complete
 reaping, unrelated process survival, and failed cleanup followed by explicit retry.
+They also inject a real helper-level pidfd signal failure while a detached writer
+remains live, verify pending receipts keep checkpoint/replacement guards, then
+restore the syscall and confirm the same helper kills/reaps before releasing.
+Fresh-helper capability failures exercise explicit pre-launch no-effects receipts;
+loss of control after a real PTY launch verifies ambiguous EOF stays guarded.
 The focused tests also exercise actual WebSocket auth,
 TTY/input, Ctrl-C, resizing, exit codes, lease renewal/expiry, limits, slow-reader
 backpressure, and internal HTTP/checkpoint exclusion:

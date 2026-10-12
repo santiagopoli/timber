@@ -230,6 +230,187 @@ while True:
             unrelated.kill()
             unrelated.wait()
 
+    def test_prelaunch_failures_acknowledge_no_effects_and_allow_replacement(self):
+        # Inject each failure INSIDE a fresh executable helper, not into a fake
+        # shell/session. The real private FD protocol and manager cleanup run.
+        helper = Path(self.tmp.name) / "prelaunch_failure.py"
+        helper.write_text("""import ctypes, errno, importlib.util, sys
+spec = importlib.util.spec_from_file_location('tested_shell_bridge', %r)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+mode, control, workspace = sys.argv[1:]
+def unavailable(*args, **kwargs):
+    raise OSError(errno.ENOSYS, 'injected unsupported capability')
+if mode == 'prctl':
+    class Unsupported:
+        def prctl(self, *args): return -1
+    module.ctypes.CDLL = lambda *args, **kwargs: Unsupported()
+elif mode == 'pidfd':
+    module.os.pidfd_open = unavailable
+elif mode == 'forkpty':
+    module.os.forkpty = unavailable
+else:
+    raise AssertionError(mode)
+sys.exit(module.supervisor_main(int(control), workspace))
+""" % str(Path(shell.__file__).resolve()))
+        real_popen = subprocess.Popen
+        for mode in ("prctl", "pidfd", "forkpty"):
+            with self.subTest(mode=mode):
+                processes = []
+
+                def failing_helper(arguments, **kwargs):
+                    process = real_popen([arguments[0], "-I", str(helper), mode,
+                                          arguments[-2], arguments[-1]], **kwargs)
+                    processes.append(process)
+                    return process
+
+                with patch.object(shell.subprocess, "Popen", side_effect=failing_helper):
+                    failed = self.client()
+                    self.assertEqual(failed.status, 503)
+                self.assertEqual(len(processes), 1)
+                self.assertEqual(processes[0].poll(), 1, "helper must be reaped before guard release")
+                self.assertIsNone(self.manager.session)
+                with self.manager.checkpoint_guard():
+                    pass
+                self.assertEqual(self.client(ident=failed.ident).status, 409)
+                replacement = self.client()
+                self.assertEqual(replacement.status, 101)
+                self.assertEqual(self.manager.close(replacement.ident), {"ok": True})
+
+    def test_postlaunch_eof_without_receipt_keeps_guard(self):
+        # Drop the initial FD handshake AFTER real forkpty. The helper's finally
+        # kills/reaps the real child, but the controller must not guess from EOF
+        # or its exit status that the launch had no effects / cleanup completed.
+        helper = Path(self.tmp.name) / "postlaunch_failure.py"
+        pidfile = Path(self.tmp.name) / "postlaunch.pid"
+        helper.write_text("""import errno, importlib.util, json, pathlib, sys
+spec = importlib.util.spec_from_file_location('tested_shell_bridge', %r)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+class LostHandshake(module.socket.socket):
+    def sendmsg(self, buffers, *args, **kwargs):
+        pathlib.Path(%r).write_text(str(json.loads(buffers[0])['pid']))
+        raise OSError(errno.EPIPE, 'injected lost handshake after launch')
+    def send(self, *args, **kwargs):
+        raise OSError(errno.EPIPE, 'injected lost control transport after launch')
+module.socket.socket = LostHandshake
+sys.exit(module.supervisor_main(int(sys.argv[1]), sys.argv[2]))
+""" % (str(Path(shell.__file__).resolve()), str(pidfile)))
+        real_popen = subprocess.Popen
+        manager = shell.ShellManager(self.tmp.name)
+        ident = str(uuid.uuid4())
+
+        def failed_handshake(arguments, **kwargs):
+            return real_popen([arguments[0], "-I", str(helper), arguments[-2], arguments[-1]], **kwargs)
+
+        with patch.object(shell.subprocess, "Popen", side_effect=failed_handshake):
+            with self.assertRaises(ValueError):
+                manager.open(ident, int(time.time()*1000)+59000)
+        session = manager.session
+        self.assertIsNotNone(session)
+        try:
+            self.assertTrue(session.run_done.is_set())
+            self.assertFalse(session.done.is_set())
+            self.assertFalse(session.cleanup_confirmed)
+            with self.assertRaises(shell.ShellError) as error:
+                manager.close(ident)
+            self.assertEqual(error.exception.code, "shell_cleanup_pending")
+            with self.assertRaises(ValueError):
+                with manager.checkpoint_guard():
+                    pass
+            with self.assertRaises(shell.ShellError) as error:
+                manager.open(str(uuid.uuid4()), int(time.time()*1000)+59000)
+            self.assertEqual(error.exception.code, "shell_busy")
+            self.assertEqual(session.helper.wait(timeout=3), 1)
+            self.assertTrue(pidfile.exists(), "real PTY child must have launched")
+            self.assertFalse(Path(f"/proc/{int(pidfile.read_text())}").exists())
+            self.assertIs(manager.session, session, "exit/reap alone must not release the guard")
+        finally:
+            # Isolated test manager deliberately retains its closing record.
+            # Close only the test-owned transport to avoid a descriptor leak.
+            session.control.close()
+
+    def test_real_helper_signal_failure_retains_guard_and_retries_shutdown(self):
+        # Fail the helper's actual pidfd signal operation until explicitly
+        # allowed. Unlike a mocked session.cleanup, the real supervisor scans,
+        # holds its children, sends pending receipts and retries across close.
+        helper = Path(self.tmp.name) / "signal_failure.py"
+        helper.write_text("""import errno, importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location('tested_shell_bridge', %r)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+root = pathlib.Path(sys.argv[2])
+real_signal = module.signal.pidfd_send_signal
+def transient_signal_failure(*args, **kwargs):
+    if not (root / 'allow-cleanup').exists():
+        (root / 'helper-cleanup-attempted').touch()
+        raise OSError(errno.EAGAIN, 'injected transient helper signal failure')
+    return real_signal(*args, **kwargs)
+module.signal.pidfd_send_signal = transient_signal_failure
+sys.exit(module.supervisor_main(int(sys.argv[1]), sys.argv[2]))
+""" % str(Path(shell.__file__).resolve()))
+        real_popen = subprocess.Popen
+
+        def failing_helper(arguments, **kwargs):
+            return real_popen([arguments[0], "-I", str(helper), arguments[-2], arguments[-1]], **kwargs)
+
+        with patch.object(shell.subprocess, "Popen", side_effect=failing_helper):
+            client = self.client()
+        self.assertEqual(client.status, 101)
+        session = self.manager.session
+        writer = Path(self.tmp.name) / "signal-writer.py"
+        writer.write_text("""import os, time
+open('signal-writer.pid', 'w').write(str(os.getpid()))
+fd = os.open('signal-writes', os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+while True:
+    os.write(fd, b'x')
+    time.sleep(.005)
+""")
+        client.send({"type": "input", "data": "env -i /usr/bin/setsid /usr/bin/python3 signal-writer.py >/dev/null 2>&1 &\n"})
+        pidfile = Path(self.tmp.name) / "signal-writer.pid"
+        writes = Path(self.tmp.name) / "signal-writes"
+        deadline = time.monotonic() + 5
+        while (not pidfile.exists() or not writes.exists()) and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertTrue(pidfile.exists())
+        pid = int(pidfile.read_text())
+        try:
+            client.close()
+            self.assertTrue(session.run_done.wait(8))
+            self.assertTrue((Path(self.tmp.name) / "helper-cleanup-attempted").exists())
+            self.assertFalse(session.done.is_set())
+            self.assertFalse(session.cleanup_confirmed)
+            self.assertIs(self.manager.session, session)
+            self.assertIsNone(session.helper.poll())
+            with self.assertRaises(ValueError):
+                with self.manager.checkpoint_guard():
+                    pass
+            self.assertEqual(self.client().status, 409)
+            with self.assertRaises(shell.ShellError) as error:
+                self.manager.close(client.ident)
+            self.assertEqual(error.exception.code, "shell_cleanup_pending")
+            self.assertFalse(session.done.is_set())
+            self.assertTrue(Path(f"/proc/{pid}").exists())
+            before = writes.stat().st_size
+            time.sleep(.05)
+            self.assertGreater(writes.stat().st_size, before, "writer must remain live while helper signal fails")
+        finally:
+            # Restore the syscall in the helper via the test gate, not a new
+            # process/session. Even assertion failures must clean the real job.
+            (Path(self.tmp.name) / "allow-cleanup").touch()
+            self.manager.close(client.ident)
+        self.assertTrue(session.done.is_set())
+        self.assertTrue(session.cleanup_confirmed)
+        self.assertEqual(session.helper.poll(), 0)
+        self.assertIsNone(self.manager.session)
+        self.assertFalse(Path(f"/proc/{session.pid}").exists())
+        self.assertFalse(Path(f"/proc/{pid}").exists())
+        before = writes.stat().st_size
+        time.sleep(.05)
+        self.assertEqual(writes.stat().st_size, before)
+        with self.manager.checkpoint_guard():
+            pass
+
     def test_failed_handler_cleanup_stays_guarded_and_explicit_close_retries(self):
         client = self.client()
         session = self.manager.session

@@ -17,7 +17,6 @@ import hmac
 import json
 import os
 from pathlib import Path
-import pty
 import select
 import signal
 import socket
@@ -180,19 +179,64 @@ def supervisor_cleanup(bash_pid, on_exit, seconds=2):
         time.sleep(.01)
 
 
+def supervisor_startup_failed(control, subreaper_ready):
+    """Acknowledge known pre-launch rejection without guessing from helper exit.
+
+    ECHILD is checked before claiming no launch. If any child is observed, only
+    a normal, fully confirmed cleanup receipt is allowed, never a no-effects one.
+    """
+    try:
+        try:
+            os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            kind = "not_started"
+        else:
+            while not supervisor_cleanup(None, lambda _status: None):
+                time.sleep(1)
+            if not subreaper_ready:
+                # Unexpected pre-existing children without established
+                # subreaping could have escaped. Never certify their shutdown.
+                control.send(b'{"type":"pending"}')
+                return 1
+            kind = "cleaned"
+        receipt = json.dumps({"type": kind}, separators=(",", ":")).encode()
+        control.send(receipt)
+        # Retain the receipt until acknowledged, just like post-launch cleanup.
+        # An EOF without a receipt must remain ambiguous to the controller.
+        while True:
+            ready, _, _ = select.select([control], [], [], 1)
+            if ready:
+                message = control.recv(1024)
+                if not message or message == b"ack":
+                    break
+                if message == b"close":
+                    control.send(receipt)
+    except OSError:
+        pass  # No positive receipt reached the controller: it remains guarded.
+    finally:
+        control.close()
+    return 1
+
+
 def supervisor_main(control_fd, workspace):
     """Entered by exec, never by Python fork from the threaded HTTP server."""
     control = socket.socket(fileno=control_fd)
     control.settimeout(CONTROL_TIMEOUT)
-    libc = ctypes.CDLL(None, use_errno=True)
-    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
-        return 1  # No PTY/process effect if subreaping is unavailable.
-    # pidfd support is mandatory: fail before launch on unsupported kernels.
-    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
-        return 1
-    fd = os.pidfd_open(os.getpid())
-    os.close(fd)
-    pid, terminal = pty.fork()  # Safe: fresh exec helper has only one thread.
+    subreaper_ready = False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+            raise OSError(ctypes.get_errno(), "subreaper unavailable")
+        subreaper_ready = True
+        # Native Linux forkpty and pidfds are mandatory. No Python fallback that
+        # could throw during child terminal setup and misreport a launch failure.
+        if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal") or not hasattr(os, "forkpty"):
+            raise OSError(errno.ENOSYS, "supervision unavailable")
+        fd = os.pidfd_open(os.getpid())
+        os.close(fd)
+        pid, terminal = os.forkpty()  # Safe: fresh exec helper has only one thread.
+    except (OSError, AttributeError):
+        return supervisor_startup_failed(control, subreaper_ready)
     if pid == 0:
         try:
             control.close()
@@ -270,7 +314,11 @@ def supervisor_main(control_fd, workspace):
                 closing = True
     finally:
         if terminal is not None:
-            os.close(terminal)
+            # A descriptor-close error must never bypass descendant shutdown.
+            try:
+                os.close(terminal)
+            except OSError:
+                pass
         # Do not exit and orphan uncertain descendants on transport exceptions.
         while not supervisor_cleanup(pid, on_exit):
             time.sleep(1)
@@ -312,7 +360,15 @@ class ShellSession:
                 fds.frombytes(payload[:len(payload) - len(payload) % fds.itemsize])
         try:
             message = json.loads(data)
-            if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) or message.get("type") != "started" or len(fds) != 1:
+            if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
+                raise ShellError("shell_failed", 503)
+            if not fds and message in ({"type": "not_started"}, {"type": "cleaned"}):
+                # Explicit no-effects (or completed shutdown) receipt, not an
+                # inference from EOF/returncode. Cleanup still acknowledges and
+                # reaps this helper before releasing the admission guard.
+                self.cleanup_confirmed = True
+                raise ShellError("shell_failed", 503)
+            if not isinstance(message, dict) or message.get("type") != "started" or len(fds) != 1:
                 raise ShellError("shell_failed", 503)
             self.pid, self.fd = message["pid"], fds.pop()
         finally:
@@ -340,7 +396,7 @@ class ShellSession:
         message = json.loads(data)
         if message.get("type") == "exit":
             self.exit_status = message["status"]
-        elif message.get("type") == "cleaned":
+        elif message == {"type": "cleaned"} or (self.pid is None and message == {"type": "not_started"}):
             self.cleanup_confirmed = True
         elif message.get("type") != "pending":
             raise ShellError("shell_cleanup_pending", 503)

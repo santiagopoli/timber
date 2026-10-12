@@ -126,7 +126,9 @@ export function createShellViewer(options: ShellViewerOptions) {
       session = ticket;
       const url = new URL(ticket.url, location.origin);
       if (!['ws:', 'wss:'].includes(url.protocol) || url.host !== location.host || url.username || url.password || url.search || url.hash || (location.protocol === 'https:' && url.protocol !== 'wss:') || !ticket.sessionId || !Array.isArray(ticket.protocols) || !ticket.protocols.length || !Number.isFinite(Date.parse(ticket.expiresAt)) || Date.parse(ticket.expiresAt) <= Date.now()) throw new Error('invalid session');
-      term = new Terminal({scrollback:1000, fontSize:13, cursorBlink:true, screenReaderMode:true, disableStdin:true, convertEol:false, allowProposedApi:false});
+      // xterm's screen-reader mode suppresses insertText events. Touchscreen
+      // keyboards rely on those events rather than desktop keypress events.
+      term = new Terminal({scrollback:1000, fontSize:13, cursorBlink:true, screenReaderMode:!window.matchMedia('(pointer:coarse)').matches, disableStdin:true, convertEol:false, allowProposedApi:false});
       fit = new FitAddon(); term.loadAddon(fit);
       const createElementDescriptor = Object.getOwnPropertyDescriptor(document, 'createElement');
       Object.defineProperty(document, 'createElement', {configurable:true, value:rendererCreateElement});
