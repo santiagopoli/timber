@@ -88,7 +88,7 @@ export class OwnerKeychain {
   request(id:string):SecureInputRequest|undefined {const row=this.storage.sql.exec<{data:string}>('SELECT data FROM secure_input_requests WHERE id=?',id).toArray()[0];return row?JSON.parse(row.data):undefined;}
   setRequest(item:SecureInputRequest):void {this.storage.sql.exec('UPDATE secure_input_requests SET data=? WHERE id=?',JSON.stringify(item),item.id);}
   hasPending(runId:string):boolean {return this.storage.sql.exec("SELECT id FROM secure_input_requests WHERE json_extract(data,'$.runId')=? AND json_extract(data,'$.status')='pending' LIMIT 1",runId).toArray().length>0;}
-  requestInput(op:string,args:Record<string,unknown>,runId:string,nativeOperationId:string,botId?:string):SecureInputRequest {
+  requestInput(op:string,args:Record<string,unknown>,runId:string,nativeOperationId:string,botId?:string,taskId?:string):SecureInputRequest {
     this.root();
     const details={...metadata(args,true),purpose:string(args.purpose,'purpose',500),...(args.secretId?{secretId:string(args.secretId,'secretId',36)}:{})};
     const secret=details.secretId?this.row(details.secretId):undefined;
@@ -96,9 +96,9 @@ export class OwnerKeychain {
     if(details.secretId&&!secret?.envelope)throw new ApiError(404,'credential_unavailable','Private input is unavailable or revoked.');
     if(details.secretId&&!details.origin)invalid('The agent must configure an HTTPS destination before requesting access.');
     const prior=this.storage.sql.exec<{data:string}>('SELECT data FROM secure_input_requests WHERE operation_id=?',op).toArray()[0];
-    if(prior) {const item:SecureInputRequest=JSON.parse(prior.data);if(Object.entries(details).some(([k,v])=>item[k as keyof SecureInputRequest]!==v))throw new ApiError(409,'idempotency_conflict','Secure request changed.');return item;}
+    if(prior) {const item:SecureInputRequest=JSON.parse(prior.data);if(item.taskId!==taskId||Object.entries(details).some(([k,v])=>item[k as keyof SecureInputRequest]!==v))throw new ApiError(409,'idempotency_conflict','Secure request changed.');return item;}
     if(this.storage.sql.exec<{n:number}>("SELECT COUNT(*) AS n FROM secure_input_requests WHERE json_extract(data,'$.status')='pending'").one().n>=16)throw new ApiError(429,'keychain_full','Too many pending secure inputs.');
-    const item:SecureInputRequest={...details,...(botId?{botId,...(details.secretId?{permissionEpoch:this.permissionEpoch(details.secretId,botId)}:{})}:{}),...(secret?{expectedRevision:(JSON.parse(secret.data) as SecretMetadata).revision}:{}),id:crypto.randomUUID(),runId,nativeOperationId,status:'pending',createdAt:now()};
+    const item:SecureInputRequest={...details,...(taskId?{taskId}:{}),...(botId?{botId,...(details.secretId?{permissionEpoch:this.permissionEpoch(details.secretId,botId)}:{})}:{}),...(secret?{expectedRevision:(JSON.parse(secret.data) as SecretMetadata).revision}:{}),id:crypto.randomUUID(),runId,nativeOperationId,status:'pending',createdAt:now()};
     this.storage.sql.exec('INSERT INTO secure_input_requests(id,operation_id,data) VALUES(?,?,?)',item.id,op,JSON.stringify(item));return item;
   }
   /** Batch encryption completes before an atomic commit. The caller fences Stop/deletion

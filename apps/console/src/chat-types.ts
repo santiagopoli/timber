@@ -16,6 +16,7 @@ export type ChatTaskSummary = {
 export type ChatModel = {
   bot: Bot; messages: Message[]; runs: Run[]; approvals: ChatApproval[]; connections: ChatConnection[]; events: BotEvent[];
   acceptedImageIds?: string[]; deliveries: MessageDelivery[]; draft: string; sending: boolean; loading: boolean;
+  composerDisabled?: boolean;
   mentionBots: Bot[]; draftMentions: string[];
   modelSettings:ModelSettingsState;
   subagents: Subagent[]; delegations: AgentDelegation[];

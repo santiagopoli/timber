@@ -1554,7 +1554,7 @@ export class BotDO extends DurableObject<Env> {
     return data;
   }
   private async requireConnection(input:RuntimeHostToolRequest,run:Run,repository:string|undefined,permission:'read'|'write'):Promise<RuntimeToolResult|undefined> {
-    const access={botId:run.botId,repository,permission};
+    const access={botId:run.botId,...(this.taskId()?{taskId:this.taskId()}:{}),repository,permission};
     const authorized=await this.github('/authorize','POST',access);
     this.active();
     if(this.getRunRow(run.id).native_operation_id!==input.runOperationId || terminal.has(this.getRun(run.id).status) || this.taskStopped() || input.signal.aborted) return {operationId:input.operationId,status:'interrupted',error:'Run is no longer active.'};
@@ -1564,7 +1564,7 @@ export class BotDO extends DurableObject<Env> {
     if(terminal.has(this.getRun(run.id).status) || this.getRunRow(run.id).native_operation_id!==input.runOperationId || input.signal.aborted) return {operationId:input.operationId,status:'interrupted',error:'Run is no longer active.'};
     const previous=this.ctx.storage.sql.exec<{fingerprint:string;data:string}>("SELECT fingerprint,data FROM connections WHERE operation_id=?",input.operationId).toArray()[0];
     if(previous && previous.fingerprint!==hash) throw new ApiError(409,'idempotency_conflict','Tool arguments changed.');
-    const connection:ConnectionRequest=previous?JSON.parse(previous.data):{id:crypto.randomUUID(),botId:run.botId,runId:run.id,nativeOperationId:input.runOperationId,provider:'github',repository,permission,status:'pending',createdAt:timestamp()};
+    const connection:ConnectionRequest=previous?JSON.parse(previous.data):{id:crypto.randomUUID(),botId:run.botId,...(this.taskId()?{taskId:this.taskId()}:{}),runId:run.id,nativeOperationId:input.runOperationId,provider:'github',repository,permission,status:'pending',createdAt:timestamp()};
     if(connection.status!=='pending') return {operationId:input.operationId,status:'failed',error:'This connection request is no longer pending. Request access again.'};
     this.ctx.storage.sql.exec("INSERT OR IGNORE INTO connections(id,operation_id,fingerprint,data) VALUES(?,?,?,?)",connection.id,input.operationId,hash,JSON.stringify(connection));
     this.updateStatus(run.id,'waiting_connection');
@@ -1575,7 +1575,7 @@ export class BotDO extends DurableObject<Env> {
     const connection=this.getConnection(id);
     if(!connection) throw new ApiError(404,'not_found','Connection request not found.');
     if(connection.status!=='pending' || terminal.has(this.getRun(connection.runId).status)) throw new ApiError(409,'connection_inactive','This connection request is no longer active.');
-    return this.github('/connect','POST',{...connection,requestId:id,origin:this.env.GITHUB_PUBLIC_ORIGIN});
+    return this.github('/connect','POST',{...connection,...(this.taskId()?{taskId:this.taskId()}:{}),requestId:id,origin:this.env.GITHUB_PUBLIC_ORIGIN});
   }
   private async completeConnection(id:string):Promise<ConnectionRequest> {
     let connection=this.getConnection(id);
@@ -1607,7 +1607,7 @@ export class BotDO extends DurableObject<Env> {
     return connection;
   }
   private async keychainTool(name:string,args:Record<string,unknown>,runId:string,nativeOperationId:string,operationId:string,signal?:AbortSignal):Promise<Record<string,unknown>>{
-    const response=await this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName('owner')).fetch('https://workspace/keychain-tools',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name,arguments:args,botId:this.bot().id,runId,nativeOperationId,operationId}),signal});
+    const response=await this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName('owner')).fetch('https://workspace/keychain-tools',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name,arguments:args,botId:this.bot().id,...(this.taskId()?{taskId:this.taskId()}:{}),runId,nativeOperationId,operationId}),signal});
     const value=await response.json<Record<string,unknown>>();
     if(!response.ok){const error=value.error as {code?:string;message?:string}|undefined;throw new ApiError(response.status,error?.code??'keychain_unavailable',error?.message??'Keychain is unavailable.');}return value;
   }
@@ -1615,7 +1615,7 @@ export class BotDO extends DurableObject<Env> {
     let continuation:string|undefined;
     this.ctx.storage.transactionSync(()=>{
       this.active();const run=this.getRun(request.runId),native=this.getRunRow(run.id).native_operation_id,id=`secure:${request.id}`;
-      if(request.botId!==this.bot().id||request.status!=='saved')throw new ApiError(409,'secure_input_inactive','Invalid secure continuation.');
+      if(request.botId!==this.bot().id||request.taskId!==this.taskId()||request.status!=='saved')throw new ApiError(409,'secure_input_inactive','Invalid secure continuation.');
       if(terminal.has(run.status)||this.stopped(run.id))return;
       if(native===id){continuation=id;return;}
       if(native!==request.nativeOperationId)return;

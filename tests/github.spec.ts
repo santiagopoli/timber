@@ -3,15 +3,15 @@ import { runInDurableObject } from "cloudflare:test";
 import { exportPKCS8, generateKeyPair } from "jose";
 import { beforeAll, beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 
-const bindings=env as unknown as {GITHUB:DurableObjectNamespace;WORKSPACE:DurableObjectNamespace};
+const bindings=env as unknown as {GITHUB:DurableObjectNamespace;WORKSPACE:DurableObjectNamespace;BOT:DurableObjectNamespace};
 const BOT="11111111-1111-4111-8111-111111111111",OTHER="22222222-2222-4222-8222-222222222222";
 const repository="owner/private-repo",origin="https://timber.test";
 let pem:string,requests:{url:string;headers:Headers;payload:unknown}[],mcpCalls:number,pr:Record<string,unknown>|undefined,failMCP:boolean,loseMCPResponse:boolean,wrongInstallation:boolean,installationPermission:"read"|"write";
 function stub() {return bindings.GITHUB.get(bindings.GITHUB.idFromName(crypto.randomUUID()));}
 async function post(instance:DurableObjectStub,path:string,payload:unknown) {return instance.fetch(`https://github${path}`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(payload)});}
 async function record(instance:DurableObjectStub) {return runInDurableObject(instance,async(_value,state)=>Object.fromEntries(await state.storage.list()));}
-async function setup(instance:DurableObjectStub,permission="write",options:{account?:boolean;settings?:boolean}={}) {
-  const response=await post(instance,"/connect",{...(options.settings?{}:{botId:BOT,requestId:"connection-test"}),...(!options.account && !options.settings?{repository}:{}),permission,origin});
+async function setup(instance:DurableObjectStub,permission="write",options:{account?:boolean;settings?:boolean;taskId?:string;requestId?:string}={}) {
+  const response=await post(instance,"/connect",{...(options.settings?{}:{botId:BOT,requestId:options.requestId??"connection-test",...(options.taskId?{taskId:options.taskId}:{})}),...(!options.account && !options.settings?{repository}:{}),permission,origin});
   const result=await response.json<{url:string}>();expect(response.status).toBe(200);
   const state=new URL(result.url).searchParams.get("state")!,cookie=`__Host-timber-github=${state}`;
   const start=await instance.fetch(result.url);expect(start.status).toBe(200);expect(await start.text()).toContain("Continue to GitHub");
@@ -62,6 +62,21 @@ beforeEach(async()=>{
 afterEach(()=>vi.restoreAllMocks());
 
 describe("GitHub authorization host",()=>{
+  it('resumes a task-scoped GitHub consent in the exact conversation and rejects a mismatched bot',async()=>{
+    const api=async(path:string,method='GET',body?:unknown)=>{const r=await exports.default.fetch(`${origin}/v1${path}`,{method,headers:{authorization:'Bearer test-only-botspace-owner-token-000000','content-type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})});return new Response(await r.text(),{status:r.status,headers:r.headers});};
+    const created=await api('/tasks','POST',{operationId:crypto.randomUUID(),title:'Connect task',description:'fixture:github-account',botId:BOT,startImmediately:true});expect(created.status).toBe(201);
+    const {task}=await created.json<{task:{id:string}}>();
+    let requestId:string|undefined;
+    for(let i=0;i<100&&!requestId;i++){const response=await api(`/tasks/${task.id}/connections`);const {connections}=await response.json<{connections:{id:string}[]}>();requestId=connections[0]?.id;if(!requestId)await new Promise(resolve=>setTimeout(resolve,10));}
+    expect(requestId).toBeTruthy();
+    const integration=bindings.GITHUB.get(bindings.GITHUB.idFromName('owner'));
+    const mismatch=await post(integration,'/connect',{botId:OTHER,taskId:task.id,requestId,origin});expect(mismatch.status).toBe(403);await mismatch.text();
+    const flow=await setup(integration,'read',{account:true,taskId:task.id,requestId});expect(flow.oauth.status).toBe(200);await flow.oauth.text();
+    const target=bindings.BOT.get(bindings.BOT.idFromName(`owner:task:${task.id}`));
+    await runInDurableObject(target,(_i,state)=>{expect(state.storage.sql.exec('SELECT 1 FROM submissions WHERE operation_id=?',`connection:${requestId}`).toArray()).toHaveLength(1);});
+    const root=bindings.BOT.get(bindings.BOT.idFromName(`owner:${BOT}`));
+    await runInDurableObject(root,(_i,state)=>{expect(state.storage.sql.exec('SELECT 1 FROM submissions WHERE operation_id=?',`connection:${requestId}`).toArray()).toHaveLength(0);});
+  });
   it("requires owner authentication and does not expose internal capability minting",async()=>{
     for(const path of ["/v1/connections/github","/v1/connections/github/connect"]) {const response=await exports.default.fetch(`${origin}${path}`);expect(response.status).toBe(401);await response.text();}
     const response=await exports.default.fetch(`${origin}/github/git-capability`,{method:"POST",body:"{}"});expect(response.status).not.toBe(200);await response.text();

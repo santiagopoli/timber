@@ -44,7 +44,7 @@ export interface Approval {id:string;botId:string;runId:string;operationId:strin
 export interface ComputerProvider {exec(botId:string,operationId:string,action:ComputerAction):Promise<ComputerResult>;cancel(botId:string,processId:string):Promise<ComputerResult>;status(botId:string):Promise<ComputerStatus>;checkpoint(botId:string):Promise<ComputerResult>;controlled?(botId:string):Promise<boolean>;}
 export interface ApiError {error:{code:string;message:string};}
 
-export interface ConnectionRequest {id:string;botId:string;runId:string;nativeOperationId?:string;provider:"github";repository?:string;permission:"read"|"write";status:"pending"|"connected"|"cancelled";createdAt:string;}
+export interface ConnectionRequest {id:string;botId:string;taskId?:string;runId:string;nativeOperationId?:string;provider:"github";repository?:string;permission:"read"|"write";status:"pending"|"connected"|"cancelled";createdAt:string;}
 
 export type {MemoryCategory,MemoryActor,MemoryState,MemorySource,MemoryEntry,MemorySaveInput,MemorySuggestionInput,MemoryForgetInput,MemoryAcceptInput,MemoryMutationResult,MemoryRevision,MemorySearchHit,MemorySearchResult,MemoryReviewStatus,MemoryLegacy,MemoryLimits,BotMemory} from './memory';
 export interface CompactionReceipt {id:string;reason:"manual"|"threshold"|"overflow";status:"running"|"completed"|"unchanged"|"failed"|"cancelled";summaryApplied:boolean;error?:string;createdAt?:string;startedAt?:string;summaryCreatedAt?:string;firstKeptEntryId?:number;summarizedEntries?:number;estimatedTokensBefore?:number;historyRetained?:true;}

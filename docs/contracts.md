@@ -471,10 +471,34 @@ work without cancelling the independent task. Ordinary execution admission and
 all task/computer effects retain exact lease fencing.
 
 The console's main segmented Bots/Tasks selector swaps the same list area and
-matching row presentation. Tasks have deep links `#tasks&task=<id>`, a dedicated
-chat, approvals and command activity, with bounded history pages and live SSE.
+matching row presentation. Tasks have deep links `#tasks&task=<id>` and mount the
+same conversation/composer components as bot chat, including inline approvals,
+command activity, failures, image messages and task-scoped agent dialogs. The
+compact task state occupies the conversation-header status area; description,
+assignment, timestamps and pending Start stay behind the Task details button.
+Task chat has bounded history pages and live SSE. Archive pages merge with
+recent activity, and retries preserve each original message's receipt identity.
 Hidden task views stop polling and streaming. The parent chat restores the latest
 status pills from the passive registry and ignores stale status versions.
+
+Task conversations expose the same context and individual-memory routes under
+`/v1/tasks/:id/context` and `/v1/tasks/:id/memory`; these operate on the isolated
+task runtime, never the assigned bot's ordinary context or notes. Model selection
+continues to inherit the assigned bot's settings. Images upload and download
+through that bot's existing artifact routes; task messages validate the same
+image ownership and input limits. Explicit task continuation retains validated
+image IDs or mentions in its durable queued input and operation fingerprint;
+text-only receipts keep their prior fingerprint. As in ordinary chat, a single
+input cannot combine images and mentions. Delegation results return to the exact
+originating task conversation, with the existing cancellation fences.
+
+The `/v1/tasks/:id/keychain` aliases retain the owner's encrypted keychain and
+assigned-bot grants, while listing and fulfilling requests for that task only.
+Secure request receipts and GitHub consent flows carry an optional host-assigned
+`taskId`; check, resume and callback delivery validate the assigned bot and address
+that task's Durable Object. Legacy receipts without a task ID address ordinary
+bot chat. A sibling task cannot fulfill a request through its alias, and Stop,
+revocation and original run/native-operation checks still fence continuation.
 
 ## Console sessions
 The cookie `__Host-timber_session` is Secure, HttpOnly, SameSite=Strict, host-only

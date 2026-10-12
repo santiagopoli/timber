@@ -146,7 +146,7 @@ const AgentsOverview = memo(function AgentsOverview({agents, namedAgents, delega
   </div>;
 }, (previous, next) => previous.botId === next.botId && previous.botName === next.botName && previous.loading === next.loading && previous.error === next.error && previous.callbacks === next.callbacks && sameItems(previous.agents, next.agents) && sameItems(previous.namedAgents, next.namedAgents) && sameItems(previous.delegations, next.delegations));
 
-function Agents({model, callbacks}: {model: AgentsModel; callbacks: Callbacks}) {
+export function Agents({model, callbacks}: {model: AgentsModel; callbacks: Callbacks}) {
   const selected = model.selectedAgentId ? model.agents.find(agent => agent.id === model.selectedAgentId) : undefined;
   if (selected) return <AgentConversation key={`${model.botId}:${selected.id}`} model={model} agent={selected} callbacks={callbacks}/>;
   return <AgentsOverview agents={model.agents} namedAgents={model.namedAgents} delegations={model.delegations} botId={model.botId} botName={model.botName} loading={model.loading} error={model.error} callbacks={callbacks}/>;

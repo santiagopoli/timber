@@ -117,7 +117,7 @@ export default {
         requestBodyForwarded=true;return env.GITHUB.get(env.GITHUB.idFromName(owner)).fetch(internalRequest(request,"https://github/status"));
       }
       const registry=env.WORKSPACE.get(env.WORKSPACE.idFromName(owner));
-      if(url.pathname==='/v1/keychain'||url.pathname.startsWith('/v1/keychain/'))return registry.fetch(internalRequest(request,`https://workspace${url.pathname.slice(3)}`));
+      if(url.pathname==='/v1/keychain'||url.pathname.startsWith('/v1/keychain/')){requestBodyForwarded=true;return registry.fetch(internalRequest(request,`https://workspace${url.pathname.slice(3)}`));}
       if(url.pathname==="/v1/tasks") {
         if(request.method==="GET") return registry.fetch(new Request("https://workspace/tasks"));
         if(request.method!=="POST") throw new ApiError(405,"method_not_allowed","Method not allowed.");
@@ -125,7 +125,7 @@ export default {
         if(!created.ok) return created;
         return created;
       }
-      const taskRoute=/^\/v1\/tasks\/([0-9a-f-]{36})(?:\/(messages|progress|runs(?:\/[0-9a-f-]{36}(?:\/cancel)?)?|events|start|continue|cancel|approvals(?:\/[0-9a-f-]{36})?|agents(?:\/[^/]+\/(?:messages|cancel))?|connections(?:\/[^/]+\/connect)?))?$/.exec(url.pathname);
+      const taskRoute=/^\/v1\/tasks\/([0-9a-f-]{36})(?:\/(messages|progress|runs(?:\/[0-9a-f-]{36}(?:\/cancel)?)?|events|context(?:\/compact)?|memory(?:\/(?:search|review|entries(?:\/[A-Za-z0-9_-]{1,128}(?:\/(?:history|accept))?)?))?|keychain(?:\/(?:requests\/[0-9a-f-]{36}\/authorize|[0-9a-f-]{36}(?:\/permissions)?))?|start|continue|cancel|approvals(?:\/[0-9a-f-]{36})?|agents(?:\/[^/]+\/(?:messages|cancel))?|connections(?:\/[^/]+\/connect)?))?$/.exec(url.pathname);
       if(taskRoute) {
         const [,taskId,endpoint]=taskRoute;
         const taskResponse=await registry.fetch(`https://workspace/tasks/${taskId}`);
@@ -135,6 +135,11 @@ export default {
         if(!botResponse.ok) return botResponse;
         const {bot}=await botResponse.json<{bot:Bot}>();
         if(!endpoint) {if(request.method!=="GET")throw new ApiError(405,"method_not_allowed","Method not allowed.");return json({task});}
+        if(endpoint==='keychain'||endpoint.startsWith('keychain/')) {
+          const forwarded=internalRequest(request,`https://workspace/${endpoint}${url.search}`);
+          forwarded.headers.set('x-keychain-bot',task.botId);forwarded.headers.set('x-keychain-task',taskId);
+          requestBodyForwarded=true;return registry.fetch(forwarded);
+        }
         const stub=env.BOT.get(env.BOT.idFromName(`${owner}:task:${taskId}`));
         const headers=new Headers();headers.set("x-botspace-config",encodeURIComponent(JSON.stringify(bot)));
         headers.set("x-timber-task-id",taskId);
@@ -196,7 +201,7 @@ export default {
       if(!record.ok) return record;
       const {bot}=await record.json<{bot:Bot}>();
       if(!tail && request.method==="GET") return json({bot});
-      if(tail==='/keychain'||tail.startsWith('/keychain/')){const forwarded=internalRequest(request,`https://workspace${tail}`);forwarded.headers.set('x-keychain-bot',botId);return registry.fetch(forwarded);}
+      if(tail==='/keychain'||tail.startsWith('/keychain/')){const forwarded=internalRequest(request,`https://workspace${tail}`);forwarded.headers.set('x-keychain-bot',botId);requestBodyForwarded=true;return registry.fetch(forwarded);}
       if(tail==="/avatar") return registry.fetch(internalRequest(request,`https://workspace/avatar/${botId}`,true));
       const artifact=/^\/artifacts\/([^/]+)$/.exec(tail);
       if(artifact && request.method==="GET") {

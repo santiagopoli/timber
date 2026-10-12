@@ -5,12 +5,12 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Env } from "./env";
 import { ApiError, errorResponse, json } from "./errors";
-import { body, string } from "./validation";
+import { body, string, UUID } from "./validation";
 
 type Permission = "read" | "write";
 interface Scope { botId:string; repository:string; permission:Permission; }
-interface ConnectionScope { botId:string; repository?:string; permission:Permission; }
-interface Flow { botId?:string; repository?:string; permission:Permission; requestId?:string; origin:string; state:string; expiresAt:number; stage:"new"|"manifest"|"install"|"oauth"|"complete"; installationId?:number; }
+interface ConnectionScope { taskId?:string;botId:string; repository?:string; permission:Permission; }
+interface Flow { taskId?:string;botId?:string; repository?:string; permission:Permission; requestId?:string; origin:string; state:string; expiresAt:number; stage:"new"|"manifest"|"install"|"oauth"|"complete"; installationId?:number; }
 interface App { id:number; slug:string; clientId:string; clientSecret:string; pem:string; ownerId:number; }
 interface UserToken { accessToken:string; refreshToken?:string; expiresAt:number; }
 interface Credentials { app:App; user?:UserToken; }
@@ -38,12 +38,14 @@ function scope(value:Record<string,unknown>):Scope {
   return {botId,repository:repository(value.repository),permission:permission(value.permission)};
 }
 function connectionScope(value:Record<string,unknown>):ConnectionScope {
-  if(value.repository!==undefined) return scope({...value,permission:value.permission??"read"});
+  const taskId=value.taskId===undefined?undefined:string(value.taskId,'taskId',36);
+  if(taskId&&!UUID.test(taskId))throw new ApiError(400,'invalid_request','Invalid task identity.');
+  if(value.repository!==undefined) return {...scope({...value,permission:value.permission??"read"}),...(taskId?{taskId}:{})};
   const botId=string(value.botId,"botId",64);
   if(!/^[0-9a-f-]{36}$/i.test(botId)) throw new ApiError(400,"invalid_bot","Invalid bot identity.");
   // The provider installation is the account-wide permission boundary.
   if(value.permission!==undefined) permission(value.permission);
-  return {botId,permission:"read"};
+  return {botId,permission:"read",...(taskId?{taskId}:{})};
 }
 function escapes(value:string):string {return value.replace(/[&<>"']/g,x=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[x]!);}
 function page(title:string,content:string,status=200,headers:HeadersInit={}):Response {
@@ -187,16 +189,31 @@ export class GitHubAuthDO extends DurableObject<Env> {
     if(typeof data.token!=="string") throw new ApiError(502,"github_token_failed","GitHub did not issue repository access.");
     return data.token;
   }
+  private async taskFor(botId:string,taskId:string):Promise<{status:string}> {
+    const response=await this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName('owner')).fetch(`https://workspace/tasks/${taskId}`);
+    if(!response.ok){await response.body?.cancel();throw new ApiError(404,'not_found','Task not found.');}
+    const {task}=await response.json<{task:{botId:string;status:string}}>();
+    if(task.botId!==botId)throw new ApiError(403,'task_mismatch','This task belongs to another bot.');
+    return task;
+  }
   private async notify(flow:Flow):Promise<boolean> {
     if(!flow.botId || !flow.requestId || await this.ctx.storage.get(`deleted:${flow.botId}`)) return true;
-    const response=await this.env.BOT.get(this.env.BOT.idFromName(`owner:${flow.botId}`)).fetch(`https://bot/connections/${encodeURIComponent(flow.requestId)}/complete`,{method:"POST",headers:{"content-type":"application/json","x-timber-internal":"github"},body:JSON.stringify({provider:"github",repository:flow.repository,permission:flow.permission})});
+    if(flow.taskId) {
+      try {if(['completed','failed','cancelled','cancelling'].includes((await this.taskFor(flow.botId,flow.taskId)).status))return true;}
+      catch(error){if(error instanceof ApiError&&[403,404].includes(error.status))return true;throw error;}
+    }
+    const response=await this.env.BOT.get(this.env.BOT.idFromName(flow.taskId?`owner:task:${flow.taskId}`:`owner:${flow.botId}`)).fetch(`https://bot/connections/${encodeURIComponent(flow.requestId)}/complete`,{method:"POST",headers:{"content-type":"application/json","x-timber-internal":"github",...(flow.taskId?{"x-timber-task-id":flow.taskId}:{})},body:JSON.stringify({provider:"github",repository:flow.repository,permission:flow.permission})});
     await response.body?.cancel();return response.ok || response.status===404 || response.status===410;
   }
   private async reconcileWaitingBots():Promise<void> {
-    const waiting=await this.ctx.storage.list<{botId:string}>({prefix:"waiting-bot:",limit:100});
-    for(const [key,{botId}] of waiting) {
+    const waiting=await this.ctx.storage.list<{botId:string;taskId?:string}>({prefix:"waiting-bot:",limit:100});
+    for(const [key,{botId,taskId}] of waiting) {
       try {
-        const response=await this.env.BOT.get(this.env.BOT.idFromName(`owner:${botId}`)).fetch("https://bot/connections/reconcile",{method:"POST",headers:{"x-timber-internal":"github"}});
+        if(taskId) {
+          try {if(['completed','failed','cancelled','cancelling'].includes((await this.taskFor(botId,taskId)).status)){await this.ctx.storage.delete(key);continue;}}
+          catch(error){if(error instanceof ApiError&&[403,404].includes(error.status)){await this.ctx.storage.delete(key);continue;}throw error;}
+        }
+        const response=await this.env.BOT.get(this.env.BOT.idFromName(taskId?`owner:task:${taskId}`:`owner:${botId}`)).fetch("https://bot/connections/reconcile",{method:"POST",headers:{"x-timber-internal":"github",...(taskId?{"x-timber-task-id":taskId}:{})}});
         if(response.status===404 || response.status===410) {await response.body?.cancel();await this.ctx.storage.delete(key);continue;}
         if(response.ok) {const data=await response.json<{pending:number}>();if(data.pending===0) await this.ctx.storage.delete(key);}
         else await response.body?.cancel();
@@ -221,6 +238,7 @@ export class GitHubAuthDO extends DurableObject<Env> {
   private async startConnection(request:Request):Promise<Response> {
     const input=await body(request),origin=this.origin(input.origin);
     const access=input.botId===undefined?{permission:"read" as const}:{...connectionScope(input),requestId:string(input.requestId,"requestId",160)};
+    if('taskId' in access&&access.taskId)await this.taskFor(access.botId,access.taskId);
     await this.encryptionKey();
     // Owner approval is explicit here. A bot cannot call this internal endpoint.
     const flow:Flow={...access,origin,state:random(),expiresAt:Date.now()+FLOW_TTL,stage:"new"};
@@ -397,7 +415,7 @@ export class GitHubAuthDO extends DurableObject<Env> {
       if(path==="/authorize" && request.method==="POST") {
         const access=connectionScope(await body(request));
         const authorized=!(await this.ctx.storage.get(`deleted:${access.botId}`)) && Boolean(access.repository?await this.grant({...access,repository:access.repository}):await this.connectedInstallation());
-        if(!authorized && !(await this.ctx.storage.get(`deleted:${access.botId}`))) {await this.ctx.storage.put(`waiting-bot:${access.botId}`,{botId:access.botId});await this.alarmAt(Date.now()+30_000);}
+        if(!authorized && !(await this.ctx.storage.get(`deleted:${access.botId}`))) {await this.ctx.storage.put(`waiting-bot:${access.taskId?`task:${access.taskId}`:access.botId}`,{botId:access.botId,...(access.taskId?{taskId:access.taskId}:{})});await this.alarmAt(Date.now()+30_000);}
         return json({authorized});
       }
       if(path.startsWith("/github/git/")) return await this.git(request);

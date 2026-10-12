@@ -16,13 +16,21 @@ export class OwnerKeychainCoordinator {
     const row=this.ctx.storage.sql.exec<{data:string}>('SELECT data FROM bots WHERE id=?',id).toArray()[0];
     if(!row)throw new ApiError(404,'not_found','Bot not found.');return JSON.parse(row.data);
   }
-  private async botRequest(botId:string,path:string,input:unknown):Promise<Response>{
+  private async botRequest(botId:string,path:string,input:unknown,taskId?:string):Promise<Response>{
     const bot=this.bot(botId);
-    return this.env.BOT.get(this.env.BOT.idFromName(`owner:${botId}`)).fetch(`https://bot/_keychain/${path}`,{method:'POST',headers:{'content-type':'application/json','x-botspace-config':encodeURIComponent(JSON.stringify(bot))},body:JSON.stringify(input)});
+    if(taskId)this.assertTask(botId,taskId);
+    return this.env.BOT.get(this.env.BOT.idFromName(taskId?`owner:task:${taskId}`:`owner:${botId}`)).fetch(`https://bot/_keychain/${path}`,{method:'POST',headers:{'content-type':'application/json','x-botspace-config':encodeURIComponent(JSON.stringify(bot)),...(taskId?{'x-timber-task-id':taskId}:{})},body:JSON.stringify(input)});
+  }
+  private assertTask(botId:string,taskId:string):{status:string} {
+    if(!UUID.test(taskId))throw new ApiError(400,'invalid_request','Invalid task identity.');
+    const row=this.ctx.storage.sql.exec<{data:string}>('SELECT data FROM tasks WHERE id=?',taskId).toArray()[0];
+    if(!row||JSON.parse(row.data).botId!==botId)throw new ApiError(403,'task_mismatch','This task belongs to another bot.');
+    return JSON.parse(row.data);
   }
   private async assertRun(request:SecureInputRequest):Promise<void>{
+    if(request.taskId&&request.botId&&['completed','failed','cancelled','cancelling'].includes(this.assertTask(request.botId,request.taskId).status))throw new ApiError(409,'secure_input_inactive','The task is no longer active.');
     if(!request.botId)throw new ApiError(409,'secure_input_inactive','Request has no bot.');
-    const response=await this.botRequest(request.botId,'check',{runId:request.runId,nativeOperationId:request.nativeOperationId});
+    const response=await this.botRequest(request.botId,'check',{runId:request.runId,nativeOperationId:request.nativeOperationId},request.taskId);
     await response.text();
     if(!response.ok)throw new ApiError(409,'secure_input_inactive','The task is no longer active.');
   }
@@ -34,7 +42,8 @@ export class OwnerKeychainCoordinator {
     const input=JSON.parse(row.data) as {request:SecureInputRequest;entries:SecretMetadata[]};
     try{
       this.bot(input.request.botId!);
-      const response=await this.botRequest(input.request.botId!,'resume',input);
+      if(input.request.taskId&&['completed','failed','cancelled','cancelling'].includes(this.assertTask(input.request.botId!,input.request.taskId).status)){this.ctx.storage.sql.exec('DELETE FROM keychain_deliveries WHERE request_id=?',id);return;}
+      const response=await this.botRequest(input.request.botId!,'resume',input,input.request.taskId);
       await response.text();
       if(!response.ok)throw new Error('Delivery unavailable');
       this.ctx.storage.sql.exec('DELETE FROM keychain_deliveries WHERE request_id=?',id);
@@ -47,6 +56,7 @@ export class OwnerKeychainCoordinator {
     const request=this.store.request(id);if(!request)throw new ApiError(404,'not_found','Secure input request not found.');
     this.bot(request.botId!);
     if(replay)return;
+    if(request.taskId&&['completed','failed','cancelled','cancelling'].includes(this.assertTask(request.botId!,request.taskId).status))throw new ApiError(409,'secure_input_inactive','The task is no longer active.');
     if(request.status!=='pending')throw new ApiError(409,'secure_input_inactive','The request is no longer pending.');
     request.status='saved';this.store.setRequest(request);
     this.ctx.storage.sql.exec('INSERT INTO keychain_deliveries(request_id,data,next_at) VALUES(?,?,?)',id,JSON.stringify({request,entries}),Date.now());
@@ -54,38 +64,40 @@ export class OwnerKeychainCoordinator {
   async tool(input:Record<string,unknown>,signal:AbortSignal):Promise<Response>{
     const botId=string(input.botId,'botId',36);this.bot(botId);
     const name=string(input.name,'name',40),args=object(input.arguments??{}),op=string(input.operationId,'operationId',200);
+    const taskId=input.taskId===undefined?undefined:string(input.taskId,'taskId',36);if(taskId)this.assertTask(botId,taskId);
     const runId=string(input.runId,'runId',36),nativeOperationId=string(input.nativeOperationId,'nativeOperationId',128);
     if(name==='cancel'){
-      for(const request of this.store.requests())if(request.botId===botId&&request.runId===runId&&request.status==='pending'){request.status='cancelled';this.store.setRequest(request);}
+      for(const request of this.store.requests())if(request.botId===botId&&request.taskId===taskId&&request.runId===runId&&request.status==='pending'){request.status='cancelled';this.store.setRequest(request);}
       return json({cancelled:true});
     }
-    await this.assertRun({botId,runId,nativeOperationId} as SecureInputRequest);
+    await this.assertRun({botId,...(taskId?{taskId}:{}),runId,nativeOperationId} as SecureInputRequest);
     if(name==='list_secrets')return json({secrets:await this.store.permitted(botId)});
     if(name==='name_secret'){
-      const entry=await this.store.rename(op,string(args.secretId,'secretId',36),args,async()=>{await this.assertRun({botId,runId,nativeOperationId} as SecureInputRequest);signal.throwIfAborted();},botId);
+      const entry=await this.store.rename(op,string(args.secretId,'secretId',36),args,async()=>{await this.assertRun({botId,...(taskId?{taskId}:{}),runId,nativeOperationId} as SecureInputRequest);signal.throwIfAborted();},botId);
       return json({secret:entry});
     }
     if(name==='request_secret'||name==='configure_secret'){
       if(name==='configure_secret')await this.store.requireAccess(string(args.secretId,'secretId',36),botId);
-      return json({request:this.store.requestInput(`${botId}:${op}`,args,runId,nativeOperationId,botId)});
+      return json({request:this.store.requestInput(`${taskId?`task:${taskId}:`:""}${botId}:${op}`,args,runId,nativeOperationId,botId,taskId)});
     }
     if(name==='secret_request'){
-      const result=await this.store.call(`${botId}:${op}`,args,signal,async()=>{this.bot(botId);await this.assertRun({botId,runId,nativeOperationId} as SecureInputRequest);},botId);
+      const result=await this.store.call(`${botId}:${op}`,args,signal,async()=>{this.bot(botId);await this.assertRun({botId,...(taskId?{taskId}:{}),runId,nativeOperationId} as SecureInputRequest);},botId);
       return json({...result,operationId:op});
     }
     throw new ApiError(404,'not_found','Tool not found.');
   }
   async fetch(request:Request):Promise<Response>{
-    const path=new URL(request.url).pathname,botId=request.headers.get('x-keychain-bot')??undefined;
+    const path=new URL(request.url).pathname,botId=request.headers.get('x-keychain-bot')??undefined,taskId=request.headers.get('x-keychain-task')??undefined;
+    if(taskId){if(!botId)throw new ApiError(403,'task_mismatch','Missing assigned bot.');this.assertTask(botId,taskId);}
     if(botId)this.bot(botId);
-    if(path==='/keychain'&&request.method==='GET')return json({entries:this.store.list(),requests:this.store.requests().filter(item=>!botId||item.botId===botId)});
+    if(path==='/keychain'&&request.method==='GET')return json({entries:this.store.list(),requests:this.store.requests().filter(item=>!botId||item.botId===botId&&item.taskId===taskId)});
     if(path==='/keychain'&&request.method==='POST'){
       let input=await body(request);if(Object.keys(input).some(key=>!['entries','operationId','requestId'].includes(key)))throw new ApiError(400,'invalid_secure_input','Unsupported input fields.');
       const requestId=input.requestId;let pending:SecureInputRequest|undefined;
       if(requestId!==undefined){
         if(typeof requestId!=='string'||!UUID.test(requestId))throw new ApiError(400,'invalid_secure_input','Invalid secure request.');
         pending=this.store.request(requestId);
-        if(!pending||pending.secretId||botId&&pending.botId!==botId)throw new ApiError(400,'invalid_secure_input','Invalid secure request.');
+        if(!pending||pending.secretId||botId&&(pending.botId!==botId||pending.taskId!==taskId))throw new ApiError(400,'invalid_secure_input','Invalid secure request.');
         if(pending.status==='pending')await this.assertRun(pending);
         if(!Array.isArray(input.entries)||input.entries.length!==1)throw new ApiError(400,'invalid_secure_input','One input is required.');
         const item=object(input.entries[0]);if(item.id!==undefined)throw new ApiError(400,'invalid_secure_input','A new input is required.');
@@ -97,7 +109,7 @@ export class OwnerKeychainCoordinator {
     }
     const authorization=/^\/keychain\/requests\/([^/]+)\/authorize$/.exec(path);
     if(authorization&&request.method==='POST'){
-      const pending=this.store.request(authorization[1]);if(!pending?.secretId||botId&&pending.botId!==botId)throw new ApiError(404,'not_found','Request not found.');
+      const pending=this.store.request(authorization[1]);if(!pending?.secretId||botId&&(pending.botId!==botId||pending.taskId!==taskId))throw new ApiError(404,'not_found','Request not found.');
       if(pending.status!=='saved'){await this.assertRun(pending);await this.store.authorize(pending,(entries,replay)=>this.commitRequest(pending.id,entries,replay));}
       await this.rearm();await this.deliver(pending.id);return json({entries:this.store.list().filter(entry=>entry.id===pending.secretId)});
     }

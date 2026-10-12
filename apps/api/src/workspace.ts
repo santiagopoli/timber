@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import type { Bot, ModelSettings,Task,TaskUpdate } from "@botspace/contracts";
 import type { Env } from "./env";
 import { ApiError, errorResponse, json } from "./errors";
-import { body, parseBotInput, parseAction, operationId, UUID } from "./validation";
+import { body, parseBotInput, parseMessage, parseAction, operationId, UUID } from "./validation";
 import { AgentCoordinator } from "./agent-coordination";
 import { AvatarCoordinator } from "./avatars";
 import {OwnerKeychainCoordinator} from './owner-keychain';
@@ -341,7 +341,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         }
         const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",slot.task_id).toArray()[0];
         if(!row){this.releaseSlot(slot.bot_id,slot.task_id,slot.token);continue;}
-        const task=JSON.parse(row.data) as {id:string;botId:string;status:string;title:string;description:string;startText?:string;startOperationId?:string;cancelRequested?:boolean;updatedAt:string};
+        const task=JSON.parse(row.data) as {id:string;botId:string;status:string;title:string;description:string;startText?:string;startAttachments?:string[];startMentions?:string[];startOperationId?:string;cancelRequested?:boolean;updatedAt:string};
         const state=await this.schedulerSnapshot(slot.bot_id,bot,task.id);
         const observedSlot=this.slotFor(slot.bot_id);
         if(!observedSlot||observedSlot.task_id!==slot.task_id||observedSlot.token!==slot.token||observedSlot.generation!==slot.generation||observedSlot.updated_at!==slot.updated_at)continue;
@@ -356,7 +356,7 @@ export class WorkspaceDO extends DurableObject<Env> {
           if(mainState.activeRuns||mainState.activeProcesses||mainState.pendingCancellations||mainState.computerControlled)continue;
           const startStub=this.env.BOT.get(this.env.BOT.idFromName(`owner:task:${task.id}`));
           const admission=this.beginComputerAdmission(slot.bot_id,task.id,this.taskStartOperation(task),true);
-          const startResponse=await startStub.fetch(new Request("https://task/messages",{method:"POST",headers:{"content-type":"application/json","x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-task-id":task.id},body:JSON.stringify({operationId:this.taskStartOperation(task),text:task.startText??(task.description||task.title)})}));
+          const startResponse=await startStub.fetch(new Request("https://task/messages",{method:"POST",headers:{"content-type":"application/json","x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-task-id":task.id},body:JSON.stringify({operationId:this.taskStartOperation(task),text:task.startText??(task.description||task.title),...(task.startAttachments?.length?{attachments:task.startAttachments}:{}),...(task.startMentions?.length?{mentions:task.startMentions}:{})})}));
           this.ctx.waitUntil(startResponse.arrayBuffer().catch(()=>{}));
           this.completeComputerAdmission(admission);
           if(startResponse.ok)this.markTaskRunning(task.id);
@@ -405,7 +405,7 @@ export class WorkspaceDO extends DurableObject<Env> {
     const queued=this.ctx.storage.sql.exec<{id:string;data:string}>("SELECT id,data FROM tasks WHERE json_extract(data,'$.status')='queued' AND json_extract(data,'$.startImmediately')=1 ORDER BY rowid").toArray();
     const bots=new Set<string>();
     for(const row of queued) {
-      const task=JSON.parse(row.data) as {id:string;botId:string;title:string;description:string;startText?:string;status:string;startOperationId?:string};
+      const task=JSON.parse(row.data) as {id:string;botId:string;title:string;description:string;startText?:string;startAttachments?:string[];startMentions?:string[];status:string;startOperationId?:string};
       if(bots.has(task.botId)||this.ctx.storage.sql.exec("SELECT 1 FROM task_slots WHERE bot_id=?",task.botId).toArray().length)continue;
       const token=crypto.randomUUID();let reserved=false;
       this.ctx.storage.transactionSync(()=>{if(!this.ctx.storage.sql.exec("SELECT 1 FROM task_slots WHERE bot_id=?",task.botId).toArray().length){const generation=this.nextSlotGeneration(task.botId);this.ctx.storage.sql.exec("INSERT INTO task_slots(bot_id,task_id,token,generation,updated_at) VALUES(?,?,?,?,?)",task.botId,task.id,token,generation,Date.now());reserved=true;}});
@@ -417,7 +417,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         const fresh=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",task.id).toArray()[0];
         const current=fresh?JSON.parse(fresh.data) as typeof task:undefined;if(!current||current.status!=="queued")continue;
         const stub=this.env.BOT.get(this.env.BOT.idFromName(`owner:task:${task.id}`)),admission=this.beginComputerAdmission(task.botId,task.id,this.taskStartOperation(task),true);
-        const response=await stub.fetch(new Request("https://task/messages",{method:"POST",headers:{"content-type":"application/json","x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-task-id":task.id},body:JSON.stringify({operationId:this.taskStartOperation(task),text:task.startText??(task.description||task.title)})}));
+        const response=await stub.fetch(new Request("https://task/messages",{method:"POST",headers:{"content-type":"application/json","x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-task-id":task.id},body:JSON.stringify({operationId:this.taskStartOperation(task),text:task.startText??(task.description||task.title),...(task.startAttachments?.length?{attachments:task.startAttachments}:{}),...(task.startMentions?.length?{mentions:task.startMentions}:{})})}));
         this.ctx.waitUntil(response.arrayBuffer().catch(()=>{}));
         this.completeComputerAdmission(admission);
         if(response.ok)this.markTaskRunning(task.id);
@@ -728,15 +728,17 @@ export class WorkspaceDO extends DurableObject<Env> {
       const continueRoute=/^\/tasks\/([0-9a-f-]{36})\/continue$/.exec(path);
       if(continueRoute&&request.method==="POST") {
         const input=await body(request);
-        if(typeof input.operationId!=="string"||!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.operationId)||typeof input.text!=="string"||!input.text.trim()||input.text.length>32000)throw new ApiError(400,"invalid_request","Continue requires a fresh operationId and explicit instructions.");
-        const id=continueRoute[1],op=`task-continue:${id}:${input.operationId}`,fingerprint=JSON.stringify({taskId:id,text:input.text});
+        if(typeof input.operationId!=="string"||!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.operationId)||typeof input.text!=="string"||input.text.length>32000)throw new ApiError(400,"invalid_request","Continue requires a fresh operationId and explicit instructions.");
+        const parsed=parseMessage(input);
+        if(parsed.attachments?.length&&parsed.mentions?.length)throw new ApiError(400,'image_mentions_unsupported','Image messages cannot mention other bots yet.');
+        const id=continueRoute[1],op=`task-continue:${id}:${input.operationId}`,fingerprint=JSON.stringify({taskId:id,text:input.text,...(parsed.attachments?.length?{attachments:parsed.attachments}:{}),...(parsed.mentions?.length?{mentions:parsed.mentions}:{})});
         const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",id).toArray()[0];if(!row)throw new ApiError(404,"not_found","Task not found.");
-        const task=JSON.parse(row.data) as {id:string;status:string;startImmediately:boolean;updatedAt:string;cancelRequested?:boolean;startOperationId?:string;startText?:string};
+        const task=JSON.parse(row.data) as {id:string;status:string;startImmediately:boolean;updatedAt:string;cancelRequested?:boolean;startOperationId?:string;startText?:string;startAttachments?:string[];startMentions?:string[]};
         if(task.cancelRequested||["cancelled","cancelling"].includes(task.status))throw new ApiError(409,"task_cancelled","Cancelled tasks cannot be continued; create a new task.");
         const previous=this.ctx.storage.sql.exec<{fingerprint:string;task_id:string}>("SELECT fingerprint,task_id FROM task_operations WHERE operation_id=?",op).toArray()[0];
         if(previous){if(previous.fingerprint!==fingerprint)throw new ApiError(409,"operation_id_conflict","Continue operationId was used with different instructions.");return json({task},202);}
         if(!["completed","failed"].includes(task.status))throw new ApiError(409,"task_not_terminal","Continue is only available for completed or failed tasks.");
-        task.status="queued";task.startImmediately=true;task.startOperationId=`task-continue:${crypto.randomUUID()}`;task.startText=input.text;task.updatedAt=new Date().toISOString();
+        task.status="queued";task.startImmediately=true;task.startOperationId=`task-continue:${crypto.randomUUID()}`;task.startText=input.text;task.startAttachments=parsed.attachments;task.startMentions=parsed.mentions;task.updatedAt=new Date().toISOString();
         this.ctx.storage.transactionSync(()=>{this.ctx.storage.sql.exec("INSERT INTO task_operations(operation_id,task_id,fingerprint) VALUES(?,?,?)",op,id,fingerprint);this.saveTask(task);});
         await this.rearmDeletion();await this.reconcileComputerSlots();
         return json({task:JSON.parse(this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",id).one().data)},202);
