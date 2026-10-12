@@ -102,7 +102,7 @@ for(const width of [390,1440])test(`global tasks: default auto-start, explicit p
   await filters.getByRole('button',{name:'Pending',exact:true}).click();assert.deepEqual(await cards.evaluateAll(nodes=>nodes.map(node=>node.dataset.taskId)),['task-pending']);
   await filterButton.click();await filters.getByRole('button',{name:'Completed',exact:true}).click();assert.deepEqual(await cards.evaluateAll(nodes=>nodes.map(node=>node.dataset.taskId)),['task-completed']);
   await filterButton.click();await filters.getByRole('button',{name:'All',exact:true}).click();assert.equal(await filterButton.getAttribute('data-filtered'),'false');
-  await filterButton.click();await page.keyboard.press('Escape');assert.equal(await filters.count(),0);assert.equal(await filterButton.evaluate(node=>node===document.activeElement),true,'Escape returns focus to the icon');
+  await filterButton.click();await page.keyboard.press('Escape');assert.equal(await filters.count(),0);await page.waitForFunction(()=>document.querySelector('.timber-tasks-filter-trigger')===document.activeElement);assert.equal(await filterButton.evaluate(node=>node===document.activeElement),true,'Escape returns focus to the icon');
   await open('task-running');
   assert.equal(await taskChat(page).innerText().then(value=>value.includes('Private conversation for task-running')),true);
   assert.equal(await taskChat(page).innerText().then(value=>value.includes('Organize the research notes')),false,'ordinary bot transcript is not copied into task chat');
