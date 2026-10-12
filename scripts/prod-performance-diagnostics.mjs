@@ -40,7 +40,7 @@ export const PERFORMANCE_DELIVERIES = `SELECT t.status AS delivery_status,
  WHERE json_extract(t.record,'$.kind')='timber.subagent-delivery' AND t.status!='terminal' ORDER BY t.id DESC LIMIT 20`;
 export const PERFORMANCE_WAKES = `SELECT capability,fn,time,running,execution_started_at,recovery_loop FROM cf_agents_jobs ORDER BY time LIMIT 40`;
 export const PERFORMANCE_RECOVERY = `SELECT 
- (SELECT COUNT(*) FROM pi_documents WHERE kind='timber.subagent-waits') AS wait_graphs,
+ (SELECT COUNT(*) FROM pi_documents WHERE kind=json_quote('timber.subagent-waits')) AS wait_graphs,
  (SELECT COUNT(*) FROM pi_tasks WHERE status!='terminal') AS active_native_tasks,
  (SELECT COUNT(*) FROM pi_submissions WHERE status='queued') AS queued_inputs`;
 export const PERFORMANCE_PROCESSES = `SELECT status,dispatch_state,cancel_requested,
