@@ -392,7 +392,8 @@ def write_workspace_file(workspace: Path, relative: str, content: bytes) -> None
             except FileExistsError:
                 pass
             next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current_fd)
-            os.fchown(next_fd, 10001, 10001)
+            if workspace_prefix():
+                os.fchown(next_fd, 10001, 10001)
             os.fchmod(next_fd, 0o2770)
             if current_fd != root_fd:
                 os.close(current_fd)
