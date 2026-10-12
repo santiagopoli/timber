@@ -4,6 +4,15 @@ import {createHash, randomUUID} from 'node:crypto';
 
 const origin = process.env.COMPUTER_URL || 'http://127.0.0.1:8080';
 const token = process.env.COMPUTER_TEST_TOKEN;
+// Public check annotations retain the exact failing smoke assertion even when
+// GitHub requires sign-in for full logs. Assertions and exit behavior are unchanged.
+if (process.env.GITHUB_ACTIONS === 'true') process.on('uncaughtExceptionMonitor', error => {
+  let message = String(error?.message || error);
+  if (token) message = message.split(token).join('[redacted]');
+  const line = /smoke-computer\.mjs:(\d+):/.exec(String(error?.stack || ''))?.[1] || '1';
+  message = message.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
+  console.error(`::error file=scripts/smoke-computer.mjs,line=${line},title=Computer image smoke failed::${message}`);
+});
 if (!token) throw new Error('COMPUTER_TEST_TOKEN is required.');
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function request(path, options = {}) {
