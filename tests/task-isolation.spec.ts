@@ -103,12 +103,14 @@ describe('independent persistent task computers',()=>{
  it('deleting a named bot drains its isolated task computers and preserves another bot',async()=>{
   const owner=await bot(),other=await bot(),first=await task(owner),second=await task(owner);
   await settled(first.id,'waiting_approval');await settled(second.id,'waiting_approval');
+  await runInDurableObject(registry(),(_,state)=>state.storage.sql.exec('INSERT INTO task_isolation_migrations(task_id,bot_id) VALUES(?,?)',first.id,owner.id));
   const response=await exports.default.fetch(`https://timber.test/v1/bots/${owner.id}`,{method:'DELETE',headers:{authorization:'Bearer test-only-botspace-owner-token-000000'}});expect([200,202]).toContain(response.status);await response.text();
   await expect.poll(async()=>{
    await tick();
    return await runInDurableObject(bindings.COMPUTER.get(bindings.COMPUTER.idFromName(computerName(owner.id,second.id))),(_,state)=>state.storage.sql.exec('SELECT 1 FROM deletion').toArray().length);
   }).toBe(1);
   for(const current of [first,second])await runInDurableObject(bindings.COMPUTER.get(bindings.COMPUTER.idFromName(computerName(owner.id,current.id))),(_,state)=>expect(state.storage.sql.exec('SELECT 1 FROM deletion').toArray()).toHaveLength(1));
+  await runInDurableObject(registry(),(_,state)=>expect(state.storage.sql.exec('SELECT 1 FROM task_isolation_migrations WHERE task_id=?',first.id).toArray()).toHaveLength(0));
   expect((await api<{bot:Bot}>(`/v1/bots/${other.id}`)).bot.id).toBe(other.id);
   await runInDurableObject(bindings.COMPUTER.get(bindings.COMPUTER.idFromName(other.id)),(_,state)=>expect(state.storage.sql.exec('SELECT 1 FROM deletion').toArray()).toHaveLength(0));
  },60000);

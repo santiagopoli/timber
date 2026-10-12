@@ -86,6 +86,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         this.ctx.storage.sql.exec("DELETE FROM task_operations WHERE task_id=?",item.task_id);
         this.ctx.storage.sql.exec("DELETE FROM task_message_receipts WHERE json_extract(fingerprint,'$.taskId')=?",item.task_id);
         this.ctx.storage.sql.exec("DELETE FROM task_updates WHERE task_id=?",item.task_id);
+        this.ctx.storage.sql.exec("DELETE FROM task_isolation_migrations WHERE task_id=?",item.task_id);
         this.ctx.storage.sql.exec("DELETE FROM tasks WHERE id=?",item.task_id);
         this.ctx.storage.sql.exec("UPDATE bot_task_deletions SET completed=1 WHERE task_id=?",item.task_id);
       }
