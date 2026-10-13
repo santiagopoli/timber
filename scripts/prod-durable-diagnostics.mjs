@@ -109,6 +109,23 @@ export const PRIVATE_PROGRESS_FAILURES = `SELECT json_group_array(json_object('a
 export const PRIVATE_PROGRESS_GOAL = `SELECT json_object('title',substr(json_extract(t.data,'$.title'),1,200),'description',substr(json_extract(t.data,'$.description'),1,6000)) AS detail,'text' AS detail_type
  FROM tasks t JOIN bots b ON b.id=json_extract(t.data,'$.botId') WHERE lower(json_extract(b.data,'$.name'))='polibot' ORDER BY t.rowid DESC LIMIT 1`;
 
+export const PRIVATE_EXECUTION_RECENT = `SELECT json_group_array(json_object('at',at,'tool',tool,'command',command,'status',status,'error',error)) AS detail,'text' AS detail_type FROM (
+ SELECT json_extract(s.data,'$.createdAt') AS at,json_extract(s.data,'$.data.actionType') AS tool,
+ substr(json_extract(s.data,'$.data.input.command'),1,220) AS command,
+ json_extract(c.data,'$.data.result.status') AS status,substr(json_extract(c.data,'$.data.result.error'),1,100) AS error
+ FROM events s LEFT JOIN events c ON c.source_key='tool:'||json_extract(s.data,'$.data.operationId')
+ WHERE json_extract(s.data,'$.type')='tool.started' AND json_extract(s.data,'$.data.actionType') IS NOT NULL ORDER BY s.id DESC LIMIT 20)`;
+export const PRIVATE_EXECUTION_REPEATS = `SELECT json_group_array(json_object('command',command,'count',n,'first',first_at,'last',last_at)) AS detail,'text' AS detail_type FROM (
+ SELECT substr(json_extract(data,'$.data.input.command'),1,220) AS command,COUNT(*) AS n,
+ MIN(json_extract(data,'$.createdAt')) AS first_at,MAX(json_extract(data,'$.createdAt')) AS last_at
+ FROM events WHERE json_extract(data,'$.type')='tool.started' AND json_extract(data,'$.data.actionType')='exec'
+ GROUP BY json_extract(data,'$.data.input.command') ORDER BY n DESC LIMIT 15)`;
+export function selectedTaskQuery(prefix) {
+ if(!prefix)return PERFORMANCE_TASKS;
+ if(!/^[a-f0-9]{8}$/.test(prefix))throw new Error('durable_diagnostics_invalid_task');
+ return PERFORMANCE_TASKS.replace(' ORDER BY (json_extract',` WHERE substr(t.id,1,8)='${prefix}' ORDER BY (json_extract`);
+}
+
 const SCHEMA_NAMES = new Set(['pi_submissions','pi_tasks','runs','submissions','botspace_runtime_generations']);
 const SIGNATURES = new Set(['no_detail','non_string_detail','chatgpt_subscription_sharing_usage_limit','sanitized_model_request_failed','contains_fixed_model_request_failed','native_json_undefined','native_entry_visibility','sdk_unfinished_tool_call','sdk_unhandled_stop_reason','json_parse','missing_origin_operation','missing_conversation_identity','sqlite_error','javascript_type_error','chatgpt_connection_changed','chatgpt_invalid_tool_namespace','chatgpt_incomplete_response','chatgpt_output_limit','unclassified']);
 const REASONS = new Set(['model_error','faulted','aborted','no_model','reset','stale','tool_error','task_error','task_failed','budget_exceeded','other']);
@@ -203,6 +220,7 @@ async function readJson(response) {
 
 export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now(),onProgress=()=>{}}={}) {
   const recipient=env.DIAGNOSTIC_RECIPIENT_PUBLIC_KEY?recipientPublicKey(env.DIAGNOSTIC_RECIPIENT_PUBLIC_KEY):undefined;
+  const taskQuery=selectedTaskQuery(env.DIAGNOSTIC_TASK_PREFIX);
   const account=env.CLOUDFLARE_ACCOUNT_ID;
   if(typeof account!=='string'||!/^[a-f0-9]{24,64}$/i.test(account))throw new Error('durable_diagnostics_account_missing');
   const headers={'content-type':'application/json'};
@@ -249,7 +267,7 @@ export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now
       return {...summarizePerformance({runs:await optional('runs',['admission_sources'],PERFORMANCE_RUNS),tools:await query(bot,name,PERFORMANCE_TOOLS),native:await query(bot,name,PERFORMANCE_NATIVE),wakes:await optional('wakes',['cf_agents_jobs'],PERFORMANCE_WAKES),recovery:await optional('recovery',['pi_documents','pi_submissions'],PERFORMANCE_RECOVERY),hostWaits:await optional('hostWaits',['run_processes','pending_run_cancellations'],PERFORMANCE_HOST_WAITS),processes:await optional('processes',['run_processes'],PERFORMANCE_PROCESSES),deliveries:await optional('deliveries',['pi_submissions','pi_document_revisions'],PERFORMANCE_DELIVERIES),usage:await query(bot,name,PERFORMANCE_USAGE)},window),inference,activity,...(unavailable.length?{unavailable}: {})};
     };
     const root=await inspect(name),tasks=[],blockers=new Map([[selected[0].id,root]]);
-    const selectedTasks=await query(workspace,'owner',PERFORMANCE_TASKS);
+    const selectedTasks=await query(workspace,'owner',taskQuery);
     for(const task of selectedTasks){
       if(!uuid(task.id))throw new Error('durable_diagnostics_invalid_response');
       let blockedBy;
@@ -260,13 +278,15 @@ export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now
       tasks.push({...performanceTaskMetadata(task),execution:await inspect(`owner:task:${task.id}`),...(blockedBy?{blockedBy}:{})});
     }
     const backgroundAvatars=summarizeAvatars(await query(workspace,'owner',AVATAR_QUERY),window).jobs;
-    let encryptedDiagnostic;
+    let encryptedDiagnostic,encryptedExecution;
     if(recipient&&selectedTasks.length){
       const selectedName=`owner:task:${selectedTasks[0].id}`;
-      const evidence=[...(await query(bot,selectedName,PRIVATE_PROGRESS_MESSAGES)),...(await query(bot,selectedName,PRIVATE_PROGRESS_FAILURES)),...(await query(workspace,'owner',PRIVATE_PROGRESS_GOAL))];
+      const goalQuery=PRIVATE_PROGRESS_GOAL.replace("lower(json_extract(b.data,'$.name'))='polibot'",`t.id='${selectedTasks[0].id}'`);
+      const evidence=[...(await query(bot,selectedName,PRIVATE_PROGRESS_MESSAGES)),...(await query(bot,selectedName,PRIVATE_PROGRESS_FAILURES)),...(await query(workspace,'owner',goalQuery))];
       encryptedDiagnostic=encryptDetails(evidence,recipient,window);
+      encryptedExecution=encryptDetails([...(await query(bot,selectedName,PRIVATE_EXECUTION_RECENT)),...(await query(bot,selectedName,PRIVATE_EXECUTION_REPEATS))],recipient,window);
     }
-    return {source:'durable_performance_fixed_select',window,root,tasks,backgroundAvatars,...(encryptedDiagnostic?{encryptedDiagnostic}:{}),limitation:'Latest 12 runs, 60 tools/native tasks and 40 model responses per conversation; Polibot chat and six tasks across all bots, prioritizing active work. Plaintext contains only allowlisted metadata. Optional task evidence is encrypted exclusively for the supplied recipient; no native prompts, private reasoning or secret storage is queried.'};
+    return {source:'durable_performance_fixed_select',window,root,tasks,backgroundAvatars,...(encryptedDiagnostic?{encryptedDiagnostic,encryptedExecution}:{}),limitation:'Latest 12 runs, 60 tools/native tasks and 40 model responses per conversation; Polibot chat and six tasks across all bots, prioritizing active work. Plaintext contains only allowlisted metadata. Optional task evidence is encrypted exclusively for the supplied recipient; no native prompts, private reasoning or secret storage is queried.'};
   }
   const schema=await query(bot,name,SCHEMA);
   if(schema.length!==SCHEMA_NAMES.size||!schema.every(row=>SCHEMA_NAMES.has(row.name)))throw new Error('durable_diagnostics_schema_mismatch');

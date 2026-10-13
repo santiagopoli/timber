@@ -136,3 +136,20 @@ test('includes active tasks from every bot before newer completed history withou
   assert.doesNotMatch(JSON.stringify(rows.map(performanceTaskMetadata)),/private|named|working|waiting/);
  } finally {db.close();}
 });
+
+test('targeted encrypted evidence selects the registered task and bounds public command projections',async()=>{
+ const {selectedTaskQuery,PRIVATE_EXECUTION_RECENT,PRIVATE_EXECUTION_REPEATS}=await import('../prod-durable-diagnostics.mjs');
+ assert.throws(()=>selectedTaskQuery("3900d946' OR 1=1"),/invalid_task/);
+ const db=new DatabaseSync(':memory:');
+ try{
+  db.exec('CREATE TABLE bots(id TEXT,data TEXT);CREATE TABLE tasks(id TEXT,data TEXT);CREATE TABLE task_slots(bot_id TEXT,task_id TEXT,updated_at INTEGER);CREATE TABLE computer_admissions(bot_id TEXT,payload TEXT);CREATE TABLE events(id INTEGER,source_key TEXT,data TEXT)');
+  db.prepare('INSERT INTO bots VALUES(?,?)').run('bot',JSON.stringify({name:'Polibot'}));
+  for(const id of ['3900d946-dd96-4f40-8c34-8ad759100000','aaaaaaaa-dd96-4f40-8c34-8ad759100000'])db.prepare('INSERT INTO tasks VALUES(?,?)').run(id,JSON.stringify({botId:'bot',status:'running'}));
+  assert.deepEqual(db.prepare(selectedTaskQuery('3900d946')).all().map(x=>x.id),['3900d946-dd96-4f40-8c34-8ad759100000']);
+  for(let i=1;i<=30;i++)db.prepare('INSERT INTO events VALUES(?,?,?)').run(i,'start:'+i,JSON.stringify({type:'tool.started',createdAt:created,data:{operationId:String(i),actionType:'exec',input:{command:'npm run check',private:'excluded-canary'}}}));
+  const recent=JSON.parse(db.prepare(PRIVATE_EXECUTION_RECENT).get().detail);
+  assert.equal(recent.length,20);assert.equal(recent[0].command,'npm run check');
+  const repeated=JSON.parse(db.prepare(PRIVATE_EXECUTION_REPEATS).get().detail);
+  assert.equal(repeated[0].count,30);assert.doesNotMatch(JSON.stringify({recent,repeated}),/excluded-canary/);
+ }finally{db.close();}
+});
