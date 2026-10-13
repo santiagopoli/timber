@@ -1,0 +1,25 @@
+name: Probe the connected ChatGPT model catalogue
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Verify probe authentication and output filtering
+        run: node --test scripts/tests/model-catalog-probe.test.mjs
+      - name: Probe the server connection and remove the temporary worker
+        env:
+          CLOUDFLARE_ACCOUNT_ID: '3acfff91febe1ba644c6358ae5612736'
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
+          CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
+        run: node scripts/probe-model-catalog.mjs
