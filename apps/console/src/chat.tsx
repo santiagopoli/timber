@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, useId, memo, type ComponentProps, type ReactNode, type KeyboardEvent } from 'react';
+import { useEffect, useLayoutEffect, useCallback, useMemo, useRef, useState, useId, memo, type ComponentProps, type ReactNode, type KeyboardEvent } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
 import { XIcon, PaperclipIcon, ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon, HistoryIcon, SquareIcon, PlusIcon, LockKeyholeIcon } from 'lucide-react';
@@ -29,6 +29,7 @@ import {SecurePill,SecurePrompt,secureReference,hasSecureReference,maskSecureRef
 import type {SecretMetadata,SecureInputRequest} from '../../../packages/contracts/src/index';
 import {collectCompactions, CompactionPill, type CompactionItem} from './compaction-timeline';
 import {AudioComposer,AudioMessage,AudioProvider} from './audio-ui';
+import {insertDictation,updateDictationAnchor,type DictationAnchor} from './dictation-draft';
 import {mergeToolResult, mergeToolStatus, runOutcomes, toolActivityState, toolFailureSummary} from './cancellation-presentation';
 
 const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
@@ -614,7 +615,7 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
   </>;
 }
 
-function ImageControls({sending,disabled=false,hasText,acceptedIds,children,onSecureInput,botId,onSendAudio,onAudioDraft,audioDraft,audioEnabled}: {sending:boolean;disabled?:boolean;audioEnabled:boolean;hasText:boolean;audioDraft:boolean;acceptedIds?:string[];children:ReactNode;onSecureInput:()=>void;botId:string;onSendAudio:ChatCallbacks['onSendAudio'];onAudioDraft:(value:boolean)=>void}) {
+function ImageControls({sending,disabled=false,hasText,acceptedIds,children,onSecureInput,botId,onSendAudio,onDictateAudio,onDictationStart,onDictationText,onAudioDraft,audioDraft,audioEnabled}: {sending:boolean;disabled?:boolean;audioEnabled:boolean;hasText:boolean;audioDraft:boolean;acceptedIds?:string[];children:ReactNode;onSecureInput:()=>void;botId:string;onSendAudio:ChatCallbacks['onSendAudio'];onDictateAudio:ChatCallbacks['onDictateAudio'];onDictationStart:()=>unknown;onDictationText:(text:string,token:unknown)=>void;onAudioDraft:(value:boolean,mode?:'message'|'dictation')=>void}) {
   const attachments=usePromptInputAttachments();
   const afterClose=useRef<(()=>void)|undefined>(undefined);
   useEffect(()=>{
@@ -626,7 +627,7 @@ function ImageControls({sending,disabled=false,hasText,acceptedIds,children,onSe
       <img src={file.url} alt={file.filename || 'Attached image'} />
       <button className="timber-image-remove" type="button" aria-label={`Remove ${file.filename || 'image'}`} title={`Remove ${file.filename || 'image'}`} disabled={sending||audioDraft} onClick={()=>attachments.remove(file.id)}><XIcon aria-hidden="true" /></button>
     </div>)}</div>}
-    {audioEnabled&&<AudioComposer textPresent={hasText} imagePresent={attachments.files.length>0} sending={sending} onSend={(file,ids,signal)=>onSendAudio!(botId,file,ids,signal)} onDraftState={onAudioDraft}/>}
+    {audioEnabled&&<AudioComposer textPresent={hasText} imagePresent={attachments.files.length>0} sending={sending} onSend={onSendAudio?(file,ids,signal)=>onSendAudio(botId,file,ids,signal):undefined} onDictate={onDictateAudio?(file,ids,signal)=>onDictateAudio(botId,file,ids,signal):undefined} onDictationStart={onDictationStart} onDictationText={onDictationText} onDraftState={onAudioDraft}/>}
     <div className="timber-composer-row">{children}
       <DropdownMenu.Root><DropdownMenu.Trigger asChild><Button className="timber-attach" type="button" variant="ghost" size="icon" disabled={disabled||sending||audioDraft} aria-label="Add" title="Add"><PlusIcon aria-hidden="true"/></Button></DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content className="timber-add-menu" side="top" align="end" sideOffset={8} onCloseAutoFocus={event=>{const action=afterClose.current;if(action){afterClose.current=undefined;event.preventDefault();action();}}}><DropdownMenu.Item onSelect={()=>{afterClose.current=onSecureInput;}}><LockKeyholeIcon/>Secure input</DropdownMenu.Item><DropdownMenu.Item disabled={full||audioDraft} onSelect={()=>attachments.openFileDialog()}><PaperclipIcon/>Attach images</DropdownMenu.Item></DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu.Root>
       <PromptInputSubmit className="timber-send" aria-label="Send message" title="Send message" disabled={audioDraft || disabled || sending || (!hasText && !attachments.files.length)}>{sending ? <LoaderCircleIcon className="timber-spinner" aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}</PromptInputSubmit>
@@ -637,18 +638,52 @@ function ImageControls({sending,disabled=false,hasText,acceptedIds,children,onSe
 
 function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallbacks }) {
   const textarea = useRef<HTMLTextAreaElement>(null);
-  const [attachmentError,setAttachmentError]=useState(''),[securing,setSecuring]=useState(false),[audioDraft,setAudioDraft]=useState(false);
+  const [attachmentError,setAttachmentError]=useState(''),[securing,setSecuring]=useState(false),[audioDraft,setAudioDraft]=useState(false),[dictationActive,setDictationActive]=useState(false);
+  const latestDraft=useRef(model.draft),dictationAnchor=useRef<DictationAnchor|null>(null),latestModel=useRef(model);
+  const dictationRange=useRef<{text:string;start:number;end:number;direction:'forward'|'backward'|'none';focus:boolean}|null>(null);
+  const onAudioDraft=useCallback((value:boolean,mode?:'message'|'dictation')=>{setAudioDraft(value&&mode!=='dictation');setDictationActive(value&&mode==='dictation');if(!value&&mode==='dictation')dictationAnchor.current=null;},[]);
+  const changeDraft=(text:string,mentions?:string[])=>{if(dictationAnchor.current)updateDictationAnchor(dictationAnchor.current,text);latestDraft.current=text;callbacks.onDraft(model.bot.id,text,mentions);};
+  useLayoutEffect(()=>{latestModel.current=model;if(dictationAnchor.current?.botId!==model.bot.id)dictationAnchor.current=null;if(dictationAnchor.current)updateDictationAnchor(dictationAnchor.current,model.draft);latestDraft.current=model.draft;},[model]);
+  useEffect(()=>{const fence=()=>{dictationAnchor.current=null;};window.addEventListener('timber-audio-interrupt',fence);return()=>{dictationAnchor.current=null;window.removeEventListener('timber-audio-interrupt',fence);};},[]);
   const selection=useRef({start:model.draft.length,end:model.draft.length});
   const [,renderSelection]=useState(0);
   const trackSelection=(start:number,end:number)=>{if(start!==selection.current.start||end!==selection.current.end){selection.current={start,end};renderSelection(n=>n+1);}setCaret(start);};
-  const secrets=useInlineSecrets(model.draft,(text,swap)=>{if(swap){const adjust=(n:number)=>n<=swap.start?n:n<swap.start+swap.oldLength?swap.start+swap.newLength:n+swap.newLength-swap.oldLength;setCaret(adjust);selection.current={start:adjust(selection.current.start),end:adjust(selection.current.end)};}callbacks.onDraft(model.bot.id,text);});
+  const secrets=useInlineSecrets(model.draft,(text,swap)=>{if(swap){const adjust=(n:number)=>n<=swap.start?n:n<swap.start+swap.oldLength?swap.start+swap.newLength:n+swap.newLength-swap.oldLength;setCaret(adjust);selection.current={start:adjust(selection.current.start),end:adjust(selection.current.end)};}changeDraft(text);});
   const pendingCaret = useRef<{text:string;position:number} | null>(null);
   const [caret, setCaret] = useState(model.draft.length), [mentionIndex, setMentionIndex] = useState(0), [dismissed, setDismissed] = useState(false);
+  const onDictationStart=()=>{
+    const current=latestModel.current;if(current.composerDisabled)return null;
+    const position=textarea.current?.selectionEnd??selection.current.end;
+    const anchor:DictationAnchor={botId:current.bot.id,text:latestDraft.current,position};dictationAnchor.current=anchor;return anchor;
+  };
+  const onDictationText=(transcript:string,token:unknown)=>{
+    const anchor=dictationAnchor.current,current=latestModel.current;
+    if(!anchor||anchor!==token||anchor.botId!==current.bot.id||current.composerDisabled)return;
+    updateDictationAnchor(anchor,latestDraft.current);
+    const inserted=insertDictation(latestDraft.current,anchor.position,transcript);
+    if(!inserted.length)return;
+    const input=textarea.current,editor=input??document.querySelector<HTMLElement>('#message.timber-secure-prompt');
+    const focused=document.activeElement===editor||Boolean(editor?.contains(document.activeElement));
+    const start=input?.selectionStart??selection.current.start,end=input?.selectionEnd??selection.current.end;
+    const map=(position:number)=>position>=inserted.position?position+inserted.length:position;
+    const range={text:inserted.text,start:map(start),end:map(end),direction:input?.selectionDirection??'none' as const,focus:focused};
+    dictationRange.current=range;dictationAnchor.current=null;pendingCaret.current=null;
+    selection.current={start:range.start,end:range.end};setCaret(range.start);setDismissed(true);
+    latestDraft.current=inserted.text;callbacks.onDraft(current.bot.id,inserted.text,current.draftMentions);
+  };
+  useLayoutEffect(()=>{
+    const range=dictationRange.current;if(!range||range.text!==model.draft)return;
+    dictationRange.current=null;
+    // Preserve ongoing editing/selection. Dictation never steals focus from a
+    // different control and never schedules a later cursor move over new edits.
+    if(range.focus)textarea.current?.focus({preventScroll:true});
+    textarea.current?.setSelectionRange(range.start,range.end,range.direction);
+  },[model.draft]);
   const securePrompt=hasSecureReference(model.draft);
   const wasSecure=useRef(securePrompt);
   useLayoutEffect(()=>{if(wasSecure.current&&!securePrompt){textarea.current?.focus({preventScroll:true});textarea.current?.setSelectionRange(caret,caret);}wasSecure.current=securePrompt;},[securePrompt,caret]);
   const addSecure=(mention=false,replacement?:SecretMetadata)=>{const start=mention?mentionStart:selection.current.start,end=mention?caret:selection.current.end;const next=secrets.create(Math.max(0,start),Math.max(0,end),replacement,!mention&&!replacement);setCaret(next);selection.current={start:next,end:next};setDismissed(true);};
-  const insertSecure=(entries:SecretMetadata[])=>{const addition=entries.map(entry=>secureReference(entry.id)).join(' '),text=model.draft.slice(0,caret)+addition+model.draft.slice(caret),position=caret+addition.length;setCaret(position);pendingCaret.current={text,position};callbacks.onDraft(model.bot.id,text);};
+  const insertSecure=(entries:SecretMetadata[])=>{const addition=entries.map(entry=>secureReference(entry.id)).join(' '),text=model.draft.slice(0,caret)+addition+model.draft.slice(caret),position=caret+addition.length;setCaret(position);pendingCaret.current={text,position};changeDraft(text);};
   const mentionMatch = /(?:^|\s)@([^\n@]{0,80})$/.exec(model.draft.slice(0, caret));
   const mentionStart = mentionMatch ? caret - mentionMatch[1].length - 1 : -1;
   const choices = !dismissed && mentionMatch ? model.mentionBots.filter(bot => bot.id !== model.bot.id && bot.name.toLocaleLowerCase().includes(mentionMatch[1].toLocaleLowerCase())).slice(0, 8) : [];
@@ -664,7 +699,7 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
     const insertion = `@${bot.name} `, text = model.draft.slice(0, mentionStart) + insertion + model.draft.slice(caret);
     const nextCaret = mentionStart + insertion.length;
     pendingCaret.current = {text,position:nextCaret};
-    callbacks.onDraft(model.bot.id, text, [...new Set([...model.draftMentions, bot.id])]);
+    changeDraft(text,[...new Set([...model.draftMentions, bot.id])]);
     setDismissed(true); setCaret(nextCaret);
   };
   useLayoutEffect(() => {
@@ -707,15 +742,15 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
       <div className="timber-composer-controls"><ModelSettings value={model.bot} state={model.modelSettings} disabled={model.sending} onChange={value=>callbacks.onModelSettings(model.bot.id,value)} onRefresh={callbacks.onRefreshModels}/><KeychainControl onInsert={insertSecure} onAdd={()=>addSecure()} onReplace={item=>addSecure(false,item)} bots={model.mentionBots}/><ContextMemoryControl botId={model.bot.id} request={callbacks.onContextRequest} refreshKey={model.events.at(-1)?.id}/></div>
       {/* Admission locks submission and attachments, not the next ordinary text draft. */}
       <PromptInput id="message-form" className="timber-composer" disabled={model.sending||securing||audioDraft} accept="image/png,image/jpeg" multiple maxFiles={4} maxFileSize={5_000_000} onError={error=>setAttachmentError(error.message)} onReset={event => event.preventDefault()} onSubmit={async ({text,files}) => {
-        if(model.composerDisabled || model.sending || securing || audioDraft || (!text.trim() && !files.length)) throw new Error('Not ready');
+        if(model.composerDisabled || model.sending || securing || audioDraft || dictationActive || (!text.trim() && !files.length)) throw new Error('Not ready');
         if(securePrompt && selectedMentions.length){setAttachmentError('Send private inputs to one bot at a time; grant other bots access from your keychain.');throw new Error('Unsupported recipients');}
         if(files.length && selectedMentions.length) {setAttachmentError('Image messages cannot mention other bots yet.');throw new Error('Unsupported recipients');}
         setAttachmentError('');
         setSecuring(true);try {const secured=await secrets.flush(text);await callbacks.onSend(model.bot.id,secured,selectedMentions.map(bot=>bot.id),files);} catch(reason) {if(typeof record(reason).deliveryOperationId!=='string')setAttachmentError(reason instanceof Error?reason.message:'The message was not delivered. Retry sending.');throw new Error('Not delivered');}finally{setSecuring(false);}
       }}>
-        <PromptInputBody><ImageControls onSecureInput={()=>addSecure()} sending={model.sending||securing} disabled={model.composerDisabled} hasText={!!model.draft.trim()} acceptedIds={model.acceptedImageIds} botId={model.bot.id} audioDraft={audioDraft} audioEnabled={Boolean(callbacks.onSendAudio)&&!model.composerDisabled} onSendAudio={callbacks.onSendAudio} onAudioDraft={setAudioDraft}><>{securePrompt?<SecurePrompt value={model.draft} name={`Message ${model.bot.name}`} disabled={model.composerDisabled||model.sending||securing||audioDraft} caret={caret} onCaret={setCaret} onRange={trackSelection} onKeyDown={mentionKeyDown} renderDraft={secrets.render} onChange={text=>{setMentionIndex(0);setDismissed(false);callbacks.onDraft(model.bot.id,text);}}/>:<PromptInputTextarea ref={textarea} id="message" rows={1} aria-label={`Message ${model.bot.name}`} placeholder={`Message ${model.bot.name}`} value={model.draft} disabled={model.composerDisabled||audioDraft}
+        <PromptInputBody><ImageControls onSecureInput={()=>addSecure()} sending={model.sending||securing} disabled={model.composerDisabled} hasText={!!model.draft.trim()} acceptedIds={model.acceptedImageIds} botId={model.bot.id} audioDraft={audioDraft||dictationActive} audioEnabled={Boolean(callbacks.onSendAudio||callbacks.onDictateAudio)&&!model.composerDisabled} onSendAudio={callbacks.onSendAudio} onDictateAudio={callbacks.onDictateAudio} onDictationStart={onDictationStart} onDictationText={onDictationText} onAudioDraft={onAudioDraft}><>{securePrompt?<SecurePrompt value={model.draft} name={`Message ${model.bot.name}`} disabled={model.composerDisabled||model.sending||securing||audioDraft} caret={caret} restoreSelection={dictationRange.current?.text===model.draft?dictationRange.current:undefined} onCaret={setCaret} onRange={trackSelection} onKeyDown={mentionKeyDown} renderDraft={secrets.render} onChange={text=>{setMentionIndex(0);setDismissed(false);changeDraft(text);}}/>:<PromptInputTextarea ref={textarea} id="message" rows={1} aria-label={`Message ${model.bot.name}`} placeholder={`Message ${model.bot.name}`} value={model.draft} disabled={model.composerDisabled||audioDraft}
           aria-autocomplete="list" aria-controls={choices.length ? 'bot-mentions' : undefined} aria-expanded={choices.length > 0} aria-activedescendant={choices.length ? `mention-${choices[Math.min(mentionIndex, choices.length - 1)].id}` : undefined}
-          onChange={event => {selection.current={start:event.currentTarget.selectionStart,end:event.currentTarget.selectionEnd};pendingCaret.current=null;setCaret(event.currentTarget.selectionStart);setMentionIndex(0);setDismissed(false);callbacks.onDraft(model.bot.id, event.currentTarget.value);}}
+          onChange={event => {selection.current={start:event.currentTarget.selectionStart,end:event.currentTarget.selectionEnd};pendingCaret.current=null;setCaret(event.currentTarget.selectionStart);setMentionIndex(0);setDismissed(false);changeDraft(event.currentTarget.value);}}
           onSelect={event => trackSelection(event.currentTarget.selectionStart,event.currentTarget.selectionEnd)}
           onBlur={event => trackSelection(event.currentTarget.selectionStart,event.currentTarget.selectionEnd)}
           onKeyDown={mentionKeyDown} />}</>

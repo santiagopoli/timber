@@ -1,9 +1,37 @@
-# Audio messages
+# Audio messages and draft dictation
 
 Audio messages retain the original recording in private, bot-scoped R2 storage.
 Transcription is a separate, explicitly billed OpenAI API request; it does not use
 ChatGPT subscription allowance or another provider as a fallback. The server uses
 its existing `OPENAI_API_KEY`; no credential is returned to the browser.
+
+## Two explicit destinations
+
+**Dictate** captures a recording, stops the microphone, and offers local review
+with **Transcribe into draft**. The transcript is inserted into the editable
+composer without sending anything to the bot. Existing text and selected words
+are preserved, as are concurrent edits and opaque private-input references.
+Enter inserts a newline. Only normal explicit **Send** submits the user-edited
+text. Dictation is available in main bot and task composers; it creates no audio
+conversation card, message, submission or run. The transcription itself uses the
+separately billed provider described below, with a visible notice before the
+explicit Transcribe action; there is no second dictation confirmation modal.
+
+**Record / Attach audio** is the existing main-conversation audio-message flow.
+It retains original playback and explicitly sends an audio message before normal
+bot admission after transcription. Tasks do not support audio messages. These
+modes share validated capture/upload machinery, not their durable destination.
+
+Draft dictation results stay scoped to the original bot/task/navigation/session.
+Cancel and Stop immediately release capture and abort pending transport where
+possible; late results cannot insert into another composer or resurrect work.
+Operation cancellation has a permanent server tombstone, independently of upload
+discard. A known cancelled receipt contains no transcript. Draft receipts and
+originals expire after 24 hours; task deletion removes its separate recording
+prefix without touching main or sibling artifacts. Paid dispatch may already
+have happened when an HTTP abort occurs. **Check transcription status** only
+reads the same operation/attempt; it never automatically starts another paid
+attempt, even after an uncertain response or a later missing receipt.
 
 ## Provider contract and billing
 
@@ -23,7 +51,7 @@ Documentation checked **2026-10-11** (public documentation only):
   $1.25/million and output $5/million). This is a provider estimate, not a fixed
   quote or a promise of the total bot-run cost. Rates and account terms can change.
 
-The composer displays the separate API billing notice before Send. A successful
+The composer displays the separate API billing notice before Send. For an explicitly sent audio message, a successful
 transcription starts normal bot work, which retains that bot's existing inference
 billing settings. An explicit transcription retry may incur another charge,
 including if an earlier request's outcome was uncertain.
@@ -31,7 +59,8 @@ including if an earlier request's outcome was uncertain.
 **Production entitlement is not verified.** Documentation of a model does not
 prove this deployment's API project has billing credit, model access or quota.
 Local verification must use mocked OpenAI responses; no paid inference is needed
-to run the feature's tests. No deployment or secret changes are part of this work.
+to run the feature's tests. No secret changes or paid calls are needed for fixture verification. Deployment
+evidence is reported separately.
 
 ## User interaction and privacy
 

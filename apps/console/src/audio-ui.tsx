@@ -160,36 +160,62 @@ function pcmWaveHeader(frames:number,rate:number):ArrayBuffer{
   tag(0,'RIFF');view.setUint32(4,36+frames*2,true);tag(8,'WAVE');tag(12,'fmt ');view.setUint32(16,16,true);view.setUint16(20,1,true);view.setUint16(22,1,true);view.setUint32(24,rate,true);view.setUint32(28,rate*2,true);view.setUint16(32,2,true);view.setUint16(34,16,true);tag(36,'data');view.setUint32(40,frames*2,true);return header.buffer;
 }
 
-export function AudioComposer({textPresent,imagePresent,sending,onSend,onDraftState}:{textPresent:boolean;imagePresent:boolean;sending:boolean;onSend:(file:File,ids:{operationId:string;audioId:string;attemptId:string},signal?:AbortSignal)=>Promise<void>;onDraftState?:(value:boolean)=>void} ){
-  const captureStop=useRef<((reason?:string)=>void)|null>(null),sendController=useRef<AbortController|null>(null);
-  const mounted=useRef(false),captureGeneration=useRef(0),selectionGeneration=useRef(0),captureBusy=useRef(false);
-  const [draft,setDraft]=useState<Blob|null>(null),idsRef=useRef<{operationId:string;audioId:string;attemptId:string}|null>(null),[draftName,setDraftName]=useState(''),[durationMs,setDurationMs]=useState(0),[recording,setRecording]=useState(false),[requesting,setRequesting]=useState(false),[selecting,setSelecting]=useState(false),[elapsed,setElapsed]=useState(0),[error,setError]=useState(''),[consent,setConsent]=useState<'send'|'retry'|null>(null),[busy,setBusy]=useState(false);
+export type AudioCaptureMode='message'|'dictation';
+export type AudioCaptureIds={operationId:string;audioId:string;attemptId:string};
+type AudioComposerProps={
+  textPresent:boolean;imagePresent:boolean;sending:boolean;
+  onSend?:(file:File,ids:AudioCaptureIds,signal?:AbortSignal)=>Promise<void>;
+  // Repeated calls for these IDs inspect the canonical receipt; they must not
+  // automatically repeat a paid attempt after a failed/uncertain dispatch.
+  onDictate?:(file:File,ids:AudioCaptureIds,signal?:AbortSignal)=>Promise<string>;
+  onDictationStart?:()=>unknown;
+  onDictationText?:(text:string,token:unknown)=>void;
+  onDraftState?:(value:boolean,mode?:AudioCaptureMode)=>void;
+};
+export function AudioComposer({textPresent,imagePresent,sending,onSend,onDictate,onDictationStart,onDictationText,onDraftState}:AudioComposerProps){
+
+  const captureStop=useRef<((reason?:string)=>void)|null>(null),sendController=useRef<AbortController|null>(null),dictationController=useRef<AbortController|null>(null);
+  const mounted=useRef(false),captureGeneration=useRef(0),selectionGeneration=useRef(0),captureBusy=useRef(false),selectionBusy=useRef(false),flowGeneration=useRef(0);
+  const modeRef=useRef<AudioCaptureMode>('message'),[mode,setMode]=useState<AudioCaptureMode>('message'),tokenRef=useRef<unknown>(undefined),interruptRef=useRef<()=>void>(()=>{});
+  const [dictationSubmitted,setDictationSubmitted]=useState(false);
+  const callbacks=useRef({onDictationText});callbacks.current={onDictationText};
+  const [draft,setDraft]=useState<Blob|null>(null),idsRef=useRef<AudioCaptureIds|null>(null),[draftName,setDraftName]=useState(''),[durationMs,setDurationMs]=useState(0),[recording,setRecording]=useState(false),[requesting,setRequesting]=useState(false),[selecting,setSelecting]=useState(false),[elapsed,setElapsed]=useState(0),[error,setError]=useState(''),[consent,setConsent]=useState<'send'|'retry'|null>(null),[busy,setBusy]=useState(false);
   const inAudioFlow=Boolean(draft||recording||requesting||selecting);
-  useEffect(()=>onDraftState?.(inAudioFlow),[inAudioFlow,onDraftState]);
+  useEffect(()=>onDraftState?.(inAudioFlow,mode),[inAudioFlow,mode,onDraftState]);
   useEffect(()=>{
     mounted.current=true;
-    const interrupt=()=>captureStop.current?.('Recording discarded because you left the active conversation.');
+    const interrupt=()=>interruptRef.current();
     const visibility=()=>{if(document.visibilityState!=='visible')interrupt();};
     // Cancel before the asynchronous logout request, not just eventual unmount.
     const logout=(event:MouseEvent)=>{if(event.target instanceof Element&&event.target.closest('#disconnect'))interrupt();};
     document.addEventListener('visibilitychange',visibility);document.addEventListener('click',logout,true);
     window.addEventListener('pagehide',interrupt);window.addEventListener('hashchange',interrupt);window.addEventListener('timber-audio-interrupt',interrupt);
-    return()=>{mounted.current=false;sendController.current?.abort();captureStop.current?.('Recording discarded.');captureGeneration.current++;selectionGeneration.current++;document.removeEventListener('visibilitychange',visibility);document.removeEventListener('click',logout,true);window.removeEventListener('pagehide',interrupt);window.removeEventListener('hashchange',interrupt);window.removeEventListener('timber-audio-interrupt',interrupt);};
+    return()=>{mounted.current=false;interrupt();captureGeneration.current++;selectionGeneration.current++;document.removeEventListener('visibilitychange',visibility);document.removeEventListener('click',logout,true);window.removeEventListener('pagehide',interrupt);window.removeEventListener('hashchange',interrupt);window.removeEventListener('timber-audio-interrupt',interrupt);};
   },[]);
   // Audio is one standalone input; new normal-composer content cancels capture.
-  useEffect(()=>{if(textPresent||imagePresent)captureStop.current?.('Audio recording was stopped because the composer is no longer audio-only.');},[textPresent,imagePresent]);
+  useEffect(()=>{if(modeRef.current==='message'&&(textPresent||imagePresent))captureStop.current?.('Audio recording was stopped because the composer is no longer audio-only.');},[textPresent,imagePresent]);
   const eligible=!textPresent&&!imagePresent;
-  const openPicker=()=>{if(!eligible||sending||busy||requesting||selecting)return;setSelecting(true);onDraftState?.(true);const input=document.createElement('input');input.type='file';input.accept='audio/wav,audio/mpeg,audio/webm,.wav,.mp3,.webm';input.addEventListener('change',()=>{void choose(input.files?.[0]);input.remove();},{once:true});input.addEventListener('cancel',()=>{if(mounted.current)setSelecting(false);input.remove();},{once:true});input.click();};
-  const choose=async(file?:File)=>{
-    if(!file||!mounted.current){if(mounted.current)setSelecting(false);return;}const generation=++selectionGeneration.current;setError('');
-    if(file.size>MAX_AUDIO_BYTES){setSelecting(false);setError('Audio must be 20 MB or smaller.');return;}
-    try{const bytes=new Uint8Array(await file.arrayBuffer()),valid=validateAudio(bytes,file.type||'');if(!mounted.current||generation!==selectionGeneration.current)return;setDraft(file);idsRef.current={operationId:crypto.randomUUID(),audioId:crypto.randomUUID(),attemptId:crypto.randomUUID()};setDraftName(file.name||`Recording.${valid.extension}`);setDurationMs(valid.durationMs);setSelecting(false);}
-    catch(reason){if(!mounted.current||generation!==selectionGeneration.current)return;setDraft(null);idsRef.current=null;setDraftName('');setDurationMs(0);setSelecting(false);setError(reason instanceof AudioValidationError?reason.message:'This audio format could not be checked safely.');}
+  const openPicker=()=>{
+    if(!onSend||!eligible||sending||busy||draft||captureBusy.current||selectionBusy.current||sendController.current)return;
+    modeRef.current='message';setMode('message');selectionBusy.current=true;setSelecting(true);onDraftState?.(true,'message');
+    const generation=++selectionGeneration.current,input=document.createElement('input');input.type='file';input.accept='audio/wav,audio/mpeg,audio/webm,.wav,.mp3,.webm';
+    input.addEventListener('change',()=>{if(mounted.current&&generation===selectionGeneration.current)void choose(input.files?.[0]);input.remove();},{once:true});
+    input.addEventListener('cancel',()=>{if(generation===selectionGeneration.current){selectionBusy.current=false;if(mounted.current)setSelecting(false);}input.remove();},{once:true});input.click();
+  };
+  const choose=async(file?:File,captureMode:AudioCaptureMode='message')=>{
+    if(!file||!mounted.current){selectionBusy.current=false;if(mounted.current)setSelecting(false);return;}const generation=++selectionGeneration.current;setError('');
+    if(file.size>MAX_AUDIO_BYTES){selectionBusy.current=false;setSelecting(false);setError('Audio must be 20 MB or smaller.');return;}
+    try{const bytes=new Uint8Array(await file.arrayBuffer()),valid=validateAudio(bytes,file.type||'');if(!mounted.current||generation!==selectionGeneration.current)return;modeRef.current=captureMode;setMode(captureMode);selectionBusy.current=false;setDictationSubmitted(false);setDraft(file);idsRef.current={operationId:crypto.randomUUID(),audioId:crypto.randomUUID(),attemptId:crypto.randomUUID()};setDraftName(file.name||`Recording.${valid.extension}`);setDurationMs(valid.durationMs);setSelecting(false);}
+    catch(reason){if(!mounted.current||generation!==selectionGeneration.current)return;selectionBusy.current=false;setDraft(null);idsRef.current=null;setDraftName('');setDurationMs(0);setSelecting(false);setError(reason instanceof AudioValidationError?reason.message:'This audio format could not be checked safely.');}
   };
   const format=captureFormat(),canRecord=typeof navigator!=='undefined'&&!!navigator.mediaDevices?.getUserMedia&&Boolean(format);
-  const start=async()=>{
-    if(!eligible||sending||busy||captureBusy.current||!mounted.current||document.visibilityState!=='visible'||!canRecord||!format)return;
-    const generation=++captureGeneration.current;captureBusy.current=true;setError('');setRequesting(true);onDraftState?.(true);
+  const start=async(captureMode:AudioCaptureMode='message')=>{
+    if((captureMode==='message'&&(!onSend||!eligible))||(captureMode==='dictation'&&!onDictate)||sending||busy||draft||captureBusy.current||selectionBusy.current||sendController.current||!mounted.current||document.visibilityState!=='visible'||!canRecord||!format)return;
+    // Capture the mode and insertion anchor synchronously before permission
+    // awaits or React state updates can mix this with a newer flow.
+    modeRef.current=captureMode;setMode(captureMode);flowGeneration.current++;
+    tokenRef.current=captureMode==='dictation'?onDictationStart?.():undefined;
+    const generation=++captureGeneration.current;captureBusy.current=true;setError('');setRequesting(true);onDraftState?.(true,captureMode);
     // Capture-local buffers prevent a stale onstop/permission grant from clearing
     // a newer recording's state or publishing into another conversation's draft.
     let acquired:MediaStream|null=null,r:MediaRecorder|null=null,ctx:AudioContext|null=null,source:MediaStreamAudioSourceNode|null=null,processor:ScriptProcessorNode|null=null,silence:GainNode|null=null;
@@ -209,7 +235,7 @@ export function AudioComposer({textPresent,imagePresent,sending,onSend,onDraftSt
       if(format==='wav')pieces.unshift(pcmWaveHeader(frames,rate));
       const clip=new Blob(pieces,{type:format==='wav'?'audio/wav':r?.mimeType||WEBM_OPUS});pieces=[];
       if(!bytes){setError('No audio was captured. Try recording again.');return;}
-      setSelecting(true);onDraftState?.(true);void choose(new File([clip],`Recording-${new Date().toISOString().replaceAll(':','-')}.${format}`,{type:clip.type}));
+      selectionBusy.current=true;setSelecting(true);onDraftState?.(true,captureMode);void choose(new File([clip],`Recording-${new Date().toISOString().replaceAll(':','-')}.${format}`,{type:clip.type}),captureMode);
     };
     const stopCapture=(reason?:string)=>{
       if(finished||(stopping&&!reason))return;stopping=true;
@@ -267,33 +293,61 @@ export function AudioComposer({textPresent,imagePresent,sending,onSend,onDraftSt
       if(!live()||finished)return;
       startedAt=performance.now();setRecording(true);setElapsed(0);setRequesting(false);
       timer=window.setInterval(()=>{if(!live()||finished)return;const seconds=Math.floor((performance.now()-startedAt)/1000);setElapsed(Math.min(seconds,MAX_AUDIO_DURATION_MS/1000));if(seconds>=MAX_AUDIO_DURATION_MS/1000)stopCapture();},250);
-    }catch(reason){release();if(live()&&!finished)stopCapture(reason instanceof Error&&reason.name==='NotAllowedError'?'Microphone permission was not granted. You can still choose an audio file.':'Microphone recording is unavailable in this browser.');}
+    }catch(reason){release();if(live()&&!finished)stopCapture(reason instanceof Error&&reason.name==='NotAllowedError'?(onSend?'Microphone permission was not granted. You can still choose an audio file.':'Microphone permission was not granted.'):'Microphone recording is unavailable in this browser.');}
   };
   const stop=()=>captureStop.current?.();
-  const remove=()=>{selectionGeneration.current++;setDraft(null);idsRef.current=null;setDraftName('');setDurationMs(0);setError('');};
+  const remove=()=>{dictationController.current=null;selectionGeneration.current++;selectionBusy.current=false;tokenRef.current=undefined;setSelecting(false);setDraft(null);idsRef.current=null;setDraftName('');setDurationMs(0);setDictationSubmitted(false);setError('');};
+  // One interrupt owns microphone, validation and network cancellation in both
+  // modes, including review/transcription when no captureStop remains.
+  interruptRef.current=()=>{
+    flowGeneration.current++;sendController.current?.abort();dictationController.current?.abort();dictationController.current=null;captureStop.current?.('Recording discarded because you left the active conversation.');
+    captureGeneration.current++;selectionGeneration.current++;captureBusy.current=false;selectionBusy.current=false;tokenRef.current=undefined;
+    if(modeRef.current==='dictation')sendController.current=null;
+    if(mounted.current){setConsent(null);setRecording(false);setRequesting(false);setSelecting(false);if(modeRef.current==='dictation'){setBusy(false);remove();}}
+  };
+  const cancelDictation=()=>{interruptRef.current();if(mounted.current)remove();};
   const cancelAudio=()=>{if(sendController.current){sendController.current.abort();setConsent(null);setError('Audio send cancelled. Its status may be unknown if already submitted. Refresh the conversation before explicitly retrying; cancellation cannot undo a stored message.');return;}remove();};
   const doSend=async()=>{
-    if(!draft||busy||sending||!eligible||sendController.current)return;
-    const controller=new AbortController();sendController.current=controller;setBusy(true);setConsent(null);setError('');
+    if(!onSend||modeRef.current!=='message'||!draft||busy||sending||!eligible||sendController.current)return;
+    const controller=new AbortController(),generation=flowGeneration.current;sendController.current=controller;setBusy(true);setConsent(null);setError('');
     try{
       const ext=draftName.split('.').pop()||'audio',file=new File([draft],draftName||`audio.${ext}`,{type:draft.type}),ids=idsRef.current||{operationId:crypto.randomUUID(),audioId:crypto.randomUUID(),attemptId:crypto.randomUUID()};idsRef.current=ids;
       await onSend(file,ids,controller.signal);
-      if(mounted.current&&!controller.signal.aborted)remove();
-    }catch(reason){if(mounted.current)setError(controller.signal.aborted?'Audio send cancelled. Its status may be unknown if already submitted. Refresh the conversation before explicitly retrying; cancellation cannot undo a stored message.':reason instanceof Error?reason.message:'Audio was not sent. Inspect its status before retrying.');}
-    finally{if(sendController.current===controller)sendController.current=null;if(mounted.current)setBusy(false);}
+      if(mounted.current&&!controller.signal.aborted&&generation===flowGeneration.current)remove();
+    }catch(reason){if(mounted.current&&generation===flowGeneration.current)setError(controller.signal.aborted?'Audio send cancelled. Its status may be unknown if already submitted. Refresh the conversation before explicitly retrying; cancellation cannot undo a stored message.':reason instanceof Error?reason.message:'Audio was not sent. Inspect its status before retrying.');}
+    finally{if(sendController.current===controller){sendController.current=null;if(mounted.current)setBusy(false);}}
   };
-  return <div className="timber-audio-composer" data-audio-ready={Boolean(draft)}>
-    {!draft&&!recording&&<div className="timber-audio-tools" title={!eligible?'Clear text and image attachments to send audio as its own message.':undefined}><Button type="button" variant="ghost" disabled={!eligible||sending||busy||requesting||selecting} onClick={openPicker} aria-label="Attach audio file"><UploadIcon aria-hidden="true"/>Audio file</Button>
-      {canRecord?<Button type="button" variant="ghost" disabled={!eligible||sending||busy||requesting||selecting} onClick={()=>void start()} aria-label="Start recording audio"><MicIcon aria-hidden="true"/>{requesting?'Requesting microphone…':'Record'}</Button>:eligible?<span className="timber-audio-browser-note">Microphone recording is not supported here. Choose a WAV, MP3 or WebM Opus file.</span>:null}
+  const doDictate=async()=>{
+    if(modeRef.current!=='dictation'||!draft||busy||sending||sendController.current||!onDictate)return;
+    // Retain this signal through failed/unknown receipt checks so a later
+    // explicit cancellation still discards the original durable operation.
+    const controller=dictationController.current||new AbortController(),generation=flowGeneration.current,token=tokenRef.current,ids=idsRef.current;
+    if(!ids)return;
+    dictationController.current=controller;sendController.current=controller;setBusy(true);setConsent(null);setError('');setDictationSubmitted(true);
+    const live=()=>mounted.current&&!controller.signal.aborted&&generation===flowGeneration.current&&modeRef.current==='dictation';
+    try{
+      const file=new File([draft],draftName||'Dictation.wav',{type:draft.type});
+      const text=await onDictate(file,ids,controller.signal);
+      if(!live())return;
+      if(!text.trim())throw new Error('No transcript was returned. Check transcription status before retrying.');
+      callbacks.current.onDictationText?.(text,token);
+      if(live())remove();
+    }catch(reason){if(live())setError(reason instanceof Error?reason.message:'Transcription status is unknown. Check its status before retrying.');}
+    finally{if(sendController.current===controller){sendController.current=null;if(mounted.current)setBusy(false);}}
+  };
+  return <div className="timber-audio-composer" data-audio-ready={Boolean(draft)} data-audio-mode={mode}>
+    {!draft&&!recording&&<div className="timber-audio-tools" title={onSend&&!eligible?'Audio messages require an empty draft; Dictate can add text to this draft.':undefined}>{onSend&&<Button type="button" variant="ghost" disabled={!eligible||sending||busy||requesting||selecting} onClick={openPicker} aria-label="Attach audio file"><UploadIcon aria-hidden="true"/>Audio file</Button>}
+      {onSend&&canRecord?<Button type="button" variant="ghost" disabled={!eligible||sending||busy||requesting||selecting} onClick={()=>void start('message')} aria-label="Start recording audio"><MicIcon aria-hidden="true"/>{requesting?'Requesting microphone…':'Record'}</Button>:!canRecord&&(eligible||onDictate)?<span className="timber-audio-browser-note">Microphone recording is not supported here.{onSend?' Choose a WAV, MP3 or WebM Opus file.':''}</span>:null}
+      {onDictate&&canRecord&&<Button type="button" variant="ghost" disabled={sending||busy||requesting||selecting} onClick={()=>void start('dictation')} aria-label="Start dictation"><MicIcon aria-hidden="true"/>Dictate</Button>}
       {/* Keep disabled tools compact so ordinary drafts do not shrink the model comparison panel. */}
-      {eligible&&canRecord&&format==='wav'&&<span className="timber-audio-capture-note">Records as PCM WAV in this browser. Recording stops when you leave or hide this conversation.</span>}
-      {eligible&&<span className="timber-audio-format-note">WAV, MP3, or WebM Opus · up to 20 MB and 10 minutes. M4A/MP4 and Ogg are not supported.</span>}
+      {(eligible||onDictate)&&canRecord&&format==='wav'&&<span className="timber-audio-capture-note">Records as PCM WAV in this browser. Recording stops when you leave or hide this conversation.</span>}
+      {onSend&&eligible&&<span className="timber-audio-format-note">WAV, MP3, or WebM Opus · up to 20 MB and 10 minutes. M4A/MP4 and Ogg are not supported.</span>}
     </div>}
-    {selecting&&<p className="timber-audio-state" role="status">Checking audio file…</p>}
-    {requesting&&!recording&&<p className="timber-audio-state" role="status">Requesting microphone permission…</p>}
-    {recording&&<div className="timber-audio-recording" role="status"><span className="timber-audio-recording-dot"/><span>Recording · {formatTime(elapsed)}</span><Button type="button" variant="outline" onClick={stop}><SquareIcon aria-hidden="true"/>Stop recording</Button><Button type="button" variant="ghost" onClick={()=>{captureStop.current?.('Recording discarded.');}}>Discard</Button></div>}
-    {draft&&<div className="timber-audio-draft"><div><AudioLinesIcon aria-hidden="true"/><span>{draftName}</span><span>{formatTime(durationMs/1000)}</span></div><Player blob={draft} durationMs={durationMs} mimeType={draft.type}/><p>OpenAI API transcription · about $0.003/minute published estimate, billed separately; actual charges may vary. Sending audio also starts your bot.</p><div className="timber-audio-draft-actions"><Button type="button" variant="outline" disabled={sending&&!busy} onClick={cancelAudio}><Trash2Icon aria-hidden="true"/>Cancel audio</Button><Button type="button" disabled={busy||sending||!eligible} onClick={()=>setConsent('send')}>{busy||sending?'Sending…':'Review & send'}</Button></div></div>}
+    {selecting&&<div className="timber-audio-state" role="status">Checking audio file…{mode==='dictation'&&<Button type="button" variant="ghost" onClick={cancelDictation}>Cancel dictation</Button>}</div>}
+    {requesting&&!recording&&<div className="timber-audio-state" role="status">Requesting microphone permission…{mode==='dictation'&&<Button type="button" variant="ghost" onClick={cancelDictation}>Cancel dictation</Button>}</div>}
+    {recording&&<div className="timber-audio-recording" role="status"><span className="timber-audio-recording-dot"/><span>{mode==='dictation'?'Dictating':'Recording'} · {formatTime(elapsed)}</span><Button type="button" variant="outline" onClick={stop}><SquareIcon aria-hidden="true"/>Stop recording</Button><Button type="button" variant="ghost" onClick={()=>{if(modeRef.current==='dictation')cancelDictation();else captureStop.current?.('Recording discarded.');}}>{mode==='dictation'?'Cancel dictation':'Discard'}</Button></div>}
+    {draft&&<div className="timber-audio-draft"><div><AudioLinesIcon aria-hidden="true"/><span>{draftName}</span><span>{formatTime(durationMs/1000)}</span></div><Player blob={draft} durationMs={durationMs} mimeType={draft.type}/><p>OpenAI API transcription · about $0.003/minute published estimate, billed separately; actual charges may vary. {mode==='dictation'?'Dictation inserts editable text into your draft. Nothing is sent to your bot until you send the draft.':'Sending audio also starts your bot.'}</p><div className="timber-audio-draft-actions"><Button type="button" variant="outline" disabled={mode==='message'&&sending&&!busy} onClick={mode==='dictation'?cancelDictation:cancelAudio}><Trash2Icon aria-hidden="true"/>{mode==='dictation'?'Cancel dictation':'Cancel audio'}</Button>{mode==='dictation'?<Button type="button" disabled={busy||sending} onClick={()=>void doDictate()}>{busy?'Transcribing…':dictationSubmitted?'Check transcription status':'Transcribe into draft'}</Button>:<Button type="button" disabled={busy||sending||!eligible} onClick={()=>setConsent('send')}>{busy||sending?'Sending…':'Review & send'}</Button>}</div></div>}
     {error&&<p className="timber-audio-error" role="alert">{error}</p>}
-    <AudioConsent open={consent==='send'} onCancel={()=>setConsent(null)} onConfirm={()=>void doSend()}/>
+    <AudioConsent open={consent==='send'&&mode==='message'} onCancel={()=>setConsent(null)} onConfirm={()=>void doSend()}/>
   </div>;
 }

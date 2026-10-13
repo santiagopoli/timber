@@ -32,6 +32,7 @@ export type ChatCallbacks = {
   onDraft(botId: string, text: string, mentions?: string[]): void;
   onSend(botId: string, text: string, mentions?: string[], files?: {url:string;mediaType?:string;filename?:string}[]): void | Promise<void>;
   onSendAudio?(botId:string,file:File,ids:{operationId:string;audioId:string;attemptId:string},signal?:AbortSignal):Promise<void>;
+  onDictateAudio?(botId:string,file:File,ids:{operationId:string;audioId:string;attemptId:string},signal?:AbortSignal):Promise<string>;
   onRetryAudio?(botId:string,operationId:string):Promise<void>;
   onOpenBot(botId: string): void;
   onOpenTask?(taskId:string): void;

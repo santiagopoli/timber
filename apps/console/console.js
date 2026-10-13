@@ -281,6 +281,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     onDraft: (botId, text, mentions) => { if (selected?.id === botId && authenticated) { drafts.set(botId, text); draftMentions.set(botId, (mentions || draftMentions.get(botId) || []).filter(id => bots.some(bot => bot.id === id && hasBotMention(text, bot.name)))); renderMessages(); } },
     onSend: (botId, text, mentions, files) => sendMessage(botId, text, undefined, mentions, files),
     onSendAudio: sendAudioMessage,
+    onDictateAudio: dictateBotAudio,
     onRetryAudio: retryAudioMessage,
     onOpenBot: openAgentBot,
     onOpenTask: openTask,
@@ -318,12 +319,12 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     $('bots-nav')?.setAttribute('aria-pressed',String(!showingTasks));
   }
   function taskSelected(id) {
-    selectedTaskId=id;
+    cancelAudioSends();selectedTaskId=id;
     document.body.dataset.mobileView=id?'tasks':'bots';
     history.pushState(null,'',`${location.pathname}${location.search}#tasks${id?`&task=${encodeURIComponent(id)}`:''}`);
   }
   function setupTasksView() {
-    const props={request:tasksRequest,bots,active:showingTasks,selectedTaskId,onSelectTask:taskSelected,onOpenBot:openAgentBot,loadArtifact:loadTaskArtifact,modelSettings:modelSettingsState(),onModelSettings:updateModelSettings,onRefreshModels:()=>void loadModelCatalog(),decorateAvatar:decorateTaskAvatar,onBotUpdated:taskBotUpdated,onOpenSettings:()=> $('settings-button').click(),listContainer:$('tasks-sidebar-root')};
+    const props={request:tasksRequest,onDictateAudio:dictateTaskAudio,bots,active:showingTasks,selectedTaskId,onSelectTask:taskSelected,onOpenBot:openAgentBot,loadArtifact:loadTaskArtifact,modelSettings:modelSettingsState(),onModelSettings:updateModelSettings,onRefreshModels:()=>void loadModelCatalog(),decorateAvatar:decorateTaskAvatar,onBotUpdated:taskBotUpdated,onOpenSettings:()=> $('settings-button').click(),listContainer:$('tasks-sidebar-root')};
     if(tasksView)tasksView.update(props);else tasksView=mountTasks($('global-tasks-root'),props);
   }
   function taskBotUpdated(bot){if(!authenticated||removedBots.has(bot.id))return;const previous=bots.find(item=>item.id===bot.id);if(!previous||previous.updatedAt>bot.updatedAt)return;bots=bots.map(item=>item.id===bot.id?bot:item);if(selected?.id===bot.id){selected=bot;updateBotHeader();}renderBots();renderMessages();}
@@ -656,7 +657,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     removedBots.clear(); deletionPending.clear(); deleteTarget = null; deleteBusy = false; editBotId = null; drafts.clear(); draftMentions.clear(); pendingMessages.clear(); acceptedImageIds.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); connectionWork.clear(); appWork.clear(); closeDialogs(); clearScreen();
     chatGPTConnected = false; chatGPTAccount = null; chatGPTBusy = false;
     modelCatalog={models:[],connected:false,defaultModel:''};modelCatalogLoading=false;modelCatalogError='';modelCatalogRequest++;modelSettingsWork.clear();
-    chat.clear(); activity.clear(); $('toggle-bots').hidden = true;
+    dictationPosts.clear();chat.clear(); activity.clear(); $('toggle-bots').hidden = true;
     for (const id of ['activity-list', 'bot-list', 'run-list', 'file-list', 'workspace-app-list']) $(id).replaceChildren();
     for (const id of ['token', 'type-text', 'exec-command', 'navigate-url', 'key-name', 'file-content', 'bot-search']) $(id).value = '';
     $('create-form').reset(); $('edit-form').reset(); $('delete-error').textContent = ''; $('delete-form').reset(); renderDeleteControls(); $('file-path').value = '.'; $('computer-result').textContent = 'No actions yet.';
@@ -772,6 +773,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   async function selectBot(bot, {replace = false} = {}) {
     if (removedBots.has(bot.id)) return;
     const wasShowingTasks=showingTasks;
+    if(wasShowingTasks)cancelAudioSends();
     document.body.dataset.mobileView = 'bot';
     showingTasks=false;$('global-tasks-workspace').hidden=true;syncTaskToggle();if(tasksView)setupTasksView();
     if(wasShowingTasks)renderLayout();
@@ -864,7 +866,82 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     }
   }
   const audioSends=new Map();
-  function cancelAudioSends(){for(const controller of audioSends.values())controller.abort();window.dispatchEvent(new Event('timber-audio-interrupt'));}
+  function cancelAudioSends(){cancelDictations();for(const controller of audioSends.values())controller.abort();window.dispatchEvent(new Event('timber-audio-interrupt'));}
+  // Dictation is an ephemeral text receipt, never a conversation input or a run.
+  const dictations=new Map(),dictationPosts=new Set();
+  let dictationView=0;
+  function cancelDictations(){dictationView++;for(const work of [...dictations.values()])work.controller.abort();}
+  function dictateBotAudio(botId,file,ids,signal){return dictateAudio('bot',botId,file,ids,signal);}
+  function dictateTaskAudio(taskId,file,ids,signal){return dictateAudio('task',taskId,file,ids,signal);}
+  async function dictateAudio(scope,targetId,file,ids,signal) {
+    const inView=()=>scope==='task'?showingTasks&&selectedTaskId===targetId:!showingTasks&&selected?.id===targetId;
+    if(!authenticated||!inView())throw new Error('Choose the current conversation before dictating.');
+    if(!ids?.operationId||!ids.audioId||!ids.attemptId)throw new Error('The dictation identity is missing. Record again.');
+    const session=authSession,version=generation,view=dictationView;
+    const base=scope==='task'?`/v1/tasks/${encodeURIComponent(targetId)}`:botPath(targetId);
+    const receiptPath=`${base}/dictations/${encodeURIComponent(ids.operationId)}`;
+    const audioPath=`${base}/${scope==='task'?'dictation-audio':'audio'}/${encodeURIComponent(ids.audioId)}`;
+    const key=`${session}:${scope}:${targetId}:${ids.operationId}`;
+    let work=dictations.get(key);
+    if(work&&(work.audioId!==ids.audioId||work.attemptId!==ids.attemptId))throw new Error('The dictation identity changed. Cancel and record again.');
+    if(work?.active)throw new Error('This dictation is already being checked.');
+    if(!work){
+      work={controller:new AbortController(),audioId:ids.audioId,attemptId:ids.attemptId,active:false,detach:new Set()};
+      work.cleanup=()=>{
+        if(dictations.get(key)===work)dictations.delete(key);
+        for(const detach of work.detach)detach();work.detach.clear();
+        if(work.cleaned||!authenticated||session!==authSession)return;
+        work.cleaned=true;
+        // Dispatch while the captured session is still current. Cleanup has its
+        // own keepalive requests: Stop/logout must not abort their signal too.
+        const options={method:'DELETE',credentials:'same-origin',cache:'no-store',redirect:'error',keepalive:true,headers:{'X-Timber-Client':'console'}};
+        void fetch(receiptPath,options).catch(()=>{});
+        void fetch(audioPath,options).catch(()=>{});
+      };
+      work.controller.signal.addEventListener('abort',work.cleanup,{once:true});
+      dictations.set(key,work);
+    }
+    const cancel=()=>work.controller.abort();
+    if(signal){signal.addEventListener('abort',cancel,{once:true});work.detach.add(()=>signal.removeEventListener('abort',cancel));if(signal.aborted)cancel();}
+    const combined=work.controller.signal;
+    const current=()=>{if(combined.aborted||session!==authSession||!validView(version)||view!==dictationView||!inView()||document.hidden)throw new DOMException('Dictation was cancelled or the conversation changed.','AbortError');};
+    const validate=receipt=>{
+      if(receipt?.operationId!==ids.operationId||receipt.audioId!==ids.audioId||receipt.transcription?.attemptId!==ids.attemptId)throw new Error('The dictation receipt could not be verified. Cancel and record again.');
+      if(!['pending','dispatching','succeeded','failed','uncertain','cancelled'].includes(receipt.transcription.status))throw new Error('The dictation status could not be verified. Cancel and record again.');
+      return receipt.transcription;
+    };
+    const pause=()=>new Promise((resolve,reject)=>{
+      const aborted=()=>{clearTimeout(timer);reject(new DOMException('Dictation was cancelled.','AbortError'));};
+      const timer=setTimeout(()=>{combined.removeEventListener('abort',aborted);resolve();},1000);
+      combined.addEventListener('abort',aborted,{once:true});if(combined.aborted)aborted();
+    });
+    work.active=true;
+    try {
+      current();let receipt;
+      // A recheck is always canonical and never authorizes another paid POST.
+      try{receipt=await request(receiptPath,{signal:combined});}
+      catch(error){if(error.status!==404)throw error;}
+      current();
+      if(!receipt){
+        if(dictationPosts.has(key))throw new Error('The transcription status is not confirmed. Nothing was retried. Cancel and record again.');
+        await request(audioPath,{method:'PUT',body:file,signal:combined});current();
+        dictationPosts.add(key); // Fence even an interrupted/lost POST response.
+        try{receipt=await request(`${base}/dictations`,{method:'POST',body:{operationId:ids.operationId,audioId:ids.audioId,attemptId:ids.attemptId},signal:combined});}
+        catch(submissionError){current();try{receipt=await request(receiptPath,{signal:combined});}catch{throw submissionError;}}
+      }
+      dictationPosts.add(key);
+      while(true){
+        current();const transcription=validate(receipt);
+        if(transcription.status==='succeeded'){
+          if(typeof transcription.text!=='string'||!transcription.text.trim())throw new Error('The transcription did not contain usable text. Cancel and record again.');
+          const text=transcription.text;current();work.cleanup();return text;
+        }
+        if(!['pending','dispatching'].includes(transcription.status))throw new Error(transcription.status==='cancelled'?'Dictation was cancelled. Record again.':transcription.status==='uncertain'?'The transcription result is uncertain. Nothing was retried. Cancel and record again.':transcription.error||'Transcription failed. Nothing was retried. Cancel and record again.');
+        await pause();current();receipt=await request(receiptPath,{signal:combined});
+      }
+    } catch(error){if(error.name==='AbortError')work.controller.abort();throw error;}
+    finally{work.active=false;}
+  }
   async function sendAudioMessage(botId,file,ids,signal) {
     if(!authenticated||showingTasks||selected?.id!==botId)throw new Error('Select a bot before sending audio.');
     if(sendBusy.has(botId)||modelSettingsWork.has(botId))throw new Error('A send is already pending for this bot. Inspect its status before sending again.');
@@ -1593,7 +1670,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     else {botsCollapsed = false; showBotList(false);}
   }
   function showBotList(updateHistory = true) {
-    showingTasks=false;$('global-tasks-workspace').hidden=true;syncTaskToggle();if(tasksView)setupTasksView();
+    cancelAudioSends();showingTasks=false;$('global-tasks-workspace').hidden=true;syncTaskToggle();if(tasksView)setupTasksView();
     $('bot-workspace').hidden=!selected;$('empty').hidden=Boolean(selected);
     document.body.dataset.mobileView = 'bots';
     if(selected)renderMessages();
@@ -1623,7 +1700,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   });
   $('disconnect').addEventListener('click', async () => {
     const button = $('disconnect'); button.disabled = true;
-    try {await desktop.disconnect(); await sessionRequest('DELETE'); disconnect(); sessionChannel?.postMessage('signed-out');}
+    try {cancelAudioSends();await desktop.disconnect(); await sessionRequest('DELETE'); disconnect(); sessionChannel?.postMessage('signed-out');}
     catch (error) {$('github-error').textContent = 'Sign out failed. Check your connection and try again.';}
     finally {button.disabled = false;}
   });

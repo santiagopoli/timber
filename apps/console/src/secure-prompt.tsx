@@ -23,12 +23,18 @@ function selectAt(root:HTMLElement,offset:number) {
   for(const node of root.childNodes){const size=readSecurePrompt(node).length;if(left<=size){if(node.nodeType===Node.TEXT_NODE)range.setStart(node,left);else if(left===0)range.setStartBefore(node);else range.setStartAfter(node);range.collapse(true);const selection=getSelection();selection?.removeAllRanges();selection?.addRange(range);return;}left-=size;}
   range.selectNodeContents(root);range.collapse(false);getSelection()?.removeAllRanges();getSelection()?.addRange(range);
 }
+function selectRange(root:HTMLElement,start:number,end:number,direction?:string) {
+  const boundary=(offset:number):[Node,number]=>{let left=offset,index=0;for(const node of root.childNodes){const size=readSecurePrompt(node).length;if(left<=size){if(node.nodeType===Node.TEXT_NODE)return [node,Math.min(left,node.textContent?.length??0)];return [root,index+(left===0?0:1)];}left-=size;index++;}return [root,root.childNodes.length];};
+  const [first,firstAt]=boundary(start),[last,lastAt]=boundary(end),selection=getSelection();
+  if(!selection)return;const range=document.createRange();range.setStart(first,firstAt);range.setEnd(last,lastAt);selection.removeAllRanges();selection.addRange(range);
+  if(direction==='backward')selection.setBaseAndExtent(last,lastAt,first,firstAt);
+}
 export function createSavedSecurePill(reference:string) {
   const chip=document.createElement('span');chip.className='timber-private-chip';chip.contentEditable='false';chip.dataset.secureRef=reference;chip.setAttribute('aria-label','Secure input');chip.title='Secure input · value hidden';
   const hidden=document.createElement('span');hidden.className='sr-only';hidden.textContent='••••••';chip.append(createLockIcon(),createDots(),hidden);return chip;
 }
 
-export function SecurePrompt({value,name,disabled,caret,onChange,onCaret,onRange,renderDraft,onKeyDown}:{value:string;name:string;disabled:boolean;caret:number;onChange:(text:string)=>void;onCaret:(offset:number)=>void;onRange:(start:number,end:number)=>void;renderDraft:(id:string)=>HTMLElement;onKeyDown:(event:KeyboardEvent<HTMLElement>)=>void}) {
+export function SecurePrompt({value,name,disabled,caret,restoreSelection,onChange,onCaret,onRange,renderDraft,onKeyDown}:{value:string;name:string;disabled:boolean;caret:number;restoreSelection?:{start:number;end:number;direction?:string;focus:boolean};onChange:(text:string)=>void;onCaret:(offset:number)=>void;onRange:(start:number,end:number)=>void;renderDraft:(id:string)=>HTMLElement;onKeyDown:(event:KeyboardEvent<HTMLElement>)=>void}) {
   const root=useRef<HTMLDivElement>(null),initialized=useRef(false);
   useLayoutEffect(()=>{
     const node=root.current;if(!node||readSecurePrompt(node)===value)return;
@@ -38,7 +44,7 @@ export function SecurePrompt({value,name,disabled,caret,onChange,onCaret,onRange
       node.append(document.createTextNode(value.slice(last,match.index)));
       if(match[1])node.append(renderDraft(match[2]));else node.append(createSavedSecurePill(match[0]));last=match.index!+match[0].length;
     }
-    node.append(document.createTextNode(value.slice(last)));const privateInput=node.querySelector<HTMLTextAreaElement>('[data-focus-private]');if(privateInput){delete privateInput.dataset.focusPrivate;privateInput.focus({preventScroll:true});}else if(editing){node.focus({preventScroll:true});selectAt(node,caret);}
+    node.append(document.createTextNode(value.slice(last)));const privateInput=node.querySelector<HTMLTextAreaElement>('[data-focus-private]');if(privateInput){delete privateInput.dataset.focusPrivate;privateInput.focus({preventScroll:true});}else if(restoreSelection){if(restoreSelection.focus)node.focus({preventScroll:true});selectRange(node,restoreSelection.start,restoreSelection.end,restoreSelection.direction);}else if(editing){node.focus({preventScroll:true});selectAt(node,caret);}
   },[value,caret]);
   const selection=()=>{
     const node=root.current,current=getSelection();if(!node||!current?.rangeCount||!node.contains(current.focusNode))return;

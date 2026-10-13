@@ -78,11 +78,11 @@ export class BotDO extends DurableObject<Env> {
   private suspending?:Promise<ComputerStatus>;
   private deleted=false;
   private audioStore?:AudioMessages;
-  private audio():AudioMessages {
+  private audio(dictation=false):AudioMessages {
     this.active();
-    if(this.taskId() || !this.ctx.id.equals(this.env.BOT.idFromName(`owner:${this.bot().id}`)))throw new ApiError(400,"audio_scope_unsupported","Audio messages are supported only in a bot's main conversation.");
+    if(this.taskId()&&!dictation || !this.ctx.id.equals(this.env.BOT.idFromName(this.taskId()?`owner:task:${this.taskId()}`:`owner:${this.bot().id}`)))throw new ApiError(400,"audio_scope_unsupported","Audio messages are supported only in a bot's main conversation.");
     return this.audioStore??=new AudioMessages(this.ctx.storage,this.env,{
-    active:()=>this.active(),botId:()=>this.bot().id,authorize:async()=>{await this.currentBot(false);this.active();},
+    active:()=>this.active(),botId:()=>this.bot().id,artifactPrefix:()=>this.taskId()?`bots/${this.bot().id}/tasks/${this.taskId()}/dictation-audio`:`bots/${this.bot().id}/artifacts`,authorize:async()=>{await this.currentBot(false,true);this.active();},authorizeCleanup:async()=>{await this.currentBot(false,true,true);this.active();},
     save:(message,initial)=>{if(initial)this.addMessage(message,`audio:${message.audio!.operationId}`);else {this.active();this.ctx.storage.sql.exec("UPDATE messages SET data=? WHERE id=?",JSON.stringify(message),message.id);this.emit("message.updated",{message},message.runId);}},
     admit:(message,operationId)=>this.createRun({text:message.text,operationId},{audioMessageId:message.id}),
     schedule:(id,delay)=>this.runtime.scheduleAdmissionRetry(id,delay),
@@ -214,11 +214,19 @@ export class BotDO extends DurableObject<Env> {
       await Promise.all([this.flushProcessCancellations(),this.flushRunCancellations()]);
       if(this.ctx.storage.sql.exec("SELECT 1 FROM run_processes WHERE status='running' OR cancel_requested=1 LIMIT 1").toArray().length||this.ctx.storage.sql.exec("SELECT 1 FROM pending_run_cancellations LIMIT 1").toArray().length)throw new Error("Task shutdown is not acknowledged");
       for(const close of this.closeStreams)close();
-      await this.runtime.destroy();
+      await Promise.all([this.audioStore?.stop(),this.runtime.destroy()]);
       await Promise.allSettled([...this.admitting.values(),...this.finishingApprovals.values(),...(this.recovering?[this.recovering]:[])]);
       // In-flight unsafe requests cannot introduce an unfenced process after
       // teardown. Recheck before discarding the journals and retry intents.
       if(this.ctx.storage.sql.exec("SELECT 1 FROM run_processes WHERE status='running' OR cancel_requested=1 LIMIT 1").toArray().length||this.ctx.storage.sql.exec("SELECT 1 FROM pending_run_cancellations LIMIT 1").toArray().length)throw new Error("Task shutdown is not acknowledged");
+      // Task recordings live in their own namespace; deleting this task must
+      // not retain draft originals or touch sibling/main message artifacts.
+      let audioCursor:string|undefined;
+      do {
+        const page=await this.env.FILES.list({prefix:`bots/${botId}/tasks/${taskId}/dictation-audio/`,...(audioCursor?{cursor:audioCursor}:{})});
+        if(page.objects.length)await this.env.FILES.delete(page.objects.map(object=>object.key));
+        audioCursor=page.truncated?page.cursor:undefined;
+      } while(audioCursor);
       const computerTaskId=await this.computerTaskId();
       if(computerTaskId)await deleteCloudComputer(this.env.COMPUTER,botId,computerTaskId);
       this.ctx.storage.sql.exec("INSERT OR IGNORE INTO bot_deletion(id,bot_id) VALUES(1,?)",botId);
@@ -294,7 +302,7 @@ export class BotDO extends DurableObject<Env> {
     if(!raw) throw new ApiError(403,"internal_only","Missing internal configuration.");
     this.acceptConfig(JSON.parse(decodeURIComponent(raw)) as Bot);
   }
-  private async currentBot(validateExecution=true):Promise<Bot> {
+  private async currentBot(validateExecution=true,allowTaskTerminal=false,allowTaskCancelled=false):Promise<Bot> {
     const id=this.bot().id;
     try {
       const registry=this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName("owner"));
@@ -313,11 +321,11 @@ export class BotDO extends DurableObject<Env> {
         if(!taskResponse.ok)throw new Error("Task configuration unavailable");
         const {task}=await taskResponse.json<{task:{botId:string;status:string;cancelRequested?:boolean}}>();
         if(task.botId!==id)throw new Error("Task assigned bot mismatch");
-        if(task.cancelRequested||["cancelled","cancelling"].includes(task.status)) {
+        if(!allowTaskCancelled&&(task.cancelRequested||["cancelled","cancelling"].includes(task.status))) {
           this.ctx.storage.sql.exec("INSERT OR IGNORE INTO task_cancel_fences(task_id,created_at) VALUES(?,?)",taskId,Date.now());
           throw new ApiError(409,"task_cancelled","This task was cancelled and cannot authorize new work.");
         }
-        if(["completed","failed"].includes(task.status))throw new ApiError(409,"task_terminal","The task is terminal and cannot authorize implicit continuation.");
+        if(!allowTaskTerminal&&["completed","failed"].includes(task.status))throw new ApiError(409,"task_terminal","The task is terminal and cannot authorize implicit continuation.");
       }
       this.acceptConfig(bot);
       return this.bot();
@@ -1046,8 +1054,8 @@ export class BotDO extends DurableObject<Env> {
 
   /** This outbox only admits durable inputs. Pi owns all execution and tool recovery. */
   private admit(nativeOperationId:string):Promise<void> {
-    if(nativeOperationId==="audio-transcribe:upload-cleanup") return this.audio().processCleanup();
-    if(nativeOperationId.startsWith("audio-transcribe:")) return this.audio().process(nativeOperationId.slice("audio-transcribe:".length));
+    if(nativeOperationId==="audio-transcribe:upload-cleanup") return this.audio(true).processCleanup();
+    if(nativeOperationId.startsWith("audio-transcribe:")) return this.audio(true).process(nativeOperationId.slice("audio-transcribe:".length));
     if(nativeOperationId.startsWith("run-cancel:")) return this.flushRunCancellations();
     if(nativeOperationId.startsWith("process-poll:")) return this.pollProcess(nativeOperationId.slice("process-poll:".length));
     if(nativeOperationId.startsWith("process-cancel:")) return this.cancelProcess(nativeOperationId.slice("process-cancel:".length));
@@ -1238,7 +1246,7 @@ export class BotDO extends DurableObject<Env> {
     if(this.deleted||this.taskDeleting) return Promise.resolve();
     if(this.recovering) return this.recovering;
     this.recovering=(async()=>{
-      if(!this.taskId() && this.ctx.id.equals(this.env.BOT.idFromName(`owner:${this.bot().id}`)))this.audio().recover();
+      if(this.taskId() || this.ctx.id.equals(this.env.BOT.idFromName(`owner:${this.bot().id}`)))this.audio(true).recover();
       await Promise.all([this.flushProcessCancellations(),this.flushRunCancellations()]);
       for(const process of this.ctx.storage.sql.exec<ProcessRow>("SELECT * FROM run_processes WHERE (status='running' OR json_extract(result,'$.checkpointStatus')='pending') AND cancel_requested=0").toArray()) {
         if(!process.result) {
@@ -2027,7 +2035,7 @@ export class BotDO extends DurableObject<Env> {
         return json({connection:await this.completeConnection(completedConnection[1])});
       }
       this.configure(request);
-      if(/^\/agents\/[^/]+\/(?:audio|audio-messages)(?:\/|$)/.test(path) || /^\/(?:audio|audio-messages)(?:\/|$)/.test(path) && (this.taskId() || !this.ctx.id.equals(this.env.BOT.idFromName(`owner:${this.bot().id}`)))) {
+      if(/^\/agents\/[^/]+\/(?:audio|audio-messages|dictation-audio|dictations)(?:\/|$)/.test(path) || /^\/(?:audio|audio-messages)(?:\/|$)/.test(path) && (this.taskId() || !this.ctx.id.equals(this.env.BOT.idFromName(`owner:${this.bot().id}`)))) {
         await consumeUnusedBody(request);
         throw new ApiError(400,"audio_scope_unsupported","Audio messages are supported only in a bot's main conversation.");
       }
@@ -2064,7 +2072,7 @@ export class BotDO extends DurableObject<Env> {
         await consumeUnusedBody(request);
         this.ctx.storage.sql.exec("INSERT OR IGNORE INTO task_cancel_fences(task_id,created_at) VALUES(?,?)",request.headers.get("x-timber-task-id"),Date.now());
         this.ctx.storage.sql.exec("UPDATE run_processes SET cancel_requested=1,next_at=0 WHERE status='running'");
-        await this.flushProcessCancellations();
+        await Promise.all([this.audio(true).cancelPendingDictations(),this.flushProcessCancellations()]);
         const active=this.ctx.storage.sql.exec("SELECT 1 FROM run_processes WHERE status='running' LIMIT 1").toArray().length>0;
         return json({confirmed:!active});
       }
@@ -2148,6 +2156,18 @@ export class BotDO extends DurableObject<Env> {
         if(request.headers.get("x-timber-internal")!=="audio")throw new ApiError(403,"internal_only","Audio access inspection is internal.");
         this.audio().access(audioId(audioAccess[1]));return json({accessible:true});
       }
+      const dictationUpload=/^\/dictation-audio\/([^/]+)$/.exec(path);
+      if(dictationUpload && !this.taskId())throw new ApiError(400,'dictation_scope_unsupported','Use the bot audio upload endpoint.');
+      if(dictationUpload && request.method==='PUT')return await this.audio(true).upload(request,audioId(dictationUpload[1]));
+      if(dictationUpload && request.method==='DELETE')return json(await this.audio(true).discard(audioId(dictationUpload[1])));
+      if(path==='/dictations' && request.method==='POST')return json(await this.audio(true).create(await body(request),'dictation'),202);
+      const dictation=/^\/dictations\/([^/]+)(\/retry)?$/.exec(path);
+      if(dictation) {
+        const id=audioId(dictation[1]);
+        if(!dictation[2] && request.method==='GET')return json(this.audio(true).receipt(id,'dictation'));
+        if(!dictation[2] && request.method==='DELETE'){await consumeUnusedBody(request);return json(await this.audio(true).cancel(id));}
+        if(dictation[2] && request.method==='POST')return json(await this.audio(true).retry(id,await body(request),'dictation'),202);
+      }
       const audioUpload=/^\/audio\/([^/]+)$/.exec(path);
       if(audioUpload && request.method==="DELETE")return json(await this.audio().discard(audioId(audioUpload[1])));
       if(audioUpload && request.method==="PUT")return await this.audio().upload(request,audioId(audioUpload[1]));
@@ -2184,7 +2204,9 @@ export class BotDO extends DurableObject<Env> {
           // Cancellation needs no payload, but consuming the accepted HTTP body
           // prevents Workerd from reading the request stream after the response.
           await consumeUnusedBody(request);
-          return json({run:await this.cancelRun(runRoute[1])});
+          this.getRunRow(runRoute[1]);
+          const [run]=await Promise.all([this.cancelRun(runRoute[1]),this.audio(true).cancelPendingDictations()]);
+          return json({run});
         }
       }
       if(path==="/events" && request.method==="GET") return url.searchParams.get("format")==="json"?json(this.listEvents(url)):this.events(request,url);

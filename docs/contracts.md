@@ -271,6 +271,44 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   `POST /v1/audio/transcriptions`, model `gpt-4o-mini-transcribe`; no provider or
   subscription fallback. The console shows separate API billing before Send and
   before an explicit retry. Production entitlement is not verified locally.
+- Draft dictation is distinct from audio messages: POST
+  `/v1/bots/:id/dictations` or `/v1/tasks/:id/dictations`
+  `{audioId,operationId,attemptId}` -> 202
+  `{operationId,audioId,transcription:{attemptId,status,text?,errorCode?,error?}}`.
+  It never saves a conversation message, submits input, or creates/adopts a run.
+  The destination is durable and part of operation identity: reusing an operation
+  for audio-message admission conflicts. Recovery and retry keep the draft-only
+  destination. GET `.../dictations/:operationId` returns only the canonical receipt.
+  Task recordings use PUT/DELETE `.../dictation-audio/:audioId`, under the separate
+  private `bots/<botId>/tasks/<taskId>/dictation-audio/<audioId>` prefix; main bot
+  dictation reuses its authenticated audio upload/discard route. Tasks require
+  current assignment and live bot membership. Completed/failed tasks may dictate
+  without implicit continuation; cancelled/cancelling tasks cannot authorize new
+  transcription. Cleanup requires live membership but may clean cancelled drafts.
+- DELETE `.../dictations/:operationId` permanently cancels that identity even
+  before creation, aborts any provider request where possible, and suppresses
+  late text. Known receipts become `cancelled` without text; an unknown cancelled
+  identity has GET/create 410. Cancelling an audio-message identity conflicts.
+  Cancelled/expired draft operations cannot retry or become messages. Draft
+  receipts/originals expire after 24 hours with bounded recoverable cleanup;
+  deleting a task removes only its task recordings, and bot deletion includes
+  its private artifacts. HTTP abort is not proof that paid dispatch never happened.
+  The console independently cancels the operation and discards its original.
+- POST `.../dictations/:operationId/retry`
+  `{attemptId,acknowledgePaidRetry:true}` is an explicit potentially paid new
+  attempt, only for failed/uncertain drafts. Dispatch is flushed before provider
+  I/O; recovery never silently retranscribes uncertain outcomes. The console has
+  no paid retry control: `Check transcription status` reads the same canonical
+  IDs and never re-POSTs after uncertain delivery, including a later 404.
+- The composer Dictate action captures bounded WebM Opus or mono PCM16 WAV,
+  reviews locally, and explicitly transcribes into editable text. Existing text,
+  selected words, concurrent edits and opaque private references remain intact;
+  insertion is after the original selection end, remapped through later edits.
+  The textarea remains editable during dictation; Enter remains newline. Only
+  ordinary explicit Send admits the final user-edited text. Dictation does not
+  use an audio card or bot execution to obtain text. Cost disclosure is visible
+  before Transcribe into draft. Cancel, Stop, navigation, task/bot changes,
+  logout/session loss, hidden page and unmount release capture and fence results.
 - POST /v1/bots/:id/messages {text,operationId,mentions?:string[],attachments?:string[]} -> 202 {run:Run}
   Up to four distinct uploaded image IDs are allowed; text can be empty only with
   an image. References from other bots or non-chat artifacts are rejected.

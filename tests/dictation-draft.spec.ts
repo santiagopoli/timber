@@ -1,0 +1,11 @@
+import {describe,it,expect} from 'vitest';
+import {insertDictation,remapDraftPosition,updateDictationAnchor} from '../apps/console/src/dictation-draft';
+describe('dictation draft insertion',()=>{
+  it('inserts at the selected range end without replacing selected text',()=>{expect(insertDictation('hello world',5,'spoken').text).toBe('hello spoken world');});
+  it('does not take ownership of current text, including concurrent edits',()=>{const anchor={botId:'bot',text:'hello world',position:5};updateDictationAnchor(anchor,'prefix hello world suffix');expect(insertDictation(anchor.text,anchor.position,'spoken').text).toBe('prefix hello spoken world suffix');});
+  it('anchors after a concurrently replaced selection',()=>{expect(remapDraftPosition('hello world','new world',3)).toBe(3);expect(insertDictation('new world',3,'spoken').text).toBe('new spoken world');});
+  it('keeps insertion before unchanged following text and after an edit at the anchor',()=>{expect(remapDraftPosition('ab cd','abtyped cd',2)).toBe(7);expect(remapDraftPosition('ab cd','ab typed cd',3)).toBe(9);expect(remapDraftPosition('ab cd','ab typed cd',2)).toBe(2);expect(remapDraftPosition('ab cd','ab cd appended',2)).toBe(2);});
+  it('preserves newlines and only adds necessary boundary spaces',()=>{expect(insertDictation('before\nafter',7,'spoken').text).toBe('before\nspoken after');expect(insertDictation('',0,'  spoken\nwords  ').text).toBe('spoken\nwords');expect(insertDictation('draft',5,'   ').text).toBe('draft');});
+  it('never splits an opaque private reference or a surrogate pair',()=>{const ref='[private:11111111-1111-4111-8111-111111111111]';expect(insertDictation(ref+' end',10,'spoken').text).toBe(ref+' spoken end');expect(insertDictation('😀x',1,'spoken').text).toBe('😀 spoken x');});
+  it('retains every original byte around bounded insertions',()=>{for(const text of ['','a b','hello\nworld','日本語 😀','[private-draft:11111111-1111-4111-8111-111111111111]'])for(let position=0;position<=text.length;position++){const result=insertDictation(text,position,'spoken');expect(result.text.slice(0,result.position)+result.text.slice(result.position+result.length)).toBe(text);expect(result.position).toBeGreaterThanOrEqual(0);expect(result.position).toBeLessThanOrEqual(text.length);}});
+});

@@ -17,6 +17,7 @@ export type TasksRequest = (path: string, options?: RequestOptions) => Promise<u
 export type TasksBot = Pick<Bot,'id'|'name'> & Partial<Bot>;
 export type TasksProps = {
   request: TasksRequest;
+  onDictateAudio?: ChatCallbacks['onDictateAudio'];
   bots: TasksBot[];
   onOpenBot?: (botId: string) => void;
   selectedTaskId?: string|null;
@@ -120,6 +121,8 @@ function TaskView({props}:{props:TasksProps}) {
   const draftState=useRef({text:draft,mentions:draftMentions});draftState.current={text:draft,mentions:draftMentions};
   const createOperation=useRef<{key:string;id:string}|null>(null),sendOperation=useRef<TaskSendOperation|null>(null),mounted=useRef(true);
   const selectedRef=useRef<string|null>(null),viewVersion=useRef(0),tasksRef=useRef(tasks);
+  const taskDictations=useRef(new Set<AbortController>());
+  const interruptDictation=()=>{for(const controller of taskDictations.current)controller.abort();taskDictations.current.clear();window.dispatchEvent(new Event('timber-audio-interrupt'));};
   const listRead=useRef<AbortController|null>(null),detailRead=useRef<AbortController|null>(null),olderRead=useRef<AbortController|null>(null);
   const propsRef=useRef(props),eventsRef=useRef(events),messageCursorRef=useRef(messageCursor),eventCursorRef=useRef(eventCursor),streamCursor=useRef(0),archiveRef=useRef(archivedActivity),olderMessagesLoaded=useRef(false);
   propsRef.current=props;eventsRef.current=events;messageCursorRef.current=messageCursor;eventCursorRef.current=eventCursor;archiveRef.current=archivedActivity;
@@ -132,10 +135,10 @@ function TaskView({props}:{props:TasksProps}) {
   },[props.bots,botId]);
   useEffect(()=>{
     mounted.current=true;
-    return()=>{mounted.current=false;listRead.current?.abort();detailRead.current?.abort();olderRead.current?.abort()};
+    return()=>{interruptDictation();mounted.current=false;listRead.current?.abort();detailRead.current?.abort();olderRead.current?.abort()};
   },[]);
   const selectTask=(id:string|null,notify=true)=>{
-    setDesktopOpen(false);
+    interruptDictation();setDesktopOpen(false);
     // Fence the old view synchronously, including switching away and back to the same task.
     viewVersion.current++;selectedRef.current=id;listRead.current?.abort();detailRead.current?.abort();olderRead.current?.abort();setSelected(id);
     setDetail(null);setMessages([]);setApprovals([]);setEvents([]);setRuns([]);setConnections([]);setSubagents([]);setDelegations([]);setAgentsOpen(false);setSelectedAgent(null);setCompactions([]);setDeliveries([]);setDraftMentions([]);setAcceptedImageIds([]);setDetailsOpen(false);busyRef.current=false;knownRuns.current.clear();partialRef.current={};setPartials({});setMessageCursor(null);setEventCursor(null);streamCursor.current=0;olderMessagesLoaded.current=false;setVisibleMessages(100);setOlderBusy(false);setArchivedActivity(false);setDraft('');setBusy(false);setError('');setLoadError('');setApprovalError('');
@@ -308,6 +311,7 @@ function TaskView({props}:{props:TasksProps}) {
     }finally{if(current()){busyRef.current=false;setBusy(false);}}
   };
   const action=async(kind:'start'|'cancel')=>{
+    if(kind==='cancel')interruptDictation();
     if(!detail||busyRef.current)return;const id=detail.id,version=viewVersion.current;
     const current=()=>mounted.current&&selectedRef.current===id&&viewVersion.current===version;
     busyRef.current=true;setBusy(true);setError('');
@@ -331,7 +335,7 @@ function TaskView({props}:{props:TasksProps}) {
   const assigned=props.bots.find(bot=>bot.id===detail?.botId);
   const bot=useMemo<Bot>(()=>({instructions:'',runtime:'pi',model:'',createdAt:'',updatedAt:'',...assigned,id:detail?.botId||'',name:assigned?.name||detail?.botName||'Assigned bot'}),[assigned,detail?.botId,detail?.botName]);
   useLayoutEffect(()=>{if(avatarRef.current&&bot.id)propsRef.current.decorateAvatar?.(avatarRef.current,bot.id)},[bot.id,bot.model,bot.updatedAt,selected]);
-  useEffect(()=>{if(!active){viewVersion.current++;busyRef.current=false;setBusy(false);setOlderBusy(false);setDeliveries(previous=>previous.map(item=>item.state==='sending'?{...item,state:'unknown',canRetry:true}:item));}},[active]);
+  useEffect(()=>{if(!active){interruptDictation();viewVersion.current++;busyRef.current=false;setBusy(false);setOlderBusy(false);setDeliveries(previous=>previous.map(item=>item.state==='sending'?{...item,state:'unknown',canRetry:true}:item));}},[active]);
   const artifactLoader=useCallback<ArtifactLoader>((botId,artifactId,signal)=>propsRef.current.loadArtifact?propsRef.current.loadArtifact(botId,artifactId,signal):Promise.reject(new Error('Task image unavailable.')),[]);
   const visibleMessageList=useMemo(()=>messages.slice(-visibleMessages),[messages,visibleMessages]);
   const currentRun=runs.filter(run=>!run.subagentId&&!['completed','failed','cancelled','interrupted'].includes(run.status)).at(-1)||null;
@@ -365,9 +369,25 @@ function TaskView({props}:{props:TasksProps}) {
     }catch(reason){popup?.close();if(current())setConnections(previous=>previous.map(item=>item.id===requestId?{...item,error:reason instanceof Error?reason.message:'Could not connect GitHub.'}:item));}
     finally{if(current())setConnections(previous=>previous.map(item=>item.id===requestId?{...item,busy:false}:item));}
   };
+  const dictateAudio:NonNullable<ChatCallbacks['onDictateAudio']>=async(botId,file,ids,signal)=>{
+    const id=selectedRef.current,version=viewVersion.current,task=detailRef.current;
+    const callback=propsRef.current.onDictateAudio;
+    // Re-read mutable props after await rather than retaining TS's pre-await narrowing.
+    const isActive=()=>propsRef.current.active!==false;
+    if(!id||!task||task.id!==id||task.botId!==botId||!callback||!mounted.current||!isActive())throw new Error('Choose the current task before dictating.');
+    const controller=new AbortController();taskDictations.current.add(controller);
+    const combined=signal?AbortSignal.any([signal,controller.signal]):controller.signal;
+    let completed=false;
+    try{
+      const result=await callback(id,file,ids,combined);
+      if(combined.aborted||!mounted.current||selectedRef.current!==id||viewVersion.current!==version||!isActive()||detailRef.current?.botId!==botId)throw new DOMException('The task changed while dictating.','AbortError');
+      completed=true;return result;
+    }finally{if(completed||combined.aborted)taskDictations.current.delete(controller);}
+  };
   bridge.current={
     onDraft:(_botId,value,mentions)=>{const recipients=mentions??draftState.current.mentions;draftState.current={text:value,mentions:recipients};setDraft(value);setDraftMentions(recipients);},
     onSend:(_botId,value,mentions,files)=>send(value,mentions,files),
+    onDictateAudio:props.onDictateAudio?dictateAudio:undefined,
     onOpenBot:id=>propsRef.current.onOpenBot?.(id),onOpenTask:id=>selectTask(id),
     onOpenAgents:id=>{setSelectedAgent(id||null);setAgentsOpen(true);},
     onModelSettings:async(id,settings)=>{if(!propsRef.current.onModelSettings)throw new Error('Model settings are unavailable.');await propsRef.current.onModelSettings(id,settings);},
@@ -384,11 +404,12 @@ function TaskView({props}:{props:TasksProps}) {
     const call=()=>{if(!current())throw new Error('The conversation changed. Send from the current task.');return bridge.current!;};
     return {
       onDraft:(...args)=>{if(current())bridge.current!.onDraft(...args);},onSend:(...args)=>call().onSend(...args),
+      onDictateAudio:props.onDictateAudio?async(...args)=>{const result=await call().onDictateAudio!(...args);if(!current())throw new DOMException('The task changed while dictating.','AbortError');return result;}:undefined,
       onOpenBot:(...args)=>call().onOpenBot(...args),onOpenTask:(...args)=>call().onOpenTask?.(...args),onOpenAgents:(...args)=>call().onOpenAgents(...args),
       onModelSettings:(...args)=>call().onModelSettings(...args),onRefreshModels:()=>call().onRefreshModels(),onContextRequest:(...args)=>call().onContextRequest(...args),onRecovery:(...args)=>call().onRecovery(...args),
       onRetry:(...args)=>call().onRetry(...args),onDecision:(...args)=>call().onDecision(...args),onClearFilter:()=>call().onClearFilter(),onHistoryNearTop:(...args)=>call().onHistoryNearTop?.(...args),onStop:(...args)=>call().onStop(...args),onConnect:(...args)=>call().onConnect(...args),
     };
-  },[selected,active,viewVersion.current]);
+  },[selected,active,viewVersion.current,props.onDictateAudio]);
   const chatModel:ChatModel={bot,messages:visibleMessageList,runs,approvals:approvals.map(item=>({...item,status:item.status==='pending'&&approvalExpired(item)?'expired':item.status,busy:busy||Boolean(approvalError)})),connections,events,
     deliveries,draft,draftMentions,acceptedImageIds,mentionBots:props.bots as Bot[],subagents,delegations,collaborationEvents:events.filter(event=>event.type.startsWith('agent.')||event.type.startsWith('delegation.')),compactions,
     sending:busy,composerDisabled:!detail||['pending','cancelling','cancelled'].includes(detail.status),loading:loadingMessages,modelSettings:props.modelSettings||{choices:[],loading:false},
