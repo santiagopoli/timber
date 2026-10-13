@@ -259,13 +259,14 @@ export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now
       }
       tasks.push({...performanceTaskMetadata(task),execution:await inspect(`owner:task:${task.id}`),...(blockedBy?{blockedBy}:{})});
     }
+    const backgroundAvatars=summarizeAvatars(await query(workspace,'owner',AVATAR_QUERY),window).jobs;
     let encryptedDiagnostic;
     if(recipient&&selectedTasks.length){
       const selectedName=`owner:task:${selectedTasks[0].id}`;
       const evidence=[...(await query(bot,selectedName,PRIVATE_PROGRESS_MESSAGES)),...(await query(bot,selectedName,PRIVATE_PROGRESS_FAILURES)),...(await query(workspace,'owner',PRIVATE_PROGRESS_GOAL))];
       encryptedDiagnostic=encryptDetails(evidence,recipient,window);
     }
-    return {source:'durable_performance_fixed_select',window,root,tasks,...(encryptedDiagnostic?{encryptedDiagnostic}:{}),limitation:'Latest 12 runs, 60 tools/native tasks and 40 model responses per conversation; Polibot chat and six tasks across all bots, prioritizing active work. Plaintext contains only allowlisted metadata. Optional task evidence is encrypted exclusively for the supplied recipient; no native prompts, private reasoning or secret storage is queried.'};
+    return {source:'durable_performance_fixed_select',window,root,tasks,backgroundAvatars,...(encryptedDiagnostic?{encryptedDiagnostic}:{}),limitation:'Latest 12 runs, 60 tools/native tasks and 40 model responses per conversation; Polibot chat and six tasks across all bots, prioritizing active work. Plaintext contains only allowlisted metadata. Optional task evidence is encrypted exclusively for the supplied recipient; no native prompts, private reasoning or secret storage is queried.'};
   }
   const schema=await query(bot,name,SCHEMA);
   if(schema.length!==SCHEMA_NAMES.size||!schema.every(row=>SCHEMA_NAMES.has(row.name)))throw new Error('durable_diagnostics_schema_mismatch');

@@ -512,7 +512,10 @@ export class WorkspaceDO extends DurableObject<Env> {
   }
   async alarm():Promise<void> {
     const due=this.ctx.storage.sql.exec<{id:string}>("SELECT id FROM bot_deletions WHERE completed=0 AND next_at<=? ORDER BY next_at LIMIT 8",Date.now()).toArray();
-    await Promise.allSettled([...due.map(row=>this.cleanup(row.id)),this.agents.alarm(),this.avatars.alarm(),this.keychain.alarm()]);
+    // Avatar inference has its own durable dispatch journal and single-flight
+    // guard. Keep it alive without holding the task scheduler's alarm hostage.
+    this.ctx.waitUntil(this.avatars.alarm().catch(()=>{}).finally(()=>this.rearmDeletion()));
+    await Promise.allSettled([...due.map(row=>this.cleanup(row.id)),this.agents.alarm(),this.keychain.alarm()]);
     await this.reconcileComputerSlots();
     await this.deliverTaskUpdates();
     await this.rearmDeletion();
