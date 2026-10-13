@@ -53,6 +53,17 @@ describe("workspace apps",()=>{
     await expect(apps.publish({name:"Other",port:3000,operationId:"duplicate-port"})).rejects.toMatchObject({code:"app_port_in_use"});
   }));
 
+  it("isolates task app computers and browser tickets while keeping the named bot authority",async()=>isolated(async(store,botId)=>{
+    const taskId=crypto.randomUUID(),calls:Array<{scope:string|null;bot:string|null}>=[];
+    const apps=new WorkspaceApps(store,computer(request=>{calls.push({scope:request.headers.get('x-timber-task-computer'),bot:request.headers.get('x-timber-bot-id')});return new Response('ready');}),botId,ORIGINS,taskId,async()=>taskId);
+    const app=await apps.publish({name:'Task frontend',port:3000,operationId:'task-app'});
+    expect(app.basePath).toBe(`/apps/${botId}.${taskId}.${app.id}/`);
+    expect((await apps.preview(new Request(app.url),app.id,app.basePath)).status).toBe(401);
+    const {cookie}=await authorize(apps,app);
+    expect((await apps.preview(new Request(app.url,{headers:{cookie}}),app.id,app.basePath)).status).toBe(200);
+    expect(calls).toEqual(Array.from({length:3},()=>({scope:taskId,bot:botId}))); // publish, opening readiness, authenticated preview
+  }));
+
   it("reports an unavailable app honestly while providing its stable framework base path",async()=>isolated(async(store,botId)=>{
     const apps=new WorkspaceApps(store,computer(()=>new Response("stopped",{status:503})),botId,ORIGINS);
     const app=await apps.publish({name:"Dashboard",port:5173,operationId:"dashboard"});

@@ -1,7 +1,8 @@
-import {createElement, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent} from 'react';
+import {createElement, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent} from 'react';
 import {createRoot} from 'react-dom/client';
 import {createPortal} from 'react-dom';
-import {ArrowLeftIcon, ArrowUpIcon, CheckSquareIcon, InfoIcon, ListFilterIcon, LoaderCircleIcon, PlusIcon, RefreshCwIcon, SearchIcon, SquareIcon, XIcon} from 'lucide-react';
+import {ArrowLeftIcon, ArrowUpIcon, CheckSquareIcon, InfoIcon, ListFilterIcon, LoaderCircleIcon, MonitorIcon, PlusIcon, RefreshCwIcon, SearchIcon, SquareIcon, XIcon} from 'lucide-react';
+import {createDesktopViewer} from './desktop';
 import {Dialog,Popover} from 'radix-ui';
 import type {AgentDelegation,Approval, Bot, BotEvent, CompactionReceipt, Message, Run,Subagent,TaskQueue} from '../../../packages/contracts/src/index';
 import {Agents} from './agents';
@@ -31,7 +32,7 @@ export type TasksProps = {
   decorateAvatar?:(node:HTMLElement,botId:string)=>void;
 };
 type TaskStatus = 'pending'|'queued'|'running'|'waiting_approval'|'waiting_connection'|'cancelling'|'completed'|'failed'|'cancelled'|string;
-type Task = {id:string;title:string;description?:string;botId:string;botName?:string;status:TaskStatus;createdAt?:string;updatedAt?:string;lastActivity?:string;queue?:TaskQueue};
+type Task = {id:string;title:string;description?:string;botId:string;botName?:string;status:TaskStatus;createdAt?:string;updatedAt?:string;lastActivity?:string;queue?:TaskQueue;computerMode?:string};
 type TaskFilter = 'all'|'active'|'pending'|'completed';
 type TaskApproval = Approval;
 type TaskMessage = Message;
@@ -52,7 +53,7 @@ function queueValue(value:unknown):TaskQueue|undefined {
 }
 function taskList(value: unknown): Task[] {
   const source = Array.isArray(value) ? value : isRecord(value) && Array.isArray(value.tasks) ? value.tasks : [];
-  return source.filter(isRecord).map(item => ({id:text(item.id),title:text(item.title)||'Untitled task',description:text(item.description),botId:text(item.botId),botName:text(item.botName),status:text(item.status)||'pending',createdAt:text(item.createdAt),updatedAt:text(item.updatedAt),lastActivity:text(item.lastActivity),queue:queueValue(item.queue)})).filter(item=>item.id);
+  return source.filter(isRecord).map(item => ({id:text(item.id),title:text(item.title)||'Untitled task',description:text(item.description),botId:text(item.botId),botName:text(item.botName),status:text(item.status)||'pending',createdAt:text(item.createdAt),updatedAt:text(item.updatedAt),lastActivity:text(item.lastActivity),computerMode:text(item.computerMode),queue:queueValue(item.queue)})).filter(item=>item.id);
 }
 function taskDetail(value: unknown): Task | undefined {
   const candidate = isRecord(value) && isRecord(value.task) ? value.task : value;
@@ -79,6 +80,25 @@ function TaskAvatar({bot,decorate}:{bot:TasksBot|undefined;decorate:TasksProps['
   useLayoutEffect(()=>{if(ref.current&&bot)decorate?.(ref.current,bot.id)},[bot,decorate]);
   return <span ref={ref} className="avatar timber-task-avatar" data-bot-id={bot?.id} aria-hidden="true">{bot?.name.slice(0,1).toUpperCase()||'T'}</span>;
 }
+function TaskDesktop({taskId,request}:{taskId:string;request:TasksRequest}) {
+  const ref=useRef<HTMLDivElement>(null);
+  useEffect(()=>{
+    if(!ref.current)return;
+    const path=`/v1/tasks/${encodeURIComponent(taskId)}/computer/live-session`;
+    const viewer=createDesktopViewer({element:ref.current,dockId:`task-desktop-dock-${taskId}`,
+      connect:async(mode,replaces)=>{
+        const data=await request(path,{method:'POST',body:{mode,...(replaces?{replaces}:{})}});
+        if(!isRecord(data)||typeof data.sessionId!=='string'||!Array.isArray(data.protocols)||!data.protocols.every(p=>typeof p==='string')||typeof data.expiresAt!=='string')throw new Error('Could not connect to the task computer.');
+        const url=new URL(`/v1/tasks/${encodeURIComponent(taskId)}/computer/live`,location.origin);url.protocol=location.protocol==='https:'?'wss:':'ws:';
+        return {sessionId:data.sessionId,protocols:data.protocols as string[],expiresAt:data.expiresAt,url:url.href};
+      },
+      renew:async sessionId=>await request(`${path}/${encodeURIComponent(sessionId)}/renew`,{method:'POST',body:{}}) as {expiresAt:string},
+      release:sessionId=>request(`${path}/${encodeURIComponent(sessionId)}`,{method:'DELETE'}),
+    });
+    viewer.setActive(true);return()=>viewer.destroy();
+  },[taskId,request]);
+  return <div ref={ref} className="timber-task-desktop"/>;
+}
 
 function TaskView({props}:{props:TasksProps}) {
   const [wide,setWide]=useState(()=>matchMedia('(min-width:761px)').matches);
@@ -89,6 +109,7 @@ function TaskView({props}:{props:TasksProps}) {
   const [filtersOpen,setFiltersOpen]=useState(false);
   const [approvals,setApprovals]=useState<TaskApproval[]>([]),[approvalError,setApprovalError]=useState('');
   const [search,setSearch]=useState(''),[events,setEvents]=useState<BotEvent[]>([]),[runs,setRuns]=useState<Run[]>([]),[detailsOpen,setDetailsOpen]=useState(false);
+  const [desktopOpen,setDesktopOpen]=useState(false);
   const [subagents,setSubagents]=useState<Subagent[]>([]),[delegations,setDelegations]=useState<AgentDelegation[]>([]),[agentsOpen,setAgentsOpen]=useState(false),[selectedAgent,setSelectedAgent]=useState<string|null>(null);
   const [connections,setConnections]=useState<ChatConnection[]>([]),[compactions,setCompactions]=useState<CompactionReceipt[]>([]),[deliveries,setDeliveries]=useState<TaskDelivery[]>([]),[draftMentions,setDraftMentions]=useState<string[]>([]),[acceptedImageIds,setAcceptedImageIds]=useState<string[]>([]);
   const [headerTarget,setHeaderTarget]=useState<HTMLElement|null>(null),avatarRef=useRef<HTMLSpanElement>(null);
@@ -114,6 +135,7 @@ function TaskView({props}:{props:TasksProps}) {
     return()=>{mounted.current=false;listRead.current?.abort();detailRead.current?.abort();olderRead.current?.abort()};
   },[]);
   const selectTask=(id:string|null,notify=true)=>{
+    setDesktopOpen(false);
     // Fence the old view synchronously, including switching away and back to the same task.
     viewVersion.current++;selectedRef.current=id;listRead.current?.abort();detailRead.current?.abort();olderRead.current?.abort();setSelected(id);
     setDetail(null);setMessages([]);setApprovals([]);setEvents([]);setRuns([]);setConnections([]);setSubagents([]);setDelegations([]);setAgentsOpen(false);setSelectedAgent(null);setCompactions([]);setDeliveries([]);setDraftMentions([]);setAcceptedImageIds([]);setDetailsOpen(false);busyRef.current=false;knownRuns.current.clear();partialRef.current={};setPartials({});setMessageCursor(null);setEventCursor(null);streamCursor.current=0;olderMessagesLoaded.current=false;setVisibleMessages(100);setOlderBusy(false);setArchivedActivity(false);setDraft('');setBusy(false);setError('');setLoadError('');setApprovalError('');
@@ -373,7 +395,23 @@ function TaskView({props}:{props:TasksProps}) {
     currentRun,runFilter:null,focusApproval:0,stream:streamed?{runId:streamed[0],text:streamed[1]}:null,
     historyLoading:olderBusy,historyHasMore:Boolean(messageCursor||eventCursor||messages.length>visibleMessages),historyError:loadError||undefined,
   };
-  const detailContent=selected?<section className="timber-tasks-detail" data-task-id={selected}>
+  const appLink=(event:MouseEvent<HTMLElement>)=>{
+    if(event.defaultPrevented||event.button!==0||event.metaKey||event.ctrlKey||event.altKey||event.shiftKey)return;
+    const anchor=(event.target as Element).closest<HTMLAnchorElement>('a[href]');if(!anchor||!selected||!detail)return;
+    let url:URL;try{url=new URL(anchor.href,location.origin);}catch{return;}
+    const match=/^\/apps\/([0-9a-f-]{36})\.([0-9a-f-]{36})\.([0-9a-f-]{36})\/$/i.exec(url.pathname);
+    if(!match||match[1]!==detail.botId||match[2]!==selected||url.search||url.hash)return;
+    event.preventDefault();const popup=window.open('about:blank','_blank');if(!popup){setError('Allow a new tab to open this app.');return;}
+    const id=selected;void(async()=>{
+      try{
+        const result=await request(`/v1/tasks/${encodeURIComponent(id)}/apps/${encodeURIComponent(match[3])}/open`,{method:'POST',body:{}});
+        if(!isRecord(result)||typeof result.actionUrl!=='string'||typeof result.ticket!=='string')throw new Error('Could not open the task app.');
+        const target=new URL(result.actionUrl);if(target.origin!==url.origin||target.pathname!==url.pathname+'__timber_open'||target.search||target.hash||target.username||target.password||popup.closed)throw new Error('Could not verify the task app.');
+        const form=popup.document.createElement('form');form.method='POST';form.action=target.href;const input=popup.document.createElement('input');input.type='hidden';input.name='ticket';input.value=result.ticket;form.append(input);popup.document.body.append(form);popup.opener=null;form.submit();
+      }catch{popup.close();if(selectedRef.current===id)setError('The task app could not be opened. Ask the task to check that it is running.');}
+    })();
+  };
+  const detailContent=selected?<section className="timber-tasks-detail" data-task-id={selected} onClick={appLink}>
     <header className="bot-header">
       <button type="button" className="icon-button quiet timber-task-back" aria-label="Back to tasks" onClick={()=>selectTask(null)}><ArrowLeftIcon/></button>
       <span ref={avatarRef} className="avatar large" aria-hidden="true" title={bot.name}>{bot.name.slice(0,1)}</span>
@@ -381,12 +419,13 @@ function TaskView({props}:{props:TasksProps}) {
       <span ref={setHeaderTarget}/><span className="spacer"/>
       {detail&&<span className="status timber-task-state" data-task-state data-status={detail.status} role="status">{statusName(detail.status)}</span>}
       {detail&&activeStatuses.has(detail.status)&&detail.status!=='cancelling'&&<button type="button" className="icon-button quiet timber-task-stop" disabled={busy} onClick={()=>void action('cancel')} aria-label="Cancel task" title="Cancel task"><SquareIcon/></button>}
+      <Dialog.Root open={desktopOpen} onOpenChange={setDesktopOpen}><Dialog.Trigger asChild><button type="button" className="icon-button quiet" aria-label="Task computer" title="Task computer"><MonitorIcon/></button></Dialog.Trigger><Dialog.Portal><Dialog.Overlay className="timber-memory-overlay"/><Dialog.Content className="timber-memory-dialog timber-task-desktop-dialog"><div className="timber-secure-title"><Dialog.Title>Task computer</Dialog.Title><Dialog.Close asChild><button type="button" className="quiet icon-button" aria-label="Close task computer"><XIcon/></button></Dialog.Close></div><Dialog.Description className="sr-only">The computer used by this task.</Dialog.Description><TaskDesktop taskId={selected} request={request}/></Dialog.Content></Dialog.Portal></Dialog.Root>
       <Dialog.Root open={detailsOpen} onOpenChange={setDetailsOpen}>
         <Dialog.Trigger asChild><button type="button" className="icon-button quiet" aria-label="Task details" title="Task details"><InfoIcon/></button></Dialog.Trigger>
         <Dialog.Portal><Dialog.Overlay className="timber-memory-overlay"/><Dialog.Content className="timber-memory-dialog timber-task-details-dialog">
           <div className="timber-secure-title"><Dialog.Title>Task details</Dialog.Title><Dialog.Close asChild><button type="button" className="quiet icon-button" aria-label="Close task details"><XIcon/></button></Dialog.Close></div>
           <h3>{detail?.title||'Task'}</h3><Dialog.Description>{detail?.description||'No description.'}</Dialog.Description>
-          <dl><dt>Bot</dt><dd>{bot.name}</dd><dt>Status</dt><dd>{detail?statusName(detail.status):'Loading…'}</dd>{detail?.createdAt&&<><dt>Created</dt><dd>{date(detail.createdAt)}</dd></>}</dl>
+          <dl><dt>Bot</dt><dd>{bot.name}</dd><dt>Status</dt><dd>{detail?statusName(detail.status):'Loading…'}</dd>{detail?.computerMode&&<><dt>Computer</dt><dd>{detail.computerMode==='isolated'?'This task':'Shared with bot'}</dd></>}{detail?.createdAt&&<><dt>Created</dt><dd>{date(detail.createdAt)}</dd></>}</dl>
           {detail?.status==='cancelled'&&<p className="hint">Cancelled tasks stay stopped. Create a new task to work again.</p>}
           <div className="dialog-actions"><button type="button" className="quiet" onClick={refresh} aria-label="Refresh task"><RefreshCwIcon/>Refresh</button>{detail?.botId&&props.onOpenBot&&<button type="button" className="quiet" onClick={()=>props.onOpenBot?.(detail.botId)}>Open bot</button>}
             {archivedActivity&&<button type="button" className="quiet" onClick={()=>{latestActivity();setDetailsOpen(false);}}>Latest activity</button>}

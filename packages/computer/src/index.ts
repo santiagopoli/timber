@@ -8,9 +8,13 @@ import desktopSource from "../../../infra/computer/desktop_bridge.py";
 import { DesktopSessions, DesktopError } from "./live";
 import { createCloudSecureWorkerDeployProvider } from "./secure-deploy";
 import { secureDeployComputerRoute } from "./secure-deploy-do";
+import {computerName,computerHeaders,TASK_COMPUTER_HEADER,type ComputerScopeResolver} from './scope';
+export {computerName,computerHeaders} from './scope';
+export type {ComputerScopeResolver} from './scope';
 
 export interface ComputerEnv {
   FILES: R2Bucket;
+  COMPUTER?: DurableObjectNamespace;
   WORKSPACE?: DurableObjectNamespace;
   GITHUB?: DurableObjectNamespace;
   /** Temporary deployment mode. Installs desktop packages at cold start. */
@@ -129,8 +133,64 @@ async function stage<T>(code: ComputerErrorCode, work: () => Promise<T>): Promis
   }
 }
 
-/** There is one instance per bot. Never expose this DO directly without API auth. */
+/** One instance per named bot or isolated task. Access only through the owner API. */
 export class ComputerDO extends DurableObject<ComputerEnv> {
+  private bindingScope?:Promise<void>;
+  /** Logical bot authority stays separate from the physical task computer. */
+  private async bindScope(request:Request,botId:string,initialize=true):Promise<void> {
+    const taskId=request.headers.get(TASK_COMPUTER_HEADER)??undefined;
+    let name:string;try{name=computerName(botId,taskId);}catch{throw new ComputerProviderError('computer_invalid_request');}
+    if(this.env.COMPUTER&&!this.ctx.id.equals(this.env.COMPUTER.idFromName(name)))throw new ComputerProviderError('computer_owner_mismatch');
+    if(taskId&&(!this.env.COMPUTER||!this.env.WORKSPACE))throw new ComputerProviderError('computer_owner_mismatch');
+    const saved=await this.ctx.storage.get<string>('taskScope');
+    if(saved!==undefined&&saved!==(taskId??''))throw new ComputerProviderError('computer_owner_mismatch');
+    if(!taskId){if(saved===undefined)await this.ctx.storage.put('taskScope','');return;}
+    if(this.bindingScope)await this.bindingScope;
+    const work=(async()=>{
+      const registry=this.env.WORKSPACE!.get(this.env.WORKSPACE!.idFromName('owner'));
+      const inspect=async()=>{
+        const response=await registry.fetch(`https://workspace/tasks/${taskId}`);
+        if(!response.ok){await response.body?.cancel();throw new ComputerProviderError('computer_owner_mismatch');}
+        const {task}=await response.json<{task:{botId:string;computerMode?:string;sourceTaskId?:string}}>();
+        if(task.botId!==botId||task.computerMode!=='isolated')throw new ComputerProviderError('computer_owner_mismatch');
+        return task;
+      };
+      const task=await inspect();
+      if(!initialize){await this.ctx.storage.put({botId,taskScope:taskId});return;}
+      if(await this.ctx.storage.get<boolean>('taskScopeInitialized'))return;
+      let seed=await this.ctx.storage.get<Checkpoint>('taskSeed');
+      const validateCopy=async(candidate:Checkpoint)=>{
+        const existing=await this.env.FILES.head(candidate.key);
+        if(!existing)return false;
+        const checksum=existing.checksums.sha256?Array.from(new Uint8Array(existing.checksums.sha256),v=>v.toString(16).padStart(2,'0')).join(''):'';
+        if(existing.size!==candidate.size||checksum!==candidate.sha256)throw new ComputerProviderError('computer_restore_failed');
+        return true;
+      };
+      // Recover a completed private copy even if its source was since removed.
+      if(!seed||!await validateCopy(seed)){
+        let sourceTaskId:string|undefined;
+        if(task.sourceTaskId){
+          const response=await registry.fetch(`https://workspace/tasks/${task.sourceTaskId}`);
+          if(response.ok){const {task:source}=await response.json<{task:{botId:string;computerMode?:string}}>();if(source.botId===botId&&source.computerMode==='isolated')sourceTaskId=task.sourceTaskId;}
+          else await response.body?.cancel();
+        }
+        const response=await this.env.COMPUTER!.get(this.env.COMPUTER!.idFromName(computerName(botId,sourceTaskId))).fetch('https://computer.internal/workspace/snapshot',{headers:computerHeaders(botId,sourceTaskId)});
+        if(!response.ok){await response.body?.cancel();throw new ComputerProviderError('computer_restore_failed');}
+        const {checkpoint}=await response.json<{checkpoint?:Checkpoint}>();
+        if(checkpoint&&(!checkpoint.key.startsWith(`bots/${botId}/checkpoints/`)||!/^([a-f0-9]{64})$/.test(checkpoint.sha256)||checkpoint.size<=0||checkpoint.size>256*1024*1024))throw new ComputerProviderError('computer_restore_failed');
+        if(checkpoint){
+          const id=seed?.id??crypto.randomUUID();seed={...checkpoint,id,key:`bots/${botId}/checkpoints/${id}.tar.gz`};await this.ctx.storage.put('taskSeed',seed);
+          // Each task owns the copy; no source cleanup can invalidate its files.
+          const source=await this.env.FILES.get(checkpoint.key);
+          if(!source||source.size!==checkpoint.size)throw new ComputerProviderError('computer_restore_missing');
+          await this.env.FILES.put(seed.key,source.body,{httpMetadata:{contentType:'application/gzip'},sha256:seed.sha256});
+        }else if(seed)throw new ComputerProviderError('computer_restore_missing');
+      }
+      await inspect();this.active();
+      await this.ctx.storage.put({botId,taskScope:taskId,taskScopeInitialized:true,...(seed?{lastCheckpoint:seed,checkpointRevision:seed.revision??0}:{})});
+    })();
+    this.bindingScope=work;try{await work;}finally{if(this.bindingScope===work)this.bindingScope=undefined;}
+  }
   private live:DesktopSessions;
   private tail: Promise<unknown> = Promise.resolve();
   // Effects stay ordered on tail. Files only share the shorter lifecycle gate,
@@ -274,6 +334,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       await Promise.all([...this.execUpdates.values()].map(work=>work.catch(()=>{})));
       await this.backgroundCheckpoint?.catch(()=>{});
       if(this.starting) await this.starting.catch(()=>{});
+      if(this.bindingScope)await this.bindingScope.catch(()=>{});
       while(true) {
         const values=await this.ctx.storage.list({limit:128});
         const keys=[...values.keys()].filter(key=>key!=="deleted");
@@ -295,8 +356,11 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       if (request.method !== "POST") throw new ComputerProviderError("computer_method_not_allowed");
       const body = await request.json<{botId:string; operationId?:string; processId?:string; action?:ComputerAction}>();
       if (!/^[A-Za-z0-9_-]{1,100}$/.test(body.botId)) throw new ComputerProviderError("computer_invalid_request");
+      const taskScope=request.headers.get(TASK_COMPUTER_HEADER)??undefined;
+      if(this.env.COMPUTER&&!this.ctx.id.equals(this.env.COMPUTER.idFromName(computerName(body.botId,taskScope)))||taskScope&&!this.env.COMPUTER)throw new ComputerProviderError('computer_owner_mismatch');
       const savedBotId = await this.ctx.storage.get<string>("deleted") ?? await this.ctx.storage.get<string>("botId");
       if (savedBotId && savedBotId !== body.botId) throw new ComputerProviderError("computer_owner_mismatch");
+      if(!await this.ctx.storage.get<string>('deleted'))await this.bindScope(request,body.botId,path!=='/delete');
       if(path==="/delete") {await this.remove(body.botId);return Response.json({botId:body.botId,deleted:true});}
       this.active();
       if (!savedBotId) await this.ctx.storage.put("botId", body.botId);
@@ -343,7 +407,9 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     if(!/^[A-Za-z0-9_-]{1,100}$/.test(botId)) throw new ComputerProviderError("computer_invalid_request");
     const owner=await this.ctx.storage.get<string>("botId");
     if(owner && owner!==botId) throw new ComputerProviderError("computer_owner_mismatch");
+    await this.bindScope(request,botId);
     if(!owner) await this.ctx.storage.put("botId",botId);
+    if(url.pathname==='/workspace/snapshot'&&request.method==='GET')return Response.json({checkpoint:await this.ctx.storage.get<Checkpoint>('lastCheckpoint')});
     if(url.pathname==="/desktop-ws") return this.live.connect(botId,request,port=>{
       if(!this.container?.running) throw new ComputerProviderError("computer_app_not_running");
       return this.container.getTcpPort(port).fetch(new Request(`http://127.0.0.1:${port}/`,{headers:{Upgrade:"websocket",Authorization:`Bearer ${this.token}`,"Sec-WebSocket-Protocol":"binary"}}));
@@ -900,7 +966,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     try {
       const response=await github.fetch("https://github.internal/git-capability", {
         method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({botId,repository:action.repository,permission:action.type==="gitClone"?"read":"write"}),
+        body:JSON.stringify({botId,...(await this.ctx.storage.get<string>('taskScope')?{taskId:await this.ctx.storage.get<string>('taskScope')} :{}),repository:action.repository,permission:action.type==="gitClone"?"read":"write"}),
       });
       if(!response.ok) throw new ComputerProviderError("computer_git_unavailable");
       transport=await response.json<GitTransport>();
@@ -927,6 +993,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     if(!botId || !/^[A-Za-z0-9_-]{1,100}$/.test(botId)) throw new ComputerProviderError("computer_invalid_request");
     const owner=await this.ctx.storage.get<string>("botId");
     if(owner!==botId) throw new ComputerProviderError("computer_owner_mismatch");
+    await this.bindScope(request,botId);
     this.active();
     const container=this.container;
     if(!container?.running) throw new ComputerProviderError("computer_app_not_running");
@@ -1203,11 +1270,11 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   }
 }
 
-async function rpc<T>(binding: DurableObjectNamespace, botId: string, path: string, extra: object = {}): Promise<T> {
+async function rpc<T>(binding: DurableObjectNamespace, botId: string, path: string, extra: object = {},taskId?:string): Promise<T> {
   let response: Response;
   try {
-    response = await binding.get(binding.idFromName(botId)).fetch(`https://computer.internal${path}`, {
-      method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({botId,...extra}),
+    response = await binding.get(binding.idFromName(computerName(botId,taskId))).fetch(`https://computer.internal${path}`, {
+      method:"POST",headers:{"Content-Type":"application/json",...computerHeaders(botId,taskId)},body:JSON.stringify({botId,...extra}),
     });
   } catch { throw new ComputerProviderError("computer_unavailable"); }
   if (!response.ok) {
@@ -1243,15 +1310,15 @@ async function rpc<T>(binding: DurableObjectNamespace, botId: string, path: stri
   catch { throw new ComputerProviderError("computer_unavailable"); }
 }
 
-export function createCloudComputerProvider(binding: DurableObjectNamespace): ComputerProvider {
-  const deploy=createCloudSecureWorkerDeployProvider(binding);
+export function createCloudComputerProvider(binding: DurableObjectNamespace,scope?:ComputerScopeResolver): ComputerProvider {
+  const deploy=createCloudSecureWorkerDeployProvider(binding,scope);
   return {
-    exec:(botId,operationId,action) => rpc<ComputerResult>(binding,botId,"/actions",{operationId,action}),
-    status:botId => rpc<ComputerStatus>(binding,botId,"/status"),
-    checkpoint:botId => rpc<ComputerResult>(binding,botId,"/actions",{operationId:crypto.randomUUID(),action:{type:"checkpoint"}}),
+    exec:async(botId,operationId,action) => rpc<ComputerResult>(binding,botId,"/actions",{operationId,action},await scope?.(botId)),
+    status:async botId => rpc<ComputerStatus>(binding,botId,"/status",{},await scope?.(botId)),
+    checkpoint:async botId => rpc<ComputerResult>(binding,botId,"/actions",{operationId:crypto.randomUUID(),action:{type:"checkpoint"}},await scope?.(botId)),
     controlled:async botId => {
       let response:Response;
-      try {response=await binding.get(binding.idFromName(botId)).fetch("https://computer.internal/desktop/control",{headers:{"x-timber-bot-id":botId}});}
+      try {const taskId=await scope?.(botId);response=await binding.get(binding.idFromName(computerName(botId,taskId))).fetch("https://computer.internal/desktop/control",{headers:computerHeaders(botId,taskId)});}
       catch {throw new ComputerProviderError("computer_unavailable");}
       if(!response.ok)throw new ComputerProviderError("computer_unavailable");
       return (await response.json<{controlled:boolean}>()).controlled;
@@ -1259,16 +1326,16 @@ export function createCloudComputerProvider(binding: DurableObjectNamespace): Co
     secureDeployCapabilities:(botId,signal)=>deploy.capabilities(botId,signal),
     secureDeploy:(botId,input)=>deploy.dispatch(botId,{...(input as unknown as Parameters<typeof deploy.dispatch>[1]),signal:input.signal??new AbortController().signal}),
     secureDeployCancel:(botId,operationId)=>deploy.cancel(botId,operationId),
-    cancel:(botId,processId)=>rpc<ComputerResult>(binding,botId,'/exec/cancel',{processId}),
+    cancel:async(botId,processId)=>rpc<ComputerResult>(binding,botId,'/exec/cancel',{processId},await scope?.(botId)),
   };
 }
-export const touchCloudComputer = (binding: DurableObjectNamespace, botId: string) => rpc<{ok:true}>(binding,botId,"/touch");
-export const suspendCloudComputer = (binding: DurableObjectNamespace, botId: string) => rpc<ComputerStatus>(binding,botId,"/suspend");
-export const deleteCloudComputer = (binding: DurableObjectNamespace, botId: string) => rpc<{botId:string;deleted:true}>(binding,botId,"/delete");
-export function previewCloudComputer(binding:DurableObjectNamespace,botId:string,port:number,request:Request):Promise<Response> {
+export const touchCloudComputer = (binding: DurableObjectNamespace, botId: string,taskId?:string) => rpc<{ok:true}>(binding,botId,"/touch",{},taskId);
+export const suspendCloudComputer = (binding: DurableObjectNamespace, botId: string,taskId?:string) => rpc<ComputerStatus>(binding,botId,"/suspend",{},taskId);
+export const deleteCloudComputer = (binding: DurableObjectNamespace, botId: string,taskId?:string) => rpc<{botId:string;deleted:true}>(binding,botId,"/delete",{},taskId);
+export function previewCloudComputer(binding:DurableObjectNamespace,botId:string,port:number,request:Request,taskId?:string):Promise<Response> {
   const url=new URL(request.url),headers=new Headers(request.headers);
-  headers.set("x-timber-bot-id",botId);
-  return binding.get(binding.idFromName(botId)).fetch(new Request(`https://computer.internal/preview/${port}${url.pathname}${url.search}`,{
+  for(const [key,value] of Object.entries(computerHeaders(botId,taskId)))headers.set(key,value);
+  return binding.get(binding.idFromName(computerName(botId,taskId))).fetch(new Request(`https://computer.internal/preview/${port}${url.pathname}${url.search}`,{
     method:request.method,headers,...(["GET","HEAD"].includes(request.method)?{}:{body:request.body}),redirect:"manual",signal:request.signal,
   }));
 }

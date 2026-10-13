@@ -3,11 +3,11 @@
 ## Product and naming
 The product is Timber. A Bot has a name, instructions, runtime,
 model and a single persistent conversation. Runs project accepted inputs inside
-that conversation. Standalone global tasks have their own conversations and share
-the assigned bot’s computer, never its ordinary chat transcript. v1 is cloud-only; no iOS implementation in this milestone.
+that conversation. Standalone global tasks have their own conversations and isolated
+computers. Previously admitted legacy tasks retain the assigned bot’s shared computer. v1 is cloud-only; no iOS implementation in this milestone.
 
 ## Deployment
-- One Cloudflare Worker, WorkspaceDO registry, BotDO per bot, ComputerDO per bot.
+- One Cloudflare Worker, WorkspaceDO registry, BotDO per conversation, ComputerDO per named bot or isolated task.
 - SQLite-backed DOs; R2 bucket FILES for immutable checkpoints and artifacts.
 - First engine Pi through official PiHarness. Default model gpt-6.1-sol via
   the user's explicitly authorized ChatGPT plan. Explicit @cf/ models retain
@@ -505,7 +505,7 @@ active runs and permanently fences subsequent starts and continuations. Cancelle
 `/approvals/:approvalId`, `/agents`, `/agents/:agentId/messages`,
 `/agents/:agentId/cancel`, `/runs/:runId`, `/runs/:runId/cancel` and `/connections`
 reuse the isolated conversation’s decision/run APIs; decisions are never applied
-to the assigned bot’s ordinary chat. A per-assigned-bot durable slot blocks
+to the assigned bot’s ordinary chat. Each new task owns a computer keyed by `task:<taskId>`, with independent lease, processes, previews and desktop tickets. Keychain/GitHub permissions still use the assigned logical bot ID. First use copies the source last durable checkpoint to a task-owned R2 key; it does not copy active processes or uncheckpointed files. Continue retains that computer. Never-started legacy queued/pending tasks migrate with a durable preparation fence; previously admitted tasks remain shared. Inbox admissions obey the same durable isolation-preparation fence as computer admissions. Recovery releases an obsolete shared slot only after its last receipt drains, without touching a replacement or isolated lease. For these legacy tasks, a per-assigned-bot durable slot blocks
 task starts while the ordinary bot has an active run; ordinary bot messages are durably receipted in the existing bounded backlog while a task holds the slot, and ordinary computer-capable runs cannot enter Pi until their conversation atomically acquires an `@bot` execution lease. Task-enabled main chat can enter the computerless coordinator mode below without claiming that slot. Expected contention uses the existing Lifecycle capacity wake without consuming delivery-failure attempts. Unadmitted backlog alone never prevents a future lease. Owner direct mutations retain exact validated queued intentions and return explicit 202 queued receipts; no task chat is admitted as ordinary bot steering while the shared computer is occupied. Other tasks remain durably `queued` and are admitted FIFO by the WorkspaceDO alarm
 once run and managed-process termination is confirmed. No browser polling is
 needed to release an idle lease or start queued tasks. Snapshot-based release is
@@ -515,19 +515,15 @@ cannot free a replacement holder. Ordinary inputs retain the separate 32/16
 backlogs, native 16-input inbox and 128-unresolved circuit breaker; these are not
 replaced by a task execution count.
 
-Bot deletion fences and cleans each assigned task's conversation/runtime before
-cleaning the shared computer. Cleanup retries leave bot deletion pending; task
-cleanup never destroys the assigned bot's computer.
+Bot deletion fences and drains each task's conversation/runtime and isolated computer before cleaning the named bot's computer and R2 prefix. Cleanup retries leave deletion pending. Task Stop only cancels its own inputs/processes; it never deletes the named bot's computer.
 
 The `create_task` host tool is explicitly gated by the assigned bot's
 `allowTaskCreation` permission. Bot creation identity is taken from the active
-host run; model-supplied source IDs are ignored. Bot-created tasks accept `startImmediately?:boolean`, default true. They queue
-behind their creating conversation and start through the durable scheduler when
-its shared computer is idle; false explicitly saves a pending task. Task list pagination, reassignment, and task
+host run; model-supplied source IDs are ignored. Bot-created tasks accept `startImmediately?:boolean`, default true. They start through the durable scheduler on their own computer without waiting for their creating conversation; false explicitly saves a pending task. Task list pagination, reassignment, and task
 user-deletion are not available.
 
 When allowed, the agent uses `create_task` for substantial multi-step work,
-finishes its brief handoff to release the shared computer, and keeps short
+finishes its brief handoff, and keeps short
 answers in the main chat. Task runtimes are told to execute their assigned work
 rather than recursively handing it off. New console-created bots default to
 allowing task creation; existing explicit permissions remain unchanged.
@@ -538,7 +534,7 @@ deduplicate notifications across retries and eviction. A terminal outcome can
 append one attributed assistant result without starting another inference run;
 a cancelled originating run never receives an implicit continuation.
 
-While a task owns its bot's computer slot, an allowed bot's new ordinary input
+While a legacy task owns its bot's computer slot, an allowed bot's new ordinary input
 can be admitted as a persisted `Run.coordinatorMode` turn. It may answer,
 inspect allowlisted metadata and create another task, but computer tools and
 service mutations fail before any effect. These turns do not claim/release the
@@ -1466,3 +1462,15 @@ Task progress and private production diagnostics expose those stages to distingu
 a request waiting for headers from an active stream and a dead connection.
 The policy follows Hermes' separation of total and stale-stream budgets and Codex's
 per-session cache affinity.
+
+### Task computer and app access
+
+Task-scoped `GET /v1/tasks/:id/computer`, `POST /computer/live-session`,
+`POST /computer/live-session/:sessionId/renew`, `DELETE /computer/live-session/:sessionId`
+and the ticket-authenticated `/computer/live` WebSocket select the canonical task
+computer server-side. Workspace reads (`tree`, `file`, `download`, `projects`,
+`changes`, `diff`) and app registration/list/refresh/open use the same scoped
+runtime. Task app URLs are `/apps/<botId>.<taskId>.<appId>/`. Registry membership
+and one-use per-app tickets remain required; users cannot select another computer
+through headers. Signed private deployments bind the same task ID while retaining
+logical bot authority.

@@ -323,6 +323,31 @@ export function createSubagents(host: SubagentHost) {
     host.native().resume();
     return { operationId: input.operationId, accepted };
   };
+  const resumeQueued = async () => {
+    host.assertActive();
+    const registry=await state(),seen=new Set<string>();
+    const deliveries=Object.entries(registry.deliveries).sort((a,b)=>a[1].taskId-b[1].taskId);
+    for(const [key] of deliveries){
+      const separator=key.indexOf(':'),agent=registry.agents[key.slice(0,separator)],operationId=key.slice(separator+1);
+      if(!agent||seen.has(agent.conversationId)||isStopped(agent)||await host.stopped(agent.parentOperationId)||host.paused(operationId))continue;
+      const conversationId=Number(agent.conversationId) as ConversationId;
+      const receipt=await host.storage().submissionByRequest(conversationId,operationId,host.context());
+      if(receipt?.status!=='queued')continue;
+      const live=await host.native().snapshot(LiveDoc,conversationId,host.context());
+      if(live?.run||(await host.native().inspect(host.context())).tasks.some(t=>t.record.conversationId===conversationId))continue;
+      const inbox=await host.native().snapshot(InboxDoc,conversationId,host.context());
+      if(!inbox?.items.some(item=>item.id===receipt.id&&item.mode!=='write'))continue;
+      const current=await find(agent.id);
+      if(isStopped(current)||await host.stopped(current.parentOperationId)||host.paused(operationId))continue;
+      const conversation=await host.native().conversation(conversationId,host.context());
+      if(!conversation)continue;
+      // Pi ends a failed generation without placing its queued inputs. A passive
+      // write asks its official admission API to apply the idle final boundary.
+      // It has no model content and does not resubmit an input or prior effect.
+      await conversation.submit({type:'write',entry:{kind:'timber.queue-wake'}},host.context());
+      seen.add(agent.conversationId);
+    }
+  };
   const finishStops = async () => {
     for (const agent of Object.values((await state()).agents).filter(agent => agent.stopPending)) {
       // Publish before native cleanup; retries retain the same event identity.
@@ -511,7 +536,7 @@ export function createSubagents(host: SubagentHost) {
     ];
   };
   return {
-    tools, tasks: [Anchor, DeliveryTask], forConversation,
+    tools, tasks: [Anchor, DeliveryTask], forConversation, resumeQueued,
     async start() { for (const agent of Object.values((await state()).agents)) await attach(agent.id); },
     async stop() { stopped = true; await Promise.all([...streams.values()].map(stream => stream.stop())); },
     async hasDeliveries() { return (await host.native().inspect(host.context())).tasks.some(task => task.record.kind === 'timber.subagent-delivery'); },

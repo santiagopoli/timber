@@ -18,6 +18,7 @@ export class WorkspaceDO extends DurableObject<Env> {
     super(ctx,env);
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS bots (id TEXT PRIMARY KEY, data TEXT NOT NULL)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY,data TEXT NOT NULL)");
+    ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS task_isolation_migrations(task_id TEXT PRIMARY KEY,bot_id TEXT NOT NULL)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS task_operations (operation_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,fingerprint TEXT NOT NULL)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS task_message_receipts (operation_id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,mode TEXT NOT NULL)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS task_updates (id TEXT PRIMARY KEY,task_id TEXT NOT NULL,data TEXT NOT NULL)");
@@ -55,7 +56,7 @@ export class WorkspaceDO extends DurableObject<Env> {
   private async rearmDeletion():Promise<void> {
     const next=this.ctx.storage.sql.exec<{next_at:number}>("SELECT next_at FROM bot_deletions WHERE completed=0 ORDER BY next_at LIMIT 1").toArray()[0];
     const agentTime=this.agents.nextAlarm();
-    const schedulerActive=this.ctx.storage.sql.exec("SELECT 1 FROM task_updates LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM direct_intents WHERE state='pending' LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM task_slots LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM computer_admissions LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM tasks WHERE json_extract(data,'$.status')='queued' AND json_extract(data,'$.startImmediately')=1 LIMIT 1").toArray().length>0;
+    const schedulerActive=this.ctx.storage.sql.exec("SELECT 1 FROM task_isolation_migrations LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM task_updates LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM direct_intents WHERE state='pending' LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM task_slots LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM computer_admissions LIMIT 1").toArray().length>0 || this.ctx.storage.sql.exec("SELECT 1 FROM tasks WHERE json_extract(data,'$.status')='queued' AND COALESCE(json_extract(data,'$.startImmediately'),1)=1 LIMIT 1").toArray().length>0;
     const now=Date.now(),existingAlarm=await this.ctx.storage.getAlarm();
     const schedulerTime=schedulerActive?Math.min(existingAlarm&&existingAlarm>now?existingAlarm:Infinity,now+5000):Infinity;
     const nextAt=Math.min(next?.next_at??Infinity,agentTime??Infinity,schedulerTime,this.avatars?.nextAlarm()??Infinity,this.keychain?.nextAlarm()??Infinity);
@@ -81,10 +82,11 @@ export class WorkspaceDO extends DurableObject<Env> {
           this.ctx.waitUntil(stopped.arrayBuffer().catch(()=>{}));
           if(!stopped.ok) throw new Error("Task shutdown pending");
         }
-        this.ctx.storage.sql.exec("DELETE FROM task_slots WHERE bot_id=? AND task_id=?",id,item.task_id);
+        this.ctx.storage.sql.exec("DELETE FROM task_slots WHERE task_id=?",item.task_id);
         this.ctx.storage.sql.exec("DELETE FROM task_operations WHERE task_id=?",item.task_id);
         this.ctx.storage.sql.exec("DELETE FROM task_message_receipts WHERE json_extract(fingerprint,'$.taskId')=?",item.task_id);
         this.ctx.storage.sql.exec("DELETE FROM task_updates WHERE task_id=?",item.task_id);
+        this.ctx.storage.sql.exec("DELETE FROM task_isolation_migrations WHERE task_id=?",item.task_id);
         this.ctx.storage.sql.exec("DELETE FROM tasks WHERE id=?",item.task_id);
         this.ctx.storage.sql.exec("UPDATE bot_task_deletions SET completed=1 WHERE task_id=?",item.task_id);
       }
@@ -117,6 +119,8 @@ export class WorkspaceDO extends DurableObject<Env> {
     this.ctx.storage.sql.exec("INSERT INTO task_slots(bot_id,task_id,token,generation,updated_at) VALUES(?,'@bot',?,?,?) ON CONFLICT(bot_id) DO UPDATE SET token=excluded.token,generation=excluded.generation,updated_at=excluded.updated_at",botId,token,generation,Date.now());
     return {token,generation};
   }
+  protected newTaskComputerMode():"shared"|"isolated" {return "isolated";}
+  private taskLeaseKey(task:{id:string;botId:string;computerMode?:string}):string {return task.computerMode==='isolated'?`task:${task.id}`:task.botId;}
   private beginComputerAdmission(botId:string,taskId:string|null,operationId:string):string {
     let slotToken:string;
     if(taskId===null) slotToken=this.reserveBotSlot(botId).token;
@@ -124,11 +128,14 @@ export class WorkspaceDO extends DurableObject<Env> {
       const taskRow=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",taskId).toArray()[0];
       if(!taskRow)throw new ApiError(404,"not_found","Task not found.");
       const task=JSON.parse(taskRow.data) as Task & {startOperationId?:string;cancelRequested?:boolean};
+      if(botId===`task:${task.id}`)botId=task.botId;
       if(task.botId!==botId)throw new ApiError(403,"task_mismatch","Task does not belong to this assigned bot.");
+      if(this.ctx.storage.sql.exec('SELECT 1 FROM task_isolation_migrations WHERE task_id=?',task.id).toArray().length)throw new ApiError(409,'computer_busy','The task environment is being isolated.');
       if(task.cancelRequested||!["queued","running","waiting_approval","waiting_connection"].includes(task.status))throw new ApiError(409,"task_not_running","The task is not accepting input.");
       // A task's initial/continuation input must enter Pi before messages saved
       // while it was waiting. Contention is capacity, never a delivery failure.
       if(task.status==="queued"&&operationId!==this.taskStartOperation(task))throw new ApiError(409,"computer_busy","Your message is saved; the task is waiting for its computer.");
+      botId=this.taskLeaseKey(task);
       const current=this.slotFor(botId);
       if(!current||current.task_id!==taskId) throw new ApiError(409,"computer_busy","The task no longer holds this bot's computer.");
       const token=crypto.randomUUID(),generation=this.nextSlotGeneration(botId);slotToken=token;
@@ -143,7 +150,9 @@ export class WorkspaceDO extends DurableObject<Env> {
     const row=this.ctx.storage.sql.exec<{data:string}>('SELECT data FROM tasks WHERE id=?',taskId).toArray()[0];
     const task=row?JSON.parse(row.data) as Task & {cancelRequested?:boolean}:undefined;
     if(!task||task.botId!==botId)throw new ApiError(404,'not_found','Task not found for this bot.');
+    if(this.ctx.storage.sql.exec('SELECT 1 FROM task_isolation_migrations WHERE task_id=?',task.id).toArray().length)throw new ApiError(409,'computer_busy','The task environment is being isolated.');
     if(task.cancelRequested||!['queued','running','waiting_approval','waiting_connection'].includes(task.status))throw new ApiError(409,'task_not_running','The task is not accepting messages.');
+    botId=this.taskLeaseKey(task);
     // Pin the receipt, not the computer. This prevents a concurrent scheduler
     // observation from finishing a task while its incoming message is in flight.
     const slot=this.slotFor(botId),token=crypto.randomUUID();
@@ -155,6 +164,10 @@ export class WorkspaceDO extends DurableObject<Env> {
     const row=this.ctx.storage.sql.exec<{bot_id:string;task_id:string;slot_token:string}>("SELECT bot_id,task_id,slot_token FROM computer_admissions WHERE token=?",token).toArray()[0];
     if(!row)return;
     this.ctx.storage.sql.exec("DELETE FROM computer_admissions WHERE token=?",token);
+    // Recover receipts admitted by an older worker during isolation. The last
+    // receipt releases only the obsolete shared slot, never a replacement or
+    // the task's canonical isolated lease.
+    this.ctx.storage.sql.exec("DELETE FROM task_slots WHERE bot_id=? AND task_id=? AND NOT EXISTS(SELECT 1 FROM computer_admissions WHERE bot_id=? AND task_id=?) AND EXISTS(SELECT 1 FROM tasks WHERE id=? AND json_extract(data,'$.computerMode')='isolated' AND json_extract(data,'$.botId')=?)",row.bot_id,row.task_id,row.bot_id,row.task_id,row.task_id,row.bot_id);
     if(!row.task_id.startsWith("@direct:"))this.ctx.storage.sql.exec("UPDATE task_slots SET updated_at=? WHERE bot_id=? AND task_id=? AND token=?",Date.now(),row.bot_id,row.task_id,row.slot_token);
   }
   private hasPendingAdmission(botId:string,taskId:string):boolean {
@@ -180,11 +193,14 @@ export class WorkspaceDO extends DurableObject<Env> {
     return (await response.json<{computerControlled:boolean}>()).computerControlled;
   }
   private async schedulerSnapshot(botId:string,bot:Bot,taskId?:string):Promise<{activeRuns:number;executionRuns:number;activeProcesses:number;pendingCancellations:number;computerControlled:boolean;latest?:string;latestRunId?:string;activeStatus?:string}> {
+    botId=bot.id;
     const identity=taskId?`owner:task:${taskId}`:`owner:${botId}`;
     const stub=this.env.BOT.get(this.env.BOT.idFromName(identity)),root=this.env.BOT.get(this.env.BOT.idFromName(`owner:${botId}`));
     const prefix=taskId?"task":"bot";
     const headers={"x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-internal":"scheduler",...(taskId?{"x-timber-task-id":taskId}:{})};
-    const [r,s,c]=await Promise.all([stub.fetch(new Request(`https://${prefix}/runs`,{headers})),stub.fetch(new Request(`https://${prefix}/summary`,{headers})),root.fetch(new Request("https://bot/computer/lease-state",{headers:{"x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-internal":"scheduler"}}))]);
+    const record=taskId?this.ctx.storage.sql.exec<{data:string}>('SELECT data FROM tasks WHERE id=?',taskId).toArray()[0]:undefined;
+    const isolated=record&&JSON.parse(record.data).computerMode==='isolated';
+    const [r,s,c]=await Promise.all([stub.fetch(new Request(`https://${prefix}/runs`,{headers})),stub.fetch(new Request(`https://${prefix}/summary`,{headers})),(isolated?stub:root).fetch(new Request("https://bot/computer/lease-state",{headers:isolated?headers:{"x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-internal":"scheduler"}}))]);
     if(!r.ok||!s.ok||!c.ok) {await Promise.all([r.arrayBuffer(),s.arrayBuffer(),c.arrayBuffer()]);throw new Error("Run reconciliation unavailable");}
     const page=await r.json<{activeRuns:Array<{status:string;subagentId?:string}>;runs:Array<{id:string;status:string;subagentId?:string}>}>(),summary=await s.json<{summary:{activeRuns:number;activeProcesses:number;pendingCancellations?:number;executionRuns?:number}}>(),lease=await c.json<{computerControlled:boolean}>();
     const latest=page.runs.find(run=>!run.subagentId);
@@ -259,8 +275,8 @@ export class WorkspaceDO extends DurableObject<Env> {
   private releaseFailedTaskSlot(taskId:string):void {
     const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",taskId).toArray()[0];if(!row)return;
     if((JSON.parse(row.data) as {status:string}).status!=="failed")return;
-    const task=JSON.parse(row.data) as {botId:string},slot=this.slotFor(task.botId);
-    if(slot?.task_id===taskId)this.releaseSlot(task.botId,taskId,slot.token,slot.updated_at);
+    const task=JSON.parse(row.data) as Task,key=this.taskLeaseKey(task),slot=this.slotFor(key);
+    if(slot?.task_id===taskId)this.releaseSlot(key,taskId,slot.token,slot.updated_at);
   }
   private saveDirectReceipt(botId:string,operationId:string,receipt:unknown,terminal=false,status=200):void {
     this.ctx.storage.sql.exec("UPDATE direct_intents SET receipt=?,receipt_status=?,state=CASE WHEN ?=1 THEN 'settled' ELSE state END WHERE bot_id=? AND operation_id=? AND state!='cancelled'",JSON.stringify(receipt),status,terminal?1:0,botId,operationId);
@@ -270,7 +286,7 @@ export class WorkspaceDO extends DurableObject<Env> {
   private taskView(task:Task):Task {
     const view={...task};delete view.queue;
     if(task.status!=="queued")return view;
-    const slot=this.slotFor(task.botId);
+    const slot=this.slotFor(this.taskLeaseKey(task));
     if(!slot)view.queue={reason:"scheduled"};
     else if(slot.task_id===task.id)view.queue={reason:"starting"};
     else if(slot.task_id==="@bot")view.queue={reason:"bot"};
@@ -288,7 +304,9 @@ export class WorkspaceDO extends DurableObject<Env> {
       // Direct pins recover through the original computer journal, not native input admission.
       if(row.task_id.startsWith("@direct:")||row.payload)continue;
       try {
-        const botRow=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",row.bot_id).toArray()[0];
+        const taskRecord=row.bot_id.startsWith('task:')?this.ctx.storage.sql.exec<{data:string}>('SELECT data FROM tasks WHERE id=?',row.task_id).toArray()[0]:undefined;
+        const ownerId=taskRecord?JSON.parse(taskRecord.data).botId:row.bot_id;
+        const botRow=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",ownerId).toArray()[0];
         if(!botRow) {this.ctx.storage.sql.exec("DELETE FROM computer_admissions WHERE bot_id=?",row.bot_id);continue;}
         const bot=JSON.parse(botRow.data) as Bot,task=row.task_id!=="@bot",identity=task?`owner:task:${row.task_id}`:`owner:${row.bot_id}`;
         const stub=this.env.BOT.get(this.env.BOT.idFromName(identity)),headers={"x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-internal":"scheduler",...(task?{"x-timber-task-id":row.task_id}:{})};
@@ -322,10 +340,14 @@ export class WorkspaceDO extends DurableObject<Env> {
   }
   private async reconcileComputerSlots():Promise<void> {
     await this.reconcileAdmissions();
+    await this.isolateQueuedTasks();
+    await this.startQueuedTasks(true);
     const slots=this.ctx.storage.sql.exec<{bot_id:string;task_id:string;token:string|null;generation:number;updated_at:number;payload:string|null;direct_process_id:string|null}>("SELECT bot_id,task_id,token,generation,updated_at,payload,direct_process_id FROM task_slots").toArray();
     for(const slot of slots) {
       try {
-        const botRow=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",slot.bot_id).toArray()[0];
+        const taskRecord=slot.bot_id.startsWith('task:')?this.ctx.storage.sql.exec<{data:string}>('SELECT data FROM tasks WHERE id=?',slot.task_id).toArray()[0]:undefined;
+        const ownerId=taskRecord?JSON.parse(taskRecord.data).botId:slot.bot_id;
+        const botRow=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",ownerId).toArray()[0];
         if(!botRow){this.releaseSlot(slot.bot_id,slot.task_id,slot.token);continue;}
         const bot=JSON.parse(botRow.data) as Bot;
         if(slot.task_id.startsWith("@direct:")) {
@@ -374,7 +396,8 @@ export class WorkspaceDO extends DurableObject<Env> {
         }
         const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",slot.task_id).toArray()[0];
         if(!row){this.releaseSlot(slot.bot_id,slot.task_id,slot.token);continue;}
-        const task=JSON.parse(row.data) as {id:string;botId:string;status:string;title:string;description:string;startText?:string;startAttachments?:string[];startMentions?:string[];startOperationId?:string;cancelRequested?:boolean;updatedAt:string};
+        const task=JSON.parse(row.data) as Task & {startText?:string;startAttachments?:string[];startMentions?:string[];startOperationId?:string;cancelRequested?:boolean};
+        if(this.taskLeaseKey(task)!==slot.bot_id){this.releaseSlot(slot.bot_id,task.id,slot.token,slot.updated_at);continue;}
         const state=await this.schedulerSnapshot(slot.bot_id,bot,task.id);
         const observedSlot=this.slotFor(slot.bot_id);
         if(!observedSlot||observedSlot.task_id!==slot.task_id||observedSlot.token!==slot.token||observedSlot.generation!==slot.generation||observedSlot.updated_at!==slot.updated_at)continue;
@@ -385,8 +408,10 @@ export class WorkspaceDO extends DurableObject<Env> {
           const fresh=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",task.id).toArray()[0];
           const currentTask=fresh?JSON.parse(fresh.data) as typeof task:undefined;
           if(!currentTask||currentTask.status!=="queued"||currentTask.cancelRequested)continue;
-          const mainState=await this.schedulerSnapshot(slot.bot_id,bot);
-          if(mainState.activeRuns||mainState.activeProcesses||mainState.pendingCancellations||mainState.computerControlled)continue;
+          if(task.computerMode!=='isolated'){
+            const mainState=await this.schedulerSnapshot(slot.bot_id,bot);
+            if(mainState.activeRuns||mainState.activeProcesses||mainState.pendingCancellations||mainState.computerControlled)continue;
+          }
           const startStub=this.env.BOT.get(this.env.BOT.idFromName(`owner:task:${task.id}`));
           const admission=this.beginComputerAdmission(slot.bot_id,task.id,this.taskStartOperation(task));
           const startResponse=await startStub.fetch(new Request("https://task/messages",{method:"POST",headers:{"content-type":"application/json","x-botspace-config":encodeURIComponent(JSON.stringify(bot)),"x-timber-task-id":task.id},body:JSON.stringify({operationId:this.taskStartOperation(task),text:task.startText??(task.description||task.title),...(task.startAttachments?.length?{attachments:task.startAttachments}:{}),...(task.startMentions?.length?{mentions:task.startMentions}:{})})}));
@@ -435,18 +460,26 @@ export class WorkspaceDO extends DurableObject<Env> {
         this.ctx.storage.sql.exec("UPDATE direct_intents SET state='claimed' WHERE bot_id=? AND operation_id=? AND state='pending'",intent.bot_id,intent.operation_id);
       });
     }
-    const queued=this.ctx.storage.sql.exec<{id:string;data:string}>("SELECT id,data FROM tasks WHERE json_extract(data,'$.status')='queued' AND json_extract(data,'$.startImmediately')=1 ORDER BY rowid").toArray();
+    await this.startQueuedTasks(false);
+  }
+  private async startQueuedTasks(isolatedOnly:boolean):Promise<void> {
+    const queued=this.ctx.storage.sql.exec<{id:string;data:string}>("SELECT id,data FROM tasks WHERE json_extract(data,'$.status')='queued' AND COALESCE(json_extract(data,'$.startImmediately'),1)=1 ORDER BY rowid").toArray();
     const bots=new Set<string>();
     for(const row of queued) {
-      const task=JSON.parse(row.data) as {id:string;botId:string;title:string;description:string;startText?:string;startAttachments?:string[];startMentions?:string[];status:string;startOperationId?:string};
-      if(bots.has(task.botId)||this.ctx.storage.sql.exec("SELECT 1 FROM task_slots WHERE bot_id=?",task.botId).toArray().length)continue;
+      const task=JSON.parse(row.data) as Task & {startText?:string;startAttachments?:string[];startMentions?:string[];startOperationId?:string};
+      if((task.computerMode==='isolated')!==isolatedOnly)continue;
+      const key=this.taskLeaseKey(task);
+      if(bots.has(key)||this.ctx.storage.sql.exec("SELECT 1 FROM task_slots WHERE bot_id=?",key).toArray().length)continue;
       const token=crypto.randomUUID();let reserved=false;
-      this.ctx.storage.transactionSync(()=>{if(!this.ctx.storage.sql.exec("SELECT 1 FROM task_slots WHERE bot_id=?",task.botId).toArray().length){const generation=this.nextSlotGeneration(task.botId);this.ctx.storage.sql.exec("INSERT INTO task_slots(bot_id,task_id,token,generation,updated_at) VALUES(?,?,?,?,?)",task.botId,task.id,token,generation,Date.now());reserved=true;}});
-      if(!reserved)continue;bots.add(task.botId);
+      this.ctx.storage.transactionSync(()=>{if(!this.ctx.storage.sql.exec("SELECT 1 FROM task_slots WHERE bot_id=?",key).toArray().length){const generation=this.nextSlotGeneration(key);this.ctx.storage.sql.exec("INSERT INTO task_slots(bot_id,task_id,token,generation,updated_at) VALUES(?,?,?,?,?)",key,task.id,token,generation,Date.now());reserved=true;}});
+      if(!reserved)continue;bots.add(key);
       try {
         const botRow=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",task.botId).toArray()[0];if(!botRow)continue;
-        const bot=JSON.parse(botRow.data) as Bot,state=await this.schedulerSnapshot(task.botId,bot);
-        if(state.activeRuns||state.activeProcesses||state.pendingCancellations||state.computerControlled){this.ctx.storage.sql.exec("UPDATE task_slots SET task_id='@bot',updated_at=? WHERE bot_id=? AND token=?",Date.now(),task.botId,token);continue;}
+        const bot=JSON.parse(botRow.data) as Bot;
+        if(task.computerMode!=='isolated'){
+          const state=await this.schedulerSnapshot(task.botId,bot);
+          if(state.activeRuns||state.activeProcesses||state.pendingCancellations||state.computerControlled){this.ctx.storage.sql.exec("UPDATE task_slots SET task_id='@bot',updated_at=? WHERE bot_id=? AND token=?",Date.now(),key,token);continue;}
+        }
         const fresh=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",task.id).toArray()[0];
         const current=fresh?JSON.parse(fresh.data) as typeof task:undefined;if(!current||current.status!=="queued")continue;
         const stub=this.env.BOT.get(this.env.BOT.idFromName(`owner:task:${task.id}`)),admission=this.beginComputerAdmission(task.botId,task.id,this.taskStartOperation(task));
@@ -456,6 +489,30 @@ export class WorkspaceDO extends DurableObject<Env> {
         if(response.ok)this.markTaskRunning(task.id);
         else if(response.status>=400&&response.status<500&&response.status!==409&&response.status!==429){this.updateTaskStatus(task.id,"failed");this.releaseFailedTaskSlot(task.id);}
       } catch { /* Keep both intent and token; stable operation ID makes retry safe. */ }
+    }
+  }
+  private async isolateQueuedTasks():Promise<void> {
+    if(this.newTaskComputerMode()!=='isolated')return;
+    const rows=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE COALESCE(json_extract(data,'$.computerMode'),'shared')='shared' AND (json_extract(data,'$.status') IN ('queued','pending') OR EXISTS(SELECT 1 FROM task_isolation_migrations m WHERE m.task_id=tasks.id))").toArray();
+    for(const row of rows){
+      const task=JSON.parse(row.data) as Task;
+      if(this.hasPendingAdmission(task.botId,task.id))continue;
+      this.ctx.storage.sql.exec('INSERT OR IGNORE INTO task_isolation_migrations(task_id,bot_id) VALUES(?,?)',task.id,task.botId);
+      let resolved=false;
+      try{
+        const botRow=this.ctx.storage.sql.exec<{data:string}>('SELECT data FROM bots WHERE id=?',task.botId).toArray()[0];if(!botRow){resolved=true;continue;}
+        const response=await this.env.BOT.get(this.env.BOT.idFromName(`owner:task:${task.id}`)).fetch('https://task/task-isolate',{method:'POST',headers:{'x-timber-internal':'scheduler','x-timber-task-id':task.id,'x-botspace-config':encodeURIComponent(botRow.data)}});
+        if(!response.ok){await response.body?.cancel();continue;}
+        const {isolated}=await response.json<{isolated:boolean}>();if(!isolated){resolved=true;continue;}
+        const saved=this.ctx.storage.sql.exec<{data:string}>('SELECT data FROM tasks WHERE id=?',task.id).toArray()[0];if(!saved){resolved=true;continue;}
+        const current=JSON.parse(saved.data) as Task;current.computerMode='isolated';if(current.status==='queued'&&current.startImmediately===undefined)current.startImmediately=true;
+        this.ctx.storage.transactionSync(()=>{
+          this.saveTask(current);
+          if(!this.hasPendingAdmission(task.botId,task.id))this.ctx.storage.sql.exec('DELETE FROM task_slots WHERE bot_id=? AND task_id=?',task.botId,task.id);
+        });
+        resolved=true;
+      }catch{/* A lost preparation receipt is retried, never an execution. */}
+      finally{if(resolved)this.ctx.storage.sql.exec('DELETE FROM task_isolation_migrations WHERE task_id=?',task.id);}
     }
   }
   async alarm():Promise<void> {
@@ -581,10 +638,11 @@ export class WorkspaceDO extends DurableObject<Env> {
         if(!currentSource||(JSON.parse(currentSource.data) as Bot).allowTaskCreation!==true)throw new ApiError(403,"task_creation_not_allowed","The owner has not allowed this bot to create tasks.");
         const raced=this.ctx.storage.sql.exec<{task_id:string;fingerprint:string}>("SELECT task_id,fingerprint FROM task_operations WHERE operation_id=?",`bot-task:${sourceId}:${input.operationId}`).toArray()[0];
         if(raced){if(raced.fingerprint!==fingerprint)throw new ApiError(409,"operation_id_conflict","operationId was already used for another task.");return json({task:JSON.parse(this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",raced.task_id).one().data)});}
-        const now=new Date().toISOString(),task={id:crypto.randomUUID(),title:input.title.trim(),description:input.description,botId:source.id,botName:source.name,creator:"bot",createdByBotId:source.id,sourceRunId:input.sourceRunId,...(sourceTaskId?{sourceTaskId}:{}),status:"pending",startImmediately:input.startImmediately!==false,createdAt:now,updatedAt:now};
+        const now=new Date().toISOString(),task={id:crypto.randomUUID(),title:input.title.trim(),description:input.description,botId:source.id,botName:source.name,creator:"bot",createdByBotId:source.id,sourceRunId:input.sourceRunId,...(sourceTaskId?{sourceTaskId}:{}),computerMode:this.newTaskComputerMode(),status:"pending",startImmediately:input.startImmediately!==false,createdAt:now,updatedAt:now};
         if(task.startImmediately)task.status="queued";
         this.ctx.storage.transactionSync(()=>{this.saveTask(task);this.ctx.storage.sql.exec("INSERT INTO task_operations(operation_id,task_id,fingerprint) VALUES(?,?,?)",`bot-task:${sourceId}:${input.operationId}`,task.id,fingerprint);});
         await this.rearmDeletion();
+        if(task.computerMode==='isolated'&&task.startImmediately)this.ctx.waitUntil(this.reconcileComputerSlots());
         return json({task},201);
       }
       if(path==="/tasks" && request.method==="POST") {
@@ -600,7 +658,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         const botRow=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",input.botId).toArray()[0];
         if(!botRow) throw new ApiError(404,"not_found","Assigned bot not found.");
         const bot=JSON.parse(botRow.data) as Bot, now=new Date().toISOString();
-        const task={id:crypto.randomUUID(),title:input.title.trim(),description:input.description,botId:bot.id,botName:bot.name,creator:"owner",status:input.startImmediately===false?"pending":"queued",startImmediately:input.startImmediately!==false,createdAt:now,updatedAt:now};
+        const task={id:crypto.randomUUID(),title:input.title.trim(),description:input.description,botId:bot.id,botName:bot.name,creator:"owner",computerMode:this.newTaskComputerMode(),status:input.startImmediately===false?"pending":"queued",startImmediately:input.startImmediately!==false,createdAt:now,updatedAt:now};
         this.ctx.storage.transactionSync(()=>{this.saveTask(task);this.ctx.storage.sql.exec("INSERT INTO task_operations(operation_id,task_id,fingerprint) VALUES(?,?,?)",input.operationId,task.id,fingerprint);});
         if(task.status==="queued"){await this.rearmDeletion();await this.reconcileComputerSlots();}
         const saved=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",task.id).toArray()[0];
@@ -749,30 +807,35 @@ export class WorkspaceDO extends DurableObject<Env> {
           else {const slot=this.slotFor(botId);if(slot?.task_id==="@bot")this.releaseSlot(botId,"@bot",slot.token);}
           await this.rearmDeletion();return json({released:true});
         }
-        if(request.method==="GET") {const slot=this.slotFor(botId);return json({taskLocked:!!slot&&slot.task_id!=="@bot",holder:slot?.task_id??null});}
+        if(request.method==="GET") {
+          const taskId=new URL(request.url).searchParams.get('taskId');let key=botId;
+          if(taskId){const row=this.ctx.storage.sql.exec<{data:string}>('SELECT data FROM tasks WHERE id=?',taskId).toArray()[0];const task=row?JSON.parse(row.data) as Task:undefined;if(!task||task.botId!==botId)throw new ApiError(404,'not_found','Task not found for this bot.');key=this.taskLeaseKey(task);}
+          const slot=this.slotFor(key);return json({taskLocked:!!slot&&slot.task_id!=="@bot",holder:slot?.task_id??null});
+        }
       }
       const taskControl=/^\/tasks\/([0-9a-f-]{36})\/(claim|release)$/.exec(path);
       if(taskControl && request.method==="POST") {
         const id=taskControl[1],row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",id).toArray()[0];
         if(!row)throw new ApiError(404,"not_found","Task not found.");
-        const task=JSON.parse(row.data) as {id:string;botId:string;status:string};
+        const task=JSON.parse(row.data) as Task;const key=this.taskLeaseKey(task);
         if(taskControl[2]==="claim"&&new URL(request.url).searchParams.get("message")==="1"&&!['running','waiting_approval','waiting_connection'].includes(task.status)) throw new ApiError(409,"task_not_running","A task can accept messages only while its run is active.");
-        if(taskControl[2]==="release") {const slot=this.ctx.storage.sql.exec<{token:string|null}>("SELECT token FROM task_slots WHERE bot_id=? AND task_id=?",task.botId,id).toArray()[0];if(slot)this.releaseSlot(task.botId,id,slot.token);await this.rearmDeletion();return json({released:true});}
-        const current=this.ctx.storage.sql.exec<{task_id:string;token:string|null;generation:number}>("SELECT task_id,token,generation FROM task_slots WHERE bot_id=?",task.botId).toArray()[0];
+        if(taskControl[2]==="release") {const slot=this.ctx.storage.sql.exec<{token:string|null}>("SELECT token FROM task_slots WHERE bot_id=? AND task_id=?",key,id).toArray()[0];if(slot)this.releaseSlot(key,id,slot.token);await this.rearmDeletion();return json({released:true});}
+        const current=this.ctx.storage.sql.exec<{task_id:string;token:string|null;generation:number}>("SELECT task_id,token,generation FROM task_slots WHERE bot_id=?",key).toArray()[0];
         if(current && current.task_id!==id) throw new ApiError(409,"task_slot_busy",current.task_id==="@bot"?"The assigned bot has active work. Task remains queued until it is idle.":"Another task assigned to this bot is active.");
         let token=current?.token??crypto.randomUUID(),generation=current?.generation??0;
-        if(!current) this.ctx.storage.transactionSync(()=>{generation=this.nextSlotGeneration(task.botId);this.ctx.storage.sql.exec("INSERT INTO task_slots(bot_id,task_id,token,generation,updated_at) VALUES(?,?,?,?,?)",task.botId,id,token,generation,Date.now());});
+        if(!current) this.ctx.storage.transactionSync(()=>{generation=this.nextSlotGeneration(key);this.ctx.storage.sql.exec("INSERT INTO task_slots(bot_id,task_id,token,generation,updated_at) VALUES(?,?,?,?,?)",key,id,token,generation,Date.now());});
         if(current?.task_id===id) {
-          if(new URL(request.url).searchParams.get("message")==="1") {token=crypto.randomUUID();const generation=this.nextSlotGeneration(task.botId);this.ctx.storage.sql.exec("UPDATE task_slots SET token=?,generation=?,updated_at=? WHERE bot_id=? AND task_id=? AND token IS ?",token,generation,Date.now(),task.botId,id,current.token);await this.rearmDeletion();return json({claimed:true,token,generation});}
+          if(new URL(request.url).searchParams.get("message")==="1") {token=crypto.randomUUID();const generation=this.nextSlotGeneration(key);this.ctx.storage.sql.exec("UPDATE task_slots SET token=?,generation=?,updated_at=? WHERE bot_id=? AND task_id=? AND token IS ?",token,generation,Date.now(),key,id,current.token);await this.rearmDeletion();return json({claimed:true,token,generation});}
           return json({claimed:true,token,generation:current.generation});
         }
+        if(task.computerMode==='isolated'){await this.rearmDeletion();return json({claimed:true,token,generation});}
         const botRow=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",task.botId).toArray()[0];if(!botRow)throw new ApiError(404,"not_found","Assigned bot not found.");
         try {
           const bot=JSON.parse(botRow.data) as Bot,state=await this.schedulerSnapshot(task.botId,bot);
-          if(state.activeRuns||state.activeProcesses||state.pendingCancellations||state.computerControlled){this.ctx.storage.sql.exec("UPDATE task_slots SET task_id='@bot',updated_at=? WHERE bot_id=? AND token=?",Date.now(),task.botId,token);await this.rearmDeletion();throw new ApiError(409,"task_slot_busy","The assigned bot has active work. Task remains queued until it is idle.");}
+          if(state.activeRuns||state.activeProcesses||state.pendingCancellations||state.computerControlled){this.ctx.storage.sql.exec("UPDATE task_slots SET task_id='@bot',updated_at=? WHERE bot_id=? AND token=?",Date.now(),key,token);await this.rearmDeletion();throw new ApiError(409,"task_slot_busy","The assigned bot has active work. Task remains queued until it is idle.");}
         } catch(error) {
           if(error instanceof ApiError) throw error;
-          this.ctx.storage.sql.exec("UPDATE task_slots SET task_id='@bot',updated_at=? WHERE bot_id=? AND token=?",Date.now(),task.botId,token);await this.rearmDeletion();
+          this.ctx.storage.sql.exec("UPDATE task_slots SET task_id='@bot',updated_at=? WHERE bot_id=? AND token=?",Date.now(),key,token);await this.rearmDeletion();
           throw new ApiError(503,"bot_busy_check_failed","Could not verify that the assigned bot is idle; task start is queued safely.");
         }
         await this.rearmDeletion();return json({claimed:true,token,generation});
@@ -807,13 +870,13 @@ export class WorkspaceDO extends DurableObject<Env> {
       }
       const taskMatch=/^\/tasks\/([0-9a-f-]{36})$/.exec(path);
       if(taskMatch && request.method==="GET") {const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",taskMatch[1]).toArray()[0];if(!row) throw new ApiError(404,"not_found","Task not found.");return json({task:this.taskView(JSON.parse(row.data) as Task)});}
-      if(taskMatch && request.method==="PATCH") {const input=await body(request);const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",taskMatch[1]).toArray()[0];if(!row) throw new ApiError(404,"not_found","Task not found.");const task=JSON.parse(row.data) as {id:string;botId:string;status:string;cancelRequested?:boolean;updatedAt?:string};if(!["pending","queued","running","waiting_approval","waiting_connection","cancelling","completed","failed","cancelled"].includes(input.status as string)) throw new ApiError(400,"invalid_request","Invalid task status.");if(["completed","failed","cancelled"].includes(task.status)&&input.status!==task.status)throw new ApiError(409,"task_terminal","A terminal task cannot be changed.");if((task.cancelRequested||task.status==="cancelling")&&!['cancelling','cancelled'].includes(input.status as string))throw new ApiError(409,"task_cancelling","A cancellation request cannot be rewound.");const firstStop=(input.status==="cancelling"||input.cancelRequested===true)&&!task.cancelRequested&&task.status!=="cancelling";task.status=input.status as string;if(input.cancelRequested===true) (task as {cancelRequested?:boolean}).cancelRequested=true;task.updatedAt=new Date().toISOString();
-        if(task.status==="cancelling"&&!this.ctx.storage.sql.exec("SELECT 1 FROM task_slots WHERE bot_id=? AND task_id=?",task.botId,task.id).toArray().length) task.status="cancelled";
+      if(taskMatch && request.method==="PATCH") {const input=await body(request);const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",taskMatch[1]).toArray()[0];if(!row) throw new ApiError(404,"not_found","Task not found.");const task=JSON.parse(row.data) as Task & {cancelRequested?:boolean};if(!["pending","queued","running","waiting_approval","waiting_connection","cancelling","completed","failed","cancelled"].includes(input.status as string)) throw new ApiError(400,"invalid_request","Invalid task status.");if(["completed","failed","cancelled"].includes(task.status)&&input.status!==task.status)throw new ApiError(409,"task_terminal","A terminal task cannot be changed.");if((task.cancelRequested||task.status==="cancelling")&&!['cancelling','cancelled'].includes(input.status as string))throw new ApiError(409,"task_cancelling","A cancellation request cannot be rewound.");const firstStop=(input.status==="cancelling"||input.cancelRequested===true)&&!task.cancelRequested&&task.status!=="cancelling";task.status=input.status as Task["status"];if(input.cancelRequested===true) (task as {cancelRequested?:boolean}).cancelRequested=true;task.updatedAt=new Date().toISOString();
+        if(task.status==="cancelling"&&!this.ctx.storage.sql.exec("SELECT 1 FROM task_slots WHERE bot_id=? AND task_id=?",this.taskLeaseKey(task),task.id).toArray().length) task.status="cancelled";
         this.ctx.storage.transactionSync(()=>{
           this.saveTask(task);
           // Stop and lease invalidation are one durable change: observations
           // sampled before Stop cannot certify post-Stop cancellation drain.
-          if(firstStop)this.ctx.storage.sql.exec("UPDATE task_slots SET token=?,generation=?,updated_at=? WHERE bot_id=? AND task_id=?",crypto.randomUUID(),this.nextSlotGeneration(task.botId),Date.now(),task.botId,task.id);
+          if(firstStop)this.ctx.storage.sql.exec("UPDATE task_slots SET token=?,generation=?,updated_at=? WHERE bot_id=? AND task_id=?",crypto.randomUUID(),this.nextSlotGeneration(this.taskLeaseKey(task)),Date.now(),this.taskLeaseKey(task),task.id);
         });await this.rearmDeletion();return json({task});}
 
       const id=path.slice(1);

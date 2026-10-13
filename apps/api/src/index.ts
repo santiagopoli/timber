@@ -5,6 +5,7 @@ import { UUID, operationId as validateOperationId, parseAction } from "./validat
 import type { Bot } from "@botspace/contracts";
 import {modelCatalog} from './model-catalog';
 import {hostTools} from './host-tools';
+import {computerName,computerHeaders} from '@botspace/computer';
 export { WorkspaceDO } from "./workspace";
 export { BotDO } from "./bot";
 export { GitHubAuthDO } from "./github";
@@ -86,16 +87,21 @@ export default {
       }
       // Browser WebSockets cannot send Authorization. Only this exact route uses
       // a one-use, bot-bound ticket in a protocol header, never in its URL.
-      const desktop=/^\/v1\/bots\/([^/]+)\/computer\/live$/.exec(url.pathname);
+      const desktop=/^\/v1\/(bots|tasks)\/([0-9a-f-]{36})\/computer\/live$/.exec(url.pathname);
       if(desktop) {
         if(!env.BOTSPACE_API_TOKEN || env.BOTSPACE_API_TOKEN.length<24) throw new ApiError(503,"auth_unconfigured","API authentication is not configured.");
-        if(request.method!=="GET" || request.headers.get("upgrade")?.toLowerCase()!=="websocket" || request.headers.get("origin")!==url.origin || url.search || !UUID.test(desktop[1])) throw new ApiError(403,"desktop_access_denied","Desktop access denied.");
+        if(request.method!=="GET" || request.headers.get("upgrade")?.toLowerCase()!=="websocket" || request.headers.get("origin")!==url.origin || url.search || !UUID.test(desktop[2])) throw new ApiError(403,"desktop_access_denied","Desktop access denied.");
         const protocols=request.headers.get("sec-websocket-protocol")??"";
         if(protocols.length>256) throw new ApiError(403,"desktop_access_denied","Desktop access denied.");
         const registry=env.WORKSPACE.get(env.WORKSPACE.idFromName("owner"));
-        const record=await registry.fetch(`https://workspace/${desktop[1]}`);
+        let botId=desktop[2],taskId:string|undefined;
+        if(desktop[1]==='tasks'){
+          const record=await registry.fetch(`https://workspace/tasks/${desktop[2]}`);if(!record.ok)return record;
+          const {task}=await record.json<{task:{botId:string;computerMode?:string}}>();botId=task.botId;if(task.computerMode==='isolated')taskId=desktop[2];
+        }
+        const record=await registry.fetch(`https://workspace/${botId}`);
         if(!record.ok) return record;
-        return env.COMPUTER.get(env.COMPUTER.idFromName(desktop[1])).fetch(new Request("https://computer.internal/desktop-ws",{headers:{"x-timber-bot-id":desktop[1],Upgrade:"websocket","sec-websocket-protocol":protocols}}));
+        return env.COMPUTER.get(env.COMPUTER.idFromName(computerName(botId,taskId))).fetch(new Request("https://computer.internal/desktop-ws",{headers:{...computerHeaders(botId,taskId),Upgrade:"websocket","sec-websocket-protocol":protocols}}));
       }
       if(url.pathname==="/v1/session") return await consoleSession(request,env.BOTSPACE_API_TOKEN);
       const owner=await authenticate(request,env.BOTSPACE_API_TOKEN);
@@ -132,7 +138,7 @@ export default {
         return created;
       }
       if(/^\/v1\/tasks\/[^/]+(?:\/agents\/[^/]+)?\/(?:audio|audio-messages)(?:\/|$)/.test(url.pathname))throw new ApiError(400,"audio_scope_unsupported","Audio messages are supported only in a bot's main conversation.");
-      const taskRoute=/^\/v1\/tasks\/([0-9a-f-]{36})(?:\/(messages|progress|runs(?:\/[0-9a-f-]{36}(?:\/cancel)?)?|events|context(?:\/compact)?|memory(?:\/(?:search|review|entries(?:\/[A-Za-z0-9_-]{1,128}(?:\/(?:history|accept))?)?))?|keychain(?:\/(?:requests\/[0-9a-f-]{36}\/authorize|[0-9a-f-]{36}(?:\/permissions)?))?|start|continue|cancel|approvals(?:\/[0-9a-f-]{36})?|agents(?:\/[^/]+\/(?:messages|cancel))?|connections(?:\/[^/]+\/connect)?))?$/.exec(url.pathname);
+      const taskRoute=/^\/v1\/tasks\/([0-9a-f-]{36})(?:\/(workspace\/(?:tree|file|download|projects|changes|diff)|computer(?:\/live-session|\/live-session\/[0-9a-f-]{36}(?:\/renew)?)?|apps(?:\/refresh|\/[0-9a-f-]{36}(?:\/open)?)?|messages|progress|runs(?:\/[0-9a-f-]{36}(?:\/cancel)?)?|events|context(?:\/compact)?|memory(?:\/(?:search|review|entries(?:\/[A-Za-z0-9_-]{1,128}(?:\/(?:history|accept))?)?))?|keychain(?:\/(?:requests\/[0-9a-f-]{36}\/authorize|[0-9a-f-]{36}(?:\/permissions)?))?|start|continue|cancel|approvals(?:\/[0-9a-f-]{36})?|agents(?:\/[^/]+\/(?:messages|cancel))?|connections(?:\/[^/]+\/connect)?))?$/.exec(url.pathname);
       if(taskRoute) {
         const [,taskId,endpoint]=taskRoute;
         const taskResponse=await registry.fetch(`https://workspace/tasks/${taskId}`);
@@ -185,7 +191,7 @@ export default {
         // task must remain writable without acquiring the shared computer here.
         const taskInput=endpoint==='messages'||/^agents\/[^/]+\/messages$/.test(endpoint);
         if(taskInput&&request.method==="POST")admissionToken=await beginAdmission(env,task.botId,await bodyOperationId(request),taskId,endpoint==='messages');
-        if(/^approvals\/[^/]+$/.test(endpoint)&&request.method==="POST")admissionToken=await beginAdmission(env,task.botId,`mutation:${crypto.randomUUID()}`,taskId);
+        if((/^approvals\/[^/]+$/.test(endpoint)||endpoint==='computer/live-session')&&request.method==="POST")admissionToken=await beginAdmission(env,task.botId,`mutation:${crypto.randomUUID()}`,taskId);
         requestBodyForwarded=true;
         const response=await stub.fetch(new Request(`https://task/${endpoint}${url.search}`,{method:request.method,headers,body:["GET","HEAD"].includes(request.method)?undefined:request.body,redirect:"manual",signal:request.signal}));
         if(admissionToken)await completeAdmission(env,task.botId,admissionToken);

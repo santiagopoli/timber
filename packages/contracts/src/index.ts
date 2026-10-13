@@ -58,7 +58,7 @@ export interface BotContextStatus {automatic:true;estimatedTokens:number;activeE
 
 export type TaskStatus = "pending" | "queued" | "running" | "waiting_approval" | "waiting_connection" | "cancelling" | "completed" | "failed" | "cancelled";
 export interface TaskQueue { reason:"task"|"bot"|"direct_action"|"starting"|"scheduled"; blockingTask?:{id:string;title:string}; }
-export interface Task { id:string; title:string; description:string; botId:string; botName:string; creator:"owner"|"bot"; createdByBotId?:string; sourceRunId?:string; sourceTaskId?:string; statusVersion?:number; status:TaskStatus; startImmediately:boolean; createdAt:string; updatedAt:string; lastActivity?:string; queue?:TaskQueue; }
+export interface Task { id:string; title:string; description:string; botId:string; botName:string; creator:"owner"|"bot"; createdByBotId?:string; sourceRunId?:string; sourceTaskId?:string; statusVersion?:number; status:TaskStatus; startImmediately:boolean; createdAt:string; updatedAt:string; lastActivity?:string; queue?:TaskQueue; computerMode?:"shared"|"isolated"; }
 export interface TaskUpdate {task:Task;notificationId:string;result?:string;}
 export interface TaskPage { tasks:Task[]; }
 export * from "./avatars";

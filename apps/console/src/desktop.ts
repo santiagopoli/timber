@@ -12,6 +12,7 @@ type Rfb = {
 };
 export interface DesktopViewerOptions {
   element: HTMLElement;
+  dockId?:string;
   connect(mode: DesktopMode, replaces?: string): Promise<DesktopSession>;
   renew(sessionId: string): Promise<{expiresAt: string}>;
   release(sessionId: string): Promise<unknown>;
@@ -24,7 +25,7 @@ export function createDesktopViewer(options: DesktopViewerOptions) {
   const root = options.element;
   root.classList.add('desktop-viewer');
   root.innerHTML = `<div class="desktop-toolbar"><div class="desktop-heading"><strong class="sr-only">Live desktop</strong><span class="desktop-status" role="status" aria-live="polite">Disconnected</span></div><div class="desktop-actions"><button type="button" data-desktop="observe" aria-label="Watch desktop" title="Watch desktop (view only)">Watch</button><button type="button" class="quiet" data-desktop="control">Take control</button><button type="button" class="quiet" data-desktop="disconnect" disabled aria-label="Disconnect desktop" title="Disconnect desktop"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v9M6.5 5.5a8 8 0 1 0 11 0"/></svg></button><button type="button" class="quiet" data-desktop="fullscreen" aria-label="Show desktop fullscreen" title="Fullscreen"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/></svg></button></div></div><p class="desktop-hint sr-only">Connect to view the desktop.</p><div class="desktop-screen" tabindex="-1" aria-label="Remote Linux desktop"><div class="desktop-empty">Desktop offline</div></div><div class="desktop-footer"><div class="desktop-keys" hidden><span>Send key</span><button type="button" data-key="Escape">Esc</button><button type="button" data-key="Tab">Tab</button><button type="button" data-key="Return">Enter</button></div></div>`;
-  const dock = document.createElement('div'); dock.id = 'desktop-chat-dock'; root.append(dock);
+  const dock = document.createElement('div'); dock.id = options.dockId??'desktop-chat-dock'; root.append(dock);
   let fallbackFullscreen = false;
   const notifyFullscreen = () => {
     const expanded = document.fullscreenElement === root || fallbackFullscreen;

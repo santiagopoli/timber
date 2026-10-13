@@ -1,4 +1,5 @@
 import type { SecureDeployCapabilities,SecureDeployReceipt } from './secure-deploy';
+import {TASK_COMPUTER_HEADER} from './scope.ts';
 const WRANGLER_VERSION='4.147.0',WRANGLER_BUILD_ID='wrangler-4.147.0-timber-no-retry-v1',WRANGLER_DIGEST='sha256:07f2d4392dbaa8944bd2a73dc1bcbef481840fddb65b6e6bd5c697e000163511';
 const CODE=new Set(['deploy_accepted','runner_failed','runner_interrupted','runner_unavailable','dispatch_already_seen','invalid_request','invalid_authorization','invalid_pin','invalid_refs','artifact_not_found','artifact_invalid','artifact_digest_mismatch']);
 const falseCaps=():SecureDeployCapabilities=>({secureDeploy:false,isolationVersion:'uid-ptrace-v1',privateCredentialChannel:false,noShellEnv:false,noBuildCredentialInheritance:false,outputRedaction:true,canaryVersion:'cross-uid-proc-env-v1'});
@@ -7,6 +8,8 @@ const json=(value:unknown,status=200)=>Response.json(value,{status,headers:{'cac
 export async function secureDeployComputerRoute(computer:any,request:Request,path:string):Promise<Response>{
  computer.active();const botId=request.headers.get('x-timber-bot-id')??'';
  if(!/^[A-Za-z0-9_-]{1,100}$/.test(botId))throw new Error('computer_invalid_request');
+ const taskScope=request.headers.get(TASK_COMPUTER_HEADER)??undefined;
+ if(computer.bindScope)await computer.bindScope(request,botId);else if(taskScope)throw new Error('computer_owner_mismatch');
  const owner=await computer.ctx.storage.get('botId');
  if(path==='/secure-deploy/capabilities'&&request.method==='GET'){
   const namespace=computer.env.WORKSPACE;if(!namespace)return json(falseCaps());
@@ -39,8 +42,13 @@ export async function secureDeployComputerRoute(computer:any,request:Request,pat
  const invalid=()=>json({operationId:typeof input?.operationId==='string'?input.operationId:'',status:'rejected',code:'invalid_request'});
  if(!input||Object.keys(input).length!==5||Object.keys(input).some(k=>!['operationId','authorization','pin','refs','credentials'].includes(k))||typeof input.operationId!=='string'||!/^[A-Za-z0-9:_.-]{1,160}$/.test(input.operationId)||!input.authorization||typeof input.authorization!=='object'||!input.pin||typeof input.pin!=='object'||!Array.isArray(input.refs)||!Array.isArray(input.credentials))return invalid();
  const auth=input.authorization as Record<string,any>,pin=input.pin as Record<string,any>,id=input.operationId;
+ if(taskScope&&auth.taskId!==taskScope)return json({operationId:id,status:'rejected',code:'invalid_authorization'});
  const authKeys=['version','ownerId','botId','taskId','runId','nativeOperationId','operationId','pin','planId','planRevision','refs','expiresAt','signature'];
  if(Object.keys(auth).some(k=>!authKeys.includes(k))||auth.taskId!==undefined&&!(typeof auth.taskId==='string'&&/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(auth.taskId))||auth.version!==1||auth.ownerId!=='owner'||auth.botId!==botId||auth.operationId!==id||typeof auth.runId!=='string'||typeof auth.nativeOperationId!=='string'||typeof auth.planId!=='string'||!Number.isSafeInteger(auth.planRevision)||auth.planRevision<1||!Number.isSafeInteger(auth.expiresAt)||auth.expiresAt<=Date.now()||typeof auth.signature!=='string'||!auth.signature)return json({operationId:id,status:'rejected',code:'invalid_authorization'});
+ if(auth.taskId&&!taskScope&&computer.env.WORKSPACE){
+  const r=await computer.env.WORKSPACE.get(computer.env.WORKSPACE.idFromName('owner')).fetch(`https://workspace/tasks/${auth.taskId}`);
+  if(r.ok){const {task}=await r.json();if(!task||task.botId!==botId||task.computerMode==='isolated')return json({operationId:id,status:'rejected',code:'invalid_authorization'});}else {await r.body?.cancel();return json({operationId:id,status:'rejected',code:'invalid_authorization'});}
+ }
  const pinKeys=['repository','commit','artifactDigest','artifactPath','accountId','workerName','destination'];
  if(Object.keys(pin).some(k=>!pinKeys.includes(k))||!auth.pin||pinKeys.some(k=>pin[k]!==auth.pin[k])||auth.pin.planId!==auth.planId||auth.pin.planRevision!==auth.planRevision||!/^([A-Za-z0-9_.-]{1,100})\/([A-Za-z0-9_.-]{1,100})$/.test(pin.repository)||pin.repository.split('/').some((x:string)=>x==='.'||x==='..'||x.includes('..'))||!/^([a-f0-9]{40}|[a-f0-9]{64})$/.test(pin.commit)||!/^sha256:[a-f0-9]{64}$/.test(pin.artifactDigest)||typeof pin.artifactPath!=='string'||pin.artifactPath.length>512||! /^(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+$/.test(pin.artifactPath)||pin.artifactPath.startsWith('.')||pin.artifactPath.split('/').some((x:string)=>x==='.'||x==='..')||!/^[a-f0-9]{32}$/.test(pin.accountId)||!/^[a-z0-9][a-z0-9-]{0,62}$/.test(pin.workerName)||pin.destination!==`https://api.cloudflare.com/client/v4/accounts/${pin.accountId}/workers/scripts/${pin.workerName}`)return json({operationId:id,status:'rejected',code:'invalid_pin'});
  if(!Array.isArray(auth.refs)||auth.refs.length<1||auth.refs.length>2||input.refs.length!==auth.refs.length||input.credentials.length!==auth.refs.length)return json({operationId:id,status:'rejected',code:'invalid_refs'});
