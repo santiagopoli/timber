@@ -5,7 +5,18 @@ import {join} from 'node:path';
 import {randomBytes,createHash} from 'node:crypto';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
+import {pathToFileURL} from 'node:url';
 const exec=promisify(execFile);
+
+export async function requestProbe(url,token,fetcher=fetch,wait=ms=>new Promise(resolve=>setTimeout(resolve,ms))) {
+  for(let attempt=0;attempt<6;attempt++) {
+    const response=await fetcher(url,{headers:{authorization:`Bearer ${token}`},redirect:'error',signal:AbortSignal.timeout(60_000)});
+    if(response.ok)return response;
+    await response.body?.cancel().catch(()=>{});
+    if(![404,503].includes(response.status)||attempt===5)throw new Error(`probe_http_${response.status}`);
+    await wait(2000);
+  }
+}
 
 // Operational probe: the server owns OAuth and performs its normal catalogue
 // read/serialized refresh. No credentials are fetched or exposed to this job.
@@ -21,21 +32,24 @@ async function main() {
     await copyFile(new URL('./model-catalog-probe-worker.mjs',import.meta.url),join(dir,'worker.mjs'));
     await writeFile(config,JSON.stringify({name,main:'worker.mjs',account_id:'3acfff91febe1ba644c6358ae5612736',compatibility_date:'2026-10-05',workers_dev:true,
       vars:{PROBE_TOKEN_SHA256:createHash('sha256').update(token).digest('hex')},
-      durable_objects:{bindings:[{name:'CHATGPT',class_name:'ChatGPTAuthDO',script_name:'timber-api'}]}}));
+      durable_objects:{bindings:[{name:'CHATGPT',class_name:'ChatGPTAuthDO',script_name:'timber-api'},{name:'WORKSPACE',class_name:'WorkspaceDO',script_name:'timber-api'},{name:'BOT',class_name:'BotDO',script_name:'timber-api'}]}}));
     attempted=true;
     const result=await cli(['deploy']);
     const url=result.stdout.match(new RegExp(`https://${name}\\.[a-z0-9-]+\\.workers\\.dev\\b`))?.[0];
     if(!url)throw new Error('probe_endpoint_unavailable');
-    const response=await fetch(`${url}/catalog`,{headers:{authorization:`Bearer ${token}`},redirect:'error',signal:AbortSignal.timeout(60_000)});
-    if(!response.ok)throw new Error(`probe_http_${response.status}`);
+    const response=await requestProbe(`${url}/catalog`,token);
     const value=await response.json();
     // Reconstruct only the already sanitized shape before writing to CI logs.
     if(typeof value.connected!=='boolean'||!Number.isSafeInteger(value.models)||value.models<0||typeof value.connection!=='string'||!/^\w{1,64}$/.test(value.connection)||value.failure!==null&&!/^\w{1,64}$/.test(value.failure))throw new Error('probe_invalid_projection');
     console.log(JSON.stringify({connection:value.connection,connected:value.connected,models:value.models,failure:value.failure}));
+    const queue=await (await requestProbe(`${url}/queue`,token)).json();
+    if(!Array.isArray(queue.bots)||queue.bots.length>20)throw new Error('probe_invalid_projection');
+    console.log(JSON.stringify(queue));
   } finally {
     try {if(attempted)await cli(['delete','--force']);}
     catch {console.error(JSON.stringify({error:'probe_cleanup_failed',worker:name}));process.exitCode=1;}
     await rm(dir,{recursive:true,force:true});
   }
 }
-main().catch(error=>{console.error(JSON.stringify({error:/^probe_[a-z0-9_]+$/.test(error?.message||'')?error.message:'probe_failed'}));process.exitCode=1;});
+if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href)
+  main().catch(error=>{console.error(JSON.stringify({error:/^probe_[a-z0-9_]+$/.test(error?.message||'')?error.message:'probe_failed'}));process.exitCode=1;});

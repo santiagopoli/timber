@@ -1,4 +1,7 @@
 const states=new Set(['verified','connected_unverified','reauthorization_required','disconnected']);
+const runStates=new Set(['queued','running','waiting_approval','waiting_connection']);
+const runErrors=new Set(['model_catalog_unavailable','chatgpt_not_connected','model_unavailable','reasoning_unsupported','fast_unsupported','model_image_unsupported','model_provider_settings_unsupported']);
+const count=value=>Number.isSafeInteger(value)&&value>=0?value:null;
 const failures=new Map([
   ['The model catalogue rejected this ChatGPT connection. Reconnect ChatGPT.','chatgpt_catalog_authorization_rejected'],
   ['ChatGPT token renewal failed. The connection was retained; try again later.','chatgpt_refresh_failed'],
@@ -19,14 +22,43 @@ export function projection(status,catalog) {
     failure:catalog?.error?failures.get(catalog.error)||'catalog_failure_unclassified':null};
 }
 
+export function queueProjection(botId,summary,page,slot) {
+  return {bot:botId.slice(0,8),activeProcesses:count(summary?.activeProcesses),pendingCancellations:count(summary?.pendingCancellations),
+    lease:!slot?.holder?'none':slot.holder==='@bot'?'bot':slot.holder.startsWith('@direct:')?'owner_action':'task',
+    runs:(Array.isArray(page?.activeRuns)?page.activeRuns:[]).slice(0,10).map(run=>({status:runStates.has(run.status)?run.status:'unknown',
+      error:run.errorCode?runErrors.has(run.errorCode)?run.errorCode:'other':null,coordinator:run.coordinatorMode===true}))};
+}
+
 export default {
   async fetch(request,env) {
     const token=request.headers.get('authorization')?.match(/^Bearer ([a-f0-9]{64})$/)?.[1];
     if(!token||!env.PROBE_TOKEN_SHA256)return new Response(null,{status:401});
     const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(token))),byte=>byte.toString(16).padStart(2,'0')).join('');
     if(digest!==env.PROBE_TOKEN_SHA256)return new Response(null,{status:401});
-    if(request.method!=='GET'||new URL(request.url).pathname!=='/catalog')return new Response(null,{status:404});
+    const path=new URL(request.url).pathname;
+    if(request.method!=='GET'||!['/catalog','/queue'].includes(path))return new Response(null,{status:404});
     try {
+      if(path==='/queue') {
+        const workspace=env.WORKSPACE.get(env.WORKSPACE.idFromName('owner'));
+        const {bots}=await (await workspace.fetch('https://workspace/bots')).json();
+        if(!Array.isArray(bots))throw new Error('invalid state');
+        const values=await Promise.all(bots.slice(0,20).map(async bot=>{
+          if(!/^[a-f0-9-]{36}$/.test(bot.id))throw new Error('invalid bot');
+          try {
+            const account=env.BOT.get(env.BOT.idFromName(`owner:${bot.id}`));
+            const headers={'x-botspace-config':encodeURIComponent(JSON.stringify(bot)),'x-timber-internal':'scheduler'};
+            const [s,r,l]=await Promise.all([
+              account.fetch(new Request('https://bot/summary',{headers})),
+              account.fetch(new Request('https://bot/runs',{headers})),
+              workspace.fetch(`https://workspace/tasks/bot-slot/${bot.id}`),
+            ]);
+            if(!s.ok||!r.ok||!l.ok)throw new Error('invalid state');
+            const [{summary},runs,slot]=await Promise.all([s.json(),r.json(),l.json()]);
+            return queueProjection(bot.id,summary,runs,slot);
+          } catch {return {bot:bot.id.slice(0,8),failure:'bot_state_unavailable'};}
+        }));
+        return Response.json({bots:values},{headers:{'cache-control':'no-store'}});
+      }
       const account=env.CHATGPT.get(env.CHATGPT.idFromName('owner'));
       const status=await (await account.fetch('https://chatgpt/')).json();
       const catalog=await (await account.fetch('https://chatgpt/models')).json();
