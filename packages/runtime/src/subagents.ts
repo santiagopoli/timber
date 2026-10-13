@@ -404,7 +404,7 @@ export function createSubagents(host: SubagentHost) {
     };
     const id = Type.String({ minLength: 1, maxLength: 160 });
     return [
-      defineTool({ name: 'spawn_subagent', description: 'Create a temporary native Pi subagent with its own context. It shares this bot’s computer and approval policy. Give a concrete self-contained task. Work runs concurrently; inspect or wait for its result. Optionally choose model, reasoningEffort or fast from list_models; omit them to inherit your current model configuration. At most 8 active agents and 3 levels.', replay: 'safe',
+      defineTool({ name: 'spawn_subagent', executionMode: 'sequential', description: 'Create a temporary native Pi subagent with its own context. It shares this bot’s computer and approval policy. Give a concrete self-contained task. Work runs concurrently; inspect or wait for its result. Optionally choose model, reasoningEffort or fast from list_models; omit them to inherit your current model configuration. At most 8 active agents and 3 levels.', replay: 'safe',
         parameters: Type.Object({ name: Type.String({ minLength: 1, maxLength: 80 }), task: Type.String({ minLength: 1, maxLength: 20_000 }), model:Type.Optional(Type.String({maxLength:128})), reasoningEffort:Type.Optional(Type.String({maxLength:40})), fast:Type.Optional(Type.Boolean()) }),
         execute: (input, api, context) => guarded(api, context, async (parentOperationId, operationId) => {
           await host.scheduleWake();
@@ -439,7 +439,7 @@ export function createSubagents(host: SubagentHost) {
         }) }),
       defineTool({ name: 'list_subagents', description: 'List temporary subagents, their status and public final results.', replay: 'safe', parameters: Type.Object({}),
         execute: (_input, api, context) => guarded(api, context, async () => content({ subagents: Object.values((await state()).agents).map(publicAgent) })) }),
-      defineTool({ name: 'send_subagent_message', description: 'Send a durable message to another temporary agent by its ID. A child may use targetId "parent". Messages start a new turn or queue behind active work.', replay: 'safe',
+      defineTool({ name: 'send_subagent_message', executionMode: 'sequential', description: 'Send a durable message to another temporary agent by its ID. A child may use targetId "parent". Messages start a new turn or queue behind active work.', replay: 'safe',
         parameters: Type.Object({ targetId: id, text: Type.String({ minLength: 1, maxLength: 20_000 }) }),
         execute: (input, api, context) => guarded(api, context, async (parentOperationId, operationId) => {
           const sender = await forConversation(api.conversationId);
@@ -468,7 +468,7 @@ export function createSubagents(host: SubagentHost) {
           if (sender && target.parentOperationId !== parentOperationId) throw new Error('Subagent belongs to another task');
           return sent(await send(target.id, `Message from ${sender?.name ?? 'parent'}:\n${input.text}`, { operationId }, false, context), target);
         }) }),
-      defineTool({ name: 'wait_subagent', description: 'Wait for a temporary agent’s current task and return its public result. Yield promptly when a new steering input arrives so you can handle it while the child keeps working. Waiting survives recovery; approval or connection waits are returned immediately for host review.', replay: 'safe',
+      defineTool({ name: 'wait_subagent', executionMode: 'sequential', description: 'Wait for a temporary agent’s current task and return its public result. Yield promptly when a new steering input arrives so you can handle it while the child keeps working. Waiting survives recovery; approval or connection waits are returned immediately for host review.', replay: 'safe',
         parameters: Type.Object({ subagentId: id }), execute: (input, api, context) => guarded(api, context, async (parentOperationId) => {
           const agent = await find(input.subagentId);
           const sender = await forConversation(api.conversationId);
@@ -526,7 +526,7 @@ export function createSubagents(host: SubagentHost) {
             }, host.context());
           }
         }) }),
-      defineTool({ name: 'cancel_subagent', description: 'Cancel a temporary agent and its descendants. Cancelled agents cannot be restarted; create a new agent for new work.', replay: 'unsafe',
+      defineTool({ name: 'cancel_subagent', executionMode: 'sequential', description: 'Cancel a temporary agent and its descendants. Cancelled agents cannot be restarted; create a new agent for new work.', replay: 'unsafe',
         parameters: Type.Object({ subagentId: id }), execute: (input, api, context) => guarded(api, context, async parentOperationId => {
           const agent = await find(input.subagentId);
           const sender = await forConversation(api.conversationId);

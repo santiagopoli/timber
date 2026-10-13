@@ -15,6 +15,7 @@ import { CHATGPT_MODEL, createChatGPTProvider } from './chatgpt.js';
 import {createOpenRouterProvider,withQuotaFallback} from './model-routing.js';
 import {createOpenAIProvider} from './openai-api.js';
 import {fetchInference,inferenceIdleMs,workingContextModel} from './inference-policy.js';
+import {previewToolOutputs, retainedOutputTool} from './tool-context.js';
 import { createBudget } from './budget.js';
 import { createStopGate } from './stop-gate.js';
 import { createSubagents } from './subagents.js';
@@ -203,7 +204,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
               await providerConversation(streamOptions?.sessionId);
               assertActive();
               policyBlocked = false;
-              const upstream = provider.streamSimple(model, context, {
+              const upstream = provider.streamSimple(model, {...context, messages: previewToolOutputs(context.messages)}, {
                 ...streamOptions, maxTokens: streamOptions?.maxTokens ?? 4096,
               });
               let emptyAnswer: AssistantMessage | undefined;
@@ -349,7 +350,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
             'An interrupted action has an unknown outcome. Inspect before deciding whether to request another attempt.',
           ].filter(Boolean).join('\n');
         } }],
-        tools: [...computerTools(bridge), ...hostTools(bridge), ...subagents.tools(), ...maintenance.tools, defineTool({name:'list_models',description:'List models available through the connected account, their reasoning efforts and Fast support. Use these IDs when creating subagents; omit model to inherit.',parameters:Type.Object({}),replay:'safe',execute:async (_input,api,context)=>{await authorizeMaintenance(api,context);return {content:[{type:'text',text:JSON.stringify(await modelSettings.catalog())}]};}})],
+        tools: [...computerTools(bridge), ...hostTools(bridge), ...subagents.tools(), ...maintenance.tools, retainedOutputTool({sql:options.storage.sql, storage:()=>storage, authorize:authorizeMaintenance}), defineTool({name:'list_models',description:'List models available through the connected account, their reasoning efforts and Fast support. Use these IDs when creating subagents; omit model to inherit.',parameters:Type.Object({}),replay:'safe',execute:async (_input,api,context)=>{await authorizeMaintenance(api,context);return {content:[{type:'text',text:JSON.stringify(await modelSettings.catalog())}]};}})],
         tasks: [...subagents.tasks,...maintenance.tasks],
       });
       native = await Harness.open(context.storage, {
@@ -358,7 +359,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
           retry: { enabled: true, maxRetries: MODEL_RETRIES, baseDelayMs: 500 },
           stream: { timeoutMs: 1_800_000, maxRetries: 0 },
           compaction: { enabled: true },
-          toolExecution: 'sequential',
+          toolExecution: 'parallel',
           steeringMode: 'one-at-a-time',
           followUpMode: 'one-at-a-time',
           progress: { partialIntervalMs: 250, outputIntervalMs: 500 },

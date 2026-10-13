@@ -1,6 +1,6 @@
 // A working set, separate from the provider's advertised maximum. Native Pi
 // compacts the old prefix and retains every original transcript entry.
-export const ACTIVE_CONTEXT_TOKENS=128_000;
+export const ACTIVE_CONTEXT_TOKENS=96_000;
 export function workingContextModel<T extends object>(model:T):T {
   const size=(model as {contextWindow?:number}).contextWindow;
   return typeof size==='number'&&size>0?{...model,contextWindow:Math.min(size,ACTIVE_CONTEXT_TOKENS)}:model;
