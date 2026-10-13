@@ -125,6 +125,7 @@ test('includes active tasks from every bot before newer completed history withou
    db.prepare('INSERT INTO tasks VALUES(?,?)').run(id,JSON.stringify({botId,status,createdAt:created,updatedAt:updated,title:'private-task-canary'}));
   const rows=db.prepare(PERFORMANCE_TASKS).all();
   assert.deepEqual(rows.map(row=>row.id),['waiting','working','new-complete']);
+  assert.equal(rows[0].bot_id,'named');
   assert.doesNotMatch(JSON.stringify(rows.map(performanceTaskMetadata)),/private|named|working|waiting/);
  } finally {db.close();}
 });
