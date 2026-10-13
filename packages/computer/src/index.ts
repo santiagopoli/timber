@@ -1053,6 +1053,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       await this.ctx.storage.delete('browserFence');
       return {state:'computer_stopped',operationId:fence.operationId,inspectBeforeRetry:true,message:'The old computer is stopped. Its last action remains unconfirmed; inspect restored effects before retrying.'};
     }
+    if(!fence.bootId)return {state:'unavailable',operationId:fence.operationId,message:'The original computer boot is unknown. Its action remains unconfirmed and was not replayed.'};
     const health=await this.health();
     if(fence.bootId&&health.bootId!==fence.bootId) {
       await this.ctx.storage.delete('browserFence');

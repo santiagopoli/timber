@@ -94,7 +94,7 @@ it('does not infer a restart or release a browser fence when an old receipt has 
   const provider=instance as unknown as {health:()=>Promise<unknown>;reconcileBrowser:(id:string)=>Promise<Record<string,unknown>>},savedHealth=provider.health;
   const descriptor=Object.getOwnPropertyDescriptor(instance,'container');
   Object.defineProperty(instance,'container',{configurable:true,value:{running:true}});
-  provider.health=async()=>({bootId:'current-boot',capabilities:[]});
+  provider.health=async()=>({bootId:'current-boot',capabilities:['browserReceipts']});
   try {
    expect(await provider.reconcileBrowser('legacy-browser')).toMatchObject({state:'unavailable'});
    expect(await state.storage.get('browserFence')).toEqual({operationId:'legacy-browser',bootId:''});
