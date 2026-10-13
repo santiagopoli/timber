@@ -24,6 +24,10 @@ on:
         required: true
         default: '1'
         type: string
+      task_prefix:
+        description: Optional exact eight hexadecimal characters identifying one task
+        required: false
+        type: string
       recipient_public_key:
         description: Optional ephemeral RSA public key PEM (3072+ bits); encrypts bounded private diagnostic evidence
         required: false
@@ -51,5 +55,10 @@ jobs:
           CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
           DIAGNOSTIC_HOURS: ${{ inputs.hours || '24' }}
           DIAGNOSTIC_SCOPE: ${{ inputs.scope || 'performance' }}
+          DIAGNOSTIC_TASK_PREFIX: ${{ inputs.task_prefix || '3900d946' }}
           DIAGNOSTIC_RECIPIENT_PUBLIC_KEY: ${{ inputs.recipient_public_key }}
-        run: node scripts/prod-durable-diagnostics.mjs
+        run: |
+          if [ -z "$DIAGNOSTIC_RECIPIENT_PUBLIC_KEY" ] && [ -f .github/diagnostic-recipient.pub ]; then
+            export DIAGNOSTIC_RECIPIENT_PUBLIC_KEY="$(cat .github/diagnostic-recipient.pub)"
+          fi
+          node scripts/prod-durable-diagnostics.mjs
