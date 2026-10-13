@@ -23,6 +23,7 @@ test('probe reads only the fixed owner status and model catalogue and never expo
 test('probe projects fixed failure labels and suppresses unknown provider prose and thrown exceptions',async()=>{
   assert.deepEqual(projection({status:'private-canary'},{connected:true,models:[],error:'private-canary'}),{connection:'unknown',connected:true,models:0,failure:'catalog_failure_unclassified'});
   assert.equal(projection({status:'verified'},{error:'ChatGPT token renewal failed. The connection was retained; try again later.'}).failure,'chatgpt_refresh_failed');
+  assert.deepEqual(projection({status:'verified'},{connected:true,models:[],error:'ChatGPT model catalogue unavailable (HTTP 403; model_access_denied). private-canary'}),{connection:'verified',connected:true,models:0,failure:'model_access_denied',upstreamStatus:403});
   const result=await worker.fetch(new Request('https://probe.test/catalog',{headers:{authorization:`Bearer ${token}`}}),{PROBE_TOKEN_SHA256:hash,CHATGPT:{idFromName(){throw new Error('private-canary');}}});
   assert.equal(result.status,502);assert.equal(await result.text(),'{"failure":"catalog_probe_failed"}');
 });
@@ -47,4 +48,20 @@ test('queue probe uses passive registry and bot routes with scheduler headers',a
   const result=await worker.fetch(new Request('https://probe.test/queue',{headers:{authorization:`Bearer ${token}`}}),env);
   assert.equal(result.status,200);assert.deepEqual(await result.json(),{bots:[{bot:'12345678',activeProcesses:0,pendingCancellations:0,lease:'bot',runs:[{status:'queued',error:'model_catalog_unavailable',coordinator:false}]}]});
   assert.deepEqual(calls,['https://workspace/','https://bot/summary','https://bot/runs',`https://workspace/tasks/bot-slot/${id}`]);
+});
+test('queue probe inspects the exact holding task without copying its title or conversation',async()=>{
+  const id='12345678-1234-1234-1234-123456789012',taskId='87654321-1234-1234-1234-123456789012',calls=[];
+  const env={PROBE_TOKEN_SHA256:hash,WORKSPACE:{idFromName(){return 'owner';},get(){return {async fetch(url){
+    if(url==='https://workspace/')return Response.json({bots:[{id,allowTaskCreation:true,instructions:'private-canary'}]});
+    if(url.includes('/tasks/bot-slot/'))return Response.json({holder:taskId});
+    assert.equal(url,`https://workspace/tasks/${taskId}`);return Response.json({task:{id:taskId,botId:id,status:'completed',title:'private-canary',computerMode:'shared'}});
+  }};}},BOT:{idFromName(name){calls.push(name);return name;},get(name){return {async fetch(request){
+    if(name.includes('task:'))assert.equal(request.headers.get('x-timber-task-id'),taskId);
+    return Response.json(request.url.endsWith('/summary')?{summary:{activeProcesses:name.includes('task:')?1:0,pendingCancellations:0}}:{activeRuns:[]});
+  }};}}};
+  const result=await worker.fetch(new Request('https://probe.test/queue',{headers:{authorization:`Bearer ${token}`}}),env);
+  const value=await result.json();
+  assert.deepEqual(value.bots[0].holdingTask,{status:'completed',computer:'shared',activeProcesses:1,pendingCancellations:0,runs:[]});
+  assert.equal(value.bots[0].coordinatorEnabled,true);
+  assert.deepEqual(calls,[`owner:${id}`,`owner:task:${taskId}`]);assert.doesNotMatch(JSON.stringify(value),/private-canary/);
 });

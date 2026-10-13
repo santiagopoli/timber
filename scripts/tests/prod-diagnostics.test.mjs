@@ -4,6 +4,13 @@ import {collect, queryBody, summarize, timeframe} from '../prod-diagnostics.mjs'
 const now = Date.parse('2026-10-09T15:00:00Z');
 const env = {CLOUDFLARE_ACCOUNT_ID:'a'.repeat(32),CLOUDFLARE_API_TOKEN:'secret-token',DIAGNOSTIC_HOURS:'6'};
 const event = overrides => ({timestamp:now-1000,$metadata:{id:'one',service:'timber-api',level:'error'},$workers:{scriptName:'timber-api',entrypoint:'ComputerDO',eventType:'fetch',outcome:'exception'},source:{message:'computer.failure',code:'computer_lifecycle_failed',stage:'request'},...overrides});
+test('catalogue failure telemetry retains fixed status and classification without provider prose',()=>{
+  const report=summarize([event({source:{event:'model.catalog.failure',errorCode:'chatgpt_allowance_exhausted',status:403,message:'private-canary'}})],timeframe({},now));
+  assert.equal(report.counts.logTypes['model.catalog.failure'],1);
+  assert.equal(report.counts.modelFailureHttpStatuses['403'],1);
+  assert.equal(report.counts.diagnosticCodes.chatgpt_allowance_exhausted,1);
+  assert.doesNotMatch(JSON.stringify(report),/private-canary/);
+});
 test('restricts historical query to the production worker and a bounded UTC window',()=>{
   const window = timeframe({},now), query = queryBody(window);
   assert.equal(window.to-window.from,6*3600_000);

@@ -41,7 +41,8 @@ async function main() {
     const value=await response.json();
     // Reconstruct only the already sanitized shape before writing to CI logs.
     if(typeof value.connected!=='boolean'||!Number.isSafeInteger(value.models)||value.models<0||typeof value.connection!=='string'||!/^\w{1,64}$/.test(value.connection)||value.failure!==null&&!/^\w{1,64}$/.test(value.failure))throw new Error('probe_invalid_projection');
-    console.log(JSON.stringify({connection:value.connection,connected:value.connected,models:value.models,failure:value.failure}));
+    console.log(JSON.stringify({connection:value.connection,connected:value.connected,models:value.models,failure:value.failure,
+      ...(Number.isInteger(value.upstreamStatus)&&value.upstreamStatus>=100&&value.upstreamStatus<=599?{upstreamStatus:value.upstreamStatus}:{})}));
     const queue=await (await requestProbe(`${url}/queue`,token)).json();
     if(!Array.isArray(queue.bots)||queue.bots.length>20)throw new Error('probe_invalid_projection');
     console.log(JSON.stringify(queue));

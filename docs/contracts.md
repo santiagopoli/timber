@@ -734,6 +734,9 @@ refresh lock; a delayed response from an old connection cannot populate the new
 cache or authorize inference under a replacement account. Catalogue failures are
 explicit. A healthy alternate catalog remains usable if one source fails;
 source errors remain visible without inventing models or capabilities.
+Failed catalogue HTTP responses retain the upstream status and a fixed shared
+failure classification in the public diagnostic. Provider error bodies are read
+only within a 32 KB bound for classification and are never returned or logged.
 
 `Bot.model`, `Bot.reasoningEffort?` and `Bot.fast?` are persisted configuration.
 Explicit selections on creation or PATCH must be available in a connected

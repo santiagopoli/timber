@@ -17,9 +17,11 @@ const failures=new Map([
 ]);
 
 export function projection(status,catalog) {
+  const upstream=typeof catalog?.error==='string'?catalog.error.match(/^ChatGPT model catalogue unavailable \(HTTP ([1-5]\d{2}); ([a-z_]{1,64})\)\. /):null;
   return {connection:states.has(status?.status)?status.status:'unknown',connected:catalog?.connected===true,
     models:Array.isArray(catalog?.models)?catalog.models.length:0,
-    failure:catalog?.error?failures.get(catalog.error)||'catalog_failure_unclassified':null};
+    failure:catalog?.error?upstream?.[2]||failures.get(catalog.error)||'catalog_failure_unclassified':null,
+    ...(upstream?{upstreamStatus:Number(upstream[1])}:{})};
 }
 
 export function queueProjection(botId,summary,page,slot) {
@@ -54,7 +56,22 @@ export default {
             ]);
             if(!s.ok||!r.ok||!l.ok)throw new Error('invalid state');
             const [{summary},runs,slot]=await Promise.all([s.json(),r.json(),l.json()]);
-            return queueProjection(bot.id,summary,runs,slot);
+            const value=queueProjection(bot.id,summary,runs,slot);
+            if(value.lease==='task'&&/^[a-f0-9-]{36}$/.test(slot.holder)) {
+              const receipt=await workspace.fetch(`https://workspace/tasks/${slot.holder}`);
+              const {task}=await receipt.json();
+              if(!receipt.ok||task?.botId!==bot.id)throw new Error('invalid task holder');
+              const holder=env.BOT.get(env.BOT.idFromName(`owner:task:${task.id}`));
+              const taskHeaders={...headers,'x-timber-task-id':task.id};
+              const [taskSummary,taskRuns]=await Promise.all([holder.fetch(new Request('https://task/summary',{headers:taskHeaders})),holder.fetch(new Request('https://task/runs',{headers:taskHeaders}))]);
+              if(!taskSummary.ok||!taskRuns.ok)throw new Error('invalid task state');
+              const [{summary:state},page]=await Promise.all([taskSummary.json(),taskRuns.json()]);
+              const projected=queueProjection(bot.id,state,page,{});
+              const taskStates=new Set([...runStates,'completed','failed','cancelled','cancelling']);
+              value.holdingTask={status:taskStates.has(task.status)?task.status:'unknown',computer:task.computerMode==='isolated'?'isolated':'shared',activeProcesses:projected.activeProcesses,pendingCancellations:projected.pendingCancellations,runs:projected.runs};
+              value.coordinatorEnabled=bot.allowTaskCreation===true;
+            }
+            return value;
           } catch {return {bot:bot.id.slice(0,8),failure:'bot_state_unavailable'};}
         }));
         return Response.json({bots:values},{headers:{'cache-control':'no-store'}});

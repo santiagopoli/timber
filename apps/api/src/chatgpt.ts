@@ -176,8 +176,21 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
         try {response=await fetch(`${RESOURCE}/models`,{headers:{Authorization:`Bearer ${initial.token}`,"User-Agent":"Timber/0.1.0"},redirect:"manual",signal:AbortSignal.any([controller.signal,AbortSignal.timeout(15_000)])});}
         catch {throw new ApiError(503,"model_catalog_unavailable","The connected account's model catalogue could not be loaded. Refresh and try again.");}
         if(!response.ok) {
-          await response.body?.cancel();
-          throw new ApiError(503,"model_catalog_unavailable",response.status===401?"The model catalogue rejected this ChatGPT connection. Reconnect ChatGPT.":"The connected account's model catalogue is unavailable. Refresh and try again.");
+          // A catalogue failure used to discard the upstream status/body, making
+          // quota, authorization and provider outages indistinguishable. Inspect
+          // a bounded error only for the shared fixed classification; never echo
+          // provider text or account metadata to the owner or logs.
+          let detail:{code?:unknown;message?:unknown;param?:unknown}|undefined;
+          const reader=response.body?.getReader();let text='',bytes=0;
+          try {
+            const decoder=new TextDecoder();
+            if(reader)for(;;){const part=await reader.read();if(part.done)break;bytes+=part.value.byteLength;if(bytes>32_000)break;text+=decoder.decode(part.value,{stream:true});}
+            const raw=JSON.parse(text);if(raw?.error&&typeof raw.error==='object')detail=raw.error;
+          }catch{/* Classify by HTTP status if the bounded body is not JSON. */}
+          finally{await reader?.cancel().catch(()=>{});}
+          const failure=publicProviderError(response.status,detail);
+          console.warn(JSON.stringify({event:'model.catalog.failure',stage:'catalog',status:response.status,errorCode:failure.code}));
+          throw new ApiError(503,"model_catalog_unavailable",`ChatGPT model catalogue unavailable (HTTP ${response.status}; ${failure.code}). ${failure.message}`);
         }
         let raw:unknown;
         const reader=response.body?.getReader();let bytes=0,text="";

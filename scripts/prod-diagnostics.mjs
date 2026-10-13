@@ -36,7 +36,7 @@ export const DIAGNOSTIC_CODES = new Set([
   'model_output_limit', 'model_response_filtered', 'model_billing_required',
   'model_empty_response', 'runtime_budget_exceeded', 'run_aborted',
 ]);
-const KNOWN_LOGS = new Set(['computer.failure', 'computer.checkpoint_failure', 'approval.failure', 'model.failure']);
+const KNOWN_LOGS = new Set(['computer.failure', 'computer.checkpoint_failure', 'approval.failure', 'model.failure', 'model.catalog.failure']);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {};
 const increment = (table, value) => { table[value] = (table[value] ?? 0) + 1; };
 const finite = (value, maximum = 1e12) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= maximum;
@@ -130,7 +130,7 @@ export function summarize(events, window, {pages = 1, truncated = false} = {}) {
       const prior = summary.diagnosticWindows[code];
       summary.diagnosticWindows[code] = {from: prior && prior.from < at ? prior.from : at, to: prior && prior.to > at ? prior.to : at};
     }
-    if (found.logs.has('model.failure')) for (const value of found.statuses) increment(summary.counts.modelFailureHttpStatuses, value);
+    if (found.logs.has('model.failure') || found.logs.has('model.catalog.failure')) for (const value of found.statuses) increment(summary.counts.modelFailureHttpStatuses, value);
   }
   summary.deploymentIds = [...versions].sort();
   return summary;

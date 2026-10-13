@@ -448,6 +448,23 @@ describe('account model catalogues and model settings',()=>{
     expect(responseCalls).toHaveLength(0);
   });
 
+  it('preserves safe catalogue HTTP diagnostics and distinguishes quota from an outage',async()=>{
+    const stub=newStub();await connect(stub);
+    for(const [http,code,expected] of [[403,'subscription_sharing_usage_limit_exceeded','chatgpt_allowance_exhausted'],[429,'rate_limit_exceeded','model_rate_limited'],[503,'private-canary','model_provider_unavailable']] as const){
+      catalogResponse=()=>Response.json({error:{code,message:'private-canary'}},{status:http});
+      const result=await (await stub.fetch('https://chatgpt/models')).json<{connected:boolean;models:unknown[];error:string}>();
+      expect(result).toMatchObject({connected:true,models:[]});
+      expect(result.error).toContain(`HTTP ${http}; ${expected}`);
+      expect(JSON.stringify(result)).not.toContain('private-canary');
+    }
+    catalogResponse=()=>new Response('private-canary'.repeat(4000),{status:502});
+    const oversized=await (await stub.fetch('https://chatgpt/models')).json<{error:string}>();
+    expect(oversized.error).toContain('HTTP 502; model_provider_unavailable');
+    expect(oversized.error).not.toContain('private-canary');
+    catalogResponse=()=>Response.json(defaultModels);
+    expect((await (await stub.fetch('https://chatgpt/models')).json<{models:unknown[]}>()).models).toHaveLength(2);
+  });
+
   it('cannot send an already validated request under a replacement account',async()=>{
     const stub=newStub();await connect(stub);
     let validated=false,resume!:()=>void;
