@@ -53,6 +53,7 @@ it('task update recipient rejects another bot and suppresses terminal reports af
  expect(await notify(other.owner,update)).toBe(403);
  expect((await api(`/v1/bots/${owner.id}/runs/${run.id}/cancel`,{})).status).toBe(200);
  expect(await notify(owner,update)).toBe(200);
+ const stoppedEvent=(await events(owner.id)).find(event=>event.data.notificationId===update.notificationId);expect(stoppedEvent?.data.task).toMatchObject({id:task.id,status:'completed'});expect(stoppedEvent?.data).not.toHaveProperty('result');expect(stoppedEvent?.data).not.toHaveProperty('messageId');
  const messages=(await(await api(`/v1/bots/${owner.id}/messages`)).json<{messages:Message[]}>()).messages;expect(messages.some(message=>message.text===update.result)).toBe(false);
  const runs=(await(await api(`/v1/bots/${owner.id}/runs`)).json<{runs:Run[]}>()).runs;expect(runs).toHaveLength(1);expect(runs[0]?.status).toBe('cancelled');
 },60000);

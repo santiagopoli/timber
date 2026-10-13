@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {createServer,request as httpRequest} from 'node:http';
 import {existsSync} from 'node:fs';
-import {webkit} from 'playwright';
+import {chromium,webkit} from 'playwright';
 import {build} from 'esbuild';
 import {readFile,writeFile} from 'node:fs/promises';
 import {pathToFileURL} from 'node:url';
@@ -20,16 +20,17 @@ async function closeResources(resources,originalError){
   const failed=results.filter(result=>result.status==='rejected').length;
   if(failed){console.error('Audio fixture cleanup failures:',failed);if(!originalError)throw new Error('Audio fixture cleanup did not complete');}
 }
-async function connectedPage({width=1280,height=900,initScript,browser:providedBrowser,fixture:providedFixture}={}){
+async function connectedPage({width=1280,height=900,initScript,browser:providedBrowser,fixture:providedFixture,setup}={}){
   let fixture,context,page;const responses=[],errors=[];
   try{
     fixture=providedFixture||await createConsoleFixture();const browser=providedBrowser||await consoleBrowser(),loginWidth=width<600?1280:width;
-    context=await browser.newContext({viewport:{width:loginWidth,height}});if(initScript)await context.addInitScript(initScript);
+    context=await browser.newContext({serviceWorkers:'block',viewport:{width:loginWidth,height}});if(initScript)await context.addInitScript(initScript);
     page=await context.newPage();page.setDefaultTimeout(6000);
     page.on('response',response=>{const path=new URL(response.url()).pathname;if(path.startsWith('/v1/'))responses.push({path,status:response.status()});});
     page.on('pageerror',error=>errors.push(error.message));
     // Extend only the fixture shell CSP; production already permits blob media.
     await page.route('**/console/',async route=>{const response=await route.fetch(),headers={...response.headers()};headers['content-security-policy']=(headers['content-security-policy']||'').replace('img-src',"media-src 'self' blob:; img-src");await route.fulfill({response,headers});});
+    if(setup)await setup(page);
     await page.goto(fixture.url);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('#message').waitFor();
     if(loginWidth!==width)await page.setViewportSize({width,height});
     return {fixture,context,page};
@@ -102,8 +103,8 @@ test('desktop draft/upload, decoded waveform, browser playback seek/pause and ex
     await retryDialog.getByRole('button',{name:'Cancel'}).click();assert.equal(calls.retries.length,0,'retry cancellation makes no API call');
     await failed.getByRole('button',{name:'Retry transcription'}).click();await page.getByRole('dialog').getByRole('button',{name:'Confirm paid retry'}).click();
     await page.locator('.timber-audio-message[data-transcription-status="succeeded"]').waitFor();message=page.locator('.timber-audio-message[data-transcription-status="succeeded"]');assert.equal(calls.retries.length,1);assert.equal(calls.retries[0].acknowledgePaidRetry,true);assert.notEqual(calls.retries[0].attemptId,calls.submissions[0].attemptId);
-    await page.getByRole('button',{name:'Show transcript'}).click();assert.equal(await page.getByText('Turn left at the next street.').isVisible(),true);
-    await page.getByRole('button',{name:'Hide transcript'}).click();assert.equal(await page.getByText('Turn left at the next street.').isVisible(),false);assert.equal(await message.getByText(/Original audio · WAV · 0:00/).isVisible(),true);
+    await page.getByRole('button',{name:'Show transcript'}).click();assert.equal(await page.getByText('Turn left at the next street.').isVisible(),true);assert.equal(await message.getByRole('button',{name:'Hide transcript'}).getAttribute('aria-expanded'),'true');
+    await page.getByRole('button',{name:'Hide transcript'}).click();assert.equal(await page.getByText('Turn left at the next street.').isVisible(),false);assert.equal(await message.locator('.timber-audio-original').count(),0,'duplicate original-audio metadata is absent');
   }finally{await context.close();await fixture.close();}
 });
 
@@ -132,6 +133,64 @@ for(const width of [320,390,1280])test(`idle ${width}px composer keeps audio in 
   }finally{await context.close();await fixture.close();}
 });
 
+// Existing messages only: no uploads, inference, transcription or paid retry.
+for(const engine of ['chromium','webkit'])for(const surface of ['bot','task'])for(const width of [320,390,1280])test(`${engine} ${surface} ${width}: sent audio is player-only with a keyboard transcript corner toggle`,{skip:engine==='webkit'&&!existsSync(process.env.CONSOLE_WEBKIT_PATH||webkit.executablePath())?'WebKit executable unavailable; not physical Safari/iPhone coverage':false},async()=>{
+  const taskId='10000000-0000-4000-8000-000000000091',fixture=await createConsoleFixture();
+  const visual=Boolean(process.env.AUDIO_MESSAGE_VISUAL)&&engine==='chromium'&&(surface==='bot'&&(width===320||width===1280)||surface==='task'&&width===390);
+  const ownedBrowser=engine==='webkit'||visual?await(engine==='webkit'?webkit:chromium).launch({headless:!visual,...(engine==='chromium'&&process.env.CONSOLE_CHROMIUM_PATH?{executablePath:process.env.CONSOLE_CHROMIUM_PATH}:{}),...(engine==='webkit'&&process.env.CONSOLE_WEBKIT_PATH?{executablePath:process.env.CONSOLE_WEBKIT_PATH}:{}),...(engine==='chromium'&&process.env.CONSOLE_CHROMIUM_ARGS?{args:JSON.parse(process.env.CONSOLE_CHROMIUM_ARGS)}:{})}):undefined;
+  const text='Existing transcript. <img src=x onerror="alert(1)"> '+('unbroken-text-'.repeat(30));
+  const saved=audioMessage({audioId:'fixture-original-audio',operationId:'fixture-original-operation',attemptId:'fixture-original-attempt',status:'succeeded',text});
+  saved.audio.size=longWav.length;saved.audio.durationMs=31000;
+  if(surface==='bot')fixture.state.messages.get(BOT_A).push(saved);
+  let context,page;const external=[],mutations=[];
+  async function review(stage){
+    if(!visual)return;
+    const label=`${surface}-${width}-${stage}`;
+    await writeFile('/tmp/timber-sent-audio-visual-state.json',JSON.stringify({label,url:page.url()}));
+    console.log('VISUAL_REVIEW_READY',label);
+    while(await readFile('/tmp/timber-sent-audio-visual-ack','utf8').catch(()=>'')!==label)await new Promise(resolve=>setTimeout(resolve,100));
+  }
+  try{
+    ({context,page}=await connectedPage({width,height:800,browser:ownedBrowser,fixture,setup:async page=>{
+      await page.context().route('**/*',route=>{const url=new URL(route.request().url());if(url.origin!==new URL(fixture.url).origin){external.push(url.origin);return route.abort('blockedbyclient');}return route.fallback();});
+      page.on('request',request=>{if(request.method()!=='GET'&&new URL(request.url()).pathname!=='/v1/session')mutations.push(request.url());});
+      await page.route('**/artifacts/fixture-original-audio',route=>route.fulfill({status:200,contentType:'audio/wav',body:longWav}));
+      if(surface==='task')await page.route('**/v1/tasks**',route=>{
+        assert.equal(route.request().method(),'GET','reading an existing audio message cannot admit work');
+        const url=new URL(route.request().url()),task={id:taskId,title:'Audio player fixture',description:'Existing audio only',botId:BOT_A,botName:'Ada',status:'completed',createdAt:date},tail=url.pathname.slice(`/v1/tasks/${taskId}`.length);
+        if(url.pathname==='/v1/tasks')return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({tasks:[task]})});
+        if(tail==='/events'&&!url.searchParams.has('format'))return route.fulfill({status:200,contentType:'text/event-stream',body:''});
+        const value=tail===''?{task}:tail==='/messages'?{messages:[{...saved,taskId}],nextCursor:null}:tail==='/runs'?{runs:[],activeRuns:[],nextCursor:null}:tail==='/approvals'?{approvals:[]}:tail==='/agents'?{agents:[],delegations:[]}:tail==='/connections'?{connections:[]}:tail==='/keychain'?{entries:[],requests:[]}:tail==='/computer'?{computer:{state:'stopped',provider:'cloudflare'}}:tail==='/context'?{context:{automatic:true,estimatedTokens:0,activeEntries:0,contextWindow:200000,compactions:[]}}:{events:[],nextCursor:null};
+        return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(value)});
+      });
+    }}));
+    if(surface==='task'){await page.goto(fixture.url+'#tasks');await page.getByRole('region',{name:'Global tasks'}).waitFor();await page.locator(`[data-task-id="${taskId}"].timber-tasks-card`).click();}
+    const message=page.locator('.timber-audio-message'),player=message.locator('.timber-audio-player'),toggle=player.getByRole('button',{name:'Show transcript',exact:true});
+    await toggle.waitFor();await message.scrollIntoViewIfNeeded();await page.waitForFunction(()=>document.querySelector('.timber-audio-message .timber-audio-player')?.dataset.waveform==='decoded');
+    assert.equal(await toggle.getAttribute('aria-expanded'),'false');assert.equal(await toggle.getAttribute('title'),'Show transcript');assert.equal(await toggle.innerText(),'','discreet icon, not a permanent text link');
+    assert.equal(await message.locator('.timber-audio-original,.timber-audio-transcription').count(),0,'no metadata or empty transcript row');
+    assert.doesNotMatch(await message.innerText(),/Original audio|Show transcript|Hide transcript/);
+    const closed=await message.evaluate(node=>{
+      const player=node.querySelector('.timber-audio-player'),content=node.closest('.timber-message-content'),style=getComputedStyle(content),rect=node=>node.getBoundingClientRect().toJSON();
+      return{message:rect(node),player:rect(player),toggle:rect(player.querySelector('.timber-audio-transcript-toggle')),wave:rect(player.querySelector('.timber-audio-track')),seek:rect(player.querySelector('[aria-label="Seek audio"]')),volume:rect(player.querySelector('.timber-audio-icon')),padding:style.padding,background:style.backgroundColor,children:node.children.length,scroll:document.documentElement.scrollWidth,viewport:innerWidth};
+    });
+    assert.equal(closed.padding,'0px','outer message card padding removed');assert.equal(closed.background,'rgba(0, 0, 0, 0)','outer message card is transparent');assert.equal(closed.children,1,'closed message contains only the player');
+    assert.equal(closed.message.height,closed.player.height,'no permanent extra row or exterior gap');assert.equal(closed.scroll,closed.viewport,'no horizontal page overflow');
+    assert.ok(closed.toggle.width>=44&&closed.toggle.height>=44,'44px transcript target');assert.ok(closed.toggle.right<=closed.player.right&&closed.toggle.bottom<=closed.player.bottom,'target inside player corner');
+    for(const part of [closed.wave,closed.seek,closed.volume])assert.ok(part.right<=closed.toggle.x,'transcript target cannot cover waveform, seek or volume');
+    await review('closed');
+    await toggle.focus();await page.keyboard.press('Enter');const openToggle=player.getByRole('button',{name:'Hide transcript',exact:true});assert.equal(await openToggle.getAttribute('aria-expanded'),'true');
+    const transcript=message.locator('blockquote');assert.equal(await transcript.innerText(),text);assert.equal(await transcript.getAttribute('id'),await openToggle.getAttribute('aria-controls'));assert.equal(await transcript.locator('img,script').count(),0,'transcript remains plain safe React text');
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth),width,'long transcript wraps on mobile');
+    assert.equal(await openToggle.evaluate(node=>document.activeElement===node),true,'toggle does not steal keyboard focus');
+    if(surface==='bot'&&width===320)await review('open');
+    await page.keyboard.press('Space');assert.equal(await toggle.getAttribute('aria-expanded'),'false');assert.equal(await transcript.count(),0);assert.equal(await player.boundingBox().then(rect=>rect.height),closed.player.height,'toggle never changes player dimensions');
+    await player.getByRole('button',{name:'Play audio'}).click();await player.getByRole('button',{name:'Pause audio'}).click();assert.equal(await player.locator('audio').evaluate(audio=>audio.paused),true);
+    await player.getByRole('slider',{name:'Seek audio'}).fill('0.45');assert.ok(Math.abs(await player.locator('audio').evaluate(audio=>audio.currentTime)-0.45)<0.08,'native seek preserved');
+    assert.deepEqual(external,[]);assert.deepEqual(mutations,[],'viewing and toggling makes no write or paid call');
+  }finally{await context?.close();await fixture.close();await ownedBrowser?.close();}
+});
+
 test('mobile permission is click-initiated, tracks are released on discard, and layout has no horizontal overflow',async()=>{
   const fakeMic=()=>{window.__micCalls=0;window.__trackStops=0;Object.defineProperty(navigator,'mediaDevices',{configurable:true,value:{getUserMedia:async()=>{window.__micCalls++;return{getTracks:()=>[{stop(){window.__trackStops++;}}]};}}});window.MediaRecorder=class{static isTypeSupported=()=>true;state='inactive';mimeType='audio/webm;codecs=opus';start(){this.state='recording';}stop(){this.state='inactive';this.onstop?.();}};};
   const {fixture,context,page}=await connectedPage({width:390,height:844,initScript:fakeMic});
@@ -149,7 +208,7 @@ test('pending status leaves original audio message visible and playable',async()
   try{
     await installAudioMocks(page,{initialStatus:'pending'});await chooseTone(page,'processing.wav');await confirmSend(page);
     const message=page.locator('.timber-audio-message[data-transcription-status="pending"]');await message.waitFor();assert.match(await message.innerText(),/Transcription in progress/);
-    await message.getByRole('button',{name:'Play audio'}).waitFor();assert.equal(await message.getByText(/Original audio · WAV · 0:00/).isVisible(),true);
+    await message.getByRole('button',{name:'Play audio'}).waitFor();assert.equal(await message.locator('.timber-audio-original').count(),0,'duplicate original-audio metadata is absent');
   }finally{await context.close();await fixture.close();}
 });
 

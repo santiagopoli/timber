@@ -1,5 +1,5 @@
 import {memo,useId,useState} from 'react';
-import {ArrowUpRightIcon, CheckIcon, CircleAlertIcon, ClockIcon, LoaderCircleIcon, SquareIcon} from 'lucide-react';
+import {ArrowUpRightIcon, CheckIcon, ChevronDownIcon, CircleAlertIcon, ClockIcon, LoaderCircleIcon, SquareIcon} from 'lucide-react';
 import type {ChatTaskSummary} from './chat-types';
 import './task-pill.css';
 
@@ -18,8 +18,8 @@ export const TaskMessagePill=memo(function TaskMessagePill({task,onOpenTask}:{ta
   const [expanded,setExpanded]=useState(false),bodyId=useId();
   const status=task.status==='accepted'?'Accepted':task.status==='sending'?'Sending':task.status==='failed'?'Failed':task.status==='interrupted'?'Interrupted':task.status==='cancelled'?'Cancelled':task.status==='queued'?'Queued':task.status.replaceAll('_',' ');
   return <article className="timber-task-pill-wrap" data-task-status={task.status} data-linked-task-id={task.taskId}>
-    <button type="button" className="timber-task-pill timber-task-pill-disclosure" aria-expanded={expanded} aria-controls={bodyId} onClick={()=>setExpanded(value=>!value)}>
-      <ClockIcon aria-hidden="true"/><span className="timber-task-pill-title">{task.title}</span><span className="timber-task-pill-status">{task.label} · {status}</span><span aria-hidden="true">{expanded?'⌃':'⌄'}</span>
+    <button type="button" className="timber-task-pill timber-task-pill-disclosure" data-task-status={task.status} aria-label={`${task.title} · ${task.label} · ${status}`} aria-expanded={expanded} aria-controls={bodyId} onClick={()=>setExpanded(value=>!value)}>
+      <ClockIcon aria-hidden="true"/><span className="timber-task-pill-title">{task.title}</span><span className="timber-task-pill-status">{task.label} · {status}</span><ChevronDownIcon aria-hidden="true" style={{transform:expanded?'rotate(180deg)':undefined}}/>
     </button>
     {expanded&&<div className="timber-task-pill-details" id={bodyId}>
       {task.text&&<p>{task.text}</p>}{task.result&&<p>{task.result}</p>}{task.error&&<p className="timber-inline-error">{task.error}</p>}

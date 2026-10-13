@@ -250,7 +250,7 @@ export class WorkspaceDO extends DurableObject<Env> {
       }catch{blocked.add(row.task_id);}
     }
   }
-  private finalizeTask(slot:{bot_id:string;task_id:string;token:string|null;generation:number;updated_at:number},status:string,resultRunId?:string):void {
+  private finalizeTask(slot:{bot_id:string;task_id:string;token:string|null;generation:number;updated_at:number},status:string,resultRunId?:string,retainLease=false):void {
     this.ctx.storage.transactionSync(()=>{
       const currentSlot=this.slotFor(slot.bot_id);
       if(!currentSlot||currentSlot.task_id!==slot.task_id||currentSlot.token!==slot.token||currentSlot.generation!==slot.generation||currentSlot.updated_at!==slot.updated_at||this.hasPendingAdmission(slot.bot_id,slot.task_id)||this.hasTaskDelegation(slot.task_id))return;
@@ -261,7 +261,7 @@ export class WorkspaceDO extends DurableObject<Env> {
       if(["completed","failed","cancelled"].includes(task.status)&&task.status!==status)return;
       task.status=status;task.updatedAt=new Date().toISOString();
       this.saveTask({...JSON.parse(row.data),...task},resultRunId);
-      this.ctx.storage.sql.exec("DELETE FROM task_slots WHERE bot_id=? AND task_id=? AND token IS ? AND generation=? AND updated_at=?",slot.bot_id,slot.task_id,slot.token,slot.generation,slot.updated_at);
+      if(!retainLease)this.ctx.storage.sql.exec("DELETE FROM task_slots WHERE bot_id=? AND task_id=? AND token IS ? AND generation=? AND updated_at=?",slot.bot_id,slot.task_id,slot.token,slot.generation,slot.updated_at);
     });
   }
   private updateTaskStatus(taskId:string,status:string):void {
@@ -405,7 +405,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         if(state.executionRuns>0&&state.activeStatus&&["queued","running","waiting_approval","waiting_connection"].includes(task.status)) {
           this.updateTaskStatus(task.id,["waiting_approval","waiting_connection"].includes(state.activeStatus)?state.activeStatus:"running");
         }
-        if(task.status==="queued" && state.executionRuns===0 && state.activeProcesses===0 && state.pendingCancellations===0 && !this.hasPendingAdmission(slot.bot_id,task.id)) {
+        if(task.status==="queued" && state.executionRuns===0 && (state.activeProcesses===0||task.startOperationId?.startsWith("task-continue:")) && state.pendingCancellations===0 && !this.hasPendingAdmission(slot.bot_id,task.id)) {
           const fresh=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",task.id).toArray()[0];
           const currentTask=fresh?JSON.parse(fresh.data) as typeof task:undefined;
           if(!currentTask||currentTask.status!=="queued"||currentTask.cancelRequested)continue;
@@ -438,11 +438,17 @@ export class WorkspaceDO extends DurableObject<Env> {
           if(after.activeRuns===0&&after.activeProcesses===0&&after.pendingCancellations===0&&!after.computerControlled&&!this.hasPendingAdmission(slot.bot_id,task.id)&&!this.hasTaskDelegation(task.id))this.finalizeTask(slot,"cancelled");
           continue;
         }
-        if(state.activeRuns===0&&state.activeProcesses===0&&state.pendingCancellations===0&&!state.computerControlled&&!this.hasPendingAdmission(slot.bot_id,task.id)&&!this.hasTaskDelegation(task.id)&&["running","waiting_approval","waiting_connection","cancelling"].includes(task.status)) {
+        if(state.activeRuns===0&&state.pendingCancellations===0&&!this.hasPendingAdmission(slot.bot_id,task.id)&&!this.hasTaskDelegation(task.id)&&state.latest==='failed'&&['running','waiting_approval','waiting_connection'].includes(task.status)) {
+          const recovered=await stub.fetch('https://task/_recover-legacy-provider',{method:'POST',headers:{...headers,'x-timber-internal':'scheduler'}});
+          if(!recovered.ok){await recovered.body?.cancel();continue;}
+          if((await recovered.json<{recovered:boolean}>()).recovered){this.markTaskRunning(task.id);continue;}
+        }
+        if(state.activeRuns===0&&state.pendingCancellations===0&&!this.hasPendingAdmission(slot.bot_id,task.id)&&!this.hasTaskDelegation(task.id)&&["running","waiting_approval","waiting_connection","cancelling"].includes(task.status)) {
           const fresh=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",task.id).toArray()[0];
           if(!fresh)continue;const current=JSON.parse(fresh.data) as typeof task;
-          const terminal=current.cancelRequested||current.status==="cancelling"?"cancelled":(["completed","failed","cancelled"].includes(state.latest??"")?state.latest!:"failed");
-          this.finalizeTask(slot,terminal,state.latestRunId);
+          if(current.cancelRequested||current.status==='cancelling')continue;
+          const terminal=(["completed","failed"].includes(state.latest??"")?state.latest!:"failed");
+          this.finalizeTask(slot,terminal,state.latestRunId,state.activeProcesses>0||state.computerControlled);
         } else if(state.activeRuns===0&&state.activeProcesses===0&&state.pendingCancellations===0&&!state.computerControlled&&!this.hasPendingAdmission(slot.bot_id,task.id)&&!this.hasTaskDelegation(task.id)&&["completed","failed","cancelled"].includes(task.status)) this.releaseSlot(slot.bot_id,slot.task_id,slot.token,slot.updated_at);
       } catch { /* An uncertain holder stays fenced until a later reconciliation. */ }
     }
@@ -877,7 +883,7 @@ export class WorkspaceDO extends DurableObject<Env> {
       }
       const taskMatch=/^\/tasks\/([0-9a-f-]{36})$/.exec(path);
       if(taskMatch && request.method==="GET") {const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",taskMatch[1]).toArray()[0];if(!row) throw new ApiError(404,"not_found","Task not found.");return json({task:this.taskView(JSON.parse(row.data) as Task)});}
-      if(taskMatch && request.method==="PATCH") {const input=await body(request);const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",taskMatch[1]).toArray()[0];if(!row) throw new ApiError(404,"not_found","Task not found.");const task=JSON.parse(row.data) as Task & {cancelRequested?:boolean};if(!["pending","queued","running","waiting_approval","waiting_connection","cancelling","completed","failed","cancelled"].includes(input.status as string)) throw new ApiError(400,"invalid_request","Invalid task status.");if(["completed","failed","cancelled"].includes(task.status)&&input.status!==task.status)throw new ApiError(409,"task_terminal","A terminal task cannot be changed.");if((task.cancelRequested||task.status==="cancelling")&&!['cancelling','cancelled'].includes(input.status as string))throw new ApiError(409,"task_cancelling","A cancellation request cannot be rewound.");const firstStop=(input.status==="cancelling"||input.cancelRequested===true)&&!task.cancelRequested&&task.status!=="cancelling";task.status=input.status as Task["status"];if(input.cancelRequested===true) (task as {cancelRequested?:boolean}).cancelRequested=true;task.updatedAt=new Date().toISOString();
+      if(taskMatch && request.method==="PATCH") {const input=await body(request);const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",taskMatch[1]).toArray()[0];if(!row) throw new ApiError(404,"not_found","Task not found.");const task=JSON.parse(row.data) as Task & {cancelRequested?:boolean};if(!["pending","queued","running","waiting_approval","waiting_connection","cancelling","completed","failed","cancelled"].includes(input.status as string)) throw new ApiError(400,"invalid_request","Invalid task status.");if(["completed","failed","cancelled"].includes(task.status)&&input.status!==task.status&&!(input.status==="cancelling"&&input.cancelRequested===true&&task.status!=="cancelled"&&this.slotFor(this.taskLeaseKey(task))?.task_id===task.id))throw new ApiError(409,"task_terminal","A terminal task cannot be changed.");if((task.cancelRequested||task.status==="cancelling")&&!['cancelling','cancelled'].includes(input.status as string))throw new ApiError(409,"task_cancelling","A cancellation request cannot be rewound.");const firstStop=(input.status==="cancelling"||input.cancelRequested===true)&&!task.cancelRequested&&task.status!=="cancelling";task.status=input.status as Task["status"];if(input.cancelRequested===true) (task as {cancelRequested?:boolean}).cancelRequested=true;task.updatedAt=new Date().toISOString();
         if(task.status==="cancelling"&&!this.ctx.storage.sql.exec("SELECT 1 FROM task_slots WHERE bot_id=? AND task_id=?",this.taskLeaseKey(task),task.id).toArray().length) task.status="cancelled";
         this.ctx.storage.transactionSync(()=>{
           this.saveTask(task);

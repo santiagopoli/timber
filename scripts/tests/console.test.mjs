@@ -447,6 +447,25 @@ test('Activity updates running actions immediately and retains them through long
   }, {viewport: {width: 390, height: 900}, colorScheme: 'dark'});
 });
 
+test('messaging failures retain host diagnostics after native completion', async () => {
+  await withPage(async ({page,login,state})=>{
+    const createdAt=new Date().toISOString(),run={id:'messaging-error-run',botId:BOT_A,operationId:'messaging-error-input',status:'completed',createdAt,updatedAt:createdAt};
+    state.runs.set(BOT_A,[run]);state.messages.set(BOT_A,[{id:'messaging-user',botId:BOT_A,runId:run.id,role:'user',text:'Message my collaborators.',createdAt}]);
+    for(const name of ['message_task','send_to_bot']){
+      state.emit(BOT_A,'tool.started',{toolCallId:name,toolName:'call_tool'},run.id);
+      state.emit(BOT_A,'tool.completed',{operationId:name,toolCallId:name,toolName:name,result:{operationId:name,status:'failed',error:'Recipient not found. (not_found)'}},run.id);
+      state.emit(BOT_A,'tool.completed',{operationId:name,toolCallId:name,toolName:'call_tool',status:'failed'},run.id);
+    }
+    await login();
+    for(const name of ['message_task','send_to_bot']){
+      const row=page.locator(`[data-tool-operation-id="${name}"]`);
+      await row.getByText('Recipient not found. (not_found)',{exact:true}).waitFor();
+      assert.equal(await row.getAttribute('data-tool-status'),'failed');
+    }
+    assert.doesNotMatch(await page.locator(`[data-run-activity="${run.id}"]`).innerText(),/No error details were recorded/);
+  });
+});
+
 test('activity preserves resolved host tools, hides private inputs, and does not invent missing file paths', async () => {
   await withPage(async ({page, login, state}) => {
     const createdAt = new Date().toISOString(), run = {id: 'safe-input-run', botId: BOT_A, operationId: 'safe-input-request', status: 'completed', createdAt, updatedAt: createdAt};

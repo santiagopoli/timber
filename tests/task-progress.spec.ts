@@ -49,6 +49,11 @@ it('allows a computerless coordinator to inspect its own tasks and rejects anoth
  const list=await call('list_tasks',{});expect(list.status).toBe('completed');expect(JSON.parse(list.output!).tasks.map((t:any)=>t.id)).toEqual([task.id]);
  const inspected=await call('inspect_task',{taskId:task.id});expect(inspected.status).toBe('completed');expect(JSON.parse(inspected.output!)).toMatchObject({task:{id:task.id},progress:{observation:'idle'}});
  await expect(call('inspect_task',{taskId:other.task.id})).rejects.toThrow('Task not found for this bot');
+ await expect(call('message_task',{taskId:other.task.id,text:'Do not deliver'})).rejects.toThrow('Task not found for this bot');
+ await runInDurableObject(root,(_,state)=>{
+  const failures=state.storage.sql.exec<{data:string}>('SELECT data FROM events').toArray().map(row=>JSON.parse(row.data)).filter(event=>event.type==='tool.completed'&&event.data.toolName==='message_task');
+  expect(failures).toContainEqual(expect.objectContaining({runId,data:expect.objectContaining({result:expect.objectContaining({status:'failed',error:expect.stringContaining('Task not found for this bot')})})}));
+ });
  const registry=bindings.WORKSPACE.get(bindings.WORKSPACE.idFromName('owner'));
  const unmarked=await registry.fetch(`https://workspace/tasks/inspect/${bot.id}`);expect(unmarked.status).toBe(403);await unmarked.text();
  await runInDurableObject(root,(_,state)=>{expect(state.storage.sql.exec('SELECT * FROM computer_operations').toArray()).toHaveLength(0);expect(state.storage.sql.exec('SELECT * FROM execution_claims').toArray()).toHaveLength(0);});

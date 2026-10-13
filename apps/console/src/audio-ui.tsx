@@ -1,5 +1,5 @@
 import {createContext,useContext,useEffect,useId,useRef,useState,type ReactNode} from 'react';
-import {AudioLinesIcon,LoaderCircleIcon,MicIcon,PauseIcon,PlayIcon,RotateCcwIcon,SquareIcon,Trash2Icon,Volume2Icon} from 'lucide-react';
+import {AudioLinesIcon,LoaderCircleIcon,MicIcon,PauseIcon,PlayIcon,RotateCcwIcon,SquareIcon,TextQuoteIcon,Trash2Icon,Volume2Icon} from 'lucide-react';
 import {Button} from './components/ui/button';
 import type {MessageAudio} from '../../../packages/contracts/src/index';
 import {validateAudio,AudioValidationError,MAX_AUDIO_BYTES,MAX_AUDIO_DURATION_MS} from '../../../packages/contracts/src/audio-validation';
@@ -86,13 +86,13 @@ function Wave({peaks,progress}:{peaks:Peaks|null;progress:number}){
   const current=Math.min(peaks.length,Math.round(progress*peaks.length));
   return <div className="timber-audio-wave" aria-hidden="true">{peaks.map((peak,i)=><i key={i} className={i<current?'is-played':''} style={{height:`${Math.round(peak*100)}%`}}/>)}</div>;
 }
-function Player({blob,durationMs,mimeType,loadError}:{blob:Blob|null;durationMs:number;mimeType:string;loadError?:string}){
+function Player({blob,durationMs,mimeType,loadError,cornerAction}:{blob:Blob|null;durationMs:number;mimeType:string;loadError?:string;cornerAction?:ReactNode}){
   const audio=useRef<HTMLAudioElement>(null),[url,setUrl]=useState(''),[peaks,setPeaks]=useState<Peaks|null>(null),[peaksReady,setPeaksReady]=useState(false),[playing,setPlaying]=useState(false),[current,setCurrent]=useState(0),[duration,setDuration]=useState(durationMs/1000),[error,setError]=useState('');
   useEffect(()=>{if(!blob){setUrl('');return;}const next=URL.createObjectURL(blob);setUrl(next);setError('');setPeaks(null);setPeaksReady(false);let live=true;const ac=new AbortController();void waveform(blob,durationMs/1000,mimeType,ac.signal).then(value=>{if(live){setPeaks(value);setPeaksReady(true);}});return()=>{live=false;ac.abort();audio.current?.pause();URL.revokeObjectURL(next);};},[blob,durationMs,mimeType]);
   useEffect(()=>{const el=audio.current;if(!el)return;const update=()=>{setCurrent(el.currentTime||0);setDuration(Number.isFinite(el.duration)&&el.duration>0?el.duration:durationMs/1000);};setDuration(durationMs/1000);const ended=()=>setPlaying(false);el.addEventListener('timeupdate',update);el.addEventListener('durationchange',update);el.addEventListener('ended',ended);return()=>{el.removeEventListener('timeupdate',update);el.removeEventListener('durationchange',update);el.removeEventListener('ended',ended);};},[url,durationMs]);
   const toggle=async()=>{const el=audio.current;if(!el||!url)return;if(el.paused){try{await el.play();setPlaying(true);}catch{setError('This browser could not play the audio.');}}else{el.pause();setPlaying(false);}};
   const seek=(value:number)=>{const el=audio.current;if(!el)return;const max=Number.isFinite(el.duration)&&el.duration>0?el.duration:durationMs/1000;if(!Number.isFinite(max)||max<=0)return;let target=Math.max(0,Math.min(max,value));try{const ranges=el.seekable;if(ranges.length){let best=target,distance=Infinity;for(let i=0;i<ranges.length;i++){const start=ranges.start(i),end=ranges.end(i);if(target>=start&&target<=end){best=target;distance=0;break;}for(const bound of [start,end])if(Math.abs(target-bound)<distance){best=bound;distance=Math.abs(target-bound);}}target=best;}el.currentTime=target;setCurrent(target);}catch{setError('Seeking is unavailable for this audio in the current browser.');}};
-  return <div className="timber-audio-player" role="group" aria-label="Audio playback controls" data-waveform={peaks?'decoded':'unavailable'}>
+  return <div className={`timber-audio-player${cornerAction?' has-transcript':''}`} role="group" aria-label="Audio playback controls" data-waveform={peaks?'decoded':'unavailable'}>
     <audio ref={audio} src={url||undefined} preload="metadata" onError={()=>setError('Audio could not be played in this browser.')} />
     <button className="timber-audio-play" type="button" onClick={()=>void toggle()} disabled={!url||Boolean(loadError)} aria-label={playing?'Pause audio':'Play audio'} title={playing?'Pause':'Play'}>{playing?<PauseIcon/>:<PlayIcon/>}</button>
     <div className="timber-audio-track"><Wave peaks={peaks} progress={duration>0?current/duration:0}/>
@@ -100,6 +100,7 @@ function Player({blob,durationMs,mimeType,loadError}:{blob:Blob|null;durationMs:
       <div className="timber-audio-times"><span>{formatTime(current)}</span><span>{formatTime(duration)}</span></div>
     </div>
     <span className="timber-audio-icon" aria-hidden="true"><Volume2Icon/></span>
+    {cornerAction}
     {!peaksReady&&blob&&<span className="timber-sr-only" role="status">Preparing audio waveform</span>}
     {!peaks&&peaksReady&&<span className="timber-sr-only" role="status">Waveform unavailable for this recording; playback and seeking are available.</span>}
     {(loadError||error)&&<span className="timber-audio-error" role="alert">{loadError||error}</span>}
@@ -117,19 +118,18 @@ export function AudioMessage({botId,audio,onRetry,busy=false}:{botId:string;audi
     if(checked.mimeType!==audio.mimeType||value.size!==audio.size||checked.durationMs!==audio.durationMs)throw new AudioValidationError(400,'audio_metadata_mismatch','Original audio does not match its validated message metadata.');
     if(active)setBlob(value);
   }).catch(reason=>{if(active&&reason?.name!=='AbortError')setError(reason instanceof AudioValidationError?'Original audio failed the local format or metadata safety check and was not loaded. Refresh the conversation before retrying.':'Original audio could not be loaded. Select Retry to fetch it again.');});return()=>{active=false;ac.abort();controller.current=null;};},[botId,audio.artifactId,audio.mimeType,audio.size,audio.durationMs,loadAudio,attempt,visible]);
+  const transcriptId=useId();
   const t=audio.transcription,failed=t.status==='failed'||t.status==='uncertain';
   return <section ref={host} className="timber-audio-message" aria-label="Audio message" data-transcription-status={t.status}>
-    <Player blob={blob} durationMs={audio.durationMs} mimeType={audio.mimeType} loadError={error}/>
+    <Player blob={blob} durationMs={audio.durationMs} mimeType={audio.mimeType} loadError={error} cornerAction={t.status==='succeeded'&&t.text?<button type="button" className="timber-audio-transcript-toggle" aria-label={showTranscript?'Hide transcript':'Show transcript'} title={showTranscript?'Hide transcript':'Show transcript'} aria-expanded={showTranscript} aria-controls={transcriptId} onClick={()=>setShowTranscript(v=>!v)}><TextQuoteIcon aria-hidden="true"/></button>:undefined}/>
     {!blob&&!error&&visible&&<p className="timber-audio-state" role="status">Loading original audio…</p>}
-    <div className="timber-audio-original"><AudioLinesIcon aria-hidden="true"/><span>Original audio · {audio.mimeType.split('/')[1].toUpperCase()} · {formatTime(audio.durationMs/1000)}</span>
-      {error&&<button type="button" className="timber-audio-text-button" onClick={()=>{setError('');setAttempt(v=>v+1);}}>Retry audio</button>}
-    </div>
-    <div className="timber-audio-transcription">
+    {error&&<button type="button" className="timber-audio-text-button" onClick={()=>{setError('');setAttempt(v=>v+1);}}>Retry audio</button>}
+    {(showTranscript&&t.status==='succeeded'&&t.text||t.status==='pending'||t.status==='dispatching'||failed)&&<div className="timber-audio-transcription">
       {t.status==='pending'||t.status==='dispatching'?<p className="timber-audio-state" role="status">Transcription in progress…</p>:null}
-      {t.status==='succeeded'&&t.text&&<><button type="button" className="timber-audio-text-button" aria-expanded={showTranscript} onClick={()=>setShowTranscript(v=>!v)}>{showTranscript?'Hide transcript':'Show transcript'}</button>{showTranscript&&<blockquote>{t.text}</blockquote>}</>}
+      {t.status==='succeeded'&&t.text&&showTranscript&&<blockquote id={transcriptId}>{t.text}</blockquote>}
       {failed&&<div className="timber-audio-failure" role="status"><strong>{t.status==='uncertain'?'Transcription outcome unknown':'Transcription failed'}</strong><p>{t.error||'Your original audio is saved. No transcript was generated.'}</p>{retryError&&<p className="timber-audio-error" role="alert">{retryError}</p>}{onRetry&&<Button type="button" size="sm" variant="outline" disabled={busy||retryBusy} onClick={()=>setConfirmRetry(true)}><RotateCcwIcon aria-hidden="true"/>Retry transcription</Button>}
       <AudioConsent open={confirmRetry} retrying onCancel={()=>setConfirmRetry(false)} onConfirm={()=>{setConfirmRetry(false);setRetryBusy(true);setRetryError('');void Promise.resolve(onRetry?.(audio.operationId)).catch(()=>setRetryError('Retry status is unknown. Refresh the conversation before submitting another attempt.')).finally(()=>setRetryBusy(false));}}/><p className="timber-audio-cost-note">A retry makes a new paid OpenAI API transcription request and may incur additional charges.</p></div>}
-    </div>
+    </div>}
   </section>;
 }
 

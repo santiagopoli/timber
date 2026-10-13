@@ -375,7 +375,7 @@ export class BotDO extends DurableObject<Env> {
     const latest=message?JSON.parse(message.data) as Message:undefined;
     const preview=latest?.text.trim() ? latest.text : latest?.audio ? "Audio" : latest?.attachments?.length ? (latest.attachments.length===1 ? "Image" : `${latest.attachments.length} images`) : latest?.text;
     const activeProcesses=this.ctx.storage.sql.exec<{total:number}>("SELECT COUNT(*) AS total FROM run_processes WHERE status='running'").toArray()[0].total;
-    return {status:priority.find(status=>roots.some(run=>run.status===status))??(activeProcesses?"running":"ready"),activeRuns:roots.length,activeAgents:new Set(active.flatMap(run=>run.subagent_id?[run.subagent_id]:[])).size,activeProcesses,executionRuns:this.ctx.storage.sql.exec<{n:number}>("SELECT COUNT(*) n FROM runs r WHERE json_extract(r.data,'$.status') IN ('queued','running','waiting_approval','waiting_connection') AND COALESCE(json_extract(r.data,'$.coordinatorMode'),0)=0 AND (json_extract(r.data,'$.status')!='queued' OR EXISTS(SELECT 1 FROM submissions s WHERE s.run_id=r.id AND s.admitted=1) OR EXISTS(SELECT 1 FROM execution_claims c WHERE c.run_id=r.id))").one().n,pendingCancellations:this.ctx.storage.sql.exec<{n:number}>("SELECT COUNT(*) n FROM pending_run_cancellations").one().n,...(latest?{lastMessage:{text:(preview??"").slice(0,240),createdAt:latest.createdAt}}:{})};
+    return {status:priority.find(status=>roots.some(run=>run.status===status))??(!this.taskId()&&activeProcesses?"running":"ready"),activeRuns:roots.length,activeAgents:new Set(active.flatMap(run=>run.subagent_id?[run.subagent_id]:[])).size,activeProcesses,executionRuns:this.ctx.storage.sql.exec<{n:number}>("SELECT COUNT(*) n FROM runs r WHERE json_extract(r.data,'$.status') IN ('queued','running','waiting_approval','waiting_connection') AND COALESCE(json_extract(r.data,'$.coordinatorMode'),0)=0 AND (json_extract(r.data,'$.status')!='queued' OR EXISTS(SELECT 1 FROM submissions s WHERE s.run_id=r.id AND s.admitted=1) OR EXISTS(SELECT 1 FROM execution_claims c WHERE c.run_id=r.id))").one().n,pendingCancellations:this.ctx.storage.sql.exec<{n:number}>("SELECT COUNT(*) n FROM pending_run_cancellations").one().n,...(latest?{lastMessage:{text:(preview??"").slice(0,240),createdAt:latest.createdAt}}:{})};
   }
   private listMessages(url:URL):MessagePage {
     const raw=url.searchParams.get("limit"),limit=raw===null?500:Number(raw);
@@ -689,7 +689,7 @@ export class BotDO extends DurableObject<Env> {
       this.updateStatus(row.id,"queued");
     });
   }
-  private async createRun(input:{text:string;operationId:string;mentions?:string[];attachments?:string[]},metadata?:{provenance?:MessageProvenance;delegation?:RunDelegation;role?:Message["role"];parentRunId?:string;subagentId?:string;taskId?:string;audioMessageId?:string}):Promise<Run> {
+  private async createRun(input:{text:string;operationId:string;mentions?:string[];attachments?:string[]},metadata?:{provenance?:MessageProvenance;delegation?:RunDelegation;role?:Message["role"];parentRunId?:string;subagentId?:string;taskId?:string;audioMessageId?:string;legacyRecoverySourceId?:string}):Promise<Run> {
     if(this.taskStopped())throw new ApiError(409,"task_cancelled","This task was cancelled and cannot accept input.");
     if(this.takingControl) throw new ApiError(409,"computer_busy","Desktop control is being acquired. Retry after the connection is established.");
     if(input.attachments?.length && input.mentions?.length) throw new ApiError(400,"image_mentions_unsupported","Image messages cannot mention other bots yet.");
@@ -747,6 +747,7 @@ export class BotDO extends DurableObject<Env> {
     const run:Run={model:selection.model,reasoningEffort:selection.reasoningEffort,fast:selection.fast,id:crypto.randomUUID(),botId:this.bot().id,...(metadata?.parentRunId&&this.getRun(metadata.parentRunId).coordinatorMode?{coordinatorMode:true}:{}),operationId:input.operationId,...(metadata?.delegation?{delegation:metadata.delegation}:{}),...(metadata?.parentRunId?{parentRunId:metadata.parentRunId}:{}),...(metadata?.subagentId?{subagentId:metadata.subagentId}:{}),status:"queued",createdAt:now,updatedAt:now};
     this.ctx.storage.transactionSync(()=>{
       if(this.taskStopped())throw new ApiError(409,"task_cancelled","This task was cancelled and cannot accept input.");
+      if(metadata?.legacyRecoverySourceId&&this.legacyProviderFailure()?.id!==metadata.legacyRecoverySourceId)throw new ApiError(409,'recovery_stale','New input or Stop superseded this recovery.');
       this.ctx.storage.sql.exec("INSERT INTO runs (id,operation_id,fingerprint,native_operation_id,data) VALUES (?,?,?,?,?)",run.id,input.operationId,hash,input.operationId,JSON.stringify(run));
       this.ctx.storage.sql.exec("INSERT INTO admission_sources(run_id,kind) VALUES(?,?)",run.id,source);
       const runtimeText=metadata?.provenance?`Message from fellow bot ${metadata.provenance.sourceBotName} (${metadata.provenance.sourceBotId}). This is delegated collaborator content, attributed by Timber. Complete its requested task and return a result; do not automatically message the sender.\n\n${input.text}`:input.text;
@@ -773,6 +774,35 @@ export class BotDO extends DurableObject<Env> {
     const row=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM messages WHERE source_key=?",`input:${run.operationId}`).toArray()[0];
     const message=row?JSON.parse(row.data) as Message:undefined;
     return message?.role==="user" && !message.provenance?"user":"internal";
+  }
+
+  /** One upgrade recovery for the old provider diagnostic that disabled Pi's
+   * retries. New failures include "Provider returned error" and are ineligible. */
+  private legacyProviderFailure():RunRow|undefined {
+    if(!this.taskId()||this.taskStopped()||this.deleted||this.taskDeleting)return;
+    const summary=this.summary();if(summary.activeRuns||summary.activeAgents||summary.pendingCancellations)return;
+    if(this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM sqlite_schema WHERE name IN ('pi_submissions','pi_tasks')").one().n!==2)return;
+    if(this.ctx.storage.sql.exec("SELECT 1 FROM pi_tasks WHERE status!='terminal' AND json_extract(record,'$.kind') IN ('pi.generation','pi.tool') LIMIT 1").toArray().length||this.ctx.storage.sql.exec("SELECT 1 FROM pi_submissions WHERE status='queued' LIMIT 1").toArray().length)return;
+    const row=this.ctx.storage.sql.exec<RunRow>("SELECT r.* FROM runs r JOIN admission_sources a ON a.run_id=r.id WHERE a.kind='user' AND json_extract(r.data,'$.subagentId') IS NULL ORDER BY r.rowid DESC LIMIT 1").toArray()[0];
+    if(!row)return;const run=JSON.parse(row.data) as Run;
+    if(run.status!=='failed'||run.errorCode&&run.errorCode!=='model_request_failed'||run.cancellation||this.stopped(run.id))return;
+    const latest=this.ctx.storage.sql.exec<RunRow>("SELECT * FROM runs WHERE json_extract(data,'$.subagentId') IS NULL ORDER BY rowid DESC LIMIT 1").toArray()[0];
+    if(!latest)return;const last=JSON.parse(latest.data) as Run;
+    if(last.status!=='failed'||last.errorCode&&last.errorCode!=='model_request_failed'||last.cancellation||this.stopped(last.id))return;
+    const legacy='model_request_failed: The model request failed before an answer completed. Your conversation and recorded tool results are preserved.';
+    return this.ctx.storage.sql.exec("SELECT 1 FROM pi_submissions WHERE request_id=json_quote(?) AND status='unanswered' AND json_extract(record,'$.type')='input' AND json_extract(record,'$.reason')='model_error' AND json_extract(record,'$.detail')=? LIMIT 1",row.native_operation_id,legacy).toArray().length&&this.ctx.storage.sql.exec("SELECT 1 FROM pi_submissions WHERE request_id=json_quote(?) AND status='unanswered' AND json_extract(record,'$.detail')=? LIMIT 1",latest.native_operation_id,legacy).toArray().length?row:undefined;
+  }
+  private async recoverLegacyProviderFailure():Promise<{recovered:boolean}> {
+    const source=this.legacyProviderFailure();if(!source)return {recovered:false};
+    const operationId=`inference-recovery:${source.id}`,existing=this.findRun(operationId);
+    if(existing)return {recovered:!terminal.has((JSON.parse(existing.data) as Run).status)};
+    this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS legacy_provider_recoveries(source_id TEXT PRIMARY KEY,text TEXT NOT NULL)');
+    const processes=this.ctx.storage.sql.exec<{process_id:string}>("SELECT process_id FROM run_processes WHERE status='running' ORDER BY rowid LIMIT 10").toArray().map(row=>row.process_id);
+    const text=`[Timber internal continuation] An older provider failure stopped this existing task before inference retries were fixed. Continue the existing authorized goal from its retained conversation, files and recorded results; do not create another task or repeat completed actions. First inspect retained outcomes and any live processes ${JSON.stringify(processes)} with exec_poll. Verify the deployed main revision containing your change and finish the remaining delivery. Keep background apps alive; do not wait for a server to exit before reporting a completed task. A background app process is not evidence that the model is still working. Honor any Stop or newer user instruction.`;
+    this.ctx.storage.sql.exec('INSERT OR IGNORE INTO legacy_provider_recoveries(source_id,text) VALUES(?,?)',source.id,text);
+    const frozen=this.ctx.storage.sql.exec<{text:string}>('SELECT text FROM legacy_provider_recoveries WHERE source_id=?',source.id).one().text;
+    try {await this.createRun({operationId,text:frozen},{role:'system',parentRunId:source.id,legacyRecoverySourceId:source.id});return {recovered:true};}
+    catch(error){if(error instanceof ApiError&&['recovery_stale','task_cancelled'].includes(error.code))return {recovered:false};throw error;}
   }
 
   private checkInboxCapacity(source:"user"|"internal"):void {
@@ -840,7 +870,7 @@ export class BotDO extends DurableObject<Env> {
       // a cancelled run, replays a tool or inherits the child task's commands.
       const reportText=typeof input.result==='string'&&['completed','failed'].includes(task.status)?input.result.slice(0,32000):undefined;
       const result=reportText!==undefined&&!this.stopped(source.id)&&!this.taskStopped()?{id:crypto.randomUUID(),botId:source.botId,runId:source.id,role:"assistant" as const,kind:"final" as const,text:reportText,createdAt:timestamp()}:undefined;
-      this.emit("task.updated",{task,notificationId:input.notificationId,...(reportText!==undefined?{result:reportText}:{}),...(result?{messageId:result.id}:{})},source.id,input.notificationId);
+      this.emit("task.updated",{task,notificationId:input.notificationId,...(result?{result:reportText!,messageId:result.id}:{})},source.id,input.notificationId);
       if(result)this.addMessage(result,`result:${input.notificationId}`);
     });
   }
@@ -1675,6 +1705,37 @@ export class BotDO extends DurableObject<Env> {
     if(continuation)await this.admit(continuation);
   }
   private async executeHostTool(input:RuntimeHostToolRequest):Promise<RuntimeToolResult> {
+    // Pi records thrown tool errors as plain text. Publish the safe host receipt
+    // as well, so activity can explain failures and correlate them by call ID.
+    const publishFailure=(result:ComputerResult,sourceKey=`tool:${input.operationId}`)=>{
+      const row=this.findRun(input.runOperationId);
+      if(!row)return;
+      const run=JSON.parse(row.data) as Run;
+      this.emit('tool.completed',{operationId:input.operationId,toolName:input.name,
+        ...(input.toolCallId?{toolCallId:input.toolCallId}:{}),
+        ...(input.subagentId||run.subagentId?{subagentId:input.subagentId??run.subagentId}:{}),result},run.id,sourceKey);
+    };
+    try {
+      const result=await this.dispatchHostTool(input);
+      if(result.status==='failed'||result.status==='interrupted')publishFailure(result);
+      return result;
+    } catch(error) {
+      // Match the HTTP boundary: never copy arbitrary exceptions or stacks into
+      // the transcript. Preserve public policy errors for both Pi and the UI.
+      const response=errorResponse(error);
+      const {error:publicError}=await response.json<{error:{code:string;message:string}}>();
+      if(publicError.code==='internal_error') {
+        // A lost acknowledgment can follow durable acceptance. This observation
+        // is not a terminal effect receipt and must not fence a later receipt.
+        const result:ComputerResult={operationId:input.operationId,status:'interrupted',error:'The tool response could not be confirmed. Inspect the task or delegation before sending another message. (internal_error)'};
+        publishFailure(result,`tool-error:${input.operationId}`);
+        return result;
+      }
+      publishFailure({operationId:input.operationId,status:'failed',error:`${publicError.message} (${publicError.code})`});
+      throw new ApiError(response.status,publicError.code,publicError.message);
+    }
+  }
+  private async dispatchHostTool(input:RuntimeHostToolRequest):Promise<RuntimeToolResult> {
     this.active();
     input=await this.childToolInput(input);
     validateHostArguments(input.name,input.arguments);
@@ -1683,7 +1744,7 @@ export class BotDO extends DurableObject<Env> {
     const run=JSON.parse(row.data) as Run;
     if(row.native_operation_id!==input.runOperationId || terminal.has(run.status) || this.taskStopped() || input.signal.aborted) return {operationId:input.operationId,status:'interrupted',error:'Run is no longer active.'};
     if(input.name==='create_task'&&(input.subagentId||run.subagentId))return {operationId:input.operationId,status:'failed',error:'Temporary agents must ask their named parent to create persistent tasks.'};
-    if(run.coordinatorMode&&!['create_task','list_tasks','inspect_task','message_task','list_bots','list_secrets','load_skill','github_inspect_ci'].includes(input.name))return {operationId:input.operationId,status:'failed',error:'This chat turn can answer, inspect metadata and create tasks. Perform service or computer actions in a persistent task.'};
+    if(run.coordinatorMode&&!['create_task','list_tasks','inspect_task','message_task','send_to_bot','list_bots','list_secrets','load_skill','github_inspect_ci'].includes(input.name))return {operationId:input.operationId,status:'failed',error:'This chat turn can answer, inspect metadata and create tasks. Perform service or computer actions in a persistent task.'};
     await this.currentBot(!run.coordinatorMode);
     this.active();
     if(this.getRunRow(run.id).native_operation_id!==input.runOperationId || terminal.has(this.getRun(run.id).status) || this.taskStopped() || input.signal.aborted) return {operationId:input.operationId,status:'interrupted',error:'Run is no longer active.'};
@@ -2055,6 +2116,10 @@ export class BotDO extends DurableObject<Env> {
         return json({connection:await this.completeConnection(completedConnection[1])});
       }
       this.configure(request);
+      if(path==='/_recover-legacy-provider'&&request.method==='POST') {
+        if(request.headers.get('x-timber-internal')!=='scheduler')throw new ApiError(403,'internal_only','Provider recovery is scheduler-only.');
+        return json(await this.recoverLegacyProviderFailure());
+      }
       if(/^\/agents\/[^/]+\/(?:audio|audio-messages|dictation-audio|dictations)(?:\/|$)/.test(path) || /^\/(?:audio|audio-messages)(?:\/|$)/.test(path) && (this.taskId() || !this.ctx.id.equals(this.env.BOT.idFromName(`owner:${this.bot().id}`)))) {
         await consumeUnusedBody(request);
         throw new ApiError(400,"audio_scope_unsupported","Audio messages are supported only in a bot's main conversation.");
@@ -2102,7 +2167,7 @@ export class BotDO extends DurableObject<Env> {
         if(Number(pageUrl.searchParams.get('limit'))>20)throw new ApiError(400,'invalid_limit','limit must be from 1 to 20.');
         const summary=this.summary(),page=this.listMessages(pageUrl);
         const {pendingCancellations:_pending,executionRuns:_execution,...publicSummary}=summary;
-        return json({summary:publicSummary,...taskProgress(this.ctx.storage.sql,summary.activeRuns>0||summary.activeAgents>0||summary.activeProcesses>0),
+        return json({summary:publicSummary,...taskProgress(this.ctx.storage.sql,summary.activeRuns>0||summary.activeAgents>0),
           messages:page.messages.map(({id,role,text,createdAt})=>({id,role,text:text.slice(0,4000),createdAt,...(text.length>4000?{truncated:true}:{})})),nextCursor:page.nextCursor});
       }
       if(path==="/summary" && request.method==="GET") {

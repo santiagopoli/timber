@@ -543,6 +543,26 @@ permissions while an isolated task gets its own physical computer, seeded from
 a durable workspace checkpoint. Legacy shared tasks retain their existing
 computer. Every task has its own transcript and run/event IDs.
 
+Task completion/failure describes its model work, independently of managed
+background processes. A terminal task retains its computer lease while a process
+or desktop control remains active; this does not kill apps or release a shared
+workspace for overlapping work. Explicit continuation can reuse that retained
+lease. Owner Stop can drain a terminal task's retained resources; an already
+released terminal task remains fenced. Task progress reports idle model work
+even when its computer has a background server.
+
+The scheduler privately recovers once from the exact legacy generic provider
+receipt that previously disabled inference retries. It requires an idle task,
+no queued native input, the latest user and root receipts still matching that
+legacy failure, and no Stop/cancellation. A frozen internal continuation keeps
+the same conversation, archived results and live process IDs. Its source guard
+is checked again after settings awaits, so newer input fences stale recovery.
+Current failures (which already received native retries), quota/configuration
+errors, ordinary named conversations and completed work are not recovered by
+this migration. Original failed receipts remain historical; no tool action is
+replayed. The private recovery route has no public API forwarding.
+
+
 `POST /v1/tasks/:id/start` admits the description under stable operation ID
 `task-start:<taskId>`. Queued task chats accept messages into the durable bounded inbox without claiming the computer. Only the original start/continuation input can enter Pi while the task is queued; saved messages follow once it starts. Unadmitted messages cannot prevent the scheduler from starting that original input. Expected contention does not consume delivery retry attempts.
 `POST /v1/tasks/:id/messages`, `GET /messages`, `GET

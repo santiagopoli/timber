@@ -172,7 +172,7 @@ export default {
         if(endpoint==="cancel") {
           if(request.method!=="POST") throw new ApiError(405,"method_not_allowed","Method not allowed.");
           await discardRequestBody(request);
-          if(["completed","failed","cancelled"].includes(task.status)) throw new ApiError(409,"task_terminal","A terminal task cannot be cancelled.");
+          if(task.status==="cancelled") throw new ApiError(409,"task_terminal","A terminal task cannot be cancelled.");
           const persisted=await registry.fetch(`https://workspace/tasks/${taskId}`,{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({status:"cancelling",cancelRequested:true})});
           if(!persisted.ok)return persisted;
           const [runs,processes]=await Promise.all([
