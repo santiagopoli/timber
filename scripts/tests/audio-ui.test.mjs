@@ -139,7 +139,8 @@ for(const engine of ['chromium','webkit'])for(const surface of ['bot','task'])fo
   const ownedBrowser=engine==='webkit'||visual?await(engine==='webkit'?webkit:chromium).launch({headless:!visual,...(engine==='chromium'&&process.env.CONSOLE_CHROMIUM_PATH?{executablePath:process.env.CONSOLE_CHROMIUM_PATH}:{}),...(engine==='webkit'&&process.env.CONSOLE_WEBKIT_PATH?{executablePath:process.env.CONSOLE_WEBKIT_PATH}:{}),...(engine==='chromium'&&process.env.CONSOLE_CHROMIUM_ARGS?{args:JSON.parse(process.env.CONSOLE_CHROMIUM_ARGS)}:{})}):undefined;
   const text='Existing transcript. <img src=x onerror="alert(1)"> '+('unbroken-text-'.repeat(30));
   const saved=audioMessage({audioId:'fixture-original-audio',operationId:'fixture-original-operation',attemptId:'fixture-original-attempt',status:'succeeded',text});
-  saved.audio.size=longWav.length;saved.audio.durationMs=31000;
+  const paddedWav=Buffer.from(longWav);paddedWav.fill(0,44,44+8000*2*4);paddedWav.fill(0,paddedWav.length-8000*2*4);
+  saved.audio.size=paddedWav.length;saved.audio.durationMs=31000;
   if(surface==='bot')fixture.state.messages.get(BOT_A).push(saved);
   let context,page;const external=[],mutations=[];
   async function review(stage){
@@ -153,7 +154,7 @@ for(const engine of ['chromium','webkit'])for(const surface of ['bot','task'])fo
     ({context,page}=await connectedPage({width,height:800,browser:ownedBrowser,fixture,setup:async page=>{
       await page.context().route('**/*',route=>{const url=new URL(route.request().url());if(url.origin!==new URL(fixture.url).origin){external.push(url.origin);return route.abort('blockedbyclient');}return route.fallback();});
       page.on('request',request=>{if(request.method()!=='GET'&&new URL(request.url()).pathname!=='/v1/session')mutations.push(request.url());});
-      await page.route('**/artifacts/fixture-original-audio',route=>route.fulfill({status:200,contentType:'audio/wav',body:longWav}));
+      await page.route('**/artifacts/fixture-original-audio',route=>route.fulfill({status:200,contentType:'audio/wav',body:paddedWav}));
       if(surface==='task')await page.route('**/v1/tasks**',route=>{
         assert.equal(route.request().method(),'GET','reading an existing audio message cannot admit work');
         const url=new URL(route.request().url()),task={id:taskId,title:'Audio player fixture',description:'Existing audio only',botId:BOT_A,botName:'Ada',status:'completed',createdAt:date},tail=url.pathname.slice(`/v1/tasks/${taskId}`.length);
@@ -171,7 +172,7 @@ for(const engine of ['chromium','webkit'])for(const surface of ['bot','task'])fo
     assert.doesNotMatch(await message.innerText(),/Original audio|Show transcript|Hide transcript/);
     const closed=await message.evaluate(node=>{
       const player=node.querySelector('.timber-audio-player'),content=node.closest('.timber-message-content'),footer=node.closest('.timber-message').querySelector('.timber-message-actions'),style=getComputedStyle(content),rect=node=>node.getBoundingClientRect().toJSON();
-      return{message:rect(node),player:rect(player),play:rect(player.querySelector('.timber-audio-play')),toggle:rect(footer.querySelector('.timber-audio-transcript-toggle')),icon:rect(footer.querySelector('.timber-audio-transcript-toggle svg')),copy:rect(footer.querySelector('[data-copy-message]')),copyIcon:rect(footer.querySelector('[data-copy-message] svg')),wave:rect(player.querySelector('.timber-audio-track')),seek:rect(player.querySelector('[aria-label="Seek audio"]')),padding:style.padding,background:style.backgroundColor,children:node.children.length,scroll:document.documentElement.scrollWidth,viewport:innerWidth};
+      return{message:rect(node),player:rect(player),play:rect(player.querySelector('.timber-audio-play')),counter:rect(player.querySelector('.timber-audio-times span')),firstBar:rect(player.querySelector('.timber-audio-wave i:first-child')),lastBar:rect(player.querySelector('.timber-audio-wave i:last-child')),toggle:rect(footer.querySelector('.timber-audio-transcript-toggle')),icon:rect(footer.querySelector('.timber-audio-transcript-toggle svg')),copy:rect(footer.querySelector('[data-copy-message]')),copyIcon:rect(footer.querySelector('[data-copy-message] svg')),wave:rect(player.querySelector('.timber-audio-track')),seek:rect(player.querySelector('[aria-label="Seek audio"]')),padding:style.padding,background:style.backgroundColor,children:node.children.length,scroll:document.documentElement.scrollWidth,viewport:innerWidth};
     });
     assert.equal(closed.padding,'0px','outer message card padding removed');assert.equal(closed.background,'rgba(0, 0, 0, 0)','outer message card is transparent');assert.equal(closed.children,1,'closed message contains only the player');
     assert.equal(closed.message.height,closed.player.height,'no permanent extra row or exterior gap');assert.equal(closed.scroll,closed.viewport,'no horizontal page overflow');
@@ -180,7 +181,11 @@ for(const engine of ['chromium','webkit'])for(const surface of ['bot','task'])fo
     assert.ok(closed.toggle.right<=closed.copy.x&&closed.copy.x-closed.toggle.right<=5,'transcript sits immediately beside Copy');
     const center=rect=>rect.y+rect.height/2;
     assert.ok(Math.abs(center(closed.copyIcon)-center(closed.icon))<1,'Copy and transcript icons share a vertical center');
-    assert.ok(closed.wave.width>=closed.player.width-67,'waveform fills the player after Play and minimal padding');
+    assert.ok(closed.wave.width>=closed.player.width-75,'waveform fills the player after Play and minimal padding');
+    assert.ok(closed.counter.x-closed.play.right>=12,'counter has breathing room beside Play');
+    assert.ok(closed.firstBar.height>=2&&closed.lastBar.height>=2,'silent audio edges remain visible as a baseline');
+    assert.ok(Math.abs(closed.firstBar.x-closed.wave.x)<1&&Math.abs(closed.lastBar.right-closed.wave.right)<1,'waveform spans the full track');
+    if(engine==='chromium'&&surface==='bot'&&width===390)await page.locator('[data-message-id="fixture-audio-message"]').screenshot({path:'/tmp/timber-audio-spacing-mobile.png'});
     await review('closed');
     await toggle.focus();await page.keyboard.press('Enter');const openToggle=page.getByRole('button',{name:'Hide transcript',exact:true});assert.equal(await openToggle.getAttribute('aria-expanded'),'true');
     const transcript=message.locator('blockquote');assert.equal(await transcript.innerText(),text);assert.equal(await transcript.getAttribute('id'),await openToggle.getAttribute('aria-controls'));assert.equal(await transcript.locator('img,script').count(),0,'transcript remains plain safe React text');
