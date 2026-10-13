@@ -143,6 +143,7 @@ describe('activity display arguments', () => {
     expect(computerActivityInput({type: 'click', x: 25, y: 40})).toEqual({x: 25, y: 40, button: 'left'});
     expect(computerActivityInput({type: 'scroll', direction: 'down'})).toEqual({direction: 'down', amount: 3});
     expect(hostActivityInput('github_clone', {repository: 'owner/repo', path: 'repo', branch: 'main', token: 'secret'})).toEqual({repository: 'owner/repo', path: 'repo', branch: 'main'});
+    expect(hostActivityInput('message_task', {taskId: 'task-1', text: 'hello', token: 'secret', progress: 'private'})).toEqual({taskId: 'task-1', text: 'hello'});
     expect(hostActivityInput('unrecognized_tool', {token: 'secret'})).toEqual({});
   });
 

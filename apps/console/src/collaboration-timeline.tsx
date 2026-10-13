@@ -9,8 +9,10 @@ import './collaboration-timeline.css';
 
 export type AgentLink = {id:string;name:string;kind:'bot'|'subagent';model?:string};
 type Creation = {agent:AgentLink;status:string;task?:string;creator?:AgentLink};
+type TaskNotice = {id:string;title:string;status:string;result?:string;messageId?:string};
+type TaskMessage = {taskId:string;title:string;text:string;status:string;error?:string;label:string};
 type Notice = {direction:'from'|'to'|'between';agent:AgentLink;recipient?:AgentLink;text?:string;status?:string;messageId?:string;label?:string;error?:string;historical?:boolean};
-export type CollaborationItem = {key:string;runId?:string;createdAt:string;creation?:Creation;notice?:Notice};
+export type CollaborationItem = {key:string;runId?:string;createdAt:string;creation?:Creation;notice?:Notice;taskUpdate?:TaskNotice;taskMessage?:TaskMessage};
 const record = (value:unknown):Record<string,unknown> => value && typeof value==='object' && !Array.isArray(value) ? value as Record<string,unknown> : {};
 const text = (value:unknown) => typeof value==='string' ? value : '';
 const statusLabel = (value:string) => value.replaceAll('_',' ');
@@ -94,7 +96,7 @@ export function provenanceNotice(message:Message,model:ChatModel):Notice | undef
 }
 
 /** Project durable product events. Never infer a sender from model-authored text. */
-type CollaborationModel = Pick<ChatModel,'events'|'subagents'|'runs'|'mentionBots'|'delegations'|'messages'|'collaborationEvents'|'runFilter'> & {bot:Pick<ChatModel['bot'],'id'|'name'>&{model?:string}};
+type CollaborationModel = Pick<ChatModel,'events'|'subagents'|'runs'|'mentionBots'|'delegations'|'messages'|'collaborationEvents'|'runFilter'|'tasks'|'knownTasks'> & {bot:Pick<ChatModel['bot'],'id'|'name'>&{model?:string}};
 export function collectCollaboration(model:CollaborationModel,scopeSubagentId?:string) {
   const items=new Map<string,CollaborationItem>(),toolIdentities=new Set<string>();
   const events=model.collaborationEvents;
@@ -110,6 +112,8 @@ export function collectCollaboration(model:CollaborationModel,scopeSubagentId?:s
   const belongsToScope=(runId?:string)=>!scopeSubagentId || model.runs.some(run=>run.id===runId&&run.subagentId===scopeSubagentId);
   const correlation=(event:BotEvent,sourceRunId=event.runId)=>{
     const operation=text(event.data.operationId),call=text(event.data.toolCallId);
+    if(operation)toolIdentities.add(`${event.runId||''}:${operation}`);
+    if(call)toolIdentities.add(`${event.runId||''}:${call}`);
     const matching=operation?model.events.filter(tool=>tool.data.operationId===operation):[];
     const sourceRuns=matching.length?[...new Set(matching.map(tool=>tool.runId))]:[sourceRunId];
     for(const runId of sourceRuns){if(operation)toolIdentities.add(`${runId||''}:${operation}`);if(call)toolIdentities.add(`${runId||''}:${call}`);}
@@ -180,6 +184,33 @@ export function collectCollaboration(model:CollaborationModel,scopeSubagentId?:s
     const withModel=(agent:AgentLink):AgentLink=>({...agent,model:agent.kind==='subagent'?model.subagents.find(item=>item.id===agent.id)?.model:agent.id===model.bot.id?model.bot.model:model.mentionBots.find(item=>item.id===agent.id)?.model});
     notice.agent=withModel(notice.agent);if(notice.recipient)notice.recipient=withModel(notice.recipient);
     items.set(message.key,{key:message.key,runId:scopeSubagentId?message.runId:rootRun(message.runId),createdAt:message.createdAt,notice});
+  }
+  for(const event of events)if(event.type==='task.updated'&&belongsToScope(event.runId)){
+    const task=record(event.data.task),id=text(task.id),status=text(task.status),notificationId=text(event.data.notificationId);
+    if(!id||!notificationId||!Number.isSafeInteger(task.statusVersion)||notificationId!==`task-update:${id}:${task.statusVersion}`)continue;
+    // A deleted task is not resurrected by a retained event.
+    if(!(model.knownTasks??model.tasks)?.some(item=>item.id===id))continue;
+    items.set(`task-update:${notificationId}`,{key:`task-update:${notificationId}`,runId:rootRun(event.runId),createdAt:event.createdAt,taskUpdate:{id,title:text(task.title)||'Task',status,result:text(event.data.result)||undefined,messageId:text(event.data.messageId)||undefined}});
+  }
+  const dispatches=new Map<string,BotEvent>();
+  const dispatchStarts=new Map<string,BotEvent>();
+  for(const event of model.events)if(['tool.started','tool.completed'].includes(event.type)&&text(event.data.toolName)==='message_task'&&belongsToScope(event.runId)){
+    const operation=text(event.data.operationId);if(!operation)continue;
+    const key=`${event.runId||''}:${operation}`;
+    if(event.type==='tool.started'){const prior=dispatchStarts.get(key);if(!prior||Number(event.id)<Number(prior.id))dispatchStarts.set(key,event);if(!dispatches.has(key))dispatches.set(key,event);continue;}
+    const previous=dispatches.get(key);
+    if(!previous||previous.type!=='tool.completed'||Number(event.id)>Number(previous.id))dispatches.set(key,event);
+  }
+  for(const [identity,event] of dispatches){
+    const input=record(event.data.input),taskId=text(input.taskId);if(!taskId)continue;
+    const result=record(event.data.result),failed=event.type==='tool.completed'&&['failed','interrupted','cancelled'].includes(String(result.status));
+    let receipt:Record<string,unknown>={};try{receipt=record(JSON.parse(text(result.output)));}catch{/* A successful operation without a parseable receipt remains accepted. */}
+    const queued=record(receipt.run).status==='queued';
+    const task=(model.knownTasks??model.tasks)?.find(item=>item.id===taskId);
+    if((model.knownTasks??model.tasks)&&!task)continue;
+    const started=dispatchStarts.get(identity);
+    correlation(event);if(started)correlation(started);
+    items.set(`task-message:${identity}`,{key:`task-message:${identity}`,runId:rootRun(event.runId),createdAt:started?.createdAt||event.createdAt,taskMessage:{taskId,title:task?.title||'Task',text:text(input.text),status:event.type!=='tool.completed'?'sending':failed?String(result.status):queued?'queued':'accepted',label:event.type!=='tool.completed'?'Sending message':failed?'Message not sent':'Message sent',error:failed?text(result.error)|| (result.status==='interrupted'?'The message was interrupted.':result.status==='cancelled'?'The message was cancelled.':'The task could not receive this message.'):undefined}});
   }
   return {items:[...items.values()].filter(item=>!model.runFilter||item.runId===model.runFilter),toolIdentities};
 }

@@ -40,6 +40,8 @@ it('terminal task reports are transcript-only, deduplicated and visible in bound
  expect(await notify(owner,update)).toBe(200);expect(await notify(owner,update)).toBe(200);
  const messages=(await(await api(`/v1/bots/${owner.id}/messages`)).json<{messages:Message[]}>()).messages;
  expect(messages.filter(message=>message.text===update.result)).toHaveLength(1);
+ const committed=(await events(owner.id)).find(event=>event.data.notificationId===update.notificationId);expect(committed?.data).toMatchObject({result:update.result,messageId:messages.find(message=>message.text===update.result)?.id});
+ expect(messages.some(message=>message.id===committed?.data.messageId)).toBe(true);
  const runs=(await(await api(`/v1/bots/${owner.id}/runs`)).json<{runs:Run[]}>()).runs;expect(runs).toHaveLength(1);
  const context=await runInDurableObject(botDO(owner.id),instance=>(instance as unknown as {taskContext():string}).taskContext());expect(context).toContain(update.result);expect(context).toContain(task.id);
  expect(await notify(owner,{...update,task:{...task,statusVersion:1},notificationId:`task-update:${task.id}:1`})).toBe(200);

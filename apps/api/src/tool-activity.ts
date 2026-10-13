@@ -69,6 +69,7 @@ const hostFields: Record<string, readonly string[]> = {
   list_bots: [],
   create_bot: ['name'],
   send_to_bot: ['botId'],
+  message_task: ['taskId', 'text'],
 };
 
 export function hostActivityInput(name: string, args: Record<string, unknown>): DisplayInput {

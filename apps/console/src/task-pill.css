@@ -9,3 +9,11 @@
 @keyframes timber-task-pill-spin{to{transform:rotate(360deg)}}
 @media(max-width:760px){.timber-task-pill{min-height:42px}}
 @media(prefers-reduced-motion:reduce){.timber-task-pill-spinner{animation:none}}
+
+.timber-task-pill-wrap{max-width:min(100%,560px)}
+.timber-task-pill-disclosure{width:fit-content;max-width:100%}
+.timber-task-pill-details{margin:6px 8px 0;padding:10px 12px;border-left:2px solid var(--line);color:var(--ink);font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}
+.timber-task-pill-details p{margin:0 0 8px}
+.timber-task-pill-details p:last-child{margin-bottom:0}
+.timber-task-pill-open{display:inline-flex;align-items:center;gap:5px;padding:4px 0;border:0;background:none;color:var(--ink);font:inherit;font-size:12px;text-decoration:underline;cursor:pointer}
+.timber-task-pill-open svg{width:13px;height:13px}

@@ -411,7 +411,7 @@ function TaskView({props}:{props:TasksProps}) {
     };
   },[selected,active,viewVersion.current,props.onDictateAudio]);
   const chatModel:ChatModel={bot,messages:visibleMessageList,runs,approvals:approvals.map(item=>({...item,status:item.status==='pending'&&approvalExpired(item)?'expired':item.status,busy:busy||Boolean(approvalError)})),connections,events,
-    deliveries,draft,draftMentions,acceptedImageIds,mentionBots:props.bots as Bot[],subagents,delegations,collaborationEvents:events.filter(event=>event.type.startsWith('agent.')||event.type.startsWith('delegation.')),compactions,
+    deliveries,draft,draftMentions,acceptedImageIds,mentionBots:props.bots as Bot[],subagents,delegations,collaborationEvents:events.filter(event=>event.type.startsWith('agent.')||event.type.startsWith('delegation.')||event.type==='task.updated'),compactions,
     sending:busy,composerDisabled:!detail||['pending','cancelling','cancelled'].includes(detail.status),loading:loadingMessages,modelSettings:props.modelSettings||{choices:[],loading:false},
     currentRun,runFilter:null,focusApproval:0,stream:streamed?{runId:streamed[0],text:streamed[1]}:null,
     historyLoading:olderBusy,historyHasMore:Boolean(messageCursor||eventCursor||messages.length>visibleMessages),historyError:loadError||undefined,

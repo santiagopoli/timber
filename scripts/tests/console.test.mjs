@@ -223,6 +223,65 @@ test('public progress stays visible beside readable tool activity and the final 
   }, {viewport: {width, height: 1000}});
 });
 
+for(const width of [320,390,1440])test(`task message pills are explicit, deduplicated, private and expandable at ${width}px`,async()=>{
+  await withPage(async({page,state,login})=>{
+    const createdAt='2026-10-11T12:00:00Z',run={id:'task-pill-root',botId:BOT_A,operationId:'task-pill-root-op',status:'completed',createdAt,updatedAt:createdAt};
+    const task={id:'10000000-0000-4000-8000-000000000071',title:'Review private task',description:'Do private work',botId:BOT_A,botName:'Ada',creator:'owner',statusVersion:1,status:'queued',startImmediately:false,createdAt,updatedAt:createdAt};
+    state.runs.set(BOT_A,[run]);state.messages.set(BOT_A,[{id:'task-pill-user',botId:BOT_A,runId:run.id,role:'user',text:'Start a task',createdAt},{id:'task-pill-result',botId:BOT_A,runId:run.id,role:'assistant',kind:'final',text:'Verified completion result',createdAt}]);
+    let registryTasks=[task];
+    await page.route('**/v1/tasks**',async route=>{const path=new URL(route.request().url()).pathname,reply=value=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(value)});if(path==='/v1/tasks')return reply({tasks:registryTasks});return reply({task});});
+    await login();
+    const sentOp='task-message-send-op',toolCallId='task-message-send-call';
+    state.emit(BOT_A,'tool.started',{operationId:sentOp,toolCallId,toolName:'message_task',input:{taskId:task.id,text:'Please verify the private dashboard.'}},run.id);
+    const sending=page.locator(`[data-linked-task-id="${task.id}"][data-task-status="sending"]`);await sending.waitFor();
+    await sending.getByRole('button').click();await page.getByText('Please verify the private dashboard.',{exact:true}).waitFor();
+    assert.equal(await sending.getAttribute('data-task-status'),'sending');
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true,'expanded sending pill never creates horizontal overflow');
+    assert.equal(await sending.locator('.timber-task-pill-details').evaluate(node=>node.scrollWidth<=node.clientWidth+1),true,'sending pill detail content wraps inside its container');
+    if(process.env.CONSOLE_SCREENSHOT_DIR){await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});await sending.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/task-message-pills-sent-${width}.png`,animations:'disabled'});}
+    await page.getByRole('button',{name:'Open task',exact:true}).click();await page.locator('.timber-tasks-detail h1').filter({hasText:task.title}).waitFor();
+    if(width<=760)await page.getByRole('button',{name:'Back to tasks',exact:true}).click();await page.locator('#bots-nav').click();await page.locator(`.bot-item[data-bot-id="${BOT_A}"]`).click();
+    state.emit(BOT_A,'tool.completed',{operationId:sentOp,toolCallId,toolName:'message_task',input:{taskId:task.id,text:'Please verify the private dashboard.'},result:{status:'completed',output:JSON.stringify({run:{status:'queued'}})}},run.id);
+    const queued=page.locator(`.timber-task-pill-wrap[data-linked-task-id="${task.id}"][data-task-status="queued"]`);await queued.waitFor();
+    assert.equal(await page.locator(`[data-tool-operation-id="${sentOp}"]`).count(),0,'a real task message is represented by a pill, not a second diagnostic');
+    await queued.locator('button').first().click();
+    assert.equal(await page.locator('#messages').getByText('Please verify the private dashboard.',{exact:true}).count(),1);
+    state.emit(BOT_A,'tool.started',{operationId:'task-inspect-op',toolName:'inspect_task',input:{taskId:task.id}},run.id);
+    state.emit(BOT_A,'tool.completed',{operationId:'task-inspect-op',toolName:'inspect_task',input:{taskId:task.id},result:{status:'completed',output:JSON.stringify({task})}},run.id);
+    await page.waitForTimeout(150);assert.equal(await page.locator('.timber-task-pill-wrap').count(),1,'inspection never creates a message pill');
+    state.emit(BOT_A,'task.updated',{task:{...task,status:'completed',statusVersion:2},notificationId:`task-update:${task.id}:2`,result:'Verified completion result',messageId:'task-pill-result'},run.id);
+    const update=page.locator(`.timber-task-pill-wrap[data-linked-task-id="${task.id}"][data-task-status="completed"]`);await update.waitFor();
+    assert.equal(await page.locator('[data-message-id="task-pill-result"]').count(),0,'the identified assistant result is shown only inside the task pill');
+    state.emit(BOT_A,'task.updated',{task:{...task,status:'completed',statusVersion:2},notificationId:`task-update:${task.id}:2`,result:'Verified completion result',messageId:'task-pill-result'},run.id);
+    assert.equal(await page.locator(`.timber-task-pill-wrap[data-linked-task-id="${task.id}"][data-task-status="completed"]`).count(),1,'repeated notifications render exactly one pill');
+    await update.getByRole('button').first().click();await update.getByText('Verified completion result',{exact:true}).waitFor();
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true,'expanded result pill never creates horizontal overflow');
+    assert.equal(await update.locator('.timber-task-pill-details').evaluate(node=>node.scrollWidth<=node.clientWidth+1),true,'result pill details stay within the available width');
+    if(process.env.CONSOLE_SCREENSHOT_DIR){await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});await update.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/task-message-pills-received-${width}.png`,animations:'disabled'});}
+    await page.reload();if(await page.locator('#login').isVisible()){await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();}await page.locator('#app').waitFor({state:'visible'});
+    if(width<=760&&await page.locator('#bot-workspace').isHidden())await page.locator('.bot-item').first().click();await page.locator('#bot-workspace').waitFor({state:'visible'});
+    await page.locator(`.timber-task-pill-wrap[data-linked-task-id="${task.id}"][data-task-status="completed"]`).waitFor();
+    assert.equal(await page.locator(`.timber-task-pill-wrap[data-linked-task-id="${task.id}"][data-task-status="completed"]`).count(),1,'reload does not duplicate completed state');
+    task.status='failed';task.statusVersion=3;state.emit(BOT_A,'tool.started',{operationId:'task-message-error-op',toolName:'message_task',input:{taskId:task.id,text:'Retry failed dispatch'}},run.id);
+    state.emit(BOT_A,'tool.completed',{operationId:'task-message-error-op',toolName:'message_task',input:{taskId:task.id,text:'Retry failed dispatch'},result:{status:'failed',error:'Task is no longer accepting messages.'}},run.id);
+    await page.locator(`.timber-task-pill-wrap[data-linked-task-id="${task.id}"][data-task-status="failed"]`).waitFor();
+    const failedPill=page.locator(`.timber-task-pill-wrap[data-linked-task-id="${task.id}"][data-task-status="failed"]`);await failedPill.locator('button').first().click();
+    assert.equal(await failedPill.getByText('Task is no longer accepting messages.',{exact:true}).count(),1);
+    assert.equal(state.calls.some(call=>call.method==='POST'&&call.path.endsWith('/messages')),false,'event rendering never submits or replays a message');
+    await selectBot(page,BOT_B);
+    assert.equal(await page.locator('.timber-task-pill-wrap').count(),0,'task pills are isolated to the canonical owning bot conversation');
+    await selectBot(page,BOT_A);
+    task.status='completed';task.statusVersion=4;
+    state.emit(BOT_A,'task.updated',{task,notificationId:`task-update:${task.id}:4`,result:'Deleted task result must stay hidden',messageId:'deleted-task-result'},run.id);
+    registryTasks=[];
+    await page.reload();if(await page.locator('#login').isVisible()){await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();}await page.locator('#app').waitFor({state:'visible'});
+    if(width<=760&&await page.locator('#bot-workspace').isHidden())await selectBot(page,BOT_A);await page.locator('#bot-workspace').waitFor({state:'visible'});
+    await page.waitForTimeout(100);
+    assert.equal(await page.locator(`.timber-task-pill-wrap[data-linked-task-id="${task.id}"]`).count(),0,'canonical reload removes deleted tasks and retained updates cannot resurrect them');
+    assert.equal(await page.getByText('Deleted task result must stay hidden',{exact:true}).count(),0,'deleted task results remain private');
+  },{viewport:{width,height:900}});
+});
+
 test('a successful command followed by an empty model answer exposes the failure without replaying the command', async () => {
   await withPage(async ({page, login, state}) => {
     const createdAt = new Date().toISOString();

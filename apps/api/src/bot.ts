@@ -836,10 +836,12 @@ export class BotDO extends DurableObject<Env> {
         VALUES(?,?,?,(SELECT COALESCE(MAX(updated_sequence),0)+1 FROM task_reports))
         ON CONFLICT(task_id) DO UPDATE SET version=excluded.version,data=excluded.data,updated_sequence=excluded.updated_sequence
         WHERE excluded.version>task_reports.version`,task.id,task.statusVersion!,JSON.stringify(input));
-      this.emit("task.updated",{task,notificationId:input.notificationId},source.id,input.notificationId);
       // A report is public transcript only: it never submits inference, revives
       // a cancelled run, replays a tool or inherits the child task's commands.
-      if(typeof input.result==='string'&&['completed','failed'].includes(task.status)&&!this.stopped(source.id)&&!this.taskStopped())this.addMessage({id:crypto.randomUUID(),botId:source.botId,runId:source.id,role:"assistant",kind:"final",text:input.result.slice(0,32000),createdAt:timestamp()},`result:${input.notificationId}`);
+      const reportText=typeof input.result==='string'&&['completed','failed'].includes(task.status)?input.result.slice(0,32000):undefined;
+      const result=reportText!==undefined&&!this.stopped(source.id)&&!this.taskStopped()?{id:crypto.randomUUID(),botId:source.botId,runId:source.id,role:"assistant" as const,kind:"final" as const,text:reportText,createdAt:timestamp()}:undefined;
+      this.emit("task.updated",{task,notificationId:input.notificationId,...(reportText!==undefined?{result:reportText}:{}),...(result?{messageId:result.id}:{})},source.id,input.notificationId);
+      if(result)this.addMessage(result,`result:${input.notificationId}`);
     });
   }
   private async receiveAgentResult(input:{delegation:AgentDelegation;status:RunStatus;text:string;provenance:MessageProvenance}):Promise<void> {

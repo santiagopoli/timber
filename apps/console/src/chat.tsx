@@ -14,7 +14,7 @@ import type { ChatApproval, ChatCallbacks, ChatModel, ChatConnection, MessageDel
 import {canRetryAdmission} from './run-recovery';
 import {failureRecovery} from './failure-recovery';
 import {ActivityCode, ActivityOutput, activityIdentity, outputFormat} from './activity-content';
-import {TaskPill} from './task-pill';
+import {TaskMessagePill, TaskPill} from './task-pill';
 import {ArtifactPreview, ArtifactProvider, type ArtifactLoader} from './artifact-preview';
 import './chat.css';
 import {hasBotMention} from './mentions';
@@ -180,8 +180,8 @@ const DeliveryEntry = memo(function DeliveryEntry({ delivery, busy, callbacks, o
 type TimelineEntry = { key: string; at: number; order: number; node: ReactNode; tool?: ToolActivity };
 type ToolActivity = { key: string; runId?: string; at: number; name: string; aliases: Set<string>; returned: boolean; status?: string; result?: {status?: string; processId?: string; checkpointStatus?: 'pending'|'saved'|'failed'; output?: string; error?: string; exitCode?: number; artifactId?: string}; process?: ChatModel['events'][number]; data: Record<string, unknown> };
 type ActivityStep = {at: number; key: string; tool: ToolActivity};
-export type ActivityModel = Pick<ChatModel, 'bot' | 'events' | 'runs' | 'approvals' | 'runFilter' | 'subagents' | 'delegations' | 'mentionBots' | 'messages' | 'collaborationEvents'>;
-const activityFields = ['bot', 'events', 'runs', 'approvals', 'runFilter', 'subagents', 'delegations', 'mentionBots', 'messages', 'collaborationEvents'] as const;
+export type ActivityModel = Pick<ChatModel, 'bot' | 'events' | 'runs' | 'approvals' | 'runFilter' | 'subagents' | 'delegations' | 'mentionBots' | 'messages' | 'collaborationEvents' | 'knownTasks'>;
+const activityFields = ['bot', 'events', 'runs', 'approvals', 'runFilter', 'subagents', 'delegations', 'mentionBots', 'messages', 'collaborationEvents', 'knownTasks'] as const;
 const sameActivityModel = (left: ActivityModel | null, right: ActivityModel) => Boolean(left && activityFields.every(key => left[key] === right[key]));
 
 const toolNames: Record<string, string> = {exec: 'Run command', read_file: 'Read file', readFile: 'Read file', write_file: 'Write file', writeFile: 'Write file', list_files: 'Browse files', listFiles: 'Browse files', desktop_screenshot: 'Capture desktop', screenshot: 'Capture desktop', browser_navigate: 'Open', navigate: 'Open', desktop_click: 'Click', click: 'Click', desktop_move: 'Move pointer', move: 'Move pointer', desktop_double_click: 'Double click', doubleClick: 'Double click', desktop_drag: 'Drag', drag: 'Drag', desktop_type: 'Type text', type: 'Type text', desktop_key: 'Press', key: 'Press', desktop_scroll: 'Scroll', scroll: 'Scroll', checkpoint: 'Save workspace', github_clone: 'Clone', gitClone: 'Clone', github_push: 'Push', gitPush: 'Push', github_connect: 'Connect GitHub', github_create_pull_request: 'Create pull request', github_list_pull_requests: 'List pull requests', github_list_repositories: 'List repositories', load_skill: 'Load skill', list_tools: 'Available tools', publish_app: 'Publish app', list_apps: 'List apps', remove_app: 'Remove app', spawn_subagent:'Create subagent', list_subagents:'View subagents', send_subagent_message:'Message subagent', wait_subagent:'Wait for subagent', cancel_subagent:'Stop subagent', send_to_bot:'Message bot', create_bot:'Create named bot', list_bots:'View bots'};
@@ -270,7 +270,7 @@ function collectTools(model: ActivityModel, includeApprovals = false, collaborat
     if (approval.result) value.result = mergeToolResult(value.result, approval.result);
     aliases.set(key, value);
   }
-  return [...new Set(aliases.values())].filter(tool=>!['spawn_subagent','create_bot','send_subagent_message','send_to_bot'].includes(tool.name) || tool.name!=='send_subagent_message'&&['failed','interrupted','cancelled'].includes(tool.result?.status||tool.status||'') || ![...tool.aliases].some(alias=>collaborationIdentities.has(alias))).map(tool => {
+  return [...new Set(aliases.values())].filter(tool=>{const correlated=[...tool.aliases].some(alias=>collaborationIdentities.has(alias));if(tool.name==='message_task')return !correlated;return !['spawn_subagent','create_bot','send_subagent_message','send_to_bot'].includes(tool.name)||tool.name!=='send_subagent_message'&&['failed','interrupted','cancelled'].includes(tool.result?.status||tool.status||'')||!correlated;}).map(tool => {
     const process = tool.process || indexes.processes.get(tool.result?.processId || displayText(tool.data.operationId));
     if (!process) return tool;
     // Process observations outlive the original tool/approval receipt. Keep the
@@ -400,8 +400,8 @@ const UnpositionedCompactionHistory = memo(function UnpositionedCompactionHistor
   return items.length ? <section className="timber-compaction-history" data-compaction-unpositioned-group data-timeline-key="unpositioned-compactions" aria-label="Compaction history with unavailable dates"><p className="timber-history-caption">Compaction history · dates unavailable</p>{items.map(item => <TimelineCompaction key={item.key} item={item}/>)}</section> : null;
 });
 
-const TimelineCollaboration = memo(function TimelineCollaboration({item, callbacks, context = 'timeline'}: {item:CollaborationItem;callbacks:Pick<ChatCallbacks,'onOpenBot'|'onOpenAgents'>;context?:'timeline'|'activity'|'preview'}) {
-  return item.notice ? <AgentMessageNotice notice={item.notice} callbacks={callbacks} eventKey={item.key} context={context}/> : item.creation ? <AgentCreationCard creation={item.creation} callbacks={callbacks} context={context === 'preview' ? 'timeline' : context}/> : null;
+const TimelineCollaboration = memo(function TimelineCollaboration({item, callbacks, context = 'timeline'}: {item:CollaborationItem;callbacks:Pick<ChatCallbacks,'onOpenBot'|'onOpenAgents'|'onOpenTask'>;context?:'timeline'|'activity'|'preview'}) {
+  return item.notice ? <AgentMessageNotice notice={item.notice} callbacks={callbacks} eventKey={item.key} context={context}/> : item.creation ? <AgentCreationCard creation={item.creation} callbacks={callbacks} context={context === 'preview' ? 'timeline' : context}/> : item.taskMessage ? <TaskMessagePill task={item.taskMessage} onOpenTask={callbacks.onOpenTask}/> : item.taskUpdate ? <TaskMessagePill task={{taskId:item.taskUpdate.id,title:item.taskUpdate.title,status:item.taskUpdate.status,result:item.taskUpdate.result,label:'Task update'}} onOpenTask={callbacks.onOpenTask}/> : null;
 }, (previous, next) => previous.callbacks === next.callbacks && previous.context === next.context && sameValue(previous.item, next.item));
 
 // All transcript text stays in the DOM: native find, selection, copy and
@@ -413,7 +413,8 @@ const TimelineHistory = memo(function TimelineHistory({entries}: {entries: Timel
 function timeline(model: ChatModel, callbacks: ChatCallbacks, secureRequests:SecureInputRequest[] = []) {
   const indexes = historyIndexes(model);
   const collaboration = collectCollaboration(model);
-  const messages = model.messages.filter(message => !model.runFilter || message.runId === model.runFilter);
+  const resultMessageIds=new Set(collaboration.items.flatMap(item=>item.taskUpdate?.messageId?[item.taskUpdate.messageId]:[]));
+  const messages = model.messages.filter(message => (!model.runFilter || message.runId === model.runFilter) && !resultMessageIds.has(message.id));
   const approvals = model.approvals.filter(approval => !model.runFilter || approval.runId === model.runFilter);
   const pendingApprovals = approvals.filter(approval => ['pending', 'executing', 'approved'].includes(approval.status));
   const current = pendingApprovals.reduce<ChatApproval | undefined>((latest, approval) => !latest || timestamp(approval.createdAt) > timestamp(latest.createdAt) ? approval : latest, undefined);
@@ -583,7 +584,7 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
   // Drafts and response chunks never invalidate the completed history. The
   // transport supplies immutable, referentially stable collection revisions.
   const {requests:secureRequests}=useKeychain();
-  const {entries, unpositionedCompactions, indexes, toolRuns, pendingApprovalRuns, pendingConnectionRuns} = useMemo(() => timeline(model, callbacks, secureRequests), [secureRequests,model.bot.id, model.bot.name, model.bot.model, model.bot.computerApprovalMode, model.messages, model.runs, model.approvals, model.connections, model.events, model.deliveries, model.subagents, model.delegations, model.mentionBots, model.collaborationEvents, model.compactions, model.tasks, model.runFilter, model.sending, callbacks]);
+  const {entries, unpositionedCompactions, indexes, toolRuns, pendingApprovalRuns, pendingConnectionRuns} = useMemo(() => timeline(model, callbacks, secureRequests), [secureRequests,model.bot.id, model.bot.name, model.bot.model, model.bot.computerApprovalMode, model.messages, model.runs, model.approvals, model.connections, model.events, model.deliveries, model.subagents, model.delegations, model.mentionBots, model.collaborationEvents, model.compactions, model.tasks, model.knownTasks, model.runFilter, model.sending, callbacks]);
   const visibleRun = model.currentRun && (!model.runFilter || model.runFilter === model.currentRun.id) ? model.currentRun : null;
   const hasInlineStatus = visibleRun && (
     pendingApprovalRuns.has(visibleRun.id) ||
@@ -772,7 +773,7 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
 
 function MiniActivity({model, historyOpen, onHistory, callbacks}: {model: ChatModel; historyOpen: boolean; onHistory(value:boolean): void;callbacks:ChatCallbacks}) {
   const [collapsed,setCollapsed] = useState(false);
-  const activityModel = useMemo<ActivityModel>(() => ({...model, runFilter: null}), [model.bot, model.events, model.runs, model.approvals, model.subagents, model.delegations, model.mentionBots, model.messages, model.collaborationEvents]);
+  const activityModel = useMemo<ActivityModel>(() => ({...model, runFilter: null}), [model.bot, model.events, model.runs, model.approvals, model.subagents, model.delegations, model.mentionBots, model.messages, model.collaborationEvents, model.knownTasks]);
   const data = useMemo(() => {
     const indexes = historyIndexes(activityModel), collaboration = collectCollaboration(activityModel);
     const notices = collaboration.items.filter(item => item.notice).sort((a,b) => timestamp(a.createdAt)-timestamp(b.createdAt)).slice(-2);

@@ -35,7 +35,8 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   const drafts = new Map(), draftMentions = new Map(), pendingMessages = new Map(), pendingActions = new Map(), computerPending = new Map(), stopping = new Set(), approvalWork = new Map(), approvalFeedback = new Map(), connectionWork = new Map(), appWork = new Map();
   let authenticated = false, bots = [], selected = null, currentRun = null, stoppableRun = null, generation = 0, authSession = 0;
   let tasksView = null, showingTasks = false, selectedTaskId = null;
-  let conversationTasks = [];
+  let conversationTasks = [],knownConversationTasks=[];
+  let canonicalConversationTaskIds=new Set(),conversationTasksLoadedFor=null;
   let taskProjectionSource=null,taskProjectionMessages=null,renderedTasks=[];
   let sessionController = new AbortController(), streamController, refreshTimer, progressTimer, computerStatusTimer;
   let computerStatusRequest = 0, currentPanel = 'conversation', workspaceExpanded = false, desktopFullscreen = false;
@@ -72,16 +73,18 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
         for(const event of result.events||[]) {
           mergeConversationTask(event);
           if(activityEvent(event)&&!retained.has(event.id))retained.set(event.id,{...event,data:redact(event.data)});
+          if(event.type==='task.updated'&&!collaborationEvents.some(item=>item.id===event.id))collaborationEvents=[...collaborationEvents,{...event,data:redact(event.data)}];
         }
         events=[...retained.values()].sort((a,b)=>a.id-b.id);state.cursor=result.nextCursor??null;
       } catch(error) {if(validView(version)&&eventHistory===state&&error.name!=='AbortError')state.error=errorText(error);}
       finally {if(validView(version)&&eventHistory===state){state.loading=false;state.promise=null;renderMessages();}}
     })();return state.promise;
   }
-  const activityEvent = event => ['process.updated','tool.started','tool.completed','subagent.tool.started','subagent.tool.completed','run.retrying','run.failed','run.cancellation.requested'].includes(event.type);
+  const activityEvent = event => ['task.updated','process.updated','tool.started','tool.completed','subagent.tool.started','subagent.tool.completed','run.retrying','run.failed','run.cancellation.requested'].includes(event.type);
   function mergeConversationTask(event) {
     if(event.type!=='task.updated'||!event.data?.task?.id)return false;
-    const task=event.data.task,prior=conversationTasks.find(item=>item.id===task.id);
+    const task=event.data.task;if(conversationTasksLoadedFor!==selected?.id||!canonicalConversationTaskIds.has(task.id))return false;
+    const prior=conversationTasks.find(item=>item.id===task.id);
     if(prior){
       const versioned=Number.isSafeInteger(prior.statusVersion)&&Number.isSafeInteger(task.statusVersion);
       if(versioned?prior.statusVersion>task.statusVersion:prior.updatedAt>task.updatedAt)return false;
@@ -95,7 +98,12 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     try {
       const result=await request('/v1/tasks',{signal:historyState.controller.signal});
       if(!validView(version))return;
-      for(const task of result.tasks||[])if(task.createdByBotId===id&&!task.sourceTaskId)mergeConversationTask({type:'task.updated',data:{task}});
+      const canonical=(result.tasks||[]).filter(task=>task.botId===id);
+      knownConversationTasks=canonical.map(task=>({id:task.id,title:task.title,botId:task.botId}));
+      const creations=canonical.filter(task=>task.createdByBotId===id&&!task.sourceTaskId);
+      canonicalConversationTaskIds=new Set(creations.map(task=>task.id));conversationTasksLoadedFor=id;
+      conversationTasks=conversationTasks.filter(task=>canonicalConversationTaskIds.has(task.id));
+      for(const task of creations)mergeConversationTask({type:'task.updated',data:{task}});
       renderMessages();
     } catch(error) {if(error.name!=='AbortError'&&validView(version))$('stream-state').textContent='Task status unavailable';}
   }
@@ -652,7 +660,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     clearTimeout(avatarPollTimer);avatarRequest++;avatarHistoryPage=0;avatarThemeDraft='';avatarReasoningDraft=null;avatarSettings={themes:[],selection:null,avatars:[],jobs:[]};avatarModels={connected:false,vectorModels:[],imageModels:[],imageAvailable:false};avatarLoading=false;avatarAdmissions.clear();revokeAvatarUrls();$('avatar-error').textContent='';$('avatar-status').textContent='Sign in to load avatar settings.';
 
     stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId=null; cancelStreamRender(); resetConversationHistory(); generation++; authSession++; authenticated = false; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
-    showingTasks=false;selectedTaskId=null;conversationTasks=[];syncTaskToggle();if($('global-tasks-workspace'))$('global-tasks-workspace').hidden=true;tasksView?.unmount();tasksView=null;selected = null; currentRun = null; stoppableRun = null; bots = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
+    showingTasks=false;selectedTaskId=null;conversationTasks=[];knownConversationTasks=[];canonicalConversationTaskIds=new Set();conversationTasksLoadedFor=null;syncTaskToggle();if($('global-tasks-workspace'))$('global-tasks-workspace').hidden=true;tasksView?.unmount();tasksView=null;selected = null; currentRun = null; stoppableRun = null; bots = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
     clearTimeout(botSummaryTimer);botSummaries.clear();botSummaryLoading=false;botSummaryPending=false;botRenderKey='';
     removedBots.clear(); deletionPending.clear(); deleteTarget = null; deleteBusy = false; editBotId = null; drafts.clear(); draftMentions.clear(); pendingMessages.clear(); acceptedImageIds.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); connectionWork.clear(); appWork.clear(); closeDialogs(); clearScreen();
     chatGPTConnected = false; chatGPTAccount = null; chatGPTBusy = false;
@@ -787,7 +795,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     cancelAudioSends();desktop.disconnect(); workspace.clear();
     if (!$('panel-files').hidden) workspace.setBot(bot.id);
     stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId = chosenHash() === bot.id ? new URLSearchParams(location.hash.slice(1)).get('agent') : null;agentsLoading=true;agentsError=''; cancelStreamRender(); resetConversationHistory(); generation++; const version = generation; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
-    selected = bot; chatLoading = true; currentRun = null; stoppableRun = null; cursor = 0; boundary = ''; events = []; conversationTasks=[]; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs = new Map(); activeRunIds = new Set(); streamDrafts = new Map(); nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; runFilter = null; runRevision = 0;
+    selected = bot; knownConversationTasks=[];canonicalConversationTaskIds=new Set();conversationTasksLoadedFor=null; chatLoading = true; currentRun = null; stoppableRun = null; cursor = 0; boundary = ''; events = []; conversationTasks=[]; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs = new Map(); activeRunIds = new Set(); streamDrafts = new Map(); nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; runFilter = null; runRevision = 0;
     $('refresh-apps').disabled = false; $('refresh-apps').textContent = 'Refresh';
     history[replace ? 'replaceState' : 'pushState'](null, '', `${location.pathname}${location.search}#bot=${encodeURIComponent(bot.id)}`);
     $('empty').hidden = true; $('bot-workspace').hidden = false; updateBotHeader(); renderBots(); renderApps();renderAgents();syncAgentHash();if(selectedAgentId)showPanel('agents');
@@ -838,7 +846,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     renderedConnections = stableProjection(renderedConnections, connections.map(item => ({...item, ...connectionWork.get(`${selected.id}:${item.id}`)})));
     renderedDeliveries = stableProjection(renderedDeliveries, [...pendingMessages.values()].filter(delivery => delivery.botId === selected.id).map(delivery => ({...delivery})));
     const model = { acceptedImageIds: acceptedImageIds.get(selected.id) || emptyList, bot: selected, messages, runs: runValues(), approvals: visibleApprovals, connections: renderedConnections, events: transcriptEvents(),
-      deliveries: renderedDeliveries, draft: drafts.get(selected.id) || '', mentionBots: bots, subagents, delegations, collaborationEvents,tasks:visibleConversationTasks(), draftMentions: draftMentions.get(selected.id) || emptyList, sending: sendBusy.has(selected.id)||modelSettingsWork.has(selected.id), loading: chatLoading,compactions,historyLoading:historyState.loading||eventHistory.loading,historyHasMore:Boolean(historyState.cursor||eventHistory.cursor),historyError:historyState.error||eventHistory.error||undefined,modelSettings:modelSettingsState(),
+      deliveries: renderedDeliveries, draft: drafts.get(selected.id) || '', mentionBots: bots, subagents, delegations, collaborationEvents,tasks:visibleConversationTasks(),knownTasks:knownConversationTasks, draftMentions: draftMentions.get(selected.id) || emptyList, sending: sendBusy.has(selected.id)||modelSettingsWork.has(selected.id), loading: chatLoading,compactions,historyLoading:historyState.loading||eventHistory.loading,historyHasMore:Boolean(historyState.cursor||eventHistory.cursor),historyError:historyState.error||eventHistory.error||undefined,modelSettings:modelSettingsState(),
       currentRun, runFilter, focusApproval, stream: stream ? {runId: stream[0], text: stream[1]} : null, feedback: approvalFeedback.get(selected.id) };
     chat.update(model); activity.update({...model, runFilter: null});
   }
@@ -1361,8 +1369,9 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     // Actions belong to the conversation, including after a task completes.
     // Only the separate diagnostic log is capped; SSE replay restores history.
     if(activityEvent(event))events.push(event);
-    if(mergeConversationTask(event))renderMessages();
-    if(['subagent.created','subagent.updated','subagent.stopped','subagent.reported','subagent.message.sent','agent.named.created','delegation.updated'].includes(event.type)) {
+    if(mergeConversationTask(event))renderMessages();else if(event.type==='task.updated'&&conversationTasksLoadedFor===selected?.id&&!canonicalConversationTaskIds.has(event.data?.task?.id)){void loadConversationTasks(version).then(()=>{if(mergeConversationTask(event))renderMessages();});}
+    if(['task.updated','subagent.created','subagent.updated','subagent.stopped','subagent.reported','subagent.message.sent','agent.named.created','delegation.updated'].includes(event.type)) {
+      if(event.type==='task.updated'&&collaborationEvents.some(item=>item.id===event.id)){renderMessages();return;}
       collaborationEvents = [...collaborationEvents, {...event,data:redact(event.data)}];
       const agent=event.data.subagent;
       if(agent && typeof agent.id==='string' && typeof agent.name==='string') {

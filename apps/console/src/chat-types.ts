@@ -23,6 +23,7 @@ export type ChatModel = {
   collaborationEvents: BotEvent[];
   compactions?: readonly CompactionReceipt[];
   tasks?: readonly ChatTaskSummary[];
+  knownTasks?: readonly ChatTaskSummary[];
   historyLoading?: boolean; historyHasMore?: boolean; historyError?: string;
   currentRun: Run | null; runFilter: string | null; focusApproval: number;
   stream: { runId: string; text: string } | null;

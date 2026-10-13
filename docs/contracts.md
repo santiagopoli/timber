@@ -574,8 +574,10 @@ answers in the main chat. Task runtimes are told to execute their assigned work
 rather than recursively handing it off. New console-created bots default to
 allowing task creation; existing explicit permissions remain unchanged.
 Bot-created tasks persist `sourceRunId`, optional `sourceTaskId`, and a monotonic
-`statusVersion`. A durable FIFO outbox sends `task.updated {task,notificationId}`
-to the originating bot or task conversation on real state changes. Exact IDs
+`statusVersion`. A durable FIFO outbox sends `task.updated {task,notificationId,result?,messageId?}`
+to the originating bot or task conversation on real state changes. `result` is
+bounded explicit completed/failed report text; `messageId` identifies the exact assistant
+transcript row created from that report, when one is appended. Exact IDs
 deduplicate notifications across retries and eviction. A terminal outcome can
 append one attributed assistant result without starting another inference run;
 a cancelled originating run never receives an implicit continuation.
