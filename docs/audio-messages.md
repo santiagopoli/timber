@@ -72,15 +72,18 @@ The original audio remains playable even when transcription fails. Transcripts
 are machine-generated and can contain errors; users can expand them independently
 of playback. Sent audio has no outer message card, duplicated Original audio/format/
 duration row, or permanent transcript link. The existing waveform and playback
-controls remain the message. A discreet icon in the player’s bottom-right corner
-opens and closes the existing transcript, initially closed, with keyboard support,
-accessible labels and expanded state, and a 44px target separated from seek and
-volume. Transcript text is rendered as plain text and wraps on narrow screens.
+controls remain the message. A discreet icon immediately beside Copy in the
+message footer opens and closes the existing transcript, initially closed, with
+keyboard support, accessible labels and expanded state. It shares Copy’s size
+and alignment. Copy uses the completed transcript for an audio message.
+Only Play and the waveform occupy the player; the waveform fills its remaining
+width. Transcript text is rendered as plain text and wraps on narrow screens.
 A failed or empty transcription is never substituted with invented
 text and never sends an empty prompt to the bot.
 
-Microphone permission is requested only after an explicit Dictate text or Record audio action, never on
-page load. Recording stops and its tracks are released when discarded, completed,
+Microphone permission is requested only after an explicit Record audio action,
+never on page load. Sending the voice message starts transcription automatically.
+Recording stops and its tracks are released when discarded, completed,
 or when leaving that conversation. Late permission grants after leaving release
 the acquired tracks without starting capture. Concurrent permission requests are
 fenced; recorder errors and the 20 MB recording limit discard the failed capture.

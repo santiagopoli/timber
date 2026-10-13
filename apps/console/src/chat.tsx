@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useCallback, useMemo, useRef, useState, useId, memo, type ComponentProps, type ReactNode, type KeyboardEvent } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
-import { XIcon, PaperclipIcon, ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon, HistoryIcon, SquareIcon, PlusIcon, LockKeyholeIcon, AudioLinesIcon, MicIcon } from 'lucide-react';
+import { XIcon, PaperclipIcon, ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon, HistoryIcon, SquareIcon, PlusIcon, LockKeyholeIcon, AudioLinesIcon, MicIcon, TextQuoteIcon } from 'lucide-react';
 import {DropdownMenu} from 'radix-ui';
 import { defaultComponents, defaultUrlTransform, type UrlTransform } from 'streamdown';
 import { Conversation, ConversationContent, ConversationEmptyState, ConversationScrollButton, useConversationContext } from '@/components/ai-elements/conversation';
@@ -61,7 +61,7 @@ const Response = memo(function Response({ text, streaming = false }: { text: str
   return <MessageResponse className="timber-markdown" mode={streaming ? 'streaming' : 'static'} isAnimating={streaming} parseIncompleteMarkdown skipHtml plugins={responsePlugins} components={responseComponents} linkSafety={responseLinkSafety} urlTransform={responseUrlTransform} controls={false}>{maskSecureReferences(text)}</MessageResponse>;
 });
 
-const CopyMessage = memo(function CopyMessage({ text, kind = 'message', createdAt }: { text: string; kind?: 'message' | 'pending' | 'streaming'; createdAt?: string }) {
+const CopyMessage = memo(function CopyMessage({ text, kind = 'message', createdAt, children }: { text: string; kind?: 'message' | 'pending' | 'streaming'; createdAt?: string; children?:ReactNode }) {
   const [state, setState] = useState<'idle' | 'copying' | 'copied' | 'failed'>('idle');
   const busy = useRef(false), mounted = useRef(true), reset = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const name = kind === 'streaming' ? 'Copy response so far' : kind === 'pending' ? 'Copy pending message' : 'Copy message';
@@ -77,6 +77,7 @@ const CopyMessage = memo(function CopyMessage({ text, kind = 'message', createdA
     finally {busy.current = false;}
   };
   return <MessageActions className="timber-message-actions">
+    {children}
     <MessageAction label={name} aria-label={name} title={name} data-copy-message disabled={state === 'copying' || !text} onClick={copy}>
       {state === 'copied' ? <CheckIcon aria-hidden="true" /> : state === 'copying' ? <LoaderCircleIcon className="timber-spinner" aria-hidden="true" /> : <CopyIcon aria-hidden="true" />}
     </MessageAction>
@@ -386,11 +387,13 @@ function sameValue(left: unknown, right: unknown): boolean {
 }
 
 const HistoryMessage = memo(function HistoryMessage({message, botId, botName, run, sending, sourceModel, callbacks, outcome,uploadState}: {uploadState?:'sending'|'unknown';message:ChatModel['messages'][number];botId:string;botName:string;run?:ChatModel['runs'][number];sending:boolean;sourceModel?:string;callbacks:ChatCallbacks;outcome?:ReactNode}) {
+  const [showTranscript,setShowTranscript]=useState(false),transcriptId=useId();
+  const transcript=message.audio?.transcription.status==='succeeded'?message.audio.transcription.text:undefined;
   if (message.provenance) return <AgentMessageNotice notice={{direction:'from',agent:{id:message.provenance.sourceBotId,name:message.provenance.sourceBotName,kind:'bot',model:sourceModel},text:message.text,messageId:message.id,status:run?.status}} callbacks={callbacks} eventKey={`message:${message.id}`}/>;
   return <Message from={message.role === 'user' ? 'user' : 'assistant'} data-message-id={message.id} data-message-kind={message.kind} data-progress-message-id={message.kind === 'progress' ? message.id : undefined} data-run-id={message.runId} className={`timber-message timber-message-${message.role}`}>
     {message.role !== 'user' && <div className="timber-message-meta"><span>{message.role === 'assistant' ? botName : label(message.role)}</span></div>}
-    <MessageContent className={`timber-message-content${message.audio?' timber-audio-content':''}`}>{message.audio?<AudioMessage uploadState={uploadState} botId={botId} audio={message.audio} onRetry={callbacks.onRetryAudio?operationId=>callbacks.onRetryAudio!(botId,operationId):undefined} busy={sending}/>:<Response text={message.text} />}{message.attachments?.map(image=><ArtifactPreview key={image.artifactId} botId={botId} artifactId={image.artifactId} compact />)}{outcome}{message.role === 'user' && <MessageRunStatus run={run} botId={botId} sending={sending} callbacks={callbacks} />}</MessageContent>
-    {['user', 'assistant'].includes(message.role) && <CopyMessage text={message.text} createdAt={message.createdAt} />}
+    <MessageContent className={`timber-message-content${message.audio?' timber-audio-content':''}`}>{message.audio?<AudioMessage showTranscript={showTranscript} transcriptId={transcriptId} uploadState={uploadState} botId={botId} audio={message.audio} onRetry={callbacks.onRetryAudio?operationId=>callbacks.onRetryAudio!(botId,operationId):undefined} busy={sending}/>:<Response text={message.text} />}{message.attachments?.map(image=><ArtifactPreview key={image.artifactId} botId={botId} artifactId={image.artifactId} compact />)}{outcome}{message.role === 'user' && <MessageRunStatus run={run} botId={botId} sending={sending} callbacks={callbacks} />}</MessageContent>
+    {['user', 'assistant'].includes(message.role) && <CopyMessage text={transcript||message.text} createdAt={message.createdAt}>{transcript&&<button type="button" className="timber-audio-transcript-toggle" aria-label={showTranscript?'Hide transcript':'Show transcript'} title={showTranscript?'Hide transcript':'Show transcript'} aria-expanded={showTranscript} aria-controls={transcriptId} onClick={()=>setShowTranscript(value=>!value)}><TextQuoteIcon aria-hidden="true"/></button>}</CopyMessage>}
   </Message>;
 });
 

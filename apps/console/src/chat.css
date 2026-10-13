@@ -113,9 +113,9 @@
 .timber-chat button:focus-visible,.timber-chat summary:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
 .timber-message-actions{min-height:28px;gap:5px;color:var(--muted)}
 .timber-message.is-user>.timber-message-actions{justify-content:flex-end}
-.timber-message-actions [data-copy-message]{width:28px;height:28px;min-height:28px;padding:6px;border-radius:7px;color:var(--muted)}
-.timber-message-actions [data-copy-message]:hover{background:var(--soft);color:var(--ink)}
-.timber-message-actions [data-copy-message] svg{width:14px;height:14px}
+.timber-message-actions :is([data-copy-message],.timber-audio-transcript-toggle){width:28px;height:28px;min-height:28px;padding:6px;border-radius:7px;color:var(--muted)}
+.timber-message-actions :is([data-copy-message],.timber-audio-transcript-toggle):hover{background:var(--soft);color:var(--ink)}
+.timber-message-actions :is([data-copy-message],.timber-audio-transcript-toggle) svg{width:14px;height:14px}
 .timber-message-actions time{font-size:10px;color:var(--muted);font-weight:400;line-height:1.4}
 .timber-copy-feedback{font-size:11px;line-height:1.5}.timber-copy-feedback:empty{display:none}
 .timber-copy-error{color:var(--danger);max-width:230px}
@@ -214,7 +214,7 @@
   .timber-markdown pre{font-size:12px}
   .timber-message-meta{font-size:11px}
   .timber-message-actions{min-height:32px;gap:4px}
-  .timber-message-actions [data-copy-message]{height:32px;width:32px;padding:8px}
+  .timber-message-actions :is([data-copy-message],.timber-audio-transcript-toggle){height:32px;width:32px;padding:8px}
   .timber-composer-wrap{padding:8px 12px 10px}
   .timber-composer{border-radius:27px}
   .timber-composer>[data-slot="input-group"]{min-height:54px}
@@ -304,4 +304,7 @@
 @media(max-width:600px){.timber-composer .timber-dictate{width:44px;height:44px;min-width:44px;min-height:44px;margin:5px 0}}
 
 /* Sent audio is the player itself, not a second padded message card. */
-.timber-message.is-user>.timber-message-content.timber-audio-content{padding:0;border:0;border-radius:0;background:transparent;box-shadow:none}
+.timber-message.is-user>.timber-message-content.timber-audio-content{width:100%;padding:0;border:0;border-radius:0;background:transparent;box-shadow:none}
+
+.timber-audio-transcript-toggle{display:flex;align-items:center;justify-content:center;border:0;background:transparent;cursor:pointer}
+.timber-audio-transcript-toggle:focus-visible{outline:2px solid var(--ink);outline-offset:-2px}
