@@ -52,6 +52,11 @@ describe('ChatGPT generated output limit',()=>{
 });
 
 describe('safe terminal SSE diagnostics',()=>{
+  it('keeps native bounded inference retries for an unclassified provider failure',async()=>{
+    const response=await readEvents([{type:'response.failed',response:{id:'resp_unknown',status:'failed',output:[],error:{code:'unrecognized_failure',message:'PRIVATE provider text'}}}]);
+    expect(response.stopReason).toBe('error');expect(response.errorMessage).toContain('model_request_failed');
+    expect(isRetryableAssistantError(response)).toBe(true);expect(JSON.stringify(response)).not.toContain('PRIVATE');
+  });
   it.each([
     {type:'response.failed',code:'unsupported_value',param:'service_tier',expected:'model_fast_unsupported'},
     {type:'response.failed',code:'context_length_exceeded',param:'input',expected:'model_context_length_exceeded'},

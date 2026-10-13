@@ -1732,7 +1732,24 @@ export class BotDO extends DurableObject<Env> {
       const response=await this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName('owner')).fetch('https://workspace/tasks/message',{method:'POST',headers:{'content-type':'application/json','x-timber-internal':'task'},body:JSON.stringify({sourceBotId:run.botId,sourceRunId:run.id,taskId:args.taskId,text:args.text,operationId:input.operationId})});
       const value=await response.json<{error?:{code:string;message:string}}>();
       if(!response.ok)throw new ApiError(response.status,value.error?.code??'task_message_failed',value.error?.message??'The task could not receive the message.');
-      result=completed(value);
+      // An accepted instruction is not evidence of task progress. Return a
+      // passive snapshot with the receipt so the coordinator can explain the
+      // remaining work without another model/tool round or another input.
+      let progress:unknown={observation:'unavailable'};
+      try {
+        const snapshot=await this.env.BOT.get(this.env.BOT.idFromName(`owner:task:${args.taskId}`)).fetch('https://task/progress?limit=3',{
+          headers:{'x-botspace-config':encodeURIComponent(JSON.stringify(this.bot())),'x-timber-task-id':String(args.taskId)},
+        });
+        if(snapshot.ok) {
+          const view=await snapshot.json<{execution:unknown[];inference:unknown[];activity:{command?:string;error?:string;output?:string}[];messages:{text:string;truncated?:boolean}[]}>();
+          progress={...view,execution:view.execution.slice(0,8),inference:view.inference.slice(0,2),
+            activity:view.activity.slice(0,6).map(item=>({...item,command:item.command?.slice(0,600),error:item.error?.slice(0,400),output:item.output?.slice(0,600)})),
+            messages:view.messages.slice(-3).map(message=>({...message,text:message.text.slice(0,1200),...(message.text.length>1200?{truncated:true}:{})})),
+          };
+        }
+        else await snapshot.body?.cancel();
+      }catch{/* A failed inspection must never retry an accepted message. */}
+      result=completed({...value,progress});
     } else if(input.name==='create_task') {
       if(this.bot().allowTaskCreation!==true) throw new ApiError(403,'task_creation_not_allowed','The owner has not allowed this bot to create tasks.');
       const registry=this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName('owner'));

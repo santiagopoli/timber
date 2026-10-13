@@ -27,6 +27,7 @@ export function responsesFixture(payload: { input: Record<string, unknown>[] }, 
   if (text.includes('request-tool-budget')) return multistepResponse(payload.input.slice(userIndex + 1),'budget');
   if (text.includes('request-long-task')) return multistepResponse(payload.input.slice(userIndex + 1),'long');
   const hasToolOutput = payload.input.slice(userIndex + 1).some(item => item.type === 'function_call_output');
+  if(text.includes('request-generic-stream-failure')&&hasToolOutput&&(text.includes('persistent')||requestNumber===2))return new Response(`data: ${JSON.stringify({type:'response.failed',response:{id:'resp_generic',status:'failed',output:[],error:{code:'unrecognized_provider_failure',message:'PRIVATE provider diagnostic must never reach transcript'}}})}\n\n`,{headers:{'content-type':'text/event-stream'}});
   if(hasToolOutput&&text.includes('request-connection-error-once')&&requestNumber===2)throw new Error('fixture network failure');
   if (hasToolOutput && (text.includes('empty-final-after-exec') || text.includes('recover-empty-once') && requestNumber === 2)) {
     const item = { type: 'reasoning', id: 'rs_empty_final', summary: [{ type: 'summary_text', text: 'Private fixture reasoning must remain hidden.' }], encrypted_content: 'synthetic-fixture-ciphertext' };

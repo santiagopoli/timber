@@ -29,6 +29,12 @@ put tokens in commands, or use browser sign-in to bypass a missing connection.
    then inspect the chosen run ID to read jobs, failed steps and a bounded failure
    log. Fix the concrete failure before rerunning checks. A green verification
    job is not proof of deployment: inspect the deployment job and production.
+   Concurrent work can supersede your CI revision. A newer successful production
+   revision that contains your commit also delivers your change: fetch main and
+   verify ancestry with git merge-base --is-ancestor, then inspect that revision’s
+   actual deploy step. Do not recommit, rebuild unchanged files or restart the task
+   solely to make your own commit the newest SHA. Preserve required checks for
+   the combined revision and fix concrete failures.
    This read does not need the computer and is safe to repeat. Normal development
    dependencies may be installed in the computer; no separate user instruction
    is needed beyond the task and current host approval policy.

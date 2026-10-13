@@ -175,6 +175,13 @@ export function createChatGPTProvider(transport: PiRuntimeOptions<object>['chatg
     const output=createAssistantMessageEventStream();
     const normalizeAllowance=(message:AssistantMessage):AssistantMessage=>{
       const failure=message.stopReason==='error'?classifyModelFailure({message:message.errorMessage}):undefined;
+      // The host replaces unclassified provider failures with this fixed code.
+      // Its reassuring public text used to erase Pi's retry signal, settling
+      // every joined input unanswered after a single HTTP-200 SSE failure.
+      // Retry only inference through Pi's bounded durable policy, never tools.
+      if(message.stopReason==='error'&&/^model_request_failed:/.test(message.errorMessage??''))return {
+        ...message,errorMessage:'model_request_failed: Provider returned error. The model request failed before an answer completed. Your conversation and recorded tool results are preserved.',
+      };
       return failure?.errorCode==='chatgpt_allowance_exhausted'
         ?{...message,errorMessage:`${failure.errorCode}: ${failure.publicMessage}`}:message;
     };

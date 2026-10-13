@@ -62,8 +62,16 @@ it('coordinates queued messages and completed-task continuations without duplica
  await runInDurableObject(root,(_,state)=>{const row=state.storage.sql.exec<{data:string}>('SELECT data FROM runs WHERE id=?',runId).one();state.storage.sql.exec('UPDATE runs SET data=? WHERE id=?',JSON.stringify({...JSON.parse(row.data),coordinatorMode:true}),runId);});
  const call=(taskId:string,text:string,op:string)=>runInDurableObject(root,async instance=>(instance as unknown as {executeHostTool(input:RuntimeHostToolRequest):Promise<ComputerResult>}).executeHostTool({name:'message_task',arguments:{taskId,text},operationId:op,runOperationId:sourceOp,signal:new AbortController().signal}));
  const status=async(value:string)=>runInDurableObject(registry,(_,state)=>{const row=state.storage.sql.exec<{data:string}>('SELECT data FROM tasks WHERE id=?',task.id).one();state.storage.sql.exec('UPDATE tasks SET data=? WHERE id=?',JSON.stringify({...JSON.parse(row.data),status:value}),task.id);});
+ await runInDurableObject(stub,(_,state)=>state.storage.sql.exec('INSERT INTO messages(id,source_key,data) VALUES(?,?,?)','large-progress','large-progress',JSON.stringify({id:'large-progress',botId:bot.id,role:'assistant',text:'Observed progress '.repeat(300),createdAt:new Date().toISOString()})));
  await status('queued');const op=crypto.randomUUID(),message='Apply this correction when you can';
- const result=await call(task.id,message,op);expect(result.status).toBe('completed');const receipt=JSON.parse(result.output!);expect(receipt.run.status).toBe('queued');
+ const result=await call(task.id,message,op);expect(result.status).toBe('completed');const receipt=JSON.parse(result.output!);expect(receipt.run.status).toBe('queued');expect(receipt.progress).toMatchObject({observedAt:expect.any(String),messages:expect.any(Array)});expect(receipt.progress.messages.find((m:any)=>m.id==='large-progress')).toMatchObject({truncated:true,text:expect.any(String)});expect(receipt.progress.messages.find((m:any)=>m.id==='large-progress').text).toHaveLength(1200);
+ await runInDurableObject(stub,(_,state)=>{
+  state.storage.sql.exec('CREATE TABLE pi_tasks(id INTEGER,status TEXT,record TEXT)');state.storage.sql.exec('CREATE TABLE pi_entries(id INTEGER,record TEXT)');
+  state.storage.sql.exec('INSERT INTO pi_tasks VALUES(1,?,?)','running','malformed native diagnostic fixture');
+ });
+ const acceptedWithUnavailableSnapshot=await call(task.id,message,op);
+ expect(JSON.parse(acceptedWithUnavailableSnapshot.output!)).toMatchObject({run:{id:receipt.run.id},progress:{observation:'unavailable'}});
+ await runInDurableObject(stub,(_,state)=>{expect(state.storage.sql.exec('SELECT 1 FROM submissions WHERE operation_id=?',op).toArray()).toHaveLength(1);state.storage.sql.exec('DROP TABLE pi_tasks');state.storage.sql.exec('DROP TABLE pi_entries');});
  await status('completed');const repeat=await call(task.id,message,op);expect(repeat).toMatchObject({status:'completed'});expect(JSON.parse(repeat.output!).run.id).toBe(receipt.run.id);
  await expect(call(task.id,'Changed instructions',op)).rejects.toThrow('different instructions');
  await expect(call(other.task.id,message,crypto.randomUUID())).rejects.toThrow('Task not found for this bot');

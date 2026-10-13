@@ -55,7 +55,7 @@ jobs:
           CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
           DIAGNOSTIC_HOURS: ${{ inputs.hours || '24' }}
           DIAGNOSTIC_SCOPE: ${{ inputs.scope || 'performance' }}
-          DIAGNOSTIC_TASK_PREFIX: ${{ inputs.task_prefix || '3900d946' }}
+          DIAGNOSTIC_TASK_PREFIX: ${{ inputs.task_prefix || '' }}
           DIAGNOSTIC_RECIPIENT_PUBLIC_KEY: ${{ inputs.recipient_public_key }}
         run: |
           if [ -z "$DIAGNOSTIC_RECIPIENT_PUBLIC_KEY" ] && [ -f .github/diagnostic-recipient.pub ]; then

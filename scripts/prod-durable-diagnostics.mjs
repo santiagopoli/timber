@@ -133,7 +133,7 @@ const SIGNATURES = new Set(['no_detail','non_string_detail','chatgpt_subscriptio
 const REASONS = new Set(['model_error','faulted','aborted','no_model','reset','stale','tool_error','task_error','task_failed','budget_exceeded','other']);
 const STATUSES = new Set(['queued','running','waiting_approval','waiting_connection','completed','failed','interrupted','cancelled']);
 const TYPES = new Set(['text','integer','real','object','array','true','false','null']);
-const ERRORS = new Set(['durable_diagnostics_account_missing','durable_diagnostics_auth_missing','durable_diagnostics_transport_failed','durable_diagnostics_response_limit','durable_diagnostics_invalid_response','durable_diagnostics_query_failed','durable_diagnostics_namespace_missing','durable_diagnostics_bot_not_unique','durable_diagnostics_schema_mismatch','durable_diagnostics_invalid_recipient','durable_diagnostics_encryption_failed']);
+const ERRORS = new Set(['durable_diagnostics_account_missing','durable_diagnostics_auth_missing','durable_diagnostics_transport_failed','durable_diagnostics_response_limit','durable_diagnostics_invalid_response','durable_diagnostics_query_failed','durable_diagnostics_namespace_missing','durable_diagnostics_bot_not_unique','durable_diagnostics_schema_mismatch','durable_diagnostics_invalid_recipient','durable_diagnostics_invalid_task','durable_diagnostics_encryption_failed']);
 const MAX_BYTES = 256 * 1024;
 const uuid = value => typeof value==='string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value);
 const iso = value => typeof value==='string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value) && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : null;
@@ -289,7 +289,7 @@ export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now
       encryptedExecution=encryptDetails([...(await query(bot,selectedName,PRIVATE_EXECUTION_RECENT)),...(await query(bot,selectedName,PRIVATE_EXECUTION_REPEATS)),...(await query(bot,selectedName,PRIVATE_PROGRESS_HOURS))],recipient,window);
       encryptedRuntimeFailures=encryptDetails(await query(bot,selectedName,PRIVATE_FAILURE_QUERY),recipient,window);
     }
-    return {source:'durable_performance_fixed_select',window,root,tasks,backgroundAvatars,...(encryptedDiagnostic?{encryptedDiagnostic,encryptedExecution,encryptedRuntimeFailures}:{}),limitation:'Latest 12 runs, 60 tools/native tasks and 40 model responses per conversation; Polibot chat and six tasks across all bots, prioritizing active work. Plaintext contains only allowlisted metadata. Optional task evidence is encrypted exclusively for the supplied recipient; no native prompts, private reasoning or secret storage is queried.'};
+    return {source:'durable_performance_fixed_select',window,root,tasks,backgroundAvatars,...(encryptedDiagnostic?{encryptedDiagnostic,encryptedExecution,encryptedRuntimeFailures}:{}),limitation:'Latest 12 runs, 60 tools/native tasks and 40 model responses per conversation; Polibot chat and six tasks across all bots, prioritizing active work. Plaintext contains only allowlisted metadata. Optional public task conversation, redacted command projections and native failure evidence are encrypted exclusively for the supplied recipient; no native prompts, private reasoning or secret storage is queried.'};
   }
   const schema=await query(bot,name,SCHEMA);
   if(schema.length!==SCHEMA_NAMES.size||!schema.every(row=>SCHEMA_NAMES.has(row.name)))throw new Error('durable_diagnostics_schema_mismatch');

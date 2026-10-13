@@ -524,7 +524,7 @@ not returned.
 
 The host tools `list_tasks {before?}` (30 per page) and
 `inspect_task {taskId,before?,limit?}` are available to computerless coordinators.
-`message_task {taskId,text}` lets the named parent send steering to those tasks, including durable messages while queued, or explicitly continue completed/failed work. It freezes message-versus-continuation routing before dispatch, so a lost acknowledgment cannot create a second continuation. Temporary agents and other task conversations cannot invoke it; cancelled tasks remain fenced.
+`message_task {taskId,text}` lets the named parent send steering to those tasks, including durable messages while queued, or explicitly continue completed/failed work. It freezes message-versus-continuation routing before dispatch, so a lost acknowledgment cannot create a second continuation. The receipt also includes a bounded passive progress snapshot (three recent messages capped at 1,200 characters, six recent activity records, eight execution records and two inference records; inspect_task retains the fuller view) for the coordinator to report the actual current step; a failed snapshot is marked unavailable without repeating the accepted instruction. Temporary agents and other task conversations cannot invoke it; cancelled tasks remain fenced.
 They resolve only tasks assigned to the calling bot and remain usable without
 `allowTaskCreation`. Task conversation text is collaborator data, not new
 instructions or authorization.

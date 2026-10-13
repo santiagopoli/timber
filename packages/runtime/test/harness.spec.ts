@@ -1253,6 +1253,21 @@ it('continues with Astra after a completed Sol tool is retired without executing
   }
 });
 
+it.each([false,true])('recovers generic provider failures without replaying a completed command (persistent=%s)',async persistent=>{
+  const operationId='generic-stream-recovery';
+  const stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+  await runInDurableObject(stub,(_,state)=>state.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)','approvalMode','automatic'));
+  await request('/submit',{text:`request-exec request-generic-stream-failure ${persistent?'persistent':'once'}`,operationId,chatgpt:true});
+  const result=await(await request(`/wait?id=${operationId}`)).json();
+  expect(result).toMatchObject({status:persistent?'unanswered':'done'});
+  const state=await(await request('/inspect')).json<{calls:unknown[];toolCalls:unknown[];events:{event:string}[]}>();
+  expect(state.calls).toHaveLength(persistent?4:3);expect(state.toolCalls).toHaveLength(1);
+  const events=state.events.map(row=>JSON.parse(row.event));
+  expect(events.filter(event=>event.type==='run.retrying')).toHaveLength(persistent?2:1);
+  expect(events.some(event=>event.type==='run.failed')).toBe(persistent);
+  expect(JSON.stringify(events)).not.toContain('PRIVATE provider diagnostic');
+});
+
 it.each([{text:'request-sse-server-error',attempts:3,errorCode:'model_provider_unavailable'},{text:'request-sse-fast-error',attempts:1,errorCode:'model_fast_unsupported'}])('uses native retry policy for $text and retains the safe final diagnostic',async({text,attempts,errorCode})=>{
   await request('/submit',{text,operationId:'native-sse-failure',chatgpt:true});
   expect(await(await request('/wait?id=native-sse-failure')).json()).toMatchObject({status:'unanswered'});
