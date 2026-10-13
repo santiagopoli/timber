@@ -101,6 +101,20 @@ class BrowserLifecycleTests(unittest.TestCase):
         self.assertNotIn(".browser-profile/SingletonLock", names)
         self.assertFalse(any("/Cache" in name for name in names))
 
+    def test_launch_removes_legacy_foreign_locks_before_starting_chromium(self):
+        self.computer.browser = None
+        profile = self.preference.parent.parent
+        (profile / 'SingletonLock').symlink_to('old-computer-15264')
+        (profile / 'SingletonCookie').symlink_to('123456')
+        (profile / 'SingletonSocket').symlink_to('/tmp/old-browser/socket')
+        def launch(*args, **kwargs):
+            self.assertFalse(server.workspace_archive.PROFILE_LOCKS.intersection(p.name for p in profile.iterdir()))
+            self.assertEqual(self.preference.read_text(), 'closed profile')
+            return self.launch.return_value
+        self.launch.side_effect = launch
+        self.computer.ensure_browser()
+        self.assertEqual(self.launch.call_count, 2)
+
     def test_combined_file_limit_includes_the_saved_profile(self):
         (self.computer.workspace / "code.txt").write_text("code")
         with patch.object(server, "MAX_FILES", 3), self.assertRaisesRegex(ValueError, "checkpoint limit"):

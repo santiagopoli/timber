@@ -81,6 +81,8 @@ const cancelled = await cancellation.json();assert.equal(cancelled.status,'cance
 // application, rather than merely claiming xdotool returned successfully.
 await action({type:'writeFile',path:'desktop-smoke.html',content:'<!doctype html><meta charset="utf-8"><title>Timber desktop smoke</title><textarea autofocus style="width:800px;height:400px;font-size:24px"></textarea>'});
 await action({type:'exec',command:'python3 -m http.server 8765 --bind 127.0.0.1 > /tmp/smoke-http.log 2>&1 < /dev/null & echo $! > /tmp/smoke-http.pid',timeoutMs:10000});
+const legacyBrowserLocks=await action({type:'exec',command:'mkdir -p .browser-profile && ln -s previous-timber-host-15264 .browser-profile/SingletonLock && ln -s 123456 .browser-profile/SingletonCookie && ln -s /tmp/previous-timber-browser/socket .browser-profile/SingletonSocket',yieldMs:10000});
+assert.equal(legacyBrowserLocks.exitCode,0,'seed foreign-computer profile locks before launching real Chromium');
 await action({type:'navigate',url:'http://127.0.0.1:8765/desktop-smoke.html'});
 await pause(1000);
 const unicodeText = 'Hola, Poli. Café, λ y 👋';
