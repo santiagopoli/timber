@@ -6,7 +6,7 @@ import {
   type Storage, type TaskId, type ToolExecutionApi, type Tx, type EntryId,
 } from '@earendil-works/pi-durable';
 import type {PiHarnessContext} from 'agents/harness/pi';
-import type {BotContextStatus, BotMemory, CompactionReceipt, MemorySaveInput,MemoryForgetInput,MemoryAcceptInput,MemorySource} from '@botspace/contracts';
+import type {BotContextStatus, BotMemory, CompactionReceipt, MemorySaveInput,MemoryRestoreInput,MemoryForgetInput,MemoryAcceptInput,MemorySource} from '@botspace/contracts';
 import {createMemoryService,MemoryError} from '@botspace/memory';
 import {createMemoryReview,originalMemoryMessages,safeMemoryText} from './memory-review.js';
 import {normalizeEntries} from './normalize.js';
@@ -183,6 +183,8 @@ export function createMaintenance(host:MaintenanceHost) {
     async memory():Promise<BotMemory> {return notes();},
     async memoryEntry(id:string){return service.get(await initialize(),id);},
     async memoryHistory(id:string){return service.history(await initialize(),id);},
+    async restoreMemory(input:MemoryRestoreInput){return service.restore(await initialize(),input);},
+    async memoryContext(query:string){return service.contextPreview(await initialize(),query);},
     async searchMemory(query:string,limit?:number){return service.search(await initialize(),query,{limit});},
     async saveMemory(input:MemorySaveInput){return service.save(await initialize(),input,{actor:'user',sources:[{kind:'user'}]});},
     async forgetMemory(input:MemoryForgetInput){return service.forget(await initialize(),input,{actor:'user'});},

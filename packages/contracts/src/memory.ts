@@ -36,10 +36,12 @@ export interface MemorySaveInput {
   pinned?: boolean;
 }
 export interface MemoryForgetInput {operationId: string; id: string; expectedRevision: number;}
+export interface MemoryRestoreInput {operationId:string;id:string;expectedRevision:number;revision:number;}
+export interface MemoryContextPreview {text:string;usedCharacters:number;maxCharacters:number;selected:Array<{id:string;scope:string;title:string}>;omittedCount:number;}
 export interface MemorySuggestionInput extends MemorySaveInput {replacesId?: string; replacesRevision?: number;}
 export interface MemoryAcceptInput {operationId: string; id: string; expectedRevision: number; replacesRevision?: number;}
 export interface MemoryMutationResult {entry: MemoryEntry; changed: boolean;}
-export interface MemoryRevision {entry: MemoryEntry; operation: 'create' | 'update' | 'forget' | 'suggest' | 'accept'; at: string;}
+export interface MemoryRevision {entry: MemoryEntry; operation: 'create' | 'update' | 'forget' | 'suggest' | 'accept' | 'restore'; at: string;}
 export interface MemorySearchHit {entry: MemoryEntry; score: number;}
 export interface MemorySearchResult {hits: MemorySearchHit[]; total: number; truncated: boolean;}
 export interface MemoryReviewStatus {

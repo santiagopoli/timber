@@ -16,10 +16,11 @@ it('authenticates all memory surfaces and scopes entry reads, search, history an
   const saved=await save(bot,draft());
   const entryId=saved.entry.id;
   const surfaces:[string,string,unknown?][]=[
-    ['', 'GET'], ['/search?q=Spanish','GET'], [`/entries/${entryId}`,'GET'], [`/entries/${entryId}/history`,'GET'],
+    ['', 'GET'], ['/context?q=Spanish','GET'], ['/search?q=Spanish','GET'], [`/entries/${entryId}`,'GET'], [`/entries/${entryId}/history`,'GET'],
     ['/entries','POST',draft()], [`/entries/${entryId}`,'PATCH',draft({expectedRevision:1})],
     [`/entries/${entryId}`,'DELETE',{operationId:crypto.randomUUID(),expectedRevision:1}],
     [`/entries/${entryId}/accept`,'POST',{operationId:crypto.randomUUID(),expectedRevision:1}],
+    [`/entries/${entryId}/restore`,'POST',{operationId:crypto.randomUUID(),expectedRevision:1,revision:1}],
     ['/review','POST',{operationId:crypto.randomUUID()}],
   ];
   for(const[suffix,method,body]of surfaces){
@@ -101,4 +102,34 @@ it('deduplicates normalized content while permitting the user to explicitly rest
   expect(restored.entry.state).toBe('active');
   expect(restored.entry.actor).toBe('user');
   expect((await memory(bot)).entries).toHaveLength(1);
+});
+
+it('restores memory atomically across receipt loss and exposes bounded selected context without crossing bot scopes',async()=>{
+ const bot=await createBot('Restorable memory'),other=await createBot('Other restore scope');
+ const first=(await save(bot,draft())).entry;
+ const edited=await api(path(bot,`/entries/${first.id}`),draft({expectedRevision:1,content:'The user prefers responses in English.'}),'PATCH');expect(edited.status).toBe(200);
+ const changed=(await edited.json<{result:MemoryMutationResult}>()).result.entry;
+ const input={operationId:crypto.randomUUID(),expectedRevision:changed.revision,revision:first.revision};
+ const response=await api(path(bot,`/entries/${first.id}/restore`),input);expect(response.status).toBe(200);
+ const restored=await response.json<{result:MemoryMutationResult}>();expect(restored.result.entry).toMatchObject({revision:3,content:first.content,actor:'user'});
+ expect(await(await api(path(bot,`/entries/${first.id}/restore`),input)).json()).toEqual(restored);
+ const stale=await api(path(bot,`/entries/${first.id}/restore`),{...input,operationId:crypto.randomUUID()});expect(stale.status).toBe(409);await stale.text();
+ const foreign=await api(path(other,`/entries/${first.id}/restore`),input);expect(foreign.status).toBe(404);await foreign.text();
+ const preview=await api(path(bot,'/context?q=Spanish'));expect(preview.status).toBe(200);
+ const {context}=await preview.json<any>();expect(context).toMatchObject({selected:[{id:first.id,title:first.title,scope:expect.any(String)}],omittedCount:0});expect(context.usedCharacters).toBe(context.text.length);expect(context.usedCharacters).toBeLessThanOrEqual(context.maxCharacters);
+ for(const suffix of ['/context',`/entries/${first.id}/restore`]){
+  const unauth=await exports.default.fetch(`https://timber.test${path(bot,suffix)}`,{...(suffix.endsWith('/restore')?{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(input)}:{})});expect(unauth.status).toBe(401);await unauth.text();
+ }
+});
+
+it('exposes revision restore and context preview through isolated task memory routes',async()=>{
+ const bot=await createBot('Task memory owner');
+ const create=await api('/v1/tasks',{operationId:crypto.randomUUID(),botId:bot.id,title:'Task memory',description:'Independent memory',startImmediately:false});
+ expect(create.status).toBe(201);const {task}=await create.json<any>(),prefix=`/v1/tasks/${task.id}/memory`;
+ const saved=await api(`${prefix}/entries`,draft());expect(saved.status).toBe(201);const {result}=await saved.json<{result:MemoryMutationResult}>();
+ const forgotten=await api(`${prefix}/entries/${result.entry.id}`,{operationId:crypto.randomUUID(),expectedRevision:1},'DELETE');expect(forgotten.status).toBe(200);
+ const restored=await api(`${prefix}/entries/${result.entry.id}/restore`,{operationId:crypto.randomUUID(),expectedRevision:2,revision:1});expect(restored.status).toBe(200);
+ const preview=await api(`${prefix}/context?q=Spanish`);expect(preview.status).toBe(200);expect((await preview.json<any>()).context.selected).toHaveLength(1);
+ expect((await memory(bot)).entries).toEqual([]);
+ expect((await api(path(bot,`/entries/${result.entry.id}/restore`),{operationId:crypto.randomUUID(),expectedRevision:3,revision:1})).status).toBe(404);
 });

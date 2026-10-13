@@ -31,7 +31,7 @@ type RuntimeAnswer = {answerId?:string;answerOperationId?:string;cancellationId?
 type RunCancellation = NonNullable<Run["cancellation"]>;
 type PendingRunCancellation = {id:string;operation_id:string|null;subagent_id:string|null;cancellation_id:string|null;attempts:number;next_at:number};
 const terminal = new Set<RunStatus>(["completed","failed","cancelled","interrupted"]);
-const automatic = new Set<ComputerAction["type"]>(["readFile","listFiles","screenshot","checkpoint","execPoll","execCancel"]);
+const automatic = new Set<ComputerAction["type"]>(["readFile","listFiles","screenshot","browserRecover","checkpoint","execPoll","execCancel"]);
 const gui = new Set<ComputerAction["type"]>(["navigate","click","move","doubleClick","drag","type","key","scroll"]);
 const timestamp = ()=>new Date().toISOString();
 const legacyAdmissionFailure="The agent runtime could not accept this run.";
@@ -136,6 +136,7 @@ export class BotDO extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS admission_fences (operation_id TEXT PRIMARY KEY,created_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS run_processes (process_id TEXT PRIMARY KEY,run_id TEXT,subagent_id TEXT,tool_call_id TEXT,action TEXT NOT NULL,input TEXT NOT NULL,status TEXT NOT NULL,result TEXT,dispatch_state TEXT NOT NULL DEFAULT 'registered',cancel_requested INTEGER NOT NULL DEFAULT 0,cancel_attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS computer_operations (operation_id TEXT PRIMARY KEY,action TEXT NOT NULL,run_id TEXT);
+      CREATE TABLE IF NOT EXISTS browser_recovery_requests (operation_id TEXT PRIMARY KEY,previous_operation_id TEXT);
       CREATE TABLE IF NOT EXISTS process_observations (process_id TEXT PRIMARY KEY,sequence INTEGER NOT NULL DEFAULT 0,operation_id TEXT,next_at INTEGER NOT NULL);
     `);
     this.taskDeleting=ctx.storage.sql.exec("SELECT 1 FROM task_deletion WHERE id=1").toArray().length>0;
@@ -704,7 +705,7 @@ export class BotDO extends DurableObject<Env> {
 
     if(this.takingControl) throw new ApiError(409,"computer_busy","Desktop control is being acquired. Retry after the connection is established.");
     this.active();
-    if(!metadata?.provenance && metadata?.role!=="system" && !metadata?.subagentId && !metadata?.audioMessageId && /^(audio|audio-transcribe|approval|delegate|connection|secure|subagent|agent-result|subagent-report|mention|process-cancel|process-poll|run-cancel):/.test(input.operationId)) throw new ApiError(400,"reserved_operation_id","This operationId prefix is reserved.");
+    if(!metadata?.provenance && metadata?.role!=="system" && !metadata?.subagentId && !metadata?.audioMessageId && /^(audio|audio-transcribe|approval|delegate|connection|secure|subagent|agent-result|subagent-report|mention|process-cancel|process-poll|run-cancel|task-supervision):/.test(input.operationId)) throw new ApiError(400,"reserved_operation_id","This operationId prefix is reserved.");
     if(this.ctx.storage.sql.exec("SELECT 1 FROM admission_fences WHERE operation_id=?",input.operationId).toArray().length)throw new ApiError(409,"admission_fenced","This input was fenced after its request outcome could not be confirmed.");
     if(this.ctx.storage.sql.exec("SELECT operation_id FROM cancelled_agent_inputs WHERE operation_id=?",input.operationId).toArray().length) throw new ApiError(409,"run_cancelled","This delegated input has been cancelled.");
     if(metadata?.parentRunId && this.stopped(metadata.parentRunId)) throw new ApiError(409,"run_cancelled","The parent task has been cancelled.");
@@ -1087,6 +1088,7 @@ export class BotDO extends DurableObject<Env> {
 
   /** This outbox only admits durable inputs. Pi owns all execution and tool recovery. */
   private admit(nativeOperationId:string):Promise<void> {
+    if(nativeOperationId==='task-supervision:tick')return this.superviseTask();
     if(nativeOperationId==="audio-transcribe:upload-cleanup") return this.audio(true).processCleanup();
     if(nativeOperationId.startsWith("audio-transcribe:")) return this.audio(true).process(nativeOperationId.slice("audio-transcribe:".length));
     if(nativeOperationId.startsWith("run-cancel:")) return this.flushRunCancellations();
@@ -1217,6 +1219,7 @@ export class BotDO extends DurableObject<Env> {
         if(current.native_operation_id===nativeOperationId && latest.status==="queued" && (configurationFailure || [admissionPending,admissionExhausted,capacityPending,computerPending].includes(latest.error??""))) this.updateStatus(run.id,"queued");
       }
       if(!submission.subagent_id) this.observe(nativeOperationId);
+      if(this.taskId()&&!this.taskStopped())await this.runtime.scheduleAdmissionRetry('task-supervision:tick',60_000);
     } catch(error) {
       if(error instanceof ApiError && error.code==="computer_busy"&&!executionToken) {
         if(this.canAdmit(nativeOperationId,run.id))await this.waitForCapacity(nativeOperationId,run.id,computerPending);return;
@@ -1311,11 +1314,30 @@ export class BotDO extends DurableObject<Env> {
       // approval finalizers. Exact-ID deduplication and the capacity lane still
       // protect concurrent HTTP, recovery and Lifecycle admission.
       for(const row of rows) this.ctx.waitUntil(this.admit(row.native_operation_id));
+      if(rows.length&&this.taskId()&&!this.taskStopped())await this.runtime.scheduleAdmissionRetry('task-supervision:tick',60_000);
       // The computer provider deduplicates these operation IDs, including interrupted operations.
       const approvals=this.ctx.storage.sql.exec<JsonRow>("SELECT data FROM approvals WHERE json_extract(data,'$.status')='executing'").toArray();
       for(const row of approvals) await this.finishApproval(JSON.parse(row.data) as Approval);
     })().finally(()=>{this.recovering=undefined;});
     return this.recovering;
+  }
+  private async superviseTask():Promise<void> {
+    if(!this.taskId()||this.deleted||this.taskDeleting||this.taskStopped())return;
+    const active=this.ctx.storage.sql.exec("SELECT 1 FROM runs WHERE json_extract(data,'$.status') IN ('queued','running') LIMIT 1").toArray().length>0;
+    if(!active)return;
+    try {
+      // Resume native scheduling and reattach observers to exact accepted IDs.
+      // This neither injects a new turn nor aborts or replays an unsafe tool.
+      await this.runtime.reconcile();
+      await this.recover();
+      const report=taskProgress(this.ctx.storage.sql,true);
+      const previous=await this.ctx.storage.get<{phase:string;needsAttention:boolean}>('taskSupervision');
+      await this.ctx.storage.put('taskSupervision',report.supervision);
+      if(!previous||previous.phase!==report.supervision.phase||previous.needsAttention!==report.supervision.needsAttention)
+        this.emit('task.supervision.updated',report.supervision);
+    } finally {
+      if(!this.deleted&&!this.taskDeleting&&!this.taskStopped())await this.runtime.scheduleAdmissionRetry('task-supervision:tick',60_000);
+    }
   }
 
   private existingToolDecision(operationId:string,hash:string):RuntimeToolResult|undefined {
@@ -1443,7 +1465,7 @@ export class BotDO extends DurableObject<Env> {
     }
     const response=(async()=>{
       let pin:string|undefined,acknowledged=false;
-      if(!["readFile","listFiles","screenshot"].includes(action.type)) {
+      if(!["readFile","listFiles","screenshot","browserRecover"].includes(action.type)) {
         const fence=await this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName("owner")).fetch(`https://workspace/tasks/bot-slot/${this.bot().id}/direct-dispatch`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({lease,operationId:op,action})});
         // An unavailable/stale fence proves no new dispatch, not the outcome
         // of an older uncertain effect under this operation ID. Retain its pin.
@@ -1452,7 +1474,7 @@ export class BotDO extends DurableObject<Env> {
       }
       try {
         this.active();
-        if(!["readFile","listFiles","screenshot","execPoll","execCancel"].includes(action.type))this.invalidatePendingGui();
+        if(!["readFile","listFiles","screenshot","browserRecover","execPoll","execCancel"].includes(action.type))this.invalidatePendingGui();
         const result=await this.dispatchComputer(op,action);
         acknowledged=true;
         this.emit("computer.action",{operationId:op,actionType:action.type,input:computerActivityInput(action),result},undefined,`direct:${op}`);
@@ -1473,11 +1495,19 @@ export class BotDO extends DurableObject<Env> {
     return response.then(response=>response.clone());
   }
   private async dispatchComputer(op:string,action:ComputerAction,run?:Run,toolCallId?:string):Promise<ComputerResult> {
+    const browserPending=await this.ctx.storage.get<{operationId:string}>('unconfirmedBrowserAction');
+    if(gui.has(action.type)&&browserPending&&browserPending.operationId!==op)throw new ApiError(409,'browser_response_unconfirmed','Use browser_recover and inspect the current page before another browser action. No new action was executed.');
     const known=this.ctx.storage.sql.exec<{action:string;run_id:string|null}>("SELECT action,run_id FROM computer_operations WHERE operation_id=?",op).toArray()[0];
     if(known && (known.action!==JSON.stringify(action) || known.run_id!==(run?.id??null))) throw new ApiError(409,"idempotency_conflict","Computer operation arguments or owner changed.");
     // Reserve the invocation before persisting a cancellation intent. A reused
     // control ID must not fence another process when the provider rejects it.
     if(!known) this.ctx.storage.sql.exec("INSERT INTO computer_operations(operation_id,action,run_id) VALUES(?,?,?)",op,JSON.stringify(action),run?.id??null);
+    let recoveryTarget:string|undefined;
+    if(action.type==='browserRecover') {
+      this.ctx.storage.sql.exec('INSERT OR IGNORE INTO browser_recovery_requests(operation_id,previous_operation_id) VALUES(?,?)',op,browserPending?.operationId??null);
+      recoveryTarget=this.ctx.storage.sql.exec<{previous_operation_id:string|null}>('SELECT previous_operation_id FROM browser_recovery_requests WHERE operation_id=?',op).one().previous_operation_id??undefined;
+    }
+    if(gui.has(action.type))await this.ctx.storage.put('unconfirmedBrowserAction',{operationId:op});
     let process:ProcessRow|undefined;
     if(action.type==="exec") {
       process=this.registerProcess(op,action,run,toolCallId);
@@ -1495,7 +1525,11 @@ export class BotDO extends DurableObject<Env> {
       this.dispatchingProcesses.set(process!.process_id,(this.dispatchingProcesses.get(process!.process_id)??0)+1);
     }
     try {
-      const result=await this.computer.exec(this.bot().id,op,action);
+      const result=await this.computer.exec(this.bot().id,op,action.type==='browserRecover'&&recoveryTarget?{...action,previousOperationId:recoveryTarget}:action);
+      if(gui.has(action.type)&&result.status!=='interrupted'&&(await this.ctx.storage.get<{operationId:string}>('unconfirmedBrowserAction'))?.operationId===op)await this.ctx.storage.delete('unconfirmedBrowserAction');
+      if(action.type==='browserRecover'&&result.status==='completed'&&result.output) {
+        try {if(['settled','not_executed','computer_stopped','computer_restarted'].includes(JSON.parse(result.output).state)&&(await this.ctx.storage.get<{operationId:string}>('unconfirmedBrowserAction'))?.operationId===recoveryTarget)await this.ctx.storage.delete('unconfirmedBrowserAction');}catch{/* Keep the fence unless the receipt is understood. */}
+      }
       if(!process || this.deleted) return result;
       if(result.processKnown===false) {
         // Direct/API and model polls need the same missing-process fence as
@@ -1511,6 +1545,14 @@ export class BotDO extends DurableObject<Env> {
       if(this.process(process.process_id)?.cancel_requested) this.ctx.waitUntil(this.cancelProcess(process.process_id));
       return receipt;
     } catch(error) {
+      if(action.type==='browserRecover')return {operationId:op,status:'failed',error:'Browser recovery could not confirm the receipt. Wait and retry recovery; the original action was not repeated.'};
+      if(gui.has(action.type)) {
+        // Direct-action transport failures must retain their pinned lease until
+        // the exact operation journal is reconciled. Do not turn them into a
+        // terminal HTTP receipt that the workspace scheduler can release.
+        if(!run)throw error;
+        return {operationId:op,status:'interrupted',error:'The browser response could not be confirmed. Use browser_recover, then inspect the current page before repeating an action.'};
+      }
       if(initial&&!this.deleted&&error instanceof ComputerProviderError&&error.code==="computer_upgrade_required") {
         // Provider rejects these before dispatch/journaling any effect. They
         // must not invent an active process that prevents upgrade/suspend.
@@ -2210,7 +2252,7 @@ export class BotDO extends DurableObject<Env> {
         if(agentRoute[2]==="messages" && request.method==="GET") return json({messages:await this.runtime.subagentMessages(id)});
         if(agentRoute[2]==="messages" && request.method==="POST") {
           const input=parseMessage(await body(request));
-          if(input.mentions?.length || /^(audio|audio-transcribe|approval|delegate|connection|secure|subagent|agent-result|subagent-report|mention|process-cancel|process-poll|run-cancel):/.test(input.operationId)) throw new ApiError(400,"invalid_request","Use an independent operation ID for the subagent message.");
+          if(input.mentions?.length || /^(audio|audio-transcribe|approval|delegate|connection|secure|subagent|agent-result|subagent-report|mention|process-cancel|process-poll|run-cancel|task-supervision):/.test(input.operationId)) throw new ApiError(400,"invalid_request","Use an independent operation ID for the subagent message.");
           const agent=await this.subagent(id),parent=this.findRun(agent.parentOperationId);
           if(agent.status==="cancelled" || this.subagentStopped(id) || !parent || this.stopped(parent.id)) throw new ApiError(409,"agent_inactive","This subagent is no longer active.");
           const run=await this.createRun(input,{subagentId:id,parentRunId:parent.id});

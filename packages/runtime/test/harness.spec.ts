@@ -167,6 +167,9 @@ it('queues a child followup without changing its active tool attribution', async
       const before = (await instance.runtime.subagents())[0]!;
       await instance.runtime.sendSubagent(before.id, 'child-fixture-message', { operationId: 'queued-child-followup' });
       expect((await instance.runtime.subagents())[0]).toMatchObject({ operationId: before.operationId, status: 'running' });
+      await instance.runtime.reconcile();
+      await instance.runtime.reconcile();
+      expect((await instance.runtime.subagents())[0]).toMatchObject({ operationId: before.operationId, status: 'running' });
       await expect(instance.runtime.sendSubagent(before.id, 'conflicting text', { operationId: 'queued-child-followup' })).rejects.toThrow('another subagent message');
       instance.releaseHeldTool?.();
     });

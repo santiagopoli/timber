@@ -28,6 +28,7 @@ export type ComputerAction =
  | {type:"writeFile";path:string;content:string}
  | {type:"listFiles";path?:string}
  | {type:"screenshot"}
+ | {type:"browserRecover";previousOperationId?:string}
  | {type:"click";x:number;y:number;button?:"left"|"right"|"middle"}
  | {type:"move";x:number;y:number}
  | {type:"doubleClick";x:number;y:number;button?:"left"|"right"|"middle"}
@@ -52,7 +53,7 @@ export interface ApiError {error:{code:string;message:string};}
 
 export interface ConnectionRequest {id:string;botId:string;taskId?:string;runId:string;nativeOperationId?:string;provider:"github";repository?:string;permission:"read"|"write";status:"pending"|"connected"|"cancelled";createdAt:string;}
 
-export type {MemoryCategory,MemoryActor,MemoryState,MemorySource,MemoryEntry,MemorySaveInput,MemorySuggestionInput,MemoryForgetInput,MemoryAcceptInput,MemoryMutationResult,MemoryRevision,MemorySearchHit,MemorySearchResult,MemoryReviewStatus,MemoryLegacy,MemoryLimits,BotMemory} from './memory';
+export type {MemoryCategory,MemoryActor,MemoryState,MemorySource,MemoryEntry,MemorySaveInput,MemorySuggestionInput,MemoryForgetInput,MemoryRestoreInput,MemoryContextPreview,MemoryAcceptInput,MemoryMutationResult,MemoryRevision,MemorySearchHit,MemorySearchResult,MemoryReviewStatus,MemoryLegacy,MemoryLimits,BotMemory} from './memory';
 export interface CompactionReceipt {id:string;reason:"manual"|"threshold"|"overflow";status:"running"|"completed"|"unchanged"|"failed"|"cancelled";summaryApplied:boolean;error?:string;createdAt?:string;startedAt?:string;summaryCreatedAt?:string;firstKeptEntryId?:number;summarizedEntries?:number;estimatedTokensBefore?:number;historyRetained?:true;}
 export interface BotContextStatus {automatic:true;estimatedTokens:number;activeEntries:number;contextWindow:number;compactions:CompactionReceipt[];historyRetained:true;}
 

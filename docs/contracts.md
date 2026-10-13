@@ -526,6 +526,14 @@ recorded activity, not a claim that work failed. A read does not submit input,
 restart tasks or take a computer lease. Native prompts and tool arguments are
 not returned.
 
+The snapshot includes `supervision {phase,tool?,needsAttention,recovery}` to
+distinguish model generation, pending tools/subagents, compaction, queued work
+and human waits. A durable per-task tick every 60 seconds resumes Pi scheduling
+and reconciles accepted input/tool receipts using their existing identities.
+It creates no new turn, never cancels work because it is quiet, and stops rearming
+after Stop or when no runnable input remains. Five quiet minutes is a diagnostic
+attention signal only; a new user's message does not reset actual progress.
+
 The host tools `list_tasks {before?}` (30 per page) and
 `inspect_task {taskId,before?,limit?}` are available to computerless coordinators.
 `message_task {taskId,text}` lets the named parent send steering to those tasks, including durable messages while queued, or explicitly continue completed/failed work. It freezes message-versus-continuation routing before dispatch, so a lost acknowledgment cannot create a second continuation. The receipt also includes a bounded passive progress snapshot (three recent messages capped at 1,200 characters, six recent activity records, eight execution records and two inference records; inspect_task retains the fuller view) for the coordinator to report the actual current step; a failed snapshot is marked unavailable without repeating the accepted instruction. Temporary agents and other task conversations cannot invoke it; cancelled tasks remain fenced.
@@ -917,6 +925,18 @@ approval result and continuation input are persisted atomically; stale finalizer
 cannot overwrite a terminal approval or rewind a later continuation. Provider
 exceptions retain only reviewed diagnostic codes/messages, still mark the outcome
 unconfirmed, and never authorize an automatic retry of the effect.
+
+`browser_recover` is an automatic metadata-only native tool; the matching
+`browserRecover` action never restarts Chromium or closes tabs. After an uncertain
+desktop response, new GUI effects are blocked until recovery checks the original
+operation receipt. `pending` preserves the running action; `settled` requires
+inspecting the current page before deciding the next action. An unaccepted request
+is fenced against late delivery and reported as `not_executed`. Both the host-to-DO
+and DO-to-container transport boundaries are covered. The host supplies the private
+original operation reference; the public action parser strips caller references.
+Recovery exposes only receipt state/status, never original output or arguments.
+Older computer images without `browserReceipts` report recovery unavailable for
+unconfirmed container effects; they are not reset or upgraded automatically.
 Late admission or observation failures from an older native input cannot change
 the status of its replacement continuation or undo cancellation.
 
@@ -1321,6 +1341,10 @@ contract is `packages/contracts/src/memory.ts`:
 - `GET /memory/search?q=...&limit=...` returns
   `{results:{hits,total,truncated}}`. Search uses deterministic text ranking;
   `limit`, when present, is an integer from 1 to 50.
+- `GET /memory/context?q=...` returns `{context:{text,usedCharacters,maxCharacters,
+  selected,omittedCount}}`, using the same bounded selection as model recall.
+  `selected` contains note IDs, scopes and titles; this is a query preview, not
+  proof that a running turn has reloaded its prompt. Suggestions remain excluded.
 - `GET /memory/entries/:id` returns `{entry}`;
   `GET /memory/entries/:id/history` returns `{history}`.
 - `POST /memory/entries` accepts
@@ -1336,6 +1360,14 @@ contract is `packages/contracts/src/memory.ts`:
   `{operationId,expectedRevision,replacesRevision?}` and returns
   `{result:{entry,changed}}`. Accepting a correction also checks the revision
   of the entry it replaces.
+- `POST /memory/entries/:id/restore` accepts
+  `{operationId,expectedRevision,revision}` and returns `{result:{entry,changed}}`.
+  This creates a new user revision from that entry's retained history, with CAS
+  and replay receipts; it never rewinds history or removes forget fences.
+  Historical suggestions remain suggestions. Undo acceptance of a correction
+  atomically restores its replaced note, provided neither note changed afterward;
+  otherwise it returns 409 without modifying either record. The console offers
+  Undo after forgetting, accepting or discarding, plus revision restore.
 - `POST /memory/review` accepts `{operationId}` and returns `202 {review}`.
   A different manual operation ID while review is queued/running returns
   `409 memory_review_busy`; an existing ID returns its recorded receipt.

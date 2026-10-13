@@ -87,3 +87,40 @@ it('coordinates queued messages and completed-task continuations without duplica
  await status('cancelled');await expect(call(task.id,message,crypto.randomUUID())).rejects.toThrow('Cancelled tasks');
  const unmarked=await registry.fetch('https://workspace/tasks/message',{method:'POST',headers:{'content-type':'application/json'},body:'{}'});expect(unmarked.status).toBe(403);await unmarked.text();
 });
+
+it('supervises accepted task work with existing IDs, without new inputs, effects or interruption',async()=>{
+ const {bot,task,stub}=await setup();
+ await runInDurableObject(stub,async(instance,state)=>{
+  const at=new Date(Date.now()-600_000).toISOString(),runId=crypto.randomUUID();
+  state.storage.sql.exec('INSERT INTO runs(id,operation_id,fingerprint,native_operation_id,data) VALUES(?,?,?,?,?)',runId,'accepted','fixture','accepted',JSON.stringify({id:runId,botId:bot.id,operationId:'accepted',model:bot.model,status:'running',createdAt:at,updatedAt:at}));
+  const host=instance as unknown as {runtime:{reconcile:()=>Promise<void>;scheduleAdmissionRetry:(id:string,delay:number)=>Promise<void>};recover:()=>Promise<void>;superviseTask:()=>Promise<void>};
+  const saved={reconcile:host.runtime.reconcile,schedule:host.runtime.scheduleAdmissionRetry,recover:host.recover};
+  let reconciled=0,recovered=0;const scheduled:Array<[string,number]>=[];
+  host.runtime.reconcile=async()=>{reconciled++;};host.recover=async()=>{recovered++;};host.runtime.scheduleAdmissionRetry=async(id,delay)=>{scheduled.push([id,delay]);};
+  try {
+   await host.superviseTask();await host.superviseTask();
+   expect(reconciled).toBe(2);expect(recovered).toBe(2);expect(scheduled).toEqual([['task-supervision:tick',60_000],['task-supervision:tick',60_000]]);
+   expect(await state.storage.get('taskSupervision')).toMatchObject({phase:'reconciling',needsAttention:true});
+   expect(state.storage.sql.exec("SELECT 1 FROM events WHERE json_extract(data,'$.type')='task.supervision.updated'").toArray()).toHaveLength(1);
+   expect(JSON.parse(state.storage.sql.exec<{data:string}>('SELECT data FROM runs WHERE id=?',runId).one().data).status).toBe('running');
+   expect(state.storage.sql.exec('SELECT 1 FROM submissions').toArray()).toHaveLength(0);expect(state.storage.sql.exec('SELECT 1 FROM computer_operations').toArray()).toHaveLength(0);
+   for(const status of ['waiting_approval','waiting_connection']) {
+    state.storage.sql.exec('UPDATE runs SET data=json_set(data,\'$.status\',?) WHERE id=?',status,runId);await host.superviseTask();
+   }
+   expect(reconciled).toBe(2);expect(scheduled).toHaveLength(2);
+   state.storage.sql.exec("UPDATE runs SET data=json_set(data,'$.status','running') WHERE id=?",runId);
+   state.storage.sql.exec('INSERT INTO task_cancel_fences VALUES(?,?)',task.id,Date.now());await host.superviseTask();expect(reconciled).toBe(2);expect(scheduled).toHaveLength(2);
+  } finally {host.runtime.reconcile=saved.reconcile;host.runtime.scheduleAdmissionRetry=saved.schedule;host.recover=saved.recover;}
+ });
+});
+
+it('reserves the internal supervision prefix without trapping an ordinary public message ID',async()=>{
+ const {bot,task}=await setup();
+ await runInDurableObject(bindings.WORKSPACE.get(bindings.WORKSPACE.idFromName('owner')),(_,state)=>state.storage.sql.exec("UPDATE tasks SET data=json_set(data,'$.status','running') WHERE id=?",task.id));
+ for(const prefix of [`/v1/bots/${bot.id}`,`/v1/tasks/${task.id}`]) {
+  const rejected=await api(`${prefix}/messages`,{operationId:'task-supervision:tick',text:'This is a human input'});
+  expect(rejected.status).toBe(400);expect(rejected.data.error.code).toBe('reserved_operation_id');
+ }
+ const ordinary=await api(`/v1/bots/${bot.id}/messages`,{operationId:'task-supervision',text:'fixture:approval'});
+ expect(ordinary.status).toBe(202);expect(ordinary.data.run.operationId).toBe('task-supervision');
+});

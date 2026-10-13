@@ -64,3 +64,40 @@ describe("real ComputerDO journal recovery without a container", () => {
     expect(await action(stub, botId, "completed-action", request)).toEqual(result);
   });
 });
+
+it('reconciles a lost browser receipt without starting a computer, replaying its click or exposing its output',async()=>{
+ const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
+ const original:ComputerAction={type:'click',x:10,y:20};
+ await runInDurableObject(stub,async(_,state)=>{
+  await state.storage.put('operation:click-receipt',{digest:await digest(original),result:{operationId:'click-receipt',status:'completed',output:'private-browser-output-canary'}});
+  await state.storage.put('browserFence',{operationId:'click-receipt',bootId:'prior-boot'});
+ });
+ const result=await action(stub,botId,'recover-click',{type:'browserRecover',previousOperationId:'click-receipt'});
+ expect(result.status).toBe('completed');expect(JSON.parse(result.output!)).toMatchObject({state:'settled',status:'completed',inspectBeforeRetry:true});
+ expect(result.output).not.toContain('private-browser-output-canary');
+ await runInDurableObject(stub,async(_,state)=>expect(await state.storage.get('browserFence')).toBeUndefined());
+ expect(await action(stub,botId,'click-receipt',original)).toMatchObject({status:'completed',output:'private-browser-output-canary'});
+});
+
+it('fences a browser request not yet accepted by ComputerDO and refuses its delayed original delivery',async()=>{
+ const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
+ const recovered=await action(stub,botId,'fence-recovery',{type:'browserRecover',previousOperationId:'late-browser-click'});
+ expect(JSON.parse(recovered.output!)).toMatchObject({state:'not_executed',operationId:'late-browser-click'});
+ const late=await action(stub,botId,'late-browser-click',{type:'click',x:1,y:1});
+ expect(late.status).toBe('interrupted');expect(late.error).toContain('fenced');
+});
+
+it('does not infer a restart or release a browser fence when an old receipt has no boot identity',async()=>{
+ const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
+ await runInDurableObject(stub,async(instance,state)=>{
+  await state.storage.put('operation:legacy-browser',{digest:'old',result:{operationId:'legacy-browser',status:'interrupted'}});
+  const provider=instance as unknown as {health:()=>Promise<unknown>;reconcileBrowser:(id:string)=>Promise<Record<string,unknown>>},savedHealth=provider.health;
+  const descriptor=Object.getOwnPropertyDescriptor(instance,'container');
+  Object.defineProperty(instance,'container',{configurable:true,value:{running:true}});
+  provider.health=async()=>({bootId:'current-boot',capabilities:[]});
+  try {
+   expect(await provider.reconcileBrowser('legacy-browser')).toMatchObject({state:'unavailable'});
+   expect(await state.storage.get('browserFence')).toEqual({operationId:'legacy-browser',bootId:''});
+  } finally {provider.health=savedHealth;if(descriptor)Object.defineProperty(instance,'container',descriptor);else Reflect.deleteProperty(instance,'container');}
+ });
+});

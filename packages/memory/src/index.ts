@@ -1,7 +1,7 @@
 import type {
   BotMemory, MemoryAcceptInput, MemoryActor, MemoryCategory, MemoryEntry,
   MemoryForgetInput, MemoryLegacy, MemoryLimits, MemoryMutationResult,
-  MemoryRevision, MemorySaveInput, MemorySearchResult, MemorySource, MemorySuggestionInput,
+  MemoryRevision, MemorySaveInput, MemorySearchResult, MemorySource, MemorySuggestionInput, MemoryRestoreInput, MemoryContextPreview,
 } from '@botspace/contracts';
 
 /** Only the host chooses a scope or verifies evidence. This service never grants access. */
@@ -261,6 +261,42 @@ export function createMemoryService(storage: MemoryStorage) {
       return [...sql.exec('SELECT data FROM timber_memory_history WHERE scope = ? AND id = ? ORDER BY revision ASC', scope, id)].map(row => JSON.parse(String(row.data)) as MemoryRevision);
     },
     save(scope: string, input: MemorySaveInput, provenance: Provenance): MemoryMutationResult { return write(scope, input, provenance, false); },
+    restore(scope:string,input:MemoryRestoreInput):MemoryMutationResult {
+      identity(input.id,'Memory ID');revision(input.expectedRevision);revision(input.revision);
+      return mutate(scope,input.operationId,{kind:'restore',input},()=>{
+        const previous=get(scope,input.id);checkRevision(previous,input.expectedRevision);
+        const row=[...sql.exec('SELECT data FROM timber_memory_history WHERE scope=? AND id=? AND revision=?',scope,input.id,input.revision)][0];
+        if(!row)return invalid('Memory revision not found.');
+        const historical=(JSON.parse(String(row.data)) as MemoryRevision).entry;
+        const targetState=historical.state==='suggested'?'suggested':'active';
+        validateSave({operationId:input.operationId,category:historical.category,title:historical.title,content:historical.content,pinned:historical.pinned},{actor:'user',sources:[{kind:'user'}]});
+        const entries=all(scope);
+        if(targetState==='suggested') {
+          const latestRow=[...sql.exec('SELECT data FROM timber_memory_history WHERE scope=? AND id=? AND revision=?',scope,input.id,previous.revision)][0];
+          const latest=latestRow?JSON.parse(String(latestRow.data)) as MemoryRevision:undefined;
+          if(previous.state!=='suggested'&&!(previous.state==='forgotten'&&latest?.operation==='forget')&&!(previous.state==='active'&&latest?.operation==='accept'))conflict('This suggestion was changed after acceptance. Review its current note before restoring.');
+          if(previous.state!=='suggested')checkCapacity(entries,'suggested');
+          if(previous.state==='active'&&previous.replacesId) {
+            const replaced=get(scope,previous.replacesId);
+            if(replaced.state!=='forgotten'||replaced.revision!==(previous.replacesRevision??0)+1)conflict('The replaced note changed after acceptance. Restore each note explicitly.');
+            if(entries.some(entry=>entry.id!==previous.id&&entry.state==='active'&&normalizeMemoryText(entry.content)===normalizeMemoryText(replaced.content)))conflict('Another active memory already contains the previous note.');
+            const restoredOriginal=persist(scope,{...replaced,state:'active',actor:'user',sources:[{kind:'user'}],revision:replaced.revision+1,updatedAt:new Date().toISOString()},'restore').entry;
+            historical.replacesRevision=restoredOriginal.revision;
+          }
+        } else {
+          if(previous.state!=='active')checkCapacity(entries,'active');
+          if(entries.some(entry=>entry.id!==input.id&&entry.state==='active'&&normalizeMemoryText(entry.content)===normalizeMemoryText(historical.content)))conflict('Another active memory already contains this note.');
+        }
+        // Restore is an explicit user correction, never a rewind of the journal
+        // or removal of forget fences. Late automatic writes stay fenced.
+        fencePrevious(scope,previous);
+        const entry:MemoryEntry={id:previous.id,category:historical.category,title:historical.title,content:historical.content,
+          pinned:historical.pinned,state:targetState,revision:previous.revision+1,createdAt:previous.createdAt,
+          updatedAt:new Date().toISOString(),actor:'user',sources:targetState==='suggested'?historical.sources:[{kind:'user'}],
+          ...(targetState==='suggested'&&historical.replacesId?{replacesId:historical.replacesId,replacesRevision:historical.replacesRevision}:{})};
+        return persist(scope,entry,'restore');
+      });
+    },
     suggest(scope: string, input: MemorySuggestionInput, provenance: {actor: 'review' | 'agent'; sources: MemorySource[]}): MemoryMutationResult { return write(scope, input, provenance, true); },
     forget(scope: string, input: MemoryForgetInput, provenance: {actor: 'user' | 'agent'}): MemoryMutationResult {
       identity(input.id, 'Memory ID'); revision(input.expectedRevision);
@@ -339,6 +375,14 @@ export function createMemoryService(storage: MemoryStorage) {
         }
       }
       return result;
+    },
+    contextPreview(scope:string,query:string):MemoryContextPreview {
+      const text=this.selectContext(scope,query);
+      const selected=text.split('\n').flatMap(line=>{try {
+        const note=JSON.parse(line);return typeof note.content==='string'?[{id:String(note.id),scope:String(note.scope),title:String(note.title)}]:[];
+      }catch{return [];}});
+      return {text,selected,usedCharacters:text.length,maxCharacters:MEMORY_LIMITS.contextCharacters,
+        omittedCount:all(scope).filter(entry=>entry.state==='active').length-selected.length};
     },
   };
 }

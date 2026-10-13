@@ -133,6 +133,7 @@ export function parseAction(value:unknown):ComputerAction {
       return {type:"gitClone",repository,path:workspacePath,...(branch===undefined?{}:{branch})};
     }
     case "screenshot": return {type:"screenshot"};
+    case "browserRecover": return {type:"browserRecover"};
     case "move": return {type:"move",x:coordinate(data.x,"x",1279),y:coordinate(data.y,"y",799)};
     case "click":
     case "doubleClick": {

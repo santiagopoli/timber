@@ -254,3 +254,68 @@ test('agent-authored notes require human-readable evidence and assistant-only cl
   assert.throws(() => service.suggest('bot', note('preference-asst'), assistant), failure('invalid_memory'));
   assert.equal(service.overview('bot').entries.length, 0);
 });
+
+test('user restore creates a new revision, deduplicates receipt loss and fences stale automatic corrections',()=>{
+ const {service}=fixture(),first=service.save('bot',note(),author).entry;
+ const changed=service.save('bot',{...note('change','Prefiere respuestas en inglés.'),id:first.id,expectedRevision:first.revision},author).entry;
+ const input={operationId:'restore-1',id:first.id,expectedRevision:changed.revision,revision:first.revision};
+ const restored=service.restore('bot',input);
+ assert.equal(restored.entry.content,first.content);assert.equal(restored.entry.revision,3);assert.equal(restored.entry.actor,'user');
+ assert.deepEqual(service.restore('bot',input),restored);
+ assert.deepEqual(service.history('bot',first.id).map(item=>item.operation),['create','update','restore']);
+ assert.throws(()=>service.restore('bot',{...input,operationId:'stale-restore'}),failure('memory_conflict'));
+ assert.throws(()=>service.restore('other',{...input,operationId:'foreign-restore'}));
+ const forgotten=service.forget('bot',{operationId:'forget-again',id:first.id,expectedRevision:3},{actor:'user'}).entry;
+ const undone=service.restore('bot',{operationId:'undo-forget',id:first.id,expectedRevision:forgotten.revision,revision:3});
+ assert.equal(undone.entry.state,'active');assert.equal(undone.entry.revision,5);
+ assert.equal(service.history('bot',first.id).length,5);
+});
+
+test('memory preview reports exactly selected whole notes while excluding suggestions, forgotten notes and other scopes',()=>{
+ const {service}=fixture();
+ for(let i=0;i<12;i++)service.save('bot',{...note(`budget-${i}`,`Prefers concise explanations of topic ${i}. `.repeat(24)),title:`Topic ${i}`},author);
+ service.suggest('bot',{...note('suggested','This unconfirmed claim should stay outside context.'),category:'fact'},review);
+ service.save('other',note('other','Other namespace private note.'),author);
+ const preview=service.contextPreview('bot','');
+ assert.ok(preview.usedCharacters<=preview.maxCharacters);
+ assert.equal(preview.usedCharacters,preview.text.length);
+ assert.equal(preview.selected.length+preview.omittedCount,12);
+ assert.ok(preview.omittedCount>0);
+ assert.doesNotMatch(preview.text,/unconfirmed claim|Other namespace/);
+ for(const selected of preview.selected)assert.ok(preview.text.includes(service.get('bot',selected.id).content));
+});
+
+test('undo correction acceptance restores both histories atomically and keeps the suggestion pending', () => {
+ const {service}=fixture();
+ const original=service.save('bot',note('original','Prefiere francés.'),author).entry;
+ const suggestion=service.suggest('bot',{...note('suggest'),replacesId:original.id,replacesRevision:1},review).entry;
+ const accepted=service.accept('bot',{operationId:'accept',id:suggestion.id,expectedRevision:1,replacesRevision:1}).entry;
+ const input={operationId:'undo-accept',id:suggestion.id,expectedRevision:accepted.revision,revision:suggestion.revision};
+ const undone=service.restore('bot',input);
+ assert.equal(undone.entry.state,'suggested');assert.equal(undone.entry.replacesRevision,3);
+ assert.equal(service.get('bot',original.id).state,'active');assert.equal(service.get('bot',original.id).revision,3);
+ assert.deepEqual(service.restore('bot',input),undone);
+ assert.doesNotMatch(service.selectContext('bot','español'),/Prefiere respuestas en español/);
+ assert.equal(service.accept('bot',{operationId:'reaccept',id:suggestion.id,expectedRevision:3,replacesRevision:3}).entry.state,'active');
+});
+
+test('undo acceptance cannot overwrite later edits and leaves both records and receipts untouched on conflict', () => {
+ const {service}=fixture();
+ const original=service.save('bot',note('original','Prefiere francés.'),author).entry;
+ const suggestion=service.suggest('bot',{...note('suggest'),replacesId:original.id,replacesRevision:1},review).entry;
+ service.accept('bot',{operationId:'accept',id:suggestion.id,expectedRevision:1,replacesRevision:1});
+ service.restore('bot',{operationId:'restore-original',id:original.id,expectedRevision:2,revision:1});
+ const before=service.overview('bot');
+ assert.throws(()=>service.restore('bot',{operationId:'undo-accept',id:suggestion.id,expectedRevision:2,revision:1}),failure('memory_conflict'));
+ assert.deepEqual(service.overview('bot'),before);assert.equal(service.history('bot',suggestion.id).length,2);
+ service.save('bot',{...note('edit','Prefiere alemán.'),id:suggestion.id,expectedRevision:2},author);
+ assert.throws(()=>service.restore('bot',{operationId:'undo-edited',id:suggestion.id,expectedRevision:3,revision:1}),failure('memory_conflict'));
+});
+
+test('undo discarded suggestions never promotes them into model context', () => {
+ const {service}=fixture(),suggestion=service.suggest('bot',note('suggest'),review).entry;
+ const forgotten=service.forget('bot',{operationId:'discard',id:suggestion.id,expectedRevision:1},author).entry;
+ const restored=service.restore('bot',{operationId:'undo-discard',id:suggestion.id,expectedRevision:forgotten.revision,revision:1}).entry;
+ assert.equal(restored.state,'suggested');assert.equal(service.selectContext('bot','español'),'');
+ assert.equal(service.overview('bot').suggestions.length,1);
+});

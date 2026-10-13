@@ -48,6 +48,7 @@ export function computerActivityInput(action: ComputerAction): DisplayInput {
     case 'navigate': return {url: displayUrl(action.url)};
     case 'gitClone':
     case 'gitPush': return {repository: bounded(action.repository), path: bounded(action.path), ...(action.branch ? {branch: bounded(action.branch)} : {})};
+    case 'browserRecover':
     case 'screenshot':
     case 'checkpoint': return {};
   }

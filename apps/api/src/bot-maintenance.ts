@@ -29,6 +29,7 @@ export async function maintenanceRequest(request:Request,path:string,runtime:Age
       return json({compaction:await runtime.compact({operationId:id,...(instructions===undefined?{}:{instructions})})},202);
     }
     if(path==='/memory'&&request.method==='GET') return json({memory:await runtime.memory()});
+    if(path==='/memory/context'&&request.method==='GET') return json({context:await runtime.memoryContext(string(new URL(request.url).searchParams.get('q')??'','q',2000,0))});
     if(path==='/memory'&&request.method==='PUT') {
       throw new ApiError(409,'memory_upgrade_required','Memory now uses individual notes. Refresh Timber to edit or add a note; your existing notes are preserved.');
     }
@@ -42,10 +43,15 @@ export async function maintenanceRequest(request:Request,path:string,runtime:Age
       return json({review:await runtime.reviewMemory({operationId:operationId(input.operationId)})},202);
     }
     if(path==='/memory/entries'&&request.method==='POST') return json({result:await runtime.saveMemory(note(await body(request)))},201);
-    const entry=/^\/memory\/entries\/([A-Za-z0-9_-]{1,128})(?:\/(history|accept))?$/.exec(path);
+    const entry=/^\/memory\/entries\/([A-Za-z0-9_-]{1,128})(?:\/(history|accept|restore))?$/.exec(path);
     if(entry) {
       const [,id,action]=entry;
       if(action==='history'&&request.method==='GET') return json({history:await runtime.memoryHistory(id)});
+      if(action==='restore'&&request.method==='POST') {
+        const input=await body(request);
+        if(Object.keys(input).some(key=>!['operationId','expectedRevision','revision'].includes(key)))throw new ApiError(400,'invalid_request','Restore accepts only the revision and operation identity.');
+        return json({result:await runtime.restoreMemory({id,operationId:operationId(input.operationId),expectedRevision:revision(input.expectedRevision),revision:revision(input.revision,'revision')})});
+      }
       if(action==='accept'&&request.method==='POST') {
         const input=await body(request);
         return json({result:await runtime.acceptMemory({id,operationId:operationId(input.operationId),expectedRevision:revision(input.expectedRevision),...(input.replacesRevision===undefined?{}:{replacesRevision:revision(input.replacesRevision,'replacesRevision')})})});

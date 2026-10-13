@@ -1,5 +1,5 @@
 import type { DurableObject } from 'cloudflare:workers';
-import type { ModelCatalog, ModelSettings, Approval, Bot, BotContextStatus, BotMemory, MemoryEntry,MemoryRevision,MemorySearchResult,MemorySaveInput,MemoryForgetInput,MemoryAcceptInput,MemoryMutationResult,MemoryReviewStatus, CompactionReceipt, ComputerAction, ComputerResult } from '@botspace/contracts';
+import type { ModelCatalog, ModelSettings, Approval, Bot, BotContextStatus, BotMemory, MemoryEntry,MemoryRestoreInput,MemoryContextPreview,MemoryRevision,MemorySearchResult,MemorySaveInput,MemoryForgetInput,MemoryAcceptInput,MemoryMutationResult,MemoryReviewStatus, CompactionReceipt, ComputerAction, ComputerResult } from '@botspace/contracts';
 import type { AISettings } from 'agents/models/pi-ai';
 
 export type PendingApproval = {
@@ -148,10 +148,13 @@ export interface AgentRuntime {
   cancelSubagent(id: string): Promise<boolean>;
   contextStatus(): Promise<BotContextStatus>;
   compact(input: {operationId:string;instructions?:string}): Promise<CompactionReceipt>;
+  reconcile():Promise<void>;
   memory(): Promise<BotMemory>;
   updateMemory(content:string,revision:number): Promise<BotMemory>;
   memoryEntry(id:string):Promise<MemoryEntry>;
   memoryHistory(id:string):Promise<MemoryRevision[]>;
+  restoreMemory(input:MemoryRestoreInput):Promise<MemoryMutationResult>;
+  memoryContext(query:string):Promise<MemoryContextPreview>;
   searchMemory(query:string,limit?:number):Promise<MemorySearchResult>;
   saveMemory(input:MemorySaveInput):Promise<MemoryMutationResult>;
   forgetMemory(input:MemoryForgetInput):Promise<MemoryMutationResult>;

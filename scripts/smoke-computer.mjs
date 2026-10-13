@@ -27,6 +27,8 @@ assert.equal(health?.ok,true,'computer starts');
 assert.equal(health?.desktop,true,'real X11 desktop is available');
 assert.ok(health?.capabilities?.includes('execSessions'),'queryable execution is available');
 assert.ok(health?.capabilities?.includes('preserveBrowserCheckpoint'),'file checkpoints can preserve Chromium');
+assert.ok(health?.capabilities?.includes('browserReceipts'),'browser receipts can be reconciled');
+assert.equal((await fetch(origin+'/browser/reconcile',{method:'POST',body:'{}'})).status,401,'browser recovery requires host auth');
 assert.equal((await fetch(origin+'/health')).status,401,'unauthenticated container request rejected');
 assert.equal((await fetch(origin+'/secure-deploy/capabilities')).status,401,'private deploy capability requires host auth');
 const privateCapsResponse=await request('/secure-deploy/capabilities');
@@ -83,7 +85,9 @@ await action({type:'writeFile',path:'desktop-smoke.html',content:'<!doctype html
 await action({type:'exec',command:'python3 -m http.server 8765 --bind 127.0.0.1 > /tmp/smoke-http.log 2>&1 < /dev/null & echo $! > /tmp/smoke-http.pid',timeoutMs:10000});
 const legacyBrowserLocks=await action({type:'exec',command:'mkdir -p .browser-profile && ln -s previous-timber-host-15264 .browser-profile/SingletonLock && ln -s 123456 .browser-profile/SingletonCookie && ln -s /tmp/previous-timber-browser/socket .browser-profile/SingletonSocket',yieldMs:10000});
 assert.equal(legacyBrowserLocks.exitCode,0,'seed foreign-computer profile locks before launching real Chromium');
-await action({type:'navigate',url:'http://127.0.0.1:8765/desktop-smoke.html'});
+const navigation=await action({type:'navigate',url:'http://127.0.0.1:8765/desktop-smoke.html'});
+const navigationReceipt=await request(`/browser/receipts/${navigation.operationId}`);
+assert.deepEqual(await navigationReceipt.json(),{operationId:navigation.operationId,state:'settled',status:'completed'},'browser receipt contains only execution metadata');
 await pause(1000);
 const unicodeText = 'Hola, Poli. Café, λ y 👋';
 await action({type:'type',text:unicodeText});
@@ -98,6 +102,13 @@ const browserWindow = (await action({type:'exec',command:'xdotool search --onlyv
 const browserPidCommand='xdotool search --onlyvisible --class chromium | xargs -r -n 1 xdotool getwindowpid';
 const browserPid=(await action({type:'exec',command:browserPidCommand})).output;
 assert.match(browserPid,/^\d+\s*$/,'real Chromium has a process identity');
+const unacceptedBrowserId=randomUUID();
+const reconciled=await request('/browser/reconcile',{method:'POST',body:JSON.stringify({operationId:unacceptedBrowserId})});
+assert.equal(reconciled.status,200);
+assert.deepEqual(await reconciled.json(),{operationId:unacceptedBrowserId,state:'not_executed'});
+const lateClick=await action({type:'click',x:1,y:1},unacceptedBrowserId,'interrupted');
+assert.match(lateClick.error,/fenced/,'a late unaccepted browser request cannot execute after recovery');
+assert.equal((await action({type:'exec',command:browserPidCommand})).output,browserPid,'browser recovery preserves the existing Chromium process');
 for (let attempt=0;attempt<2;attempt++) {
   const saved=await request('/checkpoint',{method:'POST',body:JSON.stringify({preserveBrowser:true})});
   assert.equal(saved.status,200,'automatic checkpoint succeeds with Chromium running');

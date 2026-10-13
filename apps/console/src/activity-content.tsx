@@ -58,7 +58,7 @@ export function activityIdentity(name: string, command = '') {
   if (['screenshot','desktop_screenshot'].includes(name)) return {Icon: CameraIcon, label: 'Screenshot'};
   if (/click|move|drag/i.test(name) && name !== 'remove_app') return {Icon: MousePointer2Icon, label: 'Mouse'};
   if (['type','key','desktop_type','desktop_key'].includes(name)) return {Icon: KeyboardIcon, label: 'Keyboard'};
-  if (['navigate','browser_navigate','publish_app','list_apps','remove_app'].includes(name)) return {Icon: GlobeIcon, label: 'App'};
+  if (['browserRecover','browser_recover','navigate','browser_navigate','publish_app','list_apps','remove_app'].includes(name)) return {Icon: GlobeIcon, label: 'App'};
   if (name === 'checkpoint') return {Icon: SaveIcon, label: 'Checkpoint'};
   return {Icon: WrenchIcon, label: 'Tool'};
 }

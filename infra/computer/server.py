@@ -476,6 +476,8 @@ class Computer:
             with self.journal_lock:
                 row = self.db.execute("SELECT digest,result FROM operations WHERE id=?", (operation_id,)).fetchone()
                 if row:
+                    if row[0] == 'browser-recovery-fence':
+                        return {'operationId': operation_id, **json.loads(row[1])}
                     if row[0] != digest:
                         raise IdempotencyConflict()
                     return {"operationId": operation_id, **json.loads(row[1])}
@@ -489,6 +491,24 @@ class Computer:
                 self.db.execute("UPDATE operations SET result=? WHERE id=?", (json.dumps(result), operation_id))
                 self.db.commit()
             return {"operationId": operation_id, **result}
+
+    def browser_receipt(self, operation_id: str, *, fence_missing: bool = False) -> dict:
+        if not isinstance(operation_id, str) or not re.fullmatch(r'[A-Za-z0-9:_.-]{1,160}', operation_id):
+            raise ValueError('Invalid operation identity')
+        # Inspect independently of the desktop lock. Fence only requests not
+        # yet accepted; a running action is never interrupted or replayed.
+        with self.journal_lock:
+            row = self.db.execute('SELECT result FROM operations WHERE id=?', (operation_id,)).fetchone()
+            if row is None and fence_missing:
+                result = {'status': 'interrupted', 'error': 'The unaccepted browser request was fenced. No action was executed.'}
+                self.db.execute('INSERT INTO operations(id,digest,result) VALUES(?,?,?)', (operation_id, 'browser-recovery-fence', json.dumps(result)))
+                self.db.commit()
+                return {'operationId': operation_id, 'state': 'not_executed'}
+            if row is None:
+                return {'operationId': operation_id, 'state': 'unknown'}
+            if row[0] is None:
+                return {'operationId': operation_id, 'state': 'pending'}
+            return {'operationId': operation_id, 'state': 'settled', 'status': json.loads(row[0]).get('status')}
 
     @staticmethod
     def process_identity(pid: int) -> str | None:
@@ -1397,8 +1417,13 @@ def create_handler(computer: Computer, token: str):
                 desktop = all(shutil.which(tool) for tool in ["scrot", "xdotool", "chromium", "xclip"])
                 if desktop:
                     desktop = subprocess.run([*workspace_prefix(), "xdotool", "getdisplaygeometry"], env=computer.child_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2).returncode == 0
-                return self.respond(200, {"ok": True, "bootId": computer.boot_id, "desktop": desktop, "capabilities": ["gitClone", "gitPush", "workspace", "execSessions", "preserveBrowserCheckpoint", "workspaceChangeTracking"] + (["move", "doubleClick", "drag"] if desktop else []) + (["liveDesktop"] if desktop and desktop_ready() else [])})
+                return self.respond(200, {"ok": True, "bootId": computer.boot_id, "desktop": desktop, "capabilities": ["gitClone", "gitPush", "workspace", "execSessions", "preserveBrowserCheckpoint", "workspaceChangeTracking", "browserReceipts"] + (["move", "doubleClick", "drag"] if desktop else []) + (["liveDesktop"] if desktop and desktop_ready() else [])})
             parsed = urlparse(self.path)
+            if parsed.path.startswith('/browser/receipts/'):
+                try:
+                    return self.respond(200, computer.browser_receipt(parsed.path.removeprefix('/browser/receipts/')))
+                except ValueError as exc:
+                    return self.respond(400, {'error': str(exc)})
             if parsed.path.startswith("/workspace/"):
                 try:
                     params = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=8)
@@ -1458,6 +1483,8 @@ def create_handler(computer: Computer, token: str):
                         return self.respond(503, {"operationId": body.get("operationId"), "status": "unavailable", "code": "runner_unavailable"})
                     receipt = secure_deploy_dispatch(computer.workspace, body)
                     return self.respond(200, receipt)
+                if self.path == '/browser/reconcile':
+                    return self.respond(200, computer.browser_receipt(body.get('operationId'), fence_missing=True))
                 if self.path == "/actions":
                     return self.respond(200, computer.execute(body["operationId"], body["action"], body.get("gitTransport")))
                 if self.path == "/checkpoint":

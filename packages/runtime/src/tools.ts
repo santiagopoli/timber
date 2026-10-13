@@ -133,6 +133,8 @@ export function computerTools(bridge: ToolBridge) {
       execute: ({ processId }, api, context) => executeComputerTool(bridge, { type: 'execCancel', processId }, api, context) }),
     defineTool({ name: 'browser_navigate', description: 'Navigate the computer Chromium browser to an HTTP(S) URL. Host approval policy applies.', replay: 'unsafe', executionMode: 'sequential',
       parameters: Type.Object({ url: Type.String({ minLength: 1, maxLength: 4096 }) }), execute: ({ url }, api, context) => executeComputerTool(bridge, { type: 'navigate', url }, api, context) }),
+    defineTool({name:'browser_recover',description:'Reconcile an earlier browser action whose response was lost. Never repeats its action, stops an active action, closes tabs, or resets sign-ins. Pending means wait; settled means inspect the page with desktop_screenshot before deciding what remains. An unaccepted request is fenced so late delivery cannot execute it.',replay:'safe',executionMode:'sequential',parameters:Type.Object({}),
+      execute:(_args,api,context)=>executeComputerTool(bridge,{type:'browserRecover'},api,context)}),
     defineTool({ name: 'desktop_screenshot', description: 'Capture the actual desktop. Returns image pixels and an artifact reference.', replay: 'safe', executionMode: 'sequential',
       parameters: Type.Object({}), execute: (_args, api, context) => executeComputerTool(bridge, { type: 'screenshot' }, api, context) }),
     defineTool({ name: 'desktop_click', description: 'Click a desktop pixel coordinate. Host approval policy applies.', replay: 'unsafe', executionMode: 'sequential',

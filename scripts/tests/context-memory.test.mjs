@@ -107,3 +107,135 @@ test('manual compaction retries an unconfirmed receipt with the same operation i
     await login();const d=dialog(page);await d.locator('.timber-memory-context summary').click();await d.getByRole('button',{name:'Compact now',exact:true}).click();await d.getByRole('alert').waitFor();await d.getByRole('button',{name:'Compact now',exact:true}).click();await d.locator('[data-compaction-status="completed"]').waitFor();assert.equal(submissions.length,2);assert.equal(submissions[0].operationId,submissions[1].operationId);
   });
 });
+
+// These two new routes are isolated here until the shared console fixture adopts them.
+async function memoryEnhancements(page,state,{preview}={}) {
+  const restoreRequests=[],previewRequests=[],receipts=new Map(),control={restoreRepliesToLose:0,beforeRestore:undefined,beforeRestoreReply:undefined};
+  await page.route('**/v1/bots/*/memory/context?*',async route=>{
+    const url=new URL(route.request().url()),botId=url.pathname.split('/')[3],query=url.searchParams.get('q')||'';
+    previewRequests.push({botId,query});
+    const notes=state.memories.get(botId)?.entries||[],text=notes.map(entry=>`${entry.title}: ${entry.content}`).join('\n');
+    const context=preview?await preview({botId,query}):{text,usedCharacters:text.length,maxCharacters:8000,selected:notes.map(entry=>({id:entry.id,scope:'root',title:entry.title})),omittedCount:0};
+    await route.fulfill({json:{context}});
+  });
+  await page.route('**/v1/bots/*/memory/entries/*/restore',async route=>{
+    const url=new URL(route.request().url()),parts=url.pathname.split('/'),botId=parts[3],entryId=parts[6],body=route.request().postDataJSON();
+    restoreRequests.push({botId,entryId,body});
+    const key=`${botId}:${body.operationId}`,previous=receipts.get(key);
+    if(previous){assert.deepEqual(previous.body,body,'a replay must retain the original restore payload');return route.fulfill({json:previous.payload});}
+    if(control.beforeRestore)await control.beforeRestore();
+    const memory=state.memories.get(botId),history=state.memoryHistories.get(`${botId}:${entryId}`)||[],entry=memory?.entries.concat(memory.suggestions).find(item=>item.id===entryId)||history[0]?.entry;
+    if(!entry||entry.revision!==body.expectedRevision)return route.fulfill({status:409,json:{error:{code:'memory_conflict',message:'This memory changed. Review the latest revision before restoring.'}}});
+    const source=history.find(item=>item.entry.revision===body.revision)?.entry;
+    assert.ok(source&&['active','forgotten','suggested'].includes(source.state),'restoration requires an eligible saved revision');
+    const restored={...source,state:source.state==='suggested'?'suggested':'active',actor:'user',sources:source.state==='suggested'?source.sources:[{kind:'user'}],revision:entry.revision+1,updatedAt:new Date().toISOString()};
+    if(restored.state==='suggested'&&entry.state==='active'&&entry.replacesId){
+      // Mock the atomic restore response: the former note is active again and
+      // the correction points to its new revision, still pending acceptance.
+      const original=state.memoryHistories.get(`${botId}:${entry.replacesId}`)?.find(item=>item.entry.state==='active')?.entry;
+      assert.ok(original);const previous={...original,revision:original.revision+2};memory.entries.push(previous);restored.replacesRevision=previous.revision;
+    }
+    memory.entries=memory.entries.filter(item=>item.id!==entryId);memory.suggestions=memory.suggestions.filter(item=>item.id!==entryId);
+    (restored.state==='suggested'?memory.suggestions:memory.entries).push(restored);memory.revision++;
+    history.unshift({entry:structuredClone(restored),operation:'restore',at:restored.updatedAt});
+    const payload={result:{entry:restored,changed:true}};receipts.set(key,{body,payload});
+    if(control.beforeRestoreReply)await control.beforeRestoreReply();
+    if(control.restoreRepliesToLose>0){control.restoreRepliesToLose--;return route.fulfill({contentType:'application/json',body:'{"result":'});}
+    await route.fulfill({json:payload});
+  });
+  return {restoreRequests,previewRequests,control};
+}
+const showRevisions=async(page,id)=>{await note(page,id).locator('summary').filter({hasText:'Source & history'}).click();await note(page,id).getByRole('button',{name:'View revisions',exact:true}).click();await note(page,id).locator('.timber-memory-revisions').waitFor();};
+const revision=(page,number)=>note(page).locator(`[data-memory-revision="${number}"]`);
+const previewPanel=page=>dialog(page).locator('.timber-memory-preview');
+
+for(const width of [1440,390])test(`memory preview shows the separate character budget and selected notes at ${width}px`,async()=>{
+  await withPage(async({page,login,memory,state})=>{
+    memory.entries.push(initialEntry({id:'release-workflow',title:'Release workflow',content:'Check deployments before sharing links.'}),initialEntry({id:'omitted-note',title:'Travel preferences',content:'A note outside this selection.'}));
+    const {previewRequests}=await memoryEnhancements(page,state,{preview:async({query})=>({text:query?'Release workflow: Check deployments before sharing links.':'Response style: Use concise answers.\nRelease workflow: Check deployments before sharing links.',usedCharacters:query?56:7990,maxCharacters:8000,selected:memory.entries.slice(query?1:0,2).map(entry=>({id:entry.id,scope:'root',title:entry.title})),omittedCount:query?2:1})});
+    await login();assert.equal(previewRequests.length,0,'collapsed memory preview performs no selection request');
+    await previewPanel(page).locator('summary').first().click();const meter=previewPanel(page).getByRole('meter',{name:'Memory character budget'});await meter.waitFor();
+    assert.equal(await meter.getAttribute('max'),'8000');assert.equal(await meter.getAttribute('value'),'7990');assert.match(await previewPanel(page).innerText(),/7,990 \/ 8,000 characters/);assert.match(await dialog(page).locator('.timber-memory-context').innerText(),/42,000 tokens/);
+    assert.deepEqual(await previewPanel(page).getByRole('list',{name:'Selected memories'}).locator('li span').allTextContents(),['Response style','Release workflow']);assert.match(await previewPanel(page).innerText(),/1 other note is outside this selection/);
+    await previewPanel(page).getByText('Read selected memory',{exact:true}).click();assert.doesNotMatch(await previewPanel(page).locator('pre').innerText(),/Travel preferences|outside this selection/);
+    if(process.env.CONSOLE_SCREENSHOT_DIR){await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/memory-preview-${width}.png`,animations:'disabled'});}
+    await note(page).getByRole('button',{name:'Edit',exact:true}).click();await dialog(page).getByLabel('Memory note').fill('An unsaved note stays here.');
+    await previewPanel(page).getByLabel('Task to preview',{exact:true}).fill('ship a release');await page.waitForFunction(()=>document.querySelector('[aria-label="Memory character budget"]')?.getAttribute('value')==='56');
+    assert.deepEqual(await previewPanel(page).getByRole('list',{name:'Selected memories'}).locator('li span').allTextContents(),['Release workflow']);assert.equal(await dialog(page).getByLabel('Memory note').inputValue(),'An unsaved note stays here.');assert.equal(previewRequests.at(-1).query,'ship a release');
+    assert.equal(await dialog(page).evaluate(element=>element.scrollWidth<=element.clientWidth),true,'preview remains within the mobile dialog');
+  },width);
+});
+
+test('restoring historical active or forgotten revisions creates a user revision without replacing a draft',async()=>{
+  await withPage(async({page,login,memory,state})=>{
+    const first=structuredClone(memory.entries[0]),forgotten={...first,state:'forgotten',revision:2},current={...first,revision:3,content:'Current saved preference.'};memory.entries=[current];memory.revision=3;
+    state.memoryHistories.set(`${BOT_A}:${first.id}`,[{entry:current,operation:'restore',at:current.updatedAt},{entry:forgotten,operation:'forget',at:first.updatedAt},{entry:first,operation:'create',at:first.updatedAt}]);
+    const {restoreRequests}=await memoryEnhancements(page,state);await login();await dialog(page).getByRole('button',{name:'Add memory',exact:true}).click();await dialog(page).getByLabel('Memory title').fill('Unfinished note');await dialog(page).getByLabel('Memory note').fill('Keep this draft through restoration.');await showRevisions(page);
+    assert.equal(await revision(page,3).getByRole('button',{name:'Restore this revision',exact:true}).count(),0);assert.equal(await revision(page,2).getByRole('button',{name:'Restore this revision',exact:true}).count(),1);
+    await revision(page,1).getByRole('button',{name:'Restore this revision',exact:true}).click();await dialog(page).getByRole('status').filter({hasText:'Note restored.'}).waitFor();await note(page).locator('.timber-memory-note-content').filter({hasText:'Use concise answers.'}).waitFor();
+    assert.equal(memory.entries[0].revision,4);assert.equal(memory.entries[0].actor,'user');assert.deepEqual(memory.entries[0].sources,[{kind:'user'}]);assert.equal(restoreRequests[0].body.expectedRevision,3);assert.equal(restoreRequests[0].body.revision,1);assert.equal(await dialog(page).getByLabel('Memory note').inputValue(),'Keep this draft through restoration.');
+    await showRevisions(page);await revision(page,2).getByRole('button',{name:'Restore this revision',exact:true}).click();await note(page).locator('.timber-memory-note-content').filter({hasText:'Use concise answers.'}).waitFor();await page.waitForFunction(()=>document.querySelector('[data-memory-entry="memory-concise"]')?.textContent.includes('revision 5'));
+    assert.equal(restoreRequests[1].body.expectedRevision,4);assert.equal(restoreRequests[1].body.revision,2);assert.equal(memory.entries[0].state,'active');assert.equal(await dialog(page).getByLabel('Memory title').inputValue(),'Unfinished note');
+  });
+});
+
+test('a concurrent revision rejects restoration, refreshes the note and preserves the unsaved draft',async()=>{
+  await withPage(async({page,login,memory,state})=>{
+    const original=structuredClone(memory.entries[0]);memory.entries[0]={...original,revision:2,content:'Saved revision two.'};memory.revision=2;
+    state.memoryHistories.get(`${BOT_A}:${original.id}`).unshift({entry:structuredClone(memory.entries[0]),operation:'update',at:original.updatedAt});
+    const {restoreRequests,control}=await memoryEnhancements(page,state);await login();await note(page).getByRole('button',{name:'Edit',exact:true}).click();await dialog(page).getByLabel('Memory note').fill('My draft survives a restore conflict.');await showRevisions(page);
+    control.beforeRestore=()=>{control.beforeRestore=undefined;memory.entries[0]={...original,revision:3,content:'A concurrent saved correction.'};memory.revision=3;state.memoryHistories.get(`${BOT_A}:${original.id}`).unshift({entry:structuredClone(memory.entries[0]),operation:'update',at:original.updatedAt});};
+    await revision(page,1).getByRole('button',{name:'Restore this revision',exact:true}).click();await dialog(page).getByRole('alert').filter({hasText:'This memory changed.'}).waitFor();await note(page).getByText('A concurrent saved correction.',{exact:true}).waitFor();
+    assert.equal(restoreRequests.length,1);assert.equal(restoreRequests[0].body.expectedRevision,2);assert.equal(memory.entries[0].revision,3);assert.equal(await dialog(page).getByLabel('Memory note').inputValue(),'My draft survives a restore conflict.');assert.equal(await dialog(page).getByRole('button',{name:'Retry request',exact:true}).count(),0);
+    await dialog(page).getByRole('button',{name:'Refresh memory',exact:true}).click();await showRevisions(page);await revision(page,1).getByRole('button',{name:'Restore this revision',exact:true}).click();await dialog(page).getByRole('status').filter({hasText:'Note restored.'}).waitFor();
+    assert.deepEqual(restoreRequests.map(item=>item.body.expectedRevision),[2,3]);assert.notEqual(restoreRequests[0].body.operationId,restoreRequests[1].body.operationId);assert.equal(await dialog(page).getByLabel('Memory note').inputValue(),'My draft survives a restore conflict.');
+  });
+});
+
+test('Forget and Undo recover lost receipts with identical operation IDs and no extra revisions',async()=>{
+  await withPage(async({page,login,memory,state})=>{
+    const {restoreRequests,control}=await memoryEnhancements(page,state);await login();state.memoryRepliesToLose=1;
+    await note(page).getByRole('button',{name:'Forget',exact:true}).click();await dialog(page).getByRole('button',{name:'Retry request',exact:true}).click();await dialog(page).getByRole('button',{name:'Undo',exact:true}).waitFor();assert.equal(memory.entries.length,0);
+    const deletes=state.calls.filter(call=>call.method==='DELETE'&&call.path.endsWith('/memory/entries/memory-concise'));assert.equal(deletes.length,2);assert.deepEqual(deletes[0].body,deletes[1].body);
+    control.restoreRepliesToLose=1;await dialog(page).getByRole('button',{name:'Undo',exact:true}).click();await dialog(page).getByRole('button',{name:'Retry request',exact:true}).waitFor();assert.equal(memory.entries[0].revision,3);
+    await close(page);await page.getByRole('button',{name:'Context and memory',exact:true}).click();await dialog(page).getByRole('button',{name:'Retry request',exact:true}).click();await dialog(page).getByRole('status').filter({hasText:'Note restored.'}).waitFor();
+    assert.equal(restoreRequests.length,2);assert.deepEqual(restoreRequests[0].body,restoreRequests[1].body);assert.equal(restoreRequests[0].body.expectedRevision,2);assert.equal(restoreRequests[0].body.revision,1);assert.equal(memory.entries[0].revision,3);assert.equal(state.memoryHistories.get(`${BOT_A}:memory-concise`).length,3);assert.equal(await dialog(page).getByRole('button',{name:'Undo',exact:true}).count(),0);
+  });
+});
+
+test('slow memory previews and restore receipts cannot cross a bot switch',async()=>{
+  await withPage(async({page,login,memory,state,open})=>{
+    let releasePreview,previewStarted,releaseRestore,restoreStarted;const previewGate=new Promise(resolve=>{releasePreview=resolve;}),previewSeen=new Promise(resolve=>{previewStarted=resolve;}),restoreGate=new Promise(resolve=>{releaseRestore=resolve;}),restoreSeen=new Promise(resolve=>{restoreStarted=resolve;});
+    const other=initialEntry({id:'linus-memory',title:'Linus private note',content:'Only for Linus.'});state.memories.set(BOT_B,initialMemory([other]));
+    const {control}=await memoryEnhancements(page,state,{preview:async({botId})=>{const entry=botId===BOT_A?memory.entries[0]:other;if(botId===BOT_A){previewStarted();await previewGate;}return {text:entry.content,usedCharacters:entry.content.length,maxCharacters:8000,selected:[{id:entry.id,scope:'root',title:entry.title}],omittedCount:0};}});
+    await login();await previewPanel(page).locator('summary').first().click();await previewSeen;await close(page);await page.locator('#mobile-back').click();await page.locator(`[data-bot-id="${BOT_B}"]`).click();await open();await previewPanel(page).locator('summary').first().click();await previewPanel(page).getByText('Linus private note',{exact:true}).waitFor();releasePreview();assert.doesNotMatch(await previewPanel(page).innerText(),/Response style/);
+    await close(page);await page.locator('#mobile-back').click();await page.locator(`[data-bot-id="${BOT_A}"]`).click();await open();await note(page).getByRole('button',{name:'Forget',exact:true}).click();await dialog(page).getByRole('button',{name:'Undo',exact:true}).waitFor();
+    control.beforeRestoreReply=async()=>{restoreStarted();await restoreGate;};await dialog(page).getByRole('button',{name:'Undo',exact:true}).click();await restoreSeen;await close(page);await page.locator('#mobile-back').click();await page.locator(`[data-bot-id="${BOT_B}"]`).click();await open();const receipt=page.waitForResponse(response=>response.url().endsWith('/memory/entries/memory-concise/restore'));releaseRestore();await receipt;await note(page,other.id).waitFor();await dialog(page).getByRole('button',{name:'Add memory',exact:true}).click();await dialog(page).getByLabel('Memory note').fill('A new Linus draft.');
+    assert.doesNotMatch(await dialog(page).innerText(),/Note restored|Response style/);assert.equal(await dialog(page).getByRole('button',{name:'Undo',exact:true}).count(),0);assert.equal(state.memories.get(BOT_B).entries[0].revision,1);assert.equal(memory.entries[0].revision,3);
+  },390);
+});
+
+for(const action of ['Accept','Discard'])test(`Undo ${action.toLowerCase()} returns a suggestion to review and retries lost receipts without promotion`,async()=>{
+  await withPage(async({page,login,memory,state})=>{
+    const suggestion=initialEntry({id:'reversible-suggestion',title:'Suggested response style',state:'suggested',content:'Use concise answers unless detail is requested.',pinned:false,replacesId:'memory-concise',replacesRevision:1});memory.suggestions=[suggestion];state.memoryHistories.set(`${BOT_A}:${suggestion.id}`,[{entry:structuredClone(suggestion),operation:'suggest',at:suggestion.createdAt}]);
+    const {restoreRequests,control}=await memoryEnhancements(page,state);await login();await dialog(page).getByRole('button',{name:'Add memory',exact:true}).click();await dialog(page).getByLabel('Memory title').fill('Unsaved memory');await dialog(page).getByLabel('Memory note').fill('Keep my draft while undoing a suggestion.');state.memoryRepliesToLose=1;
+    await note(page,suggestion.id).getByRole('button',{name:action,exact:true}).click();await dialog(page).getByRole('button',{name:'Retry request',exact:true}).click();await dialog(page).getByRole('button',{name:'Undo',exact:true}).waitFor();
+    assert.equal(memory.suggestions.length,0);assert.equal(memory.entries.some(item=>item.id===suggestion.id),action==='Accept');
+    const attempts=state.calls.filter(call=>action==='Accept'?call.path.endsWith(`/${suggestion.id}/accept`):call.method==='DELETE'&&call.path.endsWith(`/${suggestion.id}`));assert.equal(attempts.length,2);assert.deepEqual(attempts[0].body,attempts[1].body);
+    control.restoreRepliesToLose=1;await dialog(page).getByRole('button',{name:'Undo',exact:true}).click();await dialog(page).getByRole('button',{name:'Retry request',exact:true}).click();await dialog(page).getByRole('status').filter({hasText:'Suggestion restored.'}).waitFor();await note(page,suggestion.id).getByRole('button',{name:'Accept',exact:true}).waitFor();
+    assert.equal(memory.entries.some(item=>item.id===suggestion.id),false);assert.equal(memory.suggestions.length,1);assert.equal(memory.suggestions[0].revision,3);assert.equal(memory.suggestions[0].state,'suggested');assert.deepEqual(memory.suggestions[0].sources,suggestion.sources);assert.equal(memory.entries.find(item=>item.id==='memory-concise').content,'Use concise answers.');assert.equal(await note(page,suggestion.id).getByRole('button',{name:'Accept',exact:true}).isDisabled(),false);
+    assert.equal(restoreRequests.length,2);assert.deepEqual(restoreRequests[0].body,restoreRequests[1].body);assert.equal(restoreRequests[0].body.expectedRevision,2);assert.equal(restoreRequests[0].body.revision,1);assert.equal(await dialog(page).getByLabel('Memory note').inputValue(),'Keep my draft while undoing a suggestion.');
+    await showRevisions(page,suggestion.id);await note(page,suggestion.id).locator('[data-memory-revision="1"]').getByRole('button',{name:'Restore suggestion',exact:true}).click();await page.waitForFunction(()=>document.querySelector('[data-memory-entry="reversible-suggestion"]')?.textContent.includes('revision 4'));
+    assert.equal(restoreRequests[2].body.expectedRevision,3);assert.equal(restoreRequests[2].body.revision,1);assert.equal(memory.suggestions[0].state,'suggested');assert.equal(await dialog(page).getByLabel('Memory note').inputValue(),'Keep my draft while undoing a suggestion.');
+  },action==='Discard'?390:1440);
+});
+
+test('history offers Restore suggestion after acceptance but not after a later edit',async()=>{
+  await withPage(async({page,login,memory,state})=>{
+    const suggested=initialEntry({id:'history-suggestion',state:'suggested',title:'A past suggestion',content:'The suggested preference.'}),accepted={...suggested,state:'active',revision:2},edited={...accepted,id:'edited-suggestion',revision:3,title:'An edited accepted note',content:'A later deliberate edit.'};memory.entries=[accepted,edited];memory.revision=3;
+    state.memoryHistories.set(`${BOT_A}:${accepted.id}`,[{entry:accepted,operation:'accept',at:accepted.updatedAt},{entry:suggested,operation:'suggest',at:suggested.updatedAt}]);state.memoryHistories.set(`${BOT_A}:${edited.id}`,[{entry:edited,operation:'update',at:edited.updatedAt},{entry:{...accepted,id:edited.id},operation:'accept',at:edited.updatedAt},{entry:{...suggested,id:edited.id},operation:'suggest',at:edited.updatedAt}]);
+    const {restoreRequests}=await memoryEnhancements(page,state);await login();await showRevisions(page,edited.id);assert.equal(await note(page,edited.id).getByRole('button',{name:'Restore suggestion',exact:true}).count(),0);assert.equal(await note(page,edited.id).getByRole('button',{name:'Restore this revision',exact:true}).count(),1);
+    await showRevisions(page,accepted.id);await note(page,accepted.id).getByRole('button',{name:'Restore suggestion',exact:true}).click();await dialog(page).getByRole('status').filter({hasText:'Suggestion restored.'}).waitFor();await note(page,accepted.id).getByRole('button',{name:'Accept',exact:true}).waitFor();
+    assert.equal(restoreRequests[0].body.expectedRevision,2);assert.equal(restoreRequests[0].body.revision,1);assert.equal(memory.suggestions[0].id,accepted.id);assert.equal(memory.entries[0].id,edited.id);assert.equal(memory.entries[0].content,'A later deliberate edit.');
+  });
+});

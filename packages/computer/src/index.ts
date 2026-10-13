@@ -21,7 +21,9 @@ export interface ComputerEnv {
   COMPUTER_BOOTSTRAP?: string;
 }
 
-interface OperationRecord { digest: string; result?: ComputerResult; processId?: string; conflict?:boolean; checkpoint?:{bootId:string;revision:number;warning?:string}; }
+interface OperationRecord { digest: string; result?: ComputerResult; processId?: string; conflict?:boolean;browserBootId?:string;checkpoint?:{bootId:string;revision:number;warning?:string}; }
+interface BrowserFence {operationId:string;bootId:string;}
+const BROWSER_ACTIONS=new Set<ComputerAction['type']>(['navigate','click','doubleClick','drag','move','type','key','scroll']);
 interface OperationWork {effect:boolean;checkpoint?:{bootId:string;revision:number};}
 interface ExecutionWork {status:ComputerResult['status'];checkpoint:ExecSession['checkpoint'];}
 interface JournalIndexMigration {phase:'operations'|'executions';cursor?:string;}
@@ -422,7 +424,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       const mode=input.mode;
       const replaces=input.replaces as string|undefined;
       const create=()=>this.withWorkspace(async()=>{
-        if(mode==='control' && await this.hasActiveExecutions()) throw new ComputerProviderError('computer_execution_active');
+        if(mode==='control' && (await this.hasActiveExecutions()||await this.ctx.storage.get('browserFence'))) throw new ComputerProviderError('computer_execution_active');
         let health=this.container?.running && this.workspaceHealth
           ? this.workspaceHealth : await this.initializeWorkspace(botId);
         if(!health.capabilities?.includes("liveDesktop") && !health.capabilities?.includes("workspace")) throw new ComputerProviderError("computer_upgrade_required");
@@ -509,9 +511,16 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       const existingRecord = await this.ctx.storage.get<OperationRecord>(key);
       this.active();
       if (existingRecord) {
+        if(existingRecord.digest==='browser-recovery-fence'&&existingRecord.result)return existingRecord.result;
         if (existingRecord.digest !== digest) return {operationId, status:"failed" as const, error:"operationId was already used with different arguments"};
         return existingRecord.result ?? {operationId, status:"interrupted" as const, error:"Operation outcome is unknown; it will not be replayed"};
       }
+      if(action.type==='browserRecover') {
+        const recovery=await this.reconcileBrowser(action.previousOperationId);
+        const result:ComputerResult={operationId,status:'completed',output:JSON.stringify(recovery)};
+        await this.storeOperation(operationId,{digest,result});return result;
+      }
+      if(BROWSER_ACTIONS.has(action.type)&&await this.ctx.storage.get('browserFence'))return {operationId,status:'failed' as const,error:'An earlier browser action has no confirmed response. Use browser_recover, then inspect the current page before another browser action. This action was not executed.'};
       if(!["screenshot","readFile","listFiles"].includes(action.type) && await this.live.controlled()) return {operationId,status:"failed" as const,error:"A person has control of the desktop. No action was executed. Release desktop control before issuing a new action."};
       const health=await this.ensureReady(botId);
       if((action.type==="gitClone" || action.type==="gitPush") && !health.capabilities?.includes(action.type)) throw new ComputerProviderError("computer_upgrade_required");
@@ -520,13 +529,14 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       this.active();
       const reserved=await this.ctx.storage.transaction(async txn=>{
         const record=await txn.get<OperationRecord>(key);
-        if(!record)await txn.put({[key]:{digest},[`operation-work:${operationId}`]:{effect:true} satisfies OperationWork});
+        if(!record)await txn.put({[key]:{digest,...(BROWSER_ACTIONS.has(action.type)?{browserBootId:health.bootId}:{})},[`operation-work:${operationId}`]:{effect:true} satisfies OperationWork});
         return record;
       });
       if(reserved) return reserved.digest===digest
         ? reserved.result??{operationId,status:'interrupted' as const,error:'Operation outcome is unknown; it will not be replayed'}
         : {operationId,status:'failed' as const,error:'operationId was already used with different arguments'};
       if(action.type==='writeFile' || action.type==='gitClone') await this.markCheckpointDirty(operationId,health.bootId);
+      if(BROWSER_ACTIONS.has(action.type)&&health.capabilities?.includes('browserReceipts'))await this.ctx.storage.put('browserFence',{operationId,bootId:health.bootId} satisfies BrowserFence);
       this.active();
       let result: ComputerResult;
       let operationStage: "checkpoint" | "action" | "artifact_read" | "artifact_store" = "action";
@@ -567,6 +577,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       }
       this.active();
       await this.storeOperation(operationId,{...await this.ctx.storage.get<OperationRecord>(key),digest,result});
+      if(BROWSER_ACTIONS.has(action.type)&&result.status!=='interrupted')await this.ctx.storage.delete('browserFence');
       // The effect's outcome is now durable. Failure to renew its idle lifetime
       // must not replace that known result with an uncertain transport failure.
       try { await this.touch(); }
@@ -1010,6 +1021,51 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       catch {console.error("computer.failure",{stage:"preview_touch",code:"computer_lifecycle_failed"});}
     }
     return response;
+  }
+
+  private async reconcileBrowser(previousOperationId?:string):Promise<Record<string,unknown>> {
+    const current=await this.ctx.storage.get<BrowserFence>('browserFence');
+    const target=previousOperationId??current?.operationId;
+    if(target&&!/^[A-Za-z0-9:_.-]{1,160}$/.test(target))throw new ComputerProviderError('computer_invalid_request');
+    let fence=current;
+    if(target) {
+      const record=await this.ctx.storage.get<OperationRecord>(`operation:${target}`);
+      if(record?.digest==='browser-recovery-fence') {
+        if(current?.operationId===target)await this.ctx.storage.delete('browserFence');
+        return {state:'not_executed',operationId:target,message:'The unaccepted browser request is fenced against late delivery.'};
+      }
+      if(record?.result&&['completed','failed','cancelled'].includes(record.result.status)) {
+        if(current?.operationId===target)await this.ctx.storage.delete('browserFence');
+        return {state:'settled',operationId:target,status:record.result.status,inspectBeforeRetry:true,message:'The durable receipt confirms that the action finished. Inspect the current page before retrying.'};
+      }
+      if(!record) {
+        // Fence a delayed caller -> ComputerDO request as well as the server
+        // RPC. Recovery never allows an unaccepted old request to arrive later.
+        await this.storeOperation(target,{digest:'browser-recovery-fence',conflict:true,result:{operationId:target,status:'interrupted',error:'The unaccepted browser request was fenced. No action was executed.'}});
+        return {state:'not_executed',operationId:target,message:'The request was not accepted and is fenced against late delivery.'};
+      }
+      if(current&&current.operationId!==target)return {state:'pending',operationId:target,message:'Another browser action is awaiting reconciliation. No action was repeated.'};
+      fence={operationId:target,bootId:record.browserBootId??current?.bootId??''};
+      if(!current)await this.ctx.storage.put('browserFence',fence);
+    }
+    if(!fence)return {state:'no_pending_action',message:'No tracked browser action is awaiting reconciliation. Existing tabs and sessions are preserved.'};
+    if(!this.container?.running) {
+      await this.ctx.storage.delete('browserFence');
+      return {state:'computer_stopped',operationId:fence.operationId,inspectBeforeRetry:true,message:'The old computer is stopped. Its last action remains unconfirmed; inspect restored effects before retrying.'};
+    }
+    const health=await this.health();
+    if(fence.bootId&&health.bootId!==fence.bootId) {
+      await this.ctx.storage.delete('browserFence');
+      return {state:'computer_restarted',operationId:fence.operationId,inspectBeforeRetry:true};
+    }
+    if(!health.capabilities?.includes('browserReceipts'))return {state:'unavailable',operationId:fence.operationId,message:'This computer cannot inspect browser receipts yet. The previous action was not replayed.'};
+    const response=await this.call('/browser/reconcile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operationId:fence.operationId}),signal:AbortSignal.timeout(5000)});
+    if(!response.ok)throw new ComputerProviderError('computer_unavailable');
+    const receipt=await response.json<{operationId?:unknown;state?:unknown;status?:unknown}>();
+    if(receipt.operationId!==fence.operationId||!['pending','settled','not_executed'].includes(String(receipt.state)))throw new ComputerProviderError('computer_unavailable');
+    if(receipt.state!=='pending')await this.ctx.storage.delete('browserFence');
+    return {operationId:fence.operationId,state:receipt.state,...(typeof receipt.status==='string'?{status:receipt.status}:{}),inspectBeforeRetry:receipt.state==='settled',
+      message:receipt.state==='pending'?'The original action is still running. It was not stopped or repeated.':receipt.state==='not_executed'?'The original request was not accepted and is now fenced against late delivery. No action was executed.':'The action finished. Inspect the current page before deciding whether anything remains to do.'};
   }
 
   async alarm(): Promise<void> {
