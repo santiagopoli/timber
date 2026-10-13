@@ -12,7 +12,11 @@ import {makeToneWav} from './audio-wav.mjs';
 
 const consoleBrowser=createConsoleBrowser(),date='2026-10-05T10:00:00.000Z',wav=makeToneWav(),longWav=makeToneWav({durationSeconds:31,sampleRate:8000,amplitudeModulationHz:0.1});
 async function closeResources(resources,originalError){
-  const results=await Promise.allSettled(resources.map(resource=>resource?.close()));
+  // Close children before their parent browser; every phase still runs even
+  // when an earlier resource rejects, without masking a scenario failure.
+  const [context,fixture,browser]=resources;
+  const results=await Promise.allSettled([context?.close(),fixture?.close()]);
+  results.push(...await Promise.allSettled([browser?.close()]));
   const failed=results.filter(result=>result.status==='rejected').length;
   if(failed){console.error('Audio fixture cleanup failures:',failed);if(!originalError)throw new Error('Audio fixture cleanup did not complete');}
 }
@@ -302,10 +306,13 @@ test('real Chromium MediaRecorder WebM draft passes the shared server audio vali
     assert.ok(exactClip.length>0,`captured exact File constructed from onstop clip at ${samplePath}`);
     const actualWebmPlayer=page.locator('.timber-audio-draft .timber-audio-player');
     await actualWebmPlayer.getByRole('button',{name:'Play audio'}).click();await actualWebmPlayer.getByRole('button',{name:'Pause audio'}).waitFor();
+    // Freeze the playback clock before measuring a seek. Otherwise time
+    // advances during protocol round-trips and invalidates the same 80ms bound.
+    await actualWebmPlayer.getByRole('button',{name:'Pause audio'}).click();
     await actualWebmPlayer.getByRole('slider',{name:'Seek audio'}).fill('0.45');
     await page.waitForFunction(()=>{const audio=document.querySelector('.timber-audio-draft audio');return audio&&audio.currentTime>=0.4;},undefined,{timeout:5000});
     assert.ok(await page.locator('.timber-audio-draft audio').evaluate(audio=>Math.abs(audio.currentTime-0.45)<0.08),'seeking moves the real WebM-backed audio element');
-    await actualWebmPlayer.getByRole('button',{name:'Pause audio'}).click();assert.equal(await page.locator('.timber-audio-draft audio').evaluate(audio=>audio.paused),true,'the real WebM draft pauses after seeking');
+    assert.equal(await page.locator('.timber-audio-draft audio').evaluate(audio=>audio.paused),true,'the real WebM draft stays paused after seeking');
     assert.equal(calls.uploads.length,0,'recording creates no upload until the paid transcription warning is confirmed');
     await confirmSend(page);
     await page.locator('.timber-audio-message[data-transcription-status="pending"]').waitFor();
