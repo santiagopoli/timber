@@ -53,5 +53,5 @@
 .timber-audio-composer>.timber-audio-state{flex-wrap:wrap;padding:0 10px}
 .timber-audio-composer>.timber-audio-state button{margin-left:auto;min-height:38px;font-size:12px;border-radius:10px}
 
-/* Keep the three audio actions together on narrow phones without shrinking tap targets. */
-@media(max-width:360px){.timber-audio-tools{gap:4px;padding-inline:4px}}
+/* Give the three audio actions font-metric tolerance on narrow phones; keep their 42px height and labels. */
+@media(max-width:360px){.timber-audio-tools{gap:4px;padding-inline:4px}.timber-audio-tools button{padding-inline:8px;min-width:44px}}

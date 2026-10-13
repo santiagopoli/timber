@@ -177,7 +177,16 @@ for(const viewport of [{width:1440,height:900},{width:390,height:700},{width:320
     assert.equal(await settings.getByRole('table').isVisible(),false,'the price table is secondary information');
     const list=settings.getByRole('listbox'),listBox=await list.boundingBox(),rows=await settings.getByRole('option').all();let visible=0;
     for(const row of rows){const box=await row.boundingBox();assert.ok(box.height<=70,'each priced model uses two short lines');if(box.y>=listBox.y&&box.y+box.height<=listBox.y+listBox.height)visible++;}
-    if(viewport.height>=700)assert.ok(visible>=3,'several models are fully visible for comparison');
+    if(viewport.height>=700){
+      // Capture only public layout/capability metadata when the original
+      // visibility assertion fails; do not wait or relax its threshold.
+      const geometry=visible<3?await page.evaluate(()=>{
+        const rect=node=>{if(!node)return null;const r=node.getBoundingClientRect();return{x:r.x,y:r.y,width:r.width,height:r.height};};
+        const tools=document.querySelector('.timber-audio-tools'),panel=document.querySelector('.timber-model-popover');
+        return{webm:Boolean(window.MediaRecorder?.isTypeSupported('audio/webm;codecs=opus')),audioContext:Boolean(window.AudioContext||window.webkitAudioContext),tools:rect(tools),buttons:Array.from(tools?.querySelectorAll('button')||[]).map(button=>({label:button.getAttribute('aria-label'),rect:rect(button),font:getComputedStyle(button).font,padding:getComputedStyle(button).padding})),notes:Array.from(tools?.querySelectorAll('span[class]')||[]).map(note=>({className:note.className,rect:rect(note)})),availableHeight:panel?getComputedStyle(panel).getPropertyValue('--radix-popover-content-available-height'):null};
+      }):undefined;
+      assert.ok(visible>=3,'several models are fully visible for comparison'+(geometry?' '+JSON.stringify({visible,listBox,geometry}):''));
+    }
     const controls=settings.getByRole('group',{name:'Reasoning effort'}),fast=settings.getByRole('switch',{name:'Fast mode'});
     const inPanel=async locator=>{const box=await locator.boundingBox(),panel=await settings.boundingBox();assert.ok(box.y>=panel.y&&box.y+box.height<=panel.y+panel.height,'settings stay inside the visible panel');};
     await inPanel(controls);await inPanel(fast);assert.equal(await controls.getByRole('button').count(),7);
