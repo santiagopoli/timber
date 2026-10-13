@@ -11,14 +11,17 @@ export const PERFORMANCE_TASKS = `SELECT t.id,b.id AS bot_id,json_extract(t.data
  ORDER BY (json_extract(t.data,'$.status') IN ('queued','running','waiting_approval','waiting_connection','cancelling')) DESC,t.rowid DESC LIMIT 6`;
 export const PERFORMANCE_REQUESTS = `SELECT source,phase,started_at,last_progress_at,bytes,http_status,idle,estimated_tokens FROM timber_inference_requests ORDER BY id DESC LIMIT 20`;
 export function summarizeInferenceRequests(records){return records.slice(0,20).map(row=>({source:allow(new Set(['chatgpt','openai-api','openrouter']),row.source),phase:allow(new Set(['request','streaming','completed','failed','cancelled']),row.phase),startedAt:count(row.started_at)===null?null:new Date(row.started_at).toISOString(),lastProgressAt:count(row.last_progress_at)===null?null:new Date(row.last_progress_at).toISOString(),bytes:count(row.bytes),httpStatus:count(row.http_status),idleTimeout:row.idle===1,estimatedTokens:count(row.estimated_tokens)}));}
-export const PERFORMANCE_RUNS = `SELECT json_extract(data,'$.createdAt') AS created_at,
+export const PERFORMANCE_RUNS = `WITH recent AS (
+ SELECT id,data,rowid AS sequence FROM runs
+ ORDER BY (json_extract(data,'$.status') IN ('queued','running','waiting_approval','waiting_connection')) DESC,rowid DESC LIMIT 12
+ ) SELECT json_extract(data,'$.createdAt') AS created_at,
  json_extract(data,'$.updatedAt') AS updated_at,json_extract(data,'$.status') AS status,
  json_extract(data,'$.errorCode') AS error_code,
  (SELECT kind FROM admission_sources a WHERE a.run_id=r.id) AS source,
  (SELECT COUNT(*) FROM botspace_runtime_budget b JOIN submissions s ON s.operation_id=b.operation_id WHERE s.run_id=r.id AND b.kind='generation') AS generations,
  (SELECT COUNT(*) FROM botspace_runtime_budget b JOIN submissions s ON s.operation_id=b.operation_id WHERE s.run_id=r.id AND b.kind='tool') AS tools,
  (SELECT COUNT(*) FROM events e WHERE json_extract(e.data,'$.runId')=r.id AND json_extract(e.data,'$.type')='run.retrying') AS retries
- FROM runs r ORDER BY (json_extract(data,'$.status') IN ('queued','running','waiting_approval','waiting_connection')) DESC,rowid DESC LIMIT 12`;
+ FROM recent r ORDER BY (json_extract(data,'$.status') IN ('queued','running','waiting_approval','waiting_connection')) DESC,sequence DESC`;
 export const PERFORMANCE_TOOLS = `WITH recent AS (
  SELECT id,data FROM events WHERE json_extract(data,'$.type')='tool.started' ORDER BY id DESC LIMIT 60
  ) SELECT json_extract(s.data,'$.createdAt') AS started_at,

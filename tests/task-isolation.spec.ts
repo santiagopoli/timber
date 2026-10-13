@@ -30,11 +30,14 @@ describe('independent persistent task computers',()=>{
    const avatars=(instance as unknown as {avatars:{alarm():Promise<void>}}).avatars;
    const original=avatars.alarm.bind(avatars);
    let release!:()=>void;
-   const held=new Promise<void>(resolve=>{release=resolve;});avatars.alarm=()=>held;
+   let avatarDispatches=0;
+   const held=new Promise<void>(resolve=>{release=resolve;});avatars.alarm=()=>{avatarDispatches++;return held;};
    try {
     const returned=await Promise.race([Promise.resolve(instance.alarm!()).then(()=>true),new Promise<boolean>(resolve=>setTimeout(()=>resolve(false),1000))]);
     expect(returned).toBe(true);
     expect(state.storage.sql.exec<{task_id:string}>('SELECT task_id FROM task_slots WHERE bot_id=?',owner.id).one().task_id).toBe(queued.id);
+    await Promise.resolve(instance.alarm!());
+    expect(avatarDispatches).toBe(1);
    } finally {release();avatars.alarm=original;}
   });
   await settled(queued.id,'waiting_approval');
