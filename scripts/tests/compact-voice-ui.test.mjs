@@ -64,6 +64,9 @@ for(const engine of ['chromium','webkit'])for(const surface of ['bot','task'])fo
     const menu=await page.getByRole('menu').boundingBox();assert.ok(menu.x>=0&&menu.x+menu.width<=width+1,'Add menu remains within viewport');
     if(width===390)await capture(page,`${engine}-${surface}-${width}-menu`);
     await page.keyboard.press('Escape');assert.equal(await draft.inputValue(),'Keep this draft','opening Add preserves text');
+    // Radix restores Add focus asynchronously on Escape. Finish that keyboard
+    // interaction before explicitly focusing the next action; no sleep/retry.
+    await page.waitForFunction(()=>!document.querySelector('[role=menu]')&&document.activeElement?.getAttribute('aria-label')==='Add');
     await mic.focus();await page.keyboard.press('Enter');await composer.getByRole('button',{name:'Stop recording',exact:true}).waitFor();
     assert.equal(await page.evaluate(()=>window.__micCalls),1,'keyboard activation requests microphone exactly once');assert.equal(await draft.isDisabled(),false,'dictation keeps draft editable');
     assert.equal(await composer.locator('.timber-audio-tools').count(),0,'active dictation does not restore the rejected toolbar');
