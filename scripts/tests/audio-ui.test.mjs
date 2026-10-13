@@ -11,16 +11,29 @@ import {createConsoleFixture,BOT_A,BOT_B,TEST_TOKEN} from './console-fixture.mjs
 import {makeToneWav} from './audio-wav.mjs';
 
 const consoleBrowser=createConsoleBrowser(),date='2026-10-05T10:00:00.000Z',wav=makeToneWav(),longWav=makeToneWav({durationSeconds:31,sampleRate:8000,amplitudeModulationHz:0.1});
+async function closeResources(resources,originalError){
+  const results=await Promise.allSettled(resources.map(resource=>resource?.close()));
+  const failed=results.filter(result=>result.status==='rejected').length;
+  if(failed){console.error('Audio fixture cleanup failures:',failed);if(!originalError)throw new Error('Audio fixture cleanup did not complete');}
+}
 async function connectedPage({width=1280,height=900,initScript,browser:providedBrowser,fixture:providedFixture}={}){
-  const fixture=providedFixture||await createConsoleFixture(),browser=providedBrowser||await consoleBrowser(),loginWidth=width<600?1280:width;
-  const context=await browser.newContext({viewport:{width:loginWidth,height}});if(initScript)await context.addInitScript(initScript);
-  const page=await context.newPage();page.setDefaultTimeout(6000);
-  // The shared fixture CSP predates audio. Production permits blob-backed media.
-  // Extend only the test shell response; never modify the shared fixture.
-  await page.route('**/console/',async route=>{const response=await route.fetch(),headers={...response.headers()};headers['content-security-policy']=(headers['content-security-policy']||'').replace('img-src',"media-src 'self' blob:; img-src");await route.fulfill({response,headers});});
-  await page.goto(fixture.url);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('#message').waitFor();
-  if(loginWidth!==width)await page.setViewportSize({width,height});
-  return {fixture,context,page};
+  let fixture,context,page;const responses=[],errors=[];
+  try{
+    fixture=providedFixture||await createConsoleFixture();const browser=providedBrowser||await consoleBrowser(),loginWidth=width<600?1280:width;
+    context=await browser.newContext({viewport:{width:loginWidth,height}});if(initScript)await context.addInitScript(initScript);
+    page=await context.newPage();page.setDefaultTimeout(6000);
+    page.on('response',response=>{const path=new URL(response.url()).pathname;if(path.startsWith('/v1/'))responses.push({path,status:response.status()});});
+    page.on('pageerror',error=>errors.push(error.message));
+    // Extend only the fixture shell CSP; production already permits blob media.
+    await page.route('**/console/',async route=>{const response=await route.fetch(),headers={...response.headers()};headers['content-security-policy']=(headers['content-security-policy']||'').replace('img-src',"media-src 'self' blob:; img-src");await route.fulfill({response,headers});});
+    await page.goto(fixture.url);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('#message').waitFor();
+    if(loginWidth!==width)await page.setViewportSize({width,height});
+    return {fixture,context,page};
+  }catch(error){
+    const state=await page?.evaluate(()=>({view:document.body.dataset.view,loginError:document.querySelector('#connect-error')?.textContent,messageCount:document.querySelectorAll('#message').length})).catch(()=>null);
+    console.error('Audio fixture initialization failed:',JSON.stringify({state,responses,errors}));
+    await closeResources([context,!providedFixture?fixture:undefined],error);throw error;
+  }
 }
 function audioMessage({audioId,operationId,attemptId,status='failed',text,error='Mock transcription failed safely.'}){
   return {id:'fixture-audio-message',botId:BOT_A,role:'user',text:'',createdAt:date,audio:{artifactId:audioId,mimeType:'audio/wav',size:wav.length,durationMs:800,operationId,transcription:{attemptId,status,...(text?{text}:{}),...(status==='failed'?{error}:{}),...(status==='uncertain'?{error:'The provider result is unknown.'}:{})}}};
@@ -216,7 +229,11 @@ test('regular text chat still submits through existing messages API',async()=>{
     await page.locator('#message').fill('Text chat regression remains intact.');
     assert.equal(await page.locator('.timber-audio-format-note').count(),0,'audio details do not expand an ordinary text composer');
     assert.equal(await page.locator('.timber-audio-tools').count(),0,'text drafts never add an idle audio row');
-    assert.ok((await page.locator('.timber-composer-row').boundingBox()).height<=52,'existing composer controls stay on one compact row');
+    // The textarea grows when the draft wraps. Measure the action targets,
+    // not that growing input, and preserve the original 52px compactness bound.
+    const controls=await Promise.all(['Add','Dictate text','Send message'].map(name=>page.getByRole('button',{name,exact:true}).boundingBox()));
+    assert.ok(controls.every(box=>box&&box.height>=44&&box.height<=52),'mobile action targets are compact and accessible');
+    assert.ok(Math.max(...controls.map(box=>box.y))-Math.min(...controls.map(box=>box.y))<1,'all composer actions remain on one row beside the editable draft');
     assert.equal(await page.getByRole('button',{name:'Dictate text',exact:true}).isEnabled(),true,'dictation remains available alongside a text draft');
     await page.getByRole('button',{name:'Send message'}).click();
     await page.waitForFunction(()=>document.querySelectorAll('[data-message-id]').length>=3);
@@ -361,15 +378,17 @@ for(const engine of ['chromium','webkit'])test(`real ${engine} Web Audio PCM fal
       oscillator.frequency.value=440;oscillator.connect(destination);oscillator.start();window.__sourceContext=context;window.__oscillator=oscillator;window.__recordingStream=destination.stream;return destination.stream;
     }}});
   };
-  const browser=engine==='webkit'?await webkit.launch({headless:true,...(process.env.CONSOLE_WEBKIT_PATH?{executablePath:process.env.CONSOLE_WEBKIT_PATH}:{})}):undefined;
-  const nativeFixture=await createNativePcmFixture();
-  const{fixture,context,page}=await connectedPage({browser,initScript:nativePcmMic,fixture:nativeFixture});
+  let browser,nativeFixture,context,page,scenarioError;
+  try{
+  browser=engine==='webkit'?await webkit.launch({headless:true,...(process.env.CONSOLE_WEBKIT_PATH?{executablePath:process.env.CONSOLE_WEBKIT_PATH}:{})}):undefined;
+  nativeFixture=await createNativePcmFixture();
+  ({context,page}=await connectedPage({browser,initScript:nativePcmMic,fixture:nativeFixture}));
+  const fixture=nativeFixture;
   const audioTraffic=[],browserErrors=[];
   page.on('request',request=>{if(request.url().includes('/audio'))audioTraffic.push({event:'request',method:request.method(),path:new URL(request.url()).pathname});});
   page.on('response',response=>{if(response.url().includes('/audio'))audioTraffic.push({event:'response',method:response.request().method(),path:new URL(response.url()).pathname,status:response.status()});});
   page.on('requestfailed',request=>{if(request.url().includes('/audio'))audioTraffic.push({event:'failed',method:request.method(),path:new URL(request.url()).pathname,error:request.failure()?.errorText});});
   page.on('pageerror',error=>browserErrors.push(error.message));
-  try{
     const calls=fixture.audioCalls;
     assert.equal(await page.evaluate(()=>window.__micCalls),0);await recordAudio(page);await page.getByRole('button',{name:'Stop recording'}).waitFor();
     await page.waitForTimeout(900);await page.getByRole('button',{name:'Stop recording'}).click();await page.locator('.timber-audio-draft').waitFor();
@@ -400,7 +419,7 @@ for(const engine of ['chromium','webkit'])test(`real ${engine} Web Audio PCM fal
       throw error;
     }
     assert.equal(calls.uploads.length,1);assert.equal(calls.submissions.length,1);assert.deepEqual(calls.uploads[0].body,exactClip);assert.equal(calls.uploads[0].contentType,'audio/wav');assert.equal(await page.evaluate(()=>window.__micCalls),1);assert.deepEqual(fixture.audioFailures,[]);assert.deepEqual(fixture.state.failures,[],'native binary writes never reach the JSON-only shared fixture');
-  }finally{await page.evaluate(async()=>{try{window.__oscillator?.stop();}catch{}await window.__sourceContext?.close();}).catch(()=>{});await context.close();await fixture.close();await browser?.close();}
+  }catch(error){scenarioError=error;throw error;}finally{if(page)await page.evaluate(async()=>{try{window.__oscillator?.stop();}catch{}await window.__sourceContext?.close();}).catch(()=>{});await closeResources([context,nativeFixture,browser],scenarioError);}
 });
 
 test('Cancel audio aborts an in-flight upload without automatic admission and retains stable draft ids',async()=>{
