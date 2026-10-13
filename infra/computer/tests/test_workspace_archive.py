@@ -15,7 +15,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
-from workspace_archive import ArchiveError, create_archive, extract_archive
+from workspace_archive import ArchiveError, create_archive, extract_archive, unlock_browser_profile, PROFILE_LOCKS
 
 
 def directory_fd(path: Path) -> int:
@@ -43,6 +43,71 @@ def archive_bytes(items: list[tuple[str, str, bytes | str, int]]) -> bytes:
 
 
 class WorkspaceArchiveTests(unittest.TestCase):
+    def test_checkpoint_omits_valid_machine_local_browser_locks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / 'workspace'
+            profile = root / '.browser-profile'
+            profile.mkdir(parents=True)
+            (profile / 'Preferences').write_text('keep browser sessions')
+            (profile / 'SingletonLock').symlink_to('old-computer-15264')
+            (profile / 'SingletonCookie').symlink_to('123456')
+            (profile / 'SingletonSocket').write_text('machine-local socket placeholder')
+            output = Path(temp) / 'checkpoint.tgz'
+            source_fd = directory_fd(root)
+            output_fd = os.open(output, os.O_WRONLY | os.O_CREAT, 0o600)
+            try:
+                create_archive(source_fd, output_fd)
+            finally:
+                os.close(source_fd)
+                os.close(output_fd)
+            with tarfile.open(output) as archive:
+                self.assertEqual(archive.extractfile('.browser-profile/Preferences').read(), b'keep browser sessions')
+                self.assertFalse(any(Path(name).name in PROFILE_LOCKS for name in archive.getnames()))
+
+    def test_stale_lock_cleanup_preserves_sessions_and_does_not_follow_links(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            profile = root / 'profile'
+            profile.mkdir()
+            proc = root / 'proc'
+            proc.mkdir()
+            outside = root / 'outside'
+            outside.write_text('untouched')
+            (profile / 'Preferences').write_text('session')
+            for name in PROFILE_LOCKS:
+                (profile / name).symlink_to(outside)
+            fd = directory_fd(profile)
+            try:
+                unlock_browser_profile(fd, proc_root=proc)
+                unlock_browser_profile(fd, proc_root=proc)
+            finally:
+                os.close(fd)
+            self.assertEqual(outside.read_text(), 'untouched')
+            self.assertEqual((profile / 'Preferences').read_text(), 'session')
+            self.assertFalse(PROFILE_LOCKS.intersection(os.listdir(profile)))
+
+    def test_cleanup_refuses_a_live_local_browser_even_with_a_foreign_lock_hostname(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            profile = root / 'profile'
+            profile.mkdir()
+            (profile / 'SingletonLock').symlink_to('foreign-computer-15264')
+            process = root / 'proc' / '15264'
+            process.mkdir(parents=True)
+            alias = root / 'alias'
+            alias.symlink_to(profile, target_is_directory=True)
+            (process / 'cmdline').write_bytes(b'/usr/lib/chromium/chromium\0--user-data-dir=' + os.fsencode(alias) + b'\0')
+            fd = directory_fd(profile)
+            try:
+                with self.assertRaisesRegex(ArchiveError, 'already in use'):
+                    unlock_browser_profile(fd, proc_root=process.parent)
+                self.assertTrue((profile / 'SingletonLock').is_symlink())
+                (process / 'cmdline').write_bytes(b'/usr/lib/chromium/chromium\0--user-data-dir=/different/profile\0')
+                unlock_browser_profile(fd, proc_root=process.parent)
+                self.assertFalse((profile / 'SingletonLock').is_symlink())
+            finally:
+                os.close(fd)
+
     def test_round_trip_regular_tree_internal_link_modes_and_exclusions(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "workspace"

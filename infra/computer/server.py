@@ -949,7 +949,10 @@ class Computer:
         if not profile.resolve().is_relative_to(self.workspace):
             raise ValueError("Browser profile must remain inside the workspace")
         profile_fd = ensure_workspace_directory(self.workspace, ".browser-profile")
-        os.close(profile_fd)
+        try:
+            self._archive_helper('unlock-profile', [profile_fd])
+        finally:
+            os.close(profile_fd)
         # Snapshot only while Chromium is closed. Production copying runs as the
         # workspace UID with no controller environment; local test mode remains
         # disabled for secure deployment and uses the same workspace-only data.
@@ -1144,6 +1147,8 @@ class Computer:
         if not workspace_prefix():
             if mode == "create":
                 result = workspace_archive.create_archive(descriptors[0], descriptors[1], profile_fd=profile_fd)
+            elif mode == "unlock-profile":
+                result = workspace_archive.unlock_browser_profile(descriptors[0])
             else:
                 result = workspace_archive.extract_archive(descriptors[0], descriptors[1])
         else:

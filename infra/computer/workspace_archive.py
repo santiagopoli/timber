@@ -20,16 +20,60 @@ import os
 import posixpath
 import stat
 import tarfile
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 MAX_ARCHIVE = 256 * 1024 * 1024
 MAX_ENTRIES = 10_000
 EXCLUDED = {"node_modules", ".cache", "__pycache__", ".venv"}
 PROFILE_EXCLUDED = {"Cache", "Code Cache", "GPUCache", "ShaderCache", "GrShaderCache"}
+PROFILE_LOCKS = {"SingletonLock", "SingletonCookie", "SingletonSocket"}
 
 
 class ArchiveError(ValueError):
     """An unsafe or out-of-bounds workspace archive was rejected."""
+
+
+def unlock_browser_profile(profile_fd: int, *, proc_root: Path = Path('/proc')) -> dict:
+    """Drop machine-local locks, never a live browser's lock or its target.
+
+    Runs as the workspace UID. The open directory descriptor bounds deletion;
+    a restored hostname/PID alone is not proof of a local owner (PIDs reuse).
+    """
+    fd = _dup_dir(profile_fd)
+    try:
+        present = PROFILE_LOCKS.intersection(os.listdir(fd))
+        if not present:
+            return {"entries": 0, "bytes": 0}
+        profile = os.fstat(fd)
+        for process in proc_root.iterdir():
+            if not process.name.isdecimal():
+                continue
+            try:
+                with (process / 'cmdline').open('rb') as command:
+                    args = command.read(65536).split(b'\0')
+                if not args or Path(os.fsdecode(args[0])).name not in {'chromium', 'chromium-browser', 'chrome'}:
+                    continue
+                for index, arg in enumerate(args):
+                    directory = arg[len(b'--user-data-dir='):] if arg.startswith(b'--user-data-dir=') else args[index + 1] if arg == b'--user-data-dir' and index + 1 < len(args) else None
+                    if not directory:
+                        continue
+                    path = Path(os.fsdecode(directory))
+                    info = (path if path.is_absolute() else process / 'cwd' / path).stat()
+                    if (info.st_dev, info.st_ino) == (profile.st_dev, profile.st_ino):
+                        raise ArchiveError('Browser profile is already in use by a local Chromium process')
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except PermissionError:
+                # Other UIDs cannot run the workspace browser in production.
+                continue
+        for name in present:
+            try:
+                os.unlink(name, dir_fd=fd)
+            except FileNotFoundError:
+                pass
+        return {"entries": 0, "bytes": 0}
+    finally:
+        os.close(fd)
 
 
 def _dup_dir(fd: int) -> int:
@@ -131,6 +175,10 @@ def _walk_dir(archive: tarfile.TarFile, directory_fd: int, rel: str, count: list
         if root_level and ((exclude_root_profile and name == ".browser-profile") or name == ".browser-profile-baseline"):
             continue
         child_rel = f"{rel}/{name}" if rel else name
+        # Even a syntactically valid relative hostname-PID lock is specific to
+        # the old computer. Never carry it into a portable checkpoint.
+        if rel == '.browser-profile' and name in PROFILE_LOCKS:
+            continue
         try:
             st = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError as exc:
@@ -399,11 +447,16 @@ def create_archive_cli() -> int:
     """Descriptor-oriented command entry point for the root controller.
 
     argv: ``create WORKSPACE_FD OUTPUT_FD [PROFILE_FD]`` or
-    ``extract ARCHIVE_FD DESTINATION_FD``. The caller supplies descriptors via
+    ``extract ARCHIVE_FD DESTINATION_FD`` or ``unlock-profile PROFILE_FD``.
+    The caller supplies descriptors via
     ``pass_fds`` and starts this module under the workspace UID with env -i.
     """
     import sys
     try:
+        if len(sys.argv) == 3 and sys.argv[1] == "unlock-profile":
+            result = unlock_browser_profile(int(sys.argv[2]))
+            print(json.dumps(result, separators=(",", ":")))
+            return 0
         if len(sys.argv) == 4 and sys.argv[1] == "create":
             result = create_archive(int(sys.argv[2]), int(sys.argv[3]))
             print(json.dumps(result, separators=(",", ":")))
