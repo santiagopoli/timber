@@ -148,6 +148,26 @@ describe("durable task computer scheduler",()=>{
   const owner=await bot();await api(`/v1/bots/${owner.id}`,{computerApprovalMode:"automatic"},"PATCH");computerFixtureControl.execSession={pollsBeforeComplete:100};
   try{const record=await task(owner,"fixture:approval");await settled(record.id,"completed");await tick();expect((await (await api(`/v1/tasks/${record.id}`)).json<{task:Task}>()).task.status).toBe("completed");expect((await slot(owner.id))?.task_id).toBe(record.id);const progress=await (await api(`/v1/tasks/${record.id}/progress`)).json<any>();expect(progress.summary.status).toBe("ready");expect(progress.summary.activeProcesses).toBe(1);expect(progress.observation).toBe("idle");const continued=await api(`/v1/tasks/${record.id}/continue`,{operationId:crypto.randomUUID(),text:"A small follow-up"});expect(continued.status).toBe(202);await settled(record.id,"completed");await tick();expect((await (await api(`/v1/tasks/${record.id}`)).json<{task:Task}>()).task.status).toBe("completed");const next=await task(owner);expect(next.status).toBe("queued");expect((await api(`/v1/tasks/${record.id}/cancel`,{},"POST")).status).toBe(200);await tick();expect((await slot(owner.id))?.task_id).toBe(next.id);}finally{delete computerFixtureControl.execSession;}
  },60000);
+ it("admits main chat beside a completed task's live process without taking its lease",async()=>{
+  const owner=await bot();await api(`/v1/bots/${owner.id}`,{computerApprovalMode:"automatic"},"PATCH");
+  computerFixtureControl.execSession={pollsBeforeComplete:100};
+  try {
+   const record=await task(owner,"fixture:approval");await settled(record.id,"completed");await tick();
+   expect((await (await api(`/v1/tasks/${record.id}`)).json<{task:Task}>()).task.status).toBe("completed");
+   const held=await slot(owner.id),operationId=crypto.randomUUID(),input={operationId,text:"Can we discuss the next step while the server stays up?"};
+   const first=await (await api(`/v1/bots/${owner.id}/messages`,input)).json<{run:Run}>();
+   await expect.poll(async()=> (await (await api(`/v1/bots/${owner.id}/runs/${first.run.id}`)).json<{run:Run}>()).run.status).toBe("completed");
+   const saved=await (await api(`/v1/bots/${owner.id}/runs/${first.run.id}`)).json<{run:Run}>();
+   expect(saved.run.coordinatorMode).toBe(true);expect(await slot(owner.id)).toEqual(held);
+   const progress=await (await api(`/v1/tasks/${record.id}/progress`)).json<any>();
+   expect(progress.summary.activeProcesses).toBe(1);
+   await evictDurableObject(bindings.BOT.get(bindings.BOT.idFromName(`owner:${owner.id}`)));
+   const replay=await (await api(`/v1/bots/${owner.id}/messages`,input)).json<{run:Run}>();
+   expect(replay.run.id).toBe(first.run.id);expect(replay.run.status).toBe("completed");expect(await slot(owner.id)).toEqual(held);
+   const history=await (await api(`/v1/bots/${owner.id}/messages`)).json<{messages:Array<{role:string}>}>();
+   expect(history.messages.filter(message=>message.role==='user')).toHaveLength(1);
+  } finally {delete computerFixtureControl.execSession;}
+ },60000);
  it("keeps an orphan direct process fenced until its missing-session cancellation is acknowledged",async()=>{
   const owner=await bot(),operationId=`orphan:${crypto.randomUUID()}`,root=bindings.BOT.get(bindings.BOT.idFromName(`owner:${owner.id}`));
   computerFixtureControl.execSession={pollsBeforeComplete:100};

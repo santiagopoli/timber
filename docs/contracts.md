@@ -616,7 +616,9 @@ append one attributed assistant result without starting another inference run;
 a cancelled originating run never receives an implicit continuation.
 
 While a legacy task owns its bot's computer slot, an allowed bot's new ordinary input
-can be admitted as a persisted `Run.coordinatorMode` turn. It may answer,
+can be admitted as a persisted `Run.coordinatorMode` turn. This also applies when
+a completed, failed or cancelled task retains its computer lease for a managed
+process or cleanup; the task's lease and effect fences stay authoritative. It may answer,
 inspect allowlisted metadata and create another task, but computer tools and
 service mutations fail before any effect. These turns do not claim/release the
 task's lease or count as computer execution holders. Their Stop fences their own

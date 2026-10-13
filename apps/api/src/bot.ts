@@ -1122,7 +1122,10 @@ export class BotDO extends DurableObject<Env> {
             const receipt=await registry.fetch(`https://workspace/tasks/${holder}`);
             if(receipt.ok) {
               const {task}=await receipt.json<{task:{botId:string;status:string}}>();// No lease is acquired or replaced.
-              if(task.botId===run.botId&&['queued','running','waiting_approval','waiting_connection','cancelling'].includes(task.status)) {
+              // A terminal task can still own the computer for its managed
+              // server or cancellation cleanup. Its retained lease continues
+              // fencing effects, but must not block computerless main chat.
+              if(task.botId===run.botId&&['queued','running','waiting_approval','waiting_connection','cancelling','completed','failed','cancelled'].includes(task.status)) {
                 const current=this.getRun(run.id);current.coordinatorMode=true;
                 this.ctx.storage.sql.exec("UPDATE runs SET data=? WHERE id=?",JSON.stringify(current),current.id);
                 this.emit('run.updated',{run:current},current.id);return;
