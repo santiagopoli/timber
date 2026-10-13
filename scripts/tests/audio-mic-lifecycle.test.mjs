@@ -28,10 +28,18 @@ const immediatePermission=()=>{
   Object.defineProperty(navigator,'mediaDevices',{configurable:true,value:{getUserMedia:async()=>{window.__micCalls++;return{getTracks:()=>[{stop(){window.__trackStops++;}}]};}}});
   window.MediaRecorder=class{static isTypeSupported=()=>true;state='inactive';mimeType='audio/webm;codecs=opus';constructor(){window.__recorder=this;}start(){window.__recorderStarts++;this.state='recording';}stop(){this.state='inactive';this.onstop?.();}};
 };
+async function recordAudio(page){
+  await page.getByRole('button',{name:'Add',exact:true}).click();
+  await page.getByRole('menuitem',{name:'Record audio',exact:true}).click();
+}
+
 test('double-clicked deferred mic permission is requested once and late stream is stopped after conversation unmount',async()=>{
   const{fixture,context,page}=await pageWithMic(deferredPermission);
   try{
-    const record=page.getByRole('button',{name:'Start recording audio'});await record.waitFor();await page.evaluate(()=>{const button=document.querySelector('[aria-label="Start recording audio"]');button.click();button.click();});await page.getByText('Requesting microphone permission…').waitFor();
+    await page.getByRole('button',{name:'Add',exact:true}).click();
+    const record=page.getByRole('menuitem',{name:'Record audio',exact:true});await record.waitFor();
+    // Dispatch twice synchronously while this actual menuitem is still mounted.
+    await record.evaluate(item=>{item.click();item.click();});await page.getByText('Requesting microphone permission…').waitFor();
     assert.equal(await page.evaluate(()=>window.__micCalls),1,'two synchronous DOM clicks cannot issue a second permission request');await assertComposerLocked(page,'microphone permission is pending');
     await page.locator(`#bot-list button[data-bot-id="${BOT_B}"]`).click();await page.waitForFunction(botId=>location.hash.includes(encodeURIComponent(botId)),BOT_B);
     await page.evaluate(()=>window.__resolveMic());await page.waitForFunction(()=>window.__trackStops===1);
@@ -42,7 +50,7 @@ test('double-clicked deferred mic permission is requested once and late stream i
 test('MediaRecorder error stops capture and releases its microphone tracks',async()=>{
   const{fixture,context,page}=await pageWithMic(immediatePermission);
   try{
-    await page.getByRole('button',{name:'Start recording audio'}).click({force:true});await page.getByRole('button',{name:'Stop recording'}).waitFor();await assertComposerLocked(page,'recording is active');
+    await recordAudio(page);await page.getByRole('button',{name:'Stop recording'}).waitFor();await assertComposerLocked(page,'recording is active');
     await page.evaluate(()=>window.__recorder.onerror?.(new Event('error')));await page.waitForTimeout(200);const after=await page.evaluate(()=>({stops:window.__trackStops,state:window.__recorder?.state,error:document.querySelector('.timber-audio-error')?.innerText,recording:!!document.querySelector('[aria-label="Stop recording"]'),draft:!!document.querySelector('.timber-audio-draft')}));assert.ok(after.stops>=1);assert.equal(after.state,'inactive');assert.equal(after.recording,false);assert.equal(after.draft,false);assert.match(after.error,/could not finish this recording/);
     assert.deepEqual(await page.evaluate(()=>({calls:window.__micCalls,starts:window.__recorderStarts,state:window.__recorder.state})),{calls:1,starts:1,state:'inactive'});assert.ok(after.stops>=1,'all acquired microphone tracks are released on recorder error');assert.equal(after.recording,false);assert.equal(after.draft,false);assert.match(after.error,/could not finish this recording/);
   }finally{await context.close();await fixture.close();}
@@ -56,7 +64,7 @@ test('recording chunk over 20 MB stops capture, reports the limit, and releases 
   };
   const{fixture,context,page}=await pageWithMic(oversizePermission);
   try{
-    await page.getByRole('button',{name:'Start recording audio'}).click({force:true});await page.getByRole('button',{name:'Stop recording'}).waitFor();await assertComposerLocked(page,'recording is active');
+    await recordAudio(page);await page.getByRole('button',{name:'Stop recording'}).waitFor();await assertComposerLocked(page,'recording is active');
     await page.evaluate(()=>window.__recorder.ondataavailable?.({data:{size:20_000_001}}));
     await page.locator('.timber-audio-error').filter({hasText:'20 MB limit'}).waitFor();await page.waitForFunction(()=>window.__trackStops>=1);
     assert.match(await page.locator('.timber-audio-error').innerText(),/20 MB limit/);assert.ok(await page.evaluate(()=>window.__trackStops>=1),'oversize audio releases the microphone track');assert.equal(await page.locator('.timber-audio-draft').count(),0,'oversize recording never becomes a draft');assert.equal(await page.getByRole('button',{name:'Stop recording'}).count(),0);
@@ -77,7 +85,7 @@ const mp4OnlyPermission=()=>{
   };
   const NativeFile=window.File;window.File=class extends NativeFile{constructor(...args){super(...args);if(String(args[1]).startsWith('Recording-'))window.__pcmFile=this;}};
 };
-async function beginPcm(page){await page.getByRole('button',{name:'Start recording audio'}).click();await page.getByRole('button',{name:'Stop recording'}).waitFor();}
+async function beginPcm(page){await recordAudio(page);await page.getByRole('button',{name:'Stop recording'}).waitFor();}
 async function feedPcm(page,count=1){await page.evaluate(count=>{const data=Float32Array.from({length:4096},(_,i)=>Math.sin(i/8)*0.5);for(let i=0;i<count;i++)window.__pcmProcessor.onaudioprocess?.({inputBuffer:{getChannelData:()=>data}});},count);}
 
 test('MP4-only capability uses bounded mono PCM16 WAV, never MP4 MediaRecorder or automatic send',async()=>{
@@ -119,9 +127,9 @@ for(const event of ['visibilitychange','pagehide','hashchange'])test(`${event} d
 test('hidden deferred permission is fenced and a fresh recording cannot consume its late stream',async()=>{
   const{fixture,context,page}=await pageWithMic(deferredPermission);
   try{
-    await page.getByRole('button',{name:'Start recording audio'}).click();await page.getByText('Requesting microphone permission…').waitFor();
+    await recordAudio(page);await page.getByText('Requesting microphone permission…').waitFor();
     await page.evaluate(()=>{window.__oldResolve=window.__resolveMic;Object.defineProperty(document,'visibilityState',{configurable:true,value:'hidden'});document.dispatchEvent(new Event('visibilitychange'));Object.defineProperty(document,'visibilityState',{configurable:true,value:'visible'});document.dispatchEvent(new Event('visibilitychange'));});
-    await page.getByRole('button',{name:'Start recording audio'}).click();await page.getByText('Requesting microphone permission…').waitFor();
+    await recordAudio(page);await page.getByText('Requesting microphone permission…').waitFor();
     await page.evaluate(()=>window.__oldResolve());await page.waitForFunction(()=>window.__trackStops===1);
     assert.equal(await page.evaluate(()=>window.__recorderStarts),0);await assertComposerLocked(page,'the newer permission request remains pending');
     await page.evaluate(()=>window.__resolveMic());await page.getByRole('button',{name:'Stop recording'}).waitFor();
@@ -143,7 +151,7 @@ test('logout click cancels PCM before the session deletion settles',async()=>{
 test('visibility loss also cancels preferred WebM capture without a background draft',async()=>{
   const{fixture,context,page}=await pageWithMic(immediatePermission);
   try{
-    await page.getByRole('button',{name:'Start recording audio'}).click();await page.getByRole('button',{name:'Stop recording'}).waitFor();
+    await recordAudio(page);await page.getByRole('button',{name:'Stop recording'}).waitFor();
     await page.evaluate(()=>{Object.defineProperty(document,'visibilityState',{configurable:true,value:'hidden'});document.dispatchEvent(new Event('visibilitychange'));});
     assert.equal(await page.evaluate(()=>window.__trackStops),1);assert.equal(await page.evaluate(()=>window.__recorder.state),'inactive');assert.equal(await page.locator('.timber-audio-draft').count(),0);assert.equal(await page.getByRole('button',{name:'Stop recording'}).count(),0);
   }finally{await context.close();await fixture.close();}
@@ -158,7 +166,7 @@ for(const phase of ['recording','pending permission'])test(`actual Stop run cont
   try{
     const stopRun=page.locator('#cancel-run');await stopRun.waitFor();assert.equal(await stopRun.isEnabled(),true,'a real active fixture run enables the production Stop control');
     await page.route(`**/v1/bots/${BOT_A}/runs/${activeRun.id}/cancel`,async route=>{await gate;await route.continue();});
-    await page.getByRole('button',{name:'Start recording audio'}).click();
+    await recordAudio(page);
     if(phase==='recording')await page.getByRole('button',{name:'Stop recording'}).waitFor();else await page.getByText('Requesting microphone permission…').waitFor();
     await assertComposerLocked(page,phase);
     const cancelRequested=page.waitForRequest(request=>request.method()==='POST'&&request.url().endsWith(`/runs/${activeRun.id}/cancel`));

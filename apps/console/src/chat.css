@@ -219,7 +219,7 @@
   .timber-composer{border-radius:27px}
   .timber-composer>[data-slot="input-group"]{min-height:54px}
   .timber-composer textarea{min-height:54px;padding-block:15px}
-  .timber-composer .timber-send{width:44px;height:44px;min-width:44px;min-height:44px;margin:5px}
+  .timber-composer .timber-send{width:44px;height:44px;min-width:44px;min-height:44px;margin:5px 1px}
   .timber-approval-content{padding:14px;gap:11px}
   .timber-approval-actions button{min-height:42px}
   .timber-approval-actions .timber-approve-allow{margin-left:0;width:100%}
@@ -285,7 +285,7 @@
 .timber-image-remove svg{width:14px;height:14px}
 .timber-image-remove:hover:not(:disabled){background:var(--soft)}
 .timber-image-remove:disabled{opacity:.4;cursor:default}
-.timber-composer .timber-attach{align-self:flex-end;flex:none;width:38px;height:38px;min-width:38px;min-height:38px;margin:7px 0;padding:9px;border:0;border-radius:50%;background:transparent;color:var(--muted);box-shadow:none}
+.timber-composer .timber-attach{align-self:flex-end;flex:none;width:38px;height:38px;min-width:38px;min-height:38px;margin:7px 0;padding:9px;border:0;border-radius:50%;background:transparent;color:var(--muted);box-shadow:none;transition:color .15s,background-color .15s,opacity .15s}
 .timber-composer .timber-attach svg{width:20px;height:20px}
 .timber-composer .timber-attach:hover:not(:disabled){color:var(--ink);background:color-mix(in srgb,var(--ink) 8%,transparent)}
 .timber-composer .timber-attach:disabled{opacity:.35;cursor:default}
@@ -294,3 +294,11 @@
 @media(max-width:600px){.timber-composer .timber-attach{width:44px;height:44px;min-width:44px;min-height:44px;margin:5px 0}.timber-image-remove{width:32px;height:32px;min-height:32px}.timber-image-attachments{padding-top:16px;gap:12px}}
 .timber-composer .timber-attach,.timber-composer .timber-send{display:inline-flex;align-items:center;justify-content:center;line-height:1;padding:0}
 .timber-composer .timber-attach svg,.timber-composer .timber-send svg{display:block;flex:none}
+
+/* Dictation belongs to the existing + / Send row, not a second audio toolbar. */
+.timber-composer .timber-dictate{display:inline-flex;align-items:center;justify-content:center;align-self:flex-end;flex:none;width:38px;height:38px;min-width:38px;min-height:38px;margin:7px 0;padding:0;border:0;border-radius:50%;background:transparent;color:var(--muted);box-shadow:none;line-height:1;transition:color .15s,background-color .15s,opacity .15s}
+.timber-composer .timber-dictate svg{display:block;flex:none;width:20px;height:20px}
+.timber-composer .timber-dictate:hover:not(:disabled){color:var(--ink);background:color-mix(in srgb,var(--ink) 8%,transparent)}
+.timber-composer .timber-dictate:disabled{opacity:.35;cursor:default}
+.timber-composer .timber-dictate:focus-visible{outline:2px solid var(--ink);outline-offset:-2px}
+@media(max-width:600px){.timber-composer .timber-dictate{width:44px;height:44px;min-width:44px;min-height:44px;margin:5px 0}}

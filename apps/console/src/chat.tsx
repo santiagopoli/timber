@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useCallback, useMemo, useRef, useState, useId, memo, type ComponentProps, type ReactNode, type KeyboardEvent } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
-import { XIcon, PaperclipIcon, ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon, HistoryIcon, SquareIcon, PlusIcon, LockKeyholeIcon } from 'lucide-react';
+import { XIcon, PaperclipIcon, ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, ClockIcon, CopyIcon, LoaderCircleIcon, ShieldCheckIcon, ActivityIcon, WrenchIcon, GitBranchIcon, ExternalLinkIcon, HistoryIcon, SquareIcon, PlusIcon, LockKeyholeIcon, AudioLinesIcon, MicIcon } from 'lucide-react';
 import {DropdownMenu} from 'radix-ui';
 import { defaultComponents, defaultUrlTransform, type UrlTransform } from 'streamdown';
 import { Conversation, ConversationContent, ConversationEmptyState, ConversationScrollButton, useConversationContext } from '@/components/ai-elements/conversation';
@@ -28,7 +28,7 @@ import {useInlineSecrets} from './inline-secrets';
 import {SecurePill,SecurePrompt,secureReference,hasSecureReference,maskSecureReferences} from './secure-prompt';
 import type {SecretMetadata,SecureInputRequest} from '../../../packages/contracts/src/index';
 import {collectCompactions, CompactionPill, type CompactionItem} from './compaction-timeline';
-import {AudioComposer,AudioMessage,AudioProvider} from './audio-ui';
+import {AudioComposer,AudioMessage,AudioProvider,type AudioComposerControls} from './audio-ui';
 import {insertDictation,updateDictationAnchor,type DictationAnchor} from './dictation-draft';
 import {mergeToolResult, mergeToolStatus, runOutcomes, toolActivityState, toolFailureSummary} from './cancellation-presentation';
 
@@ -622,18 +622,24 @@ function ImageControls({sending,disabled=false,hasText,acceptedIds,children,onSe
     for(const id of acceptedIds??[]) if(attachments.files.some(file=>file.id===id)) attachments.remove(id);
   },[acceptedIds,attachments]);
   const full = attachments.files.length >= 4;
-  return <>
+  const renderControls=(audio?:AudioComposerControls)=><>
     {attachments.files.length > 0 && <div className="timber-image-attachments" aria-label="Attached images">{attachments.files.map(file=><div key={file.id} className="timber-image-attachment">
       <img src={file.url} alt={file.filename || 'Attached image'} />
       <button className="timber-image-remove" type="button" aria-label={`Remove ${file.filename || 'image'}`} title={`Remove ${file.filename || 'image'}`} disabled={sending||audioDraft} onClick={()=>attachments.remove(file.id)}><XIcon aria-hidden="true" /></button>
     </div>)}</div>}
-    {audioEnabled&&<AudioComposer textPresent={hasText} imagePresent={attachments.files.length>0} sending={sending} onSend={onSendAudio?(file,ids,signal)=>onSendAudio(botId,file,ids,signal):undefined} onDictate={onDictateAudio?(file,ids,signal)=>onDictateAudio(botId,file,ids,signal):undefined} onDictationStart={onDictationStart} onDictationText={onDictationText} onDraftState={onAudioDraft}/>}
+    {audio?.status}
     <div className="timber-composer-row">{children}
-      <DropdownMenu.Root><DropdownMenu.Trigger asChild><Button className="timber-attach" type="button" variant="ghost" size="icon" disabled={disabled||sending||audioDraft} aria-label="Add" title="Add"><PlusIcon aria-hidden="true"/></Button></DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content className="timber-add-menu" side="top" align="end" sideOffset={8} onCloseAutoFocus={event=>{const action=afterClose.current;if(action){afterClose.current=undefined;event.preventDefault();action();}}}><DropdownMenu.Item onSelect={()=>{afterClose.current=onSecureInput;}}><LockKeyholeIcon/>Secure input</DropdownMenu.Item><DropdownMenu.Item disabled={full||audioDraft} onSelect={()=>attachments.openFileDialog()}><PaperclipIcon/>Attach images</DropdownMenu.Item></DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu.Root>
-      <PromptInputSubmit className="timber-send" aria-label="Send message" title="Send message" disabled={audioDraft || disabled || sending || (!hasText && !attachments.files.length)}>{sending ? <LoaderCircleIcon className="timber-spinner" aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}</PromptInputSubmit>
+      <DropdownMenu.Root><DropdownMenu.Trigger asChild><Button className="timber-attach" type="button" variant="ghost" size="icon" disabled={disabled||sending||audioDraft} aria-label="Add" title="Add"><PlusIcon aria-hidden="true"/></Button></DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content className="timber-add-menu" side="top" align="end" sideOffset={8} onCloseAutoFocus={event=>{const action=afterClose.current;if(action){afterClose.current=undefined;event.preventDefault();action();}}}>
+        <DropdownMenu.Item onSelect={()=>{afterClose.current=onSecureInput;}}><LockKeyholeIcon/>Secure input</DropdownMenu.Item>
+        <DropdownMenu.Item disabled={full||audioDraft} onSelect={()=>attachments.openFileDialog()}><PaperclipIcon/>Attach images</DropdownMenu.Item>
+        {onSendAudio&&audio&&<><DropdownMenu.Item disabled={!audio.canAttachAudio} title={hasText||attachments.files.length?'Audio messages require an empty draft. Use Dictate text to add text to this draft.':undefined} onSelect={audio.attachAudio}><AudioLinesIcon/>Attach audio</DropdownMenu.Item><DropdownMenu.Item disabled={!audio.canRecordAudio} title={hasText||attachments.files.length?'Audio messages require an empty draft. Use Dictate text to add text to this draft.':!audio.canRecordAudio?'Microphone recording is unavailable while another action is active or unsupported in this browser.':undefined} onSelect={audio.recordAudio}><MicIcon/>Record audio</DropdownMenu.Item></>}
+      </DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu.Root>
+      {audio?.microphone}
+      {audio?.audioReady?<Button className="timber-send" type="button" aria-label="Send audio" title="Send audio" disabled={disabled||audio.audioSending} onClick={audio.sendAudio}>{audio.audioSending?<LoaderCircleIcon className="timber-spinner" aria-hidden="true"/>:<ArrowUpIcon aria-hidden="true"/>}</Button>:<PromptInputSubmit className="timber-send" aria-label="Send message" title="Send message" disabled={audioDraft || disabled || sending || (!hasText && !attachments.files.length)}>{sending ? <LoaderCircleIcon className="timber-spinner" aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}</PromptInputSubmit>}
     </div>
     {attachments.files.length > 0 && <div className="timber-attachment-status" role="status">{sending ? 'Sending images…' : `${attachments.files.length} of 4 images · Ready to send`}</div>}
   </>;
+  return audioEnabled?<AudioComposer textPresent={hasText} imagePresent={attachments.files.length>0} sending={sending} onSend={onSendAudio?(file,ids,signal)=>onSendAudio(botId,file,ids,signal):undefined} onDictate={onDictateAudio?(file,ids,signal)=>onDictateAudio(botId,file,ids,signal):undefined} onDictationStart={onDictationStart} onDictationText={onDictationText} onDraftState={onAudioDraft}>{renderControls}</AudioComposer>:renderControls();
 }
 
 function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallbacks }) {
