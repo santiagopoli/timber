@@ -1526,3 +1526,12 @@ runtime. Task app URLs are `/apps/<botId>.<taskId>.<appId>/`. Registry membershi
 and one-use per-app tickets remain required; users cannot select another computer
 through headers. Signed private deployments bind the same task ID while retaining
 logical bot authority.
+
+### Scheduling during avatar generation
+
+Workspace alarms retain avatar work with `waitUntil`, independently of task
+admission and lease reconciliation. Avatar generation keeps its existing durable
+dispatch marker and single-flight guard; it is never replayed just to wake tasks.
+While a generation is in flight it does not schedule immediate sibling alarms.
+Completion clears that guard and re-arms the remaining jobs, while task leases
+continue to reconcile on their own alarms.

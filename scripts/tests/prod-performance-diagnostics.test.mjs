@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
-import {PERFORMANCE_SCHEMA,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_PROCESSES,PERFORMANCE_DELIVERIES,PERFORMANCE_WAKES,PERFORMANCE_RECOVERY,PERFORMANCE_USAGE,summarizePerformance,performanceTaskMetadata} from '../prod-performance-diagnostics.mjs';
+import {PERFORMANCE_SCHEMA,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_PROCESSES,PERFORMANCE_DELIVERIES,PERFORMANCE_WAKES,PERFORMANCE_RECOVERY,PERFORMANCE_HOST_WAITS,PERFORMANCE_USAGE,summarizePerformance,performanceTaskMetadata} from '../prod-performance-diagnostics.mjs';
 import {collectDurable,PRIVATE_PROGRESS_MESSAGES,PRIVATE_PROGRESS_FAILURES,PRIVATE_PROGRESS_GOAL} from '../prod-durable-diagnostics.mjs';
 import {PERFORMANCE_ACTIVITY,summarizeActivity} from '../prod-performance-diagnostics.mjs';
 
@@ -10,8 +10,8 @@ const created='2026-10-12T09:00:00.000Z',updated='2026-10-12T09:30:00.000Z';
 test('performance queries measure real SQLite receipts without projecting conversation or tool content',()=>{
  const db=new DatabaseSync(':memory:');
  try{
-  db.exec('CREATE TABLE cf_agents_jobs(capability TEXT,fn TEXT,time INTEGER,running INTEGER,execution_started_at INTEGER,recovery_loop INTEGER);CREATE TABLE pi_documents(id INTEGER,kind TEXT,scope_kind TEXT,owner_id INTEGER,retired_at INTEGER);CREATE TABLE pi_document_revisions(document_id INTEGER,seq INTEGER,kind TEXT,content TEXT);CREATE TABLE bots(id TEXT,data TEXT);CREATE TABLE tasks(id TEXT,data TEXT); CREATE TABLE task_slots(bot_id TEXT,task_id TEXT,updated_at INTEGER); CREATE TABLE computer_admissions(bot_id TEXT,payload TEXT);CREATE TABLE runs(id TEXT,data TEXT);CREATE TABLE admission_sources(run_id TEXT,kind TEXT);CREATE TABLE submissions(operation_id TEXT,run_id TEXT);CREATE TABLE botspace_runtime_budget(operation_id TEXT,kind TEXT,item_id TEXT);CREATE TABLE events(id INTEGER,source_key TEXT,data TEXT);CREATE TABLE pi_tasks(id INTEGER,status TEXT,record TEXT,conversation_id INTEGER);CREATE TABLE pi_submissions(request_id TEXT,status TEXT,conversation_id INTEGER,id INTEGER);CREATE TABLE run_processes(status TEXT,dispatch_state TEXT,cancel_requested INTEGER,result TEXT);CREATE TABLE pi_entries(id INTEGER,record TEXT)');
-  for(const sql of [PERFORMANCE_SCHEMA,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_PROCESSES,PERFORMANCE_DELIVERIES,PERFORMANCE_WAKES,PERFORMANCE_RECOVERY,PERFORMANCE_USAGE]){assert.match(sql,/^(SELECT|WITH) /);assert.doesNotMatch(sql,/\b(INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE|ATTACH|PRAGMA)\b/i);assert.doesNotMatch(sql,/;/);}
+  db.exec('CREATE TABLE pending_run_cancellations(id TEXT);CREATE TABLE cf_agents_jobs(capability TEXT,fn TEXT,time INTEGER,running INTEGER,execution_started_at INTEGER,recovery_loop INTEGER);CREATE TABLE pi_documents(id INTEGER,kind TEXT,scope_kind TEXT,owner_id INTEGER,retired_at INTEGER);CREATE TABLE pi_document_revisions(document_id INTEGER,seq INTEGER,kind TEXT,content TEXT);CREATE TABLE bots(id TEXT,data TEXT);CREATE TABLE tasks(id TEXT,data TEXT); CREATE TABLE task_slots(bot_id TEXT,task_id TEXT,updated_at INTEGER); CREATE TABLE computer_admissions(bot_id TEXT,payload TEXT);CREATE TABLE runs(id TEXT,data TEXT);CREATE TABLE admission_sources(run_id TEXT,kind TEXT);CREATE TABLE submissions(operation_id TEXT,run_id TEXT);CREATE TABLE botspace_runtime_budget(operation_id TEXT,kind TEXT,item_id TEXT);CREATE TABLE events(id INTEGER,source_key TEXT,data TEXT);CREATE TABLE pi_tasks(id INTEGER,status TEXT,record TEXT,conversation_id INTEGER);CREATE TABLE pi_submissions(request_id TEXT,status TEXT,conversation_id INTEGER,id INTEGER);CREATE TABLE run_processes(status TEXT,dispatch_state TEXT,cancel_requested INTEGER,result TEXT);CREATE TABLE pi_entries(id INTEGER,record TEXT)');
+  for(const sql of [PERFORMANCE_SCHEMA,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_PROCESSES,PERFORMANCE_DELIVERIES,PERFORMANCE_WAKES,PERFORMANCE_RECOVERY,PERFORMANCE_HOST_WAITS,PERFORMANCE_USAGE]){assert.match(sql,/^(SELECT|WITH) /);assert.doesNotMatch(sql,/\b(INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE|ATTACH|PRAGMA)\b/i);assert.doesNotMatch(sql,/;/);}
   db.prepare('INSERT INTO pi_documents(kind) VALUES(?)').run(JSON.stringify('timber.subagent-waits'));
   db.prepare('INSERT INTO bots VALUES(?,?)').run('bot-canary',JSON.stringify({name:'Polibot'}));
   db.prepare('INSERT INTO tasks VALUES(?,?)').run('task-canary',JSON.stringify({botId:'bot-canary',title:'private-canary',status:'running',createdAt:created,updatedAt:updated}));
@@ -26,7 +26,7 @@ test('performance queries measure real SQLite receipts without projecting conver
   db.prepare('INSERT INTO pi_entries VALUES(?,?)').run(1,JSON.stringify({kind:'pi.assistant',model:[{timestamp:now-1000,content:'private-canary',stopReason:'toolUse',usage:{input:120000,output:200,cacheRead:100000}}]}));
   const report=summarizePerformance({runs:db.prepare(PERFORMANCE_RUNS).all(),tools:db.prepare(PERFORMANCE_TOOLS).all(),native:db.prepare(PERFORMANCE_NATIVE).all(),wakes:db.prepare(PERFORMANCE_WAKES).all(),recovery:db.prepare(PERFORMANCE_RECOVERY).all(),processes:db.prepare(PERFORMANCE_PROCESSES).all(),deliveries:db.prepare(PERFORMANCE_DELIVERIES).all(),usage:db.prepare(PERFORMANCE_USAGE).all()},window);
   assert.equal(report.recovery[0].waitGraphs,1);
-  assert.equal(db.prepare(PERFORMANCE_SCHEMA).all().length,12);assert.equal(report.runs[0].retries,1);assert.equal(report.runs[0].generations,1);assert.equal(report.tools[0].durationMs,1_800_000);assert.equal(report.tools[0].tool,'exec');assert.equal(report.modelResponses[0].inputTokens,120000);assert.equal(report.nativeTasks[0].attempt,2);
+  assert.equal(db.prepare(PERFORMANCE_SCHEMA).all().length,13);assert.equal(report.runs[0].retries,1);assert.equal(report.runs[0].generations,1);assert.equal(report.tools[0].durationMs,1_800_000);assert.equal(report.tools[0].tool,'exec');assert.equal(report.modelResponses[0].inputTokens,120000);assert.equal(report.nativeTasks[0].attempt,2);
   assert.doesNotMatch(JSON.stringify(report),/canary/);assert.doesNotMatch(JSON.stringify(performanceTaskMetadata(db.prepare(PERFORMANCE_TASKS).get())),/canary/);
   event(4,'key:start','tool.started',updated,{operationId:'key-canary',actionType:'key',input:{key:'Ctrl+C'}});
   event(5,'tool:key-canary','tool.completed',updated,{result:{status:'completed',output:'private-canary'}});
@@ -47,6 +47,13 @@ test('performance queries measure real SQLite receipts without projecting conver
   event(9,'tool:failed-canary','tool.completed',updated,{result:{status:'failed',exitCode:1,output:'bounded failure',error:'Command timed out; its process group was terminated.'}});
   assert.equal(JSON.parse(db.prepare(PRIVATE_PROGRESS_FAILURES).get().detail)[0].command,'false');
   const deadlines=summarizePerformance({tools:db.prepare(PERFORMANCE_TOOLS).all()},window).tools;
+  db.prepare('INSERT INTO run_processes VALUES(?,?,?,?)').run('running','acknowledged',0,JSON.stringify({status:'running'}));
+  for(let i=0;i<50;i++)db.prepare('INSERT INTO run_processes VALUES(?,?,?,?)').run('completed','acknowledged',0,JSON.stringify({status:'completed',exitCode:0}));
+  db.prepare('INSERT INTO pending_run_cancellations VALUES(?)').run('private-canary');
+  const waiting=summarizePerformance({hostWaits:db.prepare(PERFORMANCE_HOST_WAITS).all(),processes:db.prepare(PERFORMANCE_PROCESSES).all()},window);
+  assert.deepEqual(waiting.hostWaits,[{activeProcesses:1,pendingCancellations:1}]);
+  assert.equal(waiting.processes[0].status,'running');
+  assert.doesNotMatch(JSON.stringify(waiting),/canary/);
   assert.equal(deadlines[0].deadlineMs,10000);assert.equal(deadlines[0].yieldMs,1000);assert.equal(deadlines[0].failureKind,'timeout');
   assert.equal(summarizeActivity(db.prepare(PERFORMANCE_ACTIVITY).all(),window).find(row=>row.tool==='exec').timedOut,1);
  }finally{db.close();}
@@ -89,7 +96,7 @@ test('queued conversations without native wake tables remain inspectable without
   return Response.json({success:true,result:{results:[{columns,rows:records.map(row=>columns.map(name=>row[name])),meta:{rows_written:0}}]}});
  }});
  assert.equal(result.tasks[0].status,'queued');assert.equal(result.tasks[0].scheduler.holder,'none');
- assert.deepEqual(result.tasks[0].execution.unavailable,['runs','wakes','recovery','processes','deliveries']);
+ assert.deepEqual(result.tasks[0].execution.unavailable,['runs','wakes','recovery','hostWaits','processes','deliveries']);
  assert.doesNotMatch(JSON.stringify(result),new RegExp(`canary|${id}|${task}`));
 });
 

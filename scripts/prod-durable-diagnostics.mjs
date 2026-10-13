@@ -2,7 +2,7 @@
 import { pathToFileURL } from 'node:url';
 import {createCipheriv,createHash,createPublicKey,publicEncrypt,randomBytes,constants} from 'node:crypto';
 import { DIAGNOSTIC_CODES, timeframe } from './prod-diagnostics.mjs';
-import {PERFORMANCE_SCHEMA,PERFORMANCE_REQUESTS,summarizeInferenceRequests,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_PROCESSES,PERFORMANCE_DELIVERIES,PERFORMANCE_WAKES,PERFORMANCE_RECOVERY,PERFORMANCE_USAGE,summarizePerformance,performanceTaskMetadata} from './prod-performance-diagnostics.mjs';
+import {PERFORMANCE_SCHEMA,PERFORMANCE_REQUESTS,summarizeInferenceRequests,PERFORMANCE_TASKS,PERFORMANCE_RUNS,PERFORMANCE_TOOLS,PERFORMANCE_NATIVE,PERFORMANCE_PROCESSES,PERFORMANCE_DELIVERIES,PERFORMANCE_WAKES,PERFORMANCE_RECOVERY,PERFORMANCE_HOST_WAITS,PERFORMANCE_USAGE,summarizePerformance,performanceTaskMetadata} from './prod-performance-diagnostics.mjs';
 import {PERFORMANCE_ACTIVITY,summarizeActivity} from './prod-performance-diagnostics.mjs';
 
 // Cloudflare Data Studio's SQL API. These are fixed read-only statements;
@@ -246,7 +246,7 @@ export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now
       };
       const inference=tables.some(row=>row.name==='timber_inference_requests')?summarizeInferenceRequests(await query(bot,name,PERFORMANCE_REQUESTS)):[];
       const activity=summarizeActivity(await query(bot,name,PERFORMANCE_ACTIVITY),window);
-      return {...summarizePerformance({runs:await optional('runs',['admission_sources'],PERFORMANCE_RUNS),tools:await query(bot,name,PERFORMANCE_TOOLS),native:await query(bot,name,PERFORMANCE_NATIVE),wakes:await optional('wakes',['cf_agents_jobs'],PERFORMANCE_WAKES),recovery:await optional('recovery',['pi_documents','pi_submissions'],PERFORMANCE_RECOVERY),processes:await optional('processes',['run_processes'],PERFORMANCE_PROCESSES),deliveries:await optional('deliveries',['pi_submissions','pi_document_revisions'],PERFORMANCE_DELIVERIES),usage:await query(bot,name,PERFORMANCE_USAGE)},window),inference,activity,...(unavailable.length?{unavailable}: {})};
+      return {...summarizePerformance({runs:await optional('runs',['admission_sources'],PERFORMANCE_RUNS),tools:await query(bot,name,PERFORMANCE_TOOLS),native:await query(bot,name,PERFORMANCE_NATIVE),wakes:await optional('wakes',['cf_agents_jobs'],PERFORMANCE_WAKES),recovery:await optional('recovery',['pi_documents','pi_submissions'],PERFORMANCE_RECOVERY),hostWaits:await optional('hostWaits',['run_processes','pending_run_cancellations'],PERFORMANCE_HOST_WAITS),processes:await optional('processes',['run_processes'],PERFORMANCE_PROCESSES),deliveries:await optional('deliveries',['pi_submissions','pi_document_revisions'],PERFORMANCE_DELIVERIES),usage:await query(bot,name,PERFORMANCE_USAGE)},window),inference,activity,...(unavailable.length?{unavailable}: {})};
     };
     const root=await inspect(name),tasks=[],blockers=new Map([[selected[0].id,root]]);
     const selectedTasks=await query(workspace,'owner',PERFORMANCE_TASKS);
@@ -259,13 +259,14 @@ export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now
       }
       tasks.push({...performanceTaskMetadata(task),execution:await inspect(`owner:task:${task.id}`),...(blockedBy?{blockedBy}:{})});
     }
+    const backgroundAvatars=summarizeAvatars(await query(workspace,'owner',AVATAR_QUERY),window).jobs;
     let encryptedDiagnostic;
     if(recipient&&selectedTasks.length){
       const selectedName=`owner:task:${selectedTasks[0].id}`;
       const evidence=[...(await query(bot,selectedName,PRIVATE_PROGRESS_MESSAGES)),...(await query(bot,selectedName,PRIVATE_PROGRESS_FAILURES)),...(await query(workspace,'owner',PRIVATE_PROGRESS_GOAL))];
       encryptedDiagnostic=encryptDetails(evidence,recipient,window);
     }
-    return {source:'durable_performance_fixed_select',window,root,tasks,...(encryptedDiagnostic?{encryptedDiagnostic}:{}),limitation:'Latest 12 runs, 60 tools/native tasks and 40 model responses per conversation; Polibot chat and six tasks across all bots, prioritizing active work. Plaintext contains only allowlisted metadata. Optional task evidence is encrypted exclusively for the supplied recipient; no native prompts, private reasoning or secret storage is queried.'};
+    return {source:'durable_performance_fixed_select',window,root,tasks,backgroundAvatars,...(encryptedDiagnostic?{encryptedDiagnostic}:{}),limitation:'Latest 12 runs, 60 tools/native tasks and 40 model responses per conversation; Polibot chat and six tasks across all bots, prioritizing active work. Plaintext contains only allowlisted metadata. Optional task evidence is encrypted exclusively for the supplied recipient; no native prompts, private reasoning or secret storage is queried.'};
   }
   const schema=await query(bot,name,SCHEMA);
   if(schema.length!==SCHEMA_NAMES.size||!schema.every(row=>SCHEMA_NAMES.has(row.name)))throw new Error('durable_diagnostics_schema_mismatch');

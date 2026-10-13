@@ -75,6 +75,9 @@ export class AvatarCoordinator {
     return { themes: read<AvatarTheme>('avatar_themes'), selection: this.selection(), avatars: read<BotAvatar>('bot_avatars'), jobs: read<AvatarJob>('avatar_jobs', 'rowid DESC LIMIT 100') };
   }
   nextAlarm(): number | undefined {
+    // Completion re-arms the next job. Otherwise a queued sibling would keep
+    // requesting immediate alarms while the same paid dispatch is in flight.
+    if(this.active)return undefined;
     const row = this.ctx.storage.sql.exec<{next_at:number}>("SELECT next_at FROM avatar_jobs WHERE json_extract(data,'$.status') IN ('queued','running') ORDER BY next_at LIMIT 1").toArray()[0];
     const garbage=this.ctx.storage.sql.exec<{next_at:number}>('SELECT next_at FROM avatar_gc ORDER BY next_at LIMIT 1').toArray()[0];
     const next=Math.min(row?.next_at??Infinity,garbage?.next_at??Infinity);

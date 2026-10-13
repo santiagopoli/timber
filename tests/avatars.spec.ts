@@ -493,6 +493,8 @@ describe('owner-local AvatarCoordinator journals', () => {
       const c = coordinator(state, provider), bot = seed(state, 'Private deleted identity');
       const operationId = crypto.randomUUID(), job = (await generate(c, bot.id, operationId))[0];
       const running = c.alarm(); await entered;
+      expect(c.nextAlarm()).toBeUndefined();
+      expect(c.alarm()).toBe(running);
       state.storage.sql.exec('DELETE FROM bots WHERE id=?', bot.id);
       c.forgetBot(bot.id);
       const fenced = state.storage.sql.exec<{ bot: string; output: string | null; data: string }>('SELECT bot,output,data FROM avatar_jobs WHERE id=?', job.id).one();

@@ -19,6 +19,29 @@ async function tick(){expect(await runDurableObjectAlarm(registry())).toBe(true)
 beforeEach(()=>{computerFixtureControl.isolatedTasks=true;});
 afterEach(()=>{delete computerFixtureControl.isolatedTasks;delete computerFixtureControl.execSession;});
 describe('independent persistent task computers',()=>{
+ it('releases an idle legacy bot lease and starts its queued task while avatar inference is held',async()=>{
+  delete computerFixtureControl.isolatedTasks;
+  const owner=await bot(),queued=await task(owner,false);
+  await runInDurableObject(registry(),async(instance,state)=>{
+   const saved=state.storage.sql.exec<{data:string}>('SELECT data FROM tasks WHERE id=?',queued.id).one();
+   const value=JSON.parse(saved.data);value.status='queued';value.startImmediately=true;
+   state.storage.sql.exec('UPDATE tasks SET data=? WHERE id=?',JSON.stringify(value),queued.id);
+   state.storage.sql.exec("INSERT INTO task_slots(bot_id,task_id,token,generation,updated_at) VALUES(?,'@bot',?,1,0)",owner.id,crypto.randomUUID());
+   const avatars=(instance as unknown as {avatars:{alarm():Promise<void>}}).avatars;
+   const original=avatars.alarm.bind(avatars);
+   let release!:()=>void;
+   let avatarDispatches=0;
+   const held=new Promise<void>(resolve=>{release=resolve;});avatars.alarm=()=>{avatarDispatches++;return held;};
+   try {
+    const returned=await Promise.race([Promise.resolve(instance.alarm!()).then(()=>true),new Promise<boolean>(resolve=>setTimeout(()=>resolve(false),1000))]);
+    expect(returned).toBe(true);
+    expect(state.storage.sql.exec<{task_id:string}>('SELECT task_id FROM task_slots WHERE bot_id=?',owner.id).one().task_id).toBe(queued.id);
+    await Promise.resolve(instance.alarm!());
+    expect(avatarDispatches).toBe(1);
+   } finally {release();avatars.alarm=original;}
+  });
+  await settled(queued.id,'waiting_approval');
+ },60000);
  it('runs two tasks alongside their named bot and cancels only the selected task process',async()=>{
   const owner=await bot();
   const main=await api<{run:Run}>(`/v1/bots/${owner.id}/messages`,{operationId:crypto.randomUUID(),text:'fixture:approval'});
