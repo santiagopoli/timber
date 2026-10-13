@@ -289,7 +289,6 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     onDraft: (botId, text, mentions) => { if (selected?.id === botId && authenticated) { drafts.set(botId, text); draftMentions.set(botId, (mentions || draftMentions.get(botId) || []).filter(id => bots.some(bot => bot.id === id && hasBotMention(text, bot.name)))); renderMessages(); } },
     onSend: (botId, text, mentions, files) => sendMessage(botId, text, undefined, mentions, files),
     onSendAudio: sendAudioMessage,
-    onDictateAudio: dictateBotAudio,
     onRetryAudio: retryAudioMessage,
     onOpenBot: openAgentBot,
     onOpenTask: openTask,
@@ -332,7 +331,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     history.pushState(null,'',`${location.pathname}${location.search}#tasks${id?`&task=${encodeURIComponent(id)}`:''}`);
   }
   function setupTasksView() {
-    const props={request:tasksRequest,onDictateAudio:dictateTaskAudio,bots,active:showingTasks,selectedTaskId,onSelectTask:taskSelected,onOpenBot:openAgentBot,loadArtifact:loadTaskArtifact,modelSettings:modelSettingsState(),onModelSettings:updateModelSettings,onRefreshModels:()=>void loadModelCatalog(),decorateAvatar:decorateTaskAvatar,onBotUpdated:taskBotUpdated,onOpenSettings:()=> $('settings-button').click(),listContainer:$('tasks-sidebar-root')};
+    const props={request:tasksRequest,bots,active:showingTasks,selectedTaskId,onSelectTask:taskSelected,onOpenBot:openAgentBot,loadArtifact:loadTaskArtifact,modelSettings:modelSettingsState(),onModelSettings:updateModelSettings,onRefreshModels:()=>void loadModelCatalog(),decorateAvatar:decorateTaskAvatar,onBotUpdated:taskBotUpdated,onOpenSettings:()=> $('settings-button').click(),listContainer:$('tasks-sidebar-root')};
     if(tasksView)tasksView.update(props);else tasksView=mountTasks($('global-tasks-root'),props);
   }
   function taskBotUpdated(bot){if(!authenticated||removedBots.has(bot.id))return;const previous=bots.find(item=>item.id===bot.id);if(!previous||previous.updatedAt>bot.updatedAt)return;bots=bots.map(item=>item.id===bot.id?bot:item);if(selected?.id===bot.id){selected=bot;updateBotHeader();}renderBots();renderMessages();}

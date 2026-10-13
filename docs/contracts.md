@@ -297,20 +297,25 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
 - POST `.../dictations/:operationId/retry`
   `{attemptId,acknowledgePaidRetry:true}` is an explicit potentially paid new
   attempt, only for failed/uncertain drafts. Dispatch is flushed before provider
-  I/O; recovery never silently retranscribes uncertain outcomes. The console has
-  no paid retry control: `Check transcription status` reads the same canonical
-  IDs and never re-POSTs after uncertain delivery, including a later 404.
-- The compact toolbar Dictate text microphone captures bounded WebM Opus or
-  mono PCM16 WAV. Stop recording validates and immediately transcribes into
-  editable text without a review row or modal. Existing text,
-  selected words, concurrent edits and opaque private references remain intact;
-  insertion is after the original selection end, remapped through later edits.
-  The textarea remains editable during dictation; Enter remains newline. Only
-  ordinary explicit Send admits the final user-edited text. Dictation does not
-  use an audio card or bot execution to obtain text. Separate API billing is disclosed in the microphone tooltip before starting.
-  Bot Add menus retain images/secure input and offer Attach audio/Record audio
-  as secondary voice-note actions, sent only by explicit Send audio with consent. Cancel, Stop, navigation, task/bot changes,
-  logout/session loss, hidden page and unmount release capture and fence results.
+  I/O; recovery never silently retranscribes uncertain outcomes. These draft-only
+  APIs remain available for existing clients; the console now uses the unified
+  audio-message flow below.
+- The bot composer has one direct Record audio microphone, capturing bounded
+  WebM Opus or mono PCM16 WAV. Stop validates a local playback preview; Send audio
+  immediately posts a local audio card while uploading, then admits the original
+  and automatically transcribes it. There is no separate dictation action or
+  first-send transcription modal. Billing is disclosed in the microphone tooltip.
+  The card plays the validated local original while upload/transcription proceeds;
+  matching canonical receipts replace it without a duplicate card or download.
+  Local bytes are bounded to one recent clip per mounted conversation and do not
+  cross bot changes or logout. Unknown delivery retains the original operation IDs
+  and requires checking its receipt before another submission. A paid transcription
+  retry still requires explicit confirmation. Add retains Attach audio for files,
+  images and secure input; recording is available directly in the composer only.
+  Existing draft-only dictation APIs remain for compatibility but have no console
+  capture action. Tasks do not advertise unsupported audio-message endpoints.
+  Cancel, Stop, navigation, task/bot changes, logout/session loss, hidden page and
+  unmount release capture and fence results.
 - POST /v1/bots/:id/messages {text,operationId,mentions?:string[],attachments?:string[]} -> 202 {run:Run}
   Up to four distinct uploaded image IDs are allowed; text can be empty only with
   an image. References from other bots or non-chat artifacts are rejected.

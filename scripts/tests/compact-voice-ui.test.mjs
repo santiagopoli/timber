@@ -48,30 +48,31 @@ for(const engine of ['chromium','webkit'])for(const surface of ['bot','task'])fo
     await page.goto(surface==='task'?`${fixture.url}#tasks`:fixture.url);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();
     if(surface==='task'){await page.getByRole('region',{name:'Global tasks'}).waitFor();await page.locator(`[data-task-id="${TASK}"].timber-tasks-card`).click();await page.locator(`.timber-tasks-detail[data-task-id="${TASK}"] #message`).waitFor();}
     else {if(width<=760)await page.locator(`#bot-list button[data-bot-id="${BOT_A}"]`).click();await page.locator('#message:visible').waitFor();}
-    const composer=page.locator('.timber-composer:visible'),mic=composer.getByRole('button',{name:'Dictate text',exact:true}),draft=page.locator('#message:visible');
+    const composer=page.locator('.timber-composer:visible'),mic=composer.getByRole('button',{name:'Record audio',exact:true}),draft=page.locator('#message:visible');
+    if(surface==='task'){assert.equal(await mic.count(),0,'tasks do not advertise an unsupported audio-message endpoint');assert.equal(await composer.getByRole('button',{name:'Dictate text',exact:true}).count(),0);return;}
     await mic.waitFor();assert.equal(await composer.locator('.timber-audio-tools,.timber-audio-note').count(),0,'no idle voice row or permanent format disclaimer');
     assert.doesNotMatch(await composer.innerText(),/WAV, MP3|M4A\/MP4|Audio file|billed separately|billing is separate|10 minutes/i,'format/billing help is contextual, not permanent composer copy');
-    assert.equal(await composer.getByRole('button',{name:'Dictate text',exact:true}).count(),1,'one primary microphone');
+    assert.equal(await composer.getByRole('button',{name:'Record audio',exact:true}).count(),1,'one primary microphone');
     assert.equal(await page.evaluate(()=>window.__micCalls),0,'opening a composer never requests microphone permission');
     assert.equal(await draft.evaluate(node=>document.activeElement===node),false,'opening never autofocuses the draft');
-    const geometry=await composer.evaluate(node=>{const row=node.querySelector('.timber-composer-row'),buttons=['Add','Dictate text','Send message'].map(label=>row.querySelector(`[aria-label="${label}"]`)),box=element=>element.getBoundingClientRect().toJSON();return{composer:box(node),row:box(row),buttons:buttons.map(box),scroll:document.documentElement.scrollWidth,viewport:innerWidth};});
+    const geometry=await composer.evaluate(node=>{const row=node.querySelector('.timber-composer-row'),buttons=['Add','Record audio','Send message'].map(label=>row.querySelector(`[aria-label="${label}"]`)),box=element=>element.getBoundingClientRect().toJSON();return{composer:box(node),row:box(row),buttons:buttons.map(box),scroll:document.documentElement.scrollWidth,viewport:innerWidth};});
     assert.equal(geometry.scroll,geometry.viewport,'no page horizontal overflow');assert.ok(geometry.composer.height<=90,`idle composer remains compact (${geometry.composer.height}px)`);
     for(const [index,button] of geometry.buttons.entries()){assert.ok(button.x>=geometry.row.x&&button.right<=geometry.row.right+1,'voice actions stay within existing row');if(width<600){assert.ok(button.width>=44&&button.height>=44,'44px mobile action targets');}if(index)assert.ok(button.x>=geometry.buttons[index-1].right-1,'order remains Add, microphone, Send');}
     assert.ok(await mic.getAttribute('title'),'microphone has contextual tooltip');
     await capture(page,`${engine}-${surface}-${width}-idle`);
     await draft.fill('Keep this draft');await composer.getByRole('button',{name:'Add',exact:true}).click();
-    for(const name of (surface==='bot'?['Secure input','Attach images','Attach audio','Record audio']:['Secure input','Attach images']))await page.getByRole('menuitem',{name,exact:true}).waitFor();
+    for(const name of (surface==='bot'?['Secure input','Attach images','Attach audio']:['Secure input','Attach images']))await page.getByRole('menuitem',{name,exact:true}).waitFor();
     const menu=await page.getByRole('menu').boundingBox();assert.ok(menu.x>=0&&menu.x+menu.width<=width+1,'Add menu remains within viewport');
     if(width===390)await capture(page,`${engine}-${surface}-${width}-menu`);
     await page.keyboard.press('Escape');assert.equal(await draft.inputValue(),'Keep this draft','opening Add preserves text');
     // Radix restores Add focus asynchronously on Escape. Finish that keyboard
     // interaction before explicitly focusing the next action; no sleep/retry.
     await page.waitForFunction(()=>!document.querySelector('[role=menu]')&&document.activeElement?.getAttribute('aria-label')==='Add');
-    await mic.focus();await page.keyboard.press('Enter');await composer.getByRole('button',{name:'Stop recording',exact:true}).waitFor();
-    assert.equal(await page.evaluate(()=>window.__micCalls),1,'keyboard activation requests microphone exactly once');assert.equal(await draft.isDisabled(),false,'dictation keeps draft editable');
+    await draft.fill('');await mic.focus();await page.keyboard.press('Enter');await composer.getByRole('button',{name:'Stop recording',exact:true}).waitFor();
+    assert.equal(await page.evaluate(()=>window.__micCalls),1,'keyboard activation requests microphone exactly once');assert.equal(await draft.isDisabled(),true,'audio capture locks the standalone input');
     assert.equal(await composer.locator('.timber-audio-tools').count(),0,'active dictation does not restore the rejected toolbar');
     if(width===390)await capture(page,`${engine}-${surface}-${width}-recording`);
-    await composer.getByRole('button',{name:'Cancel dictation',exact:true}).click();await mic.waitFor();assert.equal(await page.evaluate(()=>window.__trackStops),1,'Cancel releases microphone');assert.equal(await draft.inputValue(),'Keep this draft');
+    await composer.getByRole('button',{name:'Discard',exact:true}).click();await mic.waitFor();assert.equal(await page.evaluate(()=>window.__trackStops),1,'Cancel releases microphone');assert.equal(await draft.inputValue(),'');
     assert.equal(await page.getByRole('dialog').count(),0,'dictation cancellation has no mode/confirmation modal');
     assert.deepEqual(traffic,[],'layout and cancelled capture never uploads, transcribes or sends');assert.deepEqual(external,[]);assert.deepEqual(errors,[]);assert.deepEqual(fixture.state.failures,[]);
   }catch(error){

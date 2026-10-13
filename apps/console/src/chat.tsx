@@ -28,7 +28,7 @@ import {useInlineSecrets} from './inline-secrets';
 import {SecurePill,SecurePrompt,secureReference,hasSecureReference,maskSecureReferences} from './secure-prompt';
 import type {SecretMetadata,SecureInputRequest} from '../../../packages/contracts/src/index';
 import {collectCompactions, CompactionPill, type CompactionItem} from './compaction-timeline';
-import {AudioComposer,AudioMessage,AudioProvider,type AudioComposerControls} from './audio-ui';
+import {AudioComposer,AudioMessage,AudioProvider,useAudioUpload,type AudioComposerControls} from './audio-ui';
 import {insertDictation,updateDictationAnchor,type DictationAnchor} from './dictation-draft';
 import {mergeToolResult, mergeToolStatus, runOutcomes, toolActivityState, toolFailureSummary} from './cancellation-presentation';
 
@@ -385,11 +385,11 @@ function sameValue(left: unknown, right: unknown): boolean {
   return a.length === b.length && a.every(key => Object.prototype.hasOwnProperty.call(right, key) && sameValue((left as Record<string, unknown>)[key], (right as Record<string, unknown>)[key]));
 }
 
-const HistoryMessage = memo(function HistoryMessage({message, botId, botName, run, sending, sourceModel, callbacks, outcome}: {message:ChatModel['messages'][number];botId:string;botName:string;run?:ChatModel['runs'][number];sending:boolean;sourceModel?:string;callbacks:ChatCallbacks;outcome?:ReactNode}) {
+const HistoryMessage = memo(function HistoryMessage({message, botId, botName, run, sending, sourceModel, callbacks, outcome,uploadState}: {uploadState?:'sending'|'unknown';message:ChatModel['messages'][number];botId:string;botName:string;run?:ChatModel['runs'][number];sending:boolean;sourceModel?:string;callbacks:ChatCallbacks;outcome?:ReactNode}) {
   if (message.provenance) return <AgentMessageNotice notice={{direction:'from',agent:{id:message.provenance.sourceBotId,name:message.provenance.sourceBotName,kind:'bot',model:sourceModel},text:message.text,messageId:message.id,status:run?.status}} callbacks={callbacks} eventKey={`message:${message.id}`}/>;
   return <Message from={message.role === 'user' ? 'user' : 'assistant'} data-message-id={message.id} data-message-kind={message.kind} data-progress-message-id={message.kind === 'progress' ? message.id : undefined} data-run-id={message.runId} className={`timber-message timber-message-${message.role}`}>
     {message.role !== 'user' && <div className="timber-message-meta"><span>{message.role === 'assistant' ? botName : label(message.role)}</span></div>}
-    <MessageContent className={`timber-message-content${message.audio?' timber-audio-content':''}`}>{message.audio?<AudioMessage botId={botId} audio={message.audio} onRetry={callbacks.onRetryAudio?operationId=>callbacks.onRetryAudio!(botId,operationId):undefined} busy={sending}/>:<Response text={message.text} />}{message.attachments?.map(image=><ArtifactPreview key={image.artifactId} botId={botId} artifactId={image.artifactId} compact />)}{outcome}{message.role === 'user' && <MessageRunStatus run={run} botId={botId} sending={sending} callbacks={callbacks} />}</MessageContent>
+    <MessageContent className={`timber-message-content${message.audio?' timber-audio-content':''}`}>{message.audio?<AudioMessage uploadState={uploadState} botId={botId} audio={message.audio} onRetry={callbacks.onRetryAudio?operationId=>callbacks.onRetryAudio!(botId,operationId):undefined} busy={sending}/>:<Response text={message.text} />}{message.attachments?.map(image=><ArtifactPreview key={image.artifactId} botId={botId} artifactId={image.artifactId} compact />)}{outcome}{message.role === 'user' && <MessageRunStatus run={run} botId={botId} sending={sending} callbacks={callbacks} />}</MessageContent>
     {['user', 'assistant'].includes(message.role) && <CopyMessage text={message.text} createdAt={message.createdAt} />}
   </Message>;
 });
@@ -410,7 +410,7 @@ const TimelineHistory = memo(function TimelineHistory({entries}: {entries: Timel
   return <>{entries.map(entry => <div className="timber-timeline-entry" data-timeline-key={entry.key} key={entry.key}>{entry.node}</div>)}</>;
 });
 
-function timeline(model: ChatModel, callbacks: ChatCallbacks, secureRequests:SecureInputRequest[] = []) {
+function timeline(model: ChatModel, callbacks: ChatCallbacks, secureRequests:SecureInputRequest[] = [],upload:ReturnType<typeof useAudioUpload> = null) {
   const indexes = historyIndexes(model);
   const collaboration = collectCollaboration(model);
   const resultMessageIds=new Set(collaboration.items.flatMap(item=>item.taskUpdate?.messageId?[item.taskUpdate.messageId]:[]));
@@ -467,8 +467,12 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks, secureRequests:Sec
   const entries: TimelineEntry[] = [];
   messages.forEach((message, index) => {
     const run = indexes.runs.get(message.runId || '');
-    entries.push({key: `message:${message.id}`, ...messagePosition(message,index), node: <HistoryMessage message={message} botId={model.bot.id} botName={model.bot.name} run={(message.role === 'user' && run?.status === 'queued') || message.provenance ? run : undefined} sending={message.audio || (message.role === 'user' && run?.status === 'queued' && Boolean(run.error)) ? model.sending : false} sourceModel={message.provenance ? indexes.bots.get(message.provenance.sourceBotId)?.model : undefined} outcome={message.role==='user'&&!message.provenance&&indexes.requests.get(message.runId||'')?.id===message.id?inlineFailure(message.runId,message):undefined} callbacks={callbacks}/>});
+    entries.push({key: `message:${message.audio?.operationId??message.id}`, ...messagePosition(message,index), node: <HistoryMessage message={message} botId={model.bot.id} botName={model.bot.name} run={(message.role === 'user' && run?.status === 'queued') || message.provenance ? run : undefined} sending={message.audio || (message.role === 'user' && run?.status === 'queued' && Boolean(run.error)) ? model.sending : false} sourceModel={message.provenance ? indexes.bots.get(message.provenance.sourceBotId)?.model : undefined} outcome={message.role==='user'&&!message.provenance&&indexes.requests.get(message.runId||'')?.id===message.id?inlineFailure(message.runId,message):undefined} callbacks={callbacks}/>});
   });
+  if(upload&&!model.runFilter&&!model.messages.some(message=>message.audio?.operationId===upload.audio.operationId)) {
+    const message={id:`audio-upload:${upload.audio.operationId}`,botId:model.bot.id,role:'user' as const,text:'',createdAt:upload.createdAt,audio:upload.audio};
+    entries.push({key:`message:${upload.audio.operationId}`,at:timestamp(upload.createdAt),order:(messages.length+deliveries.length)*2,node:<HistoryMessage message={message} botId={model.bot.id} botName={model.bot.name} uploadState={upload.state} sending callbacks={callbacks}/>});
+  }
   for (const approval of approvals) entries.push({key: `approval:${approval.id}`, ...afterRequest(approval.runId, timestamp(approval.createdAt)), node: <ApprovalEntry approval={approval} process={indexes.processes.get(approval.result?.processId || approval.operationId)} agentName={indexes.agents.get(indexes.runs.get(approval.runId)?.subagentId || '')?.name} current={approval.id === current?.id} automatic={model.bot.computerApprovalMode === 'automatic'} callbacks={callbacks} />});
   for (const connection of model.connections.filter(item => !model.runFilter || item.runId === model.runFilter)) {
     entries.push({key: `connection:${connection.id}`, ...afterRequest(connection.runId, timestamp(connection.createdAt)), node: <ConnectionEntry connection={connection} callbacks={callbacks} />});
@@ -521,15 +525,17 @@ function timeline(model: ChatModel, callbacks: ChatCallbacks, secureRequests:Sec
 
 function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: ChatCallbacks }) {
   const { scrollRef, scrollToBottom } = useConversationContext();
+  const upload=useAudioUpload();
   const focus = useRef(model.focusApproval);
   const sending = useRef(new Set<string>());
   useLayoutEffect(() => {
     const next = new Set(model.deliveries.filter(delivery => delivery.state === 'sending').map(delivery => delivery.operationId));
+    if(upload?.state==='sending')next.add(upload.audio.operationId);
     // A local send follows immediately, including when reading history. An
     // acknowledgement must not pull back someone who has since scrolled away.
     if ([...next].some(id => !sending.current.has(id))) scrollToBottom();
     sending.current = next;
-  }, [model.deliveries, scrollToBottom]);
+  }, [model.deliveries,upload,scrollToBottom]);
   useEffect(() => {
     const node = scrollRef.current;
     if (node) {node.id = 'messages'; node.setAttribute('aria-label', `${model.bot.name} conversation`);}
@@ -584,7 +590,7 @@ function ConversationBody({ model, callbacks }: { model: ChatModel; callbacks: C
   // Drafts and response chunks never invalidate the completed history. The
   // transport supplies immutable, referentially stable collection revisions.
   const {requests:secureRequests}=useKeychain();
-  const {entries, unpositionedCompactions, indexes, toolRuns, pendingApprovalRuns, pendingConnectionRuns} = useMemo(() => timeline(model, callbacks, secureRequests), [secureRequests,model.bot.id, model.bot.name, model.bot.model, model.bot.computerApprovalMode, model.messages, model.runs, model.approvals, model.connections, model.events, model.deliveries, model.subagents, model.delegations, model.mentionBots, model.collaborationEvents, model.compactions, model.tasks, model.knownTasks, model.runFilter, model.sending, callbacks]);
+  const {entries, unpositionedCompactions, indexes, toolRuns, pendingApprovalRuns, pendingConnectionRuns} = useMemo(() => timeline(model, callbacks, secureRequests,upload), [upload,secureRequests,model.bot.id, model.bot.name, model.bot.model, model.bot.computerApprovalMode, model.messages, model.runs, model.approvals, model.connections, model.events, model.deliveries, model.subagents, model.delegations, model.mentionBots, model.collaborationEvents, model.compactions, model.tasks, model.knownTasks, model.runFilter, model.sending, callbacks]);
   const visibleRun = model.currentRun && (!model.runFilter || model.runFilter === model.currentRun.id) ? model.currentRun : null;
   const hasInlineStatus = visibleRun && (
     pendingApprovalRuns.has(visibleRun.id) ||
@@ -633,14 +639,14 @@ function ImageControls({sending,disabled=false,hasText,acceptedIds,children,onSe
       <DropdownMenu.Root><DropdownMenu.Trigger asChild><Button className="timber-attach" type="button" variant="ghost" size="icon" disabled={disabled||sending||audioDraft} aria-label="Add" title="Add"><PlusIcon aria-hidden="true"/></Button></DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content className="timber-add-menu" side="top" align="end" sideOffset={8} onCloseAutoFocus={event=>{const action=afterClose.current;if(action){afterClose.current=undefined;event.preventDefault();action();}}}>
         <DropdownMenu.Item onSelect={()=>{afterClose.current=onSecureInput;}}><LockKeyholeIcon/>Secure input</DropdownMenu.Item>
         <DropdownMenu.Item disabled={full||audioDraft} onSelect={()=>attachments.openFileDialog()}><PaperclipIcon/>Attach images</DropdownMenu.Item>
-        {onSendAudio&&audio&&<><DropdownMenu.Item disabled={!audio.canAttachAudio} title={hasText||attachments.files.length?'Audio messages require an empty draft. Use Dictate text to add text to this draft.':undefined} onSelect={audio.attachAudio}><AudioLinesIcon/>Attach audio</DropdownMenu.Item><DropdownMenu.Item disabled={!audio.canRecordAudio} title={hasText||attachments.files.length?'Audio messages require an empty draft. Use Dictate text to add text to this draft.':!audio.canRecordAudio?'Microphone recording is unavailable while another action is active or unsupported in this browser.':undefined} onSelect={audio.recordAudio}><MicIcon/>Record audio</DropdownMenu.Item></>}
+        {onSendAudio&&audio&&<DropdownMenu.Item disabled={!audio.canAttachAudio} title={hasText||attachments.files.length?'Send or clear your text and images before attaching audio.':undefined} onSelect={audio.attachAudio}><AudioLinesIcon/>Attach audio</DropdownMenu.Item>}
       </DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu.Root>
       {audio?.microphone}
       {audio?.audioReady?<Button className="timber-send" type="button" aria-label="Send audio" title="Send audio" disabled={disabled||audio.audioSending} onClick={audio.sendAudio}>{audio.audioSending?<LoaderCircleIcon className="timber-spinner" aria-hidden="true"/>:<ArrowUpIcon aria-hidden="true"/>}</Button>:<PromptInputSubmit className="timber-send" aria-label="Send message" title="Send message" disabled={audioDraft || disabled || sending || (!hasText && !attachments.files.length)}>{sending ? <LoaderCircleIcon className="timber-spinner" aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}</PromptInputSubmit>}
     </div>
     {attachments.files.length > 0 && <div className="timber-attachment-status" role="status">{sending ? 'Sending images…' : `${attachments.files.length} of 4 images · Ready to send`}</div>}
   </>;
-  return audioEnabled?<AudioComposer textPresent={hasText} imagePresent={attachments.files.length>0} sending={sending} onSend={onSendAudio?(file,ids,signal)=>onSendAudio(botId,file,ids,signal):undefined} onDictate={onDictateAudio?(file,ids,signal)=>onDictateAudio(botId,file,ids,signal):undefined} onDictationStart={onDictationStart} onDictationText={onDictationText} onDraftState={onAudioDraft}>{renderControls}</AudioComposer>:renderControls();
+  return audioEnabled?<AudioComposer textPresent={hasText} imagePresent={attachments.files.length>0} sending={sending} onSend={onSendAudio?(file,ids,signal)=>onSendAudio(botId,file,ids,signal):undefined} onDraftState={onAudioDraft}>{renderControls}</AudioComposer>:renderControls();
 }
 
 function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallbacks }) {
@@ -758,7 +764,7 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
         setAttachmentError('');
         setSecuring(true);try {const secured=await secrets.flush(text);await callbacks.onSend(model.bot.id,secured,selectedMentions.map(bot=>bot.id),files);} catch(reason) {if(typeof record(reason).deliveryOperationId!=='string')setAttachmentError(reason instanceof Error?reason.message:'The message was not delivered. Retry sending.');throw new Error('Not delivered');}finally{setSecuring(false);}
       }}>
-        <PromptInputBody><ImageControls onSecureInput={()=>addSecure()} sending={model.sending||securing} disabled={model.composerDisabled} hasText={!!model.draft.trim()} acceptedIds={model.acceptedImageIds} botId={model.bot.id} audioDraft={audioDraft||dictationActive} audioEnabled={Boolean(callbacks.onSendAudio||callbacks.onDictateAudio)&&!model.composerDisabled} onSendAudio={callbacks.onSendAudio} onDictateAudio={callbacks.onDictateAudio} onDictationStart={onDictationStart} onDictationText={onDictationText} onAudioDraft={onAudioDraft}><>{securePrompt?<SecurePrompt value={model.draft} name={`Message ${model.bot.name}`} disabled={model.composerDisabled||model.sending||securing||audioDraft} caret={caret} restoreSelection={dictationRange.current?.text===model.draft?dictationRange.current:undefined} onCaret={setCaret} onRange={trackSelection} onKeyDown={mentionKeyDown} renderDraft={secrets.render} onChange={text=>{setMentionIndex(0);setDismissed(false);changeDraft(text);}}/>:<PromptInputTextarea ref={textarea} id="message" rows={1} aria-label={`Message ${model.bot.name}`} placeholder={`Message ${model.bot.name}`} value={model.draft} disabled={model.composerDisabled||audioDraft}
+        <PromptInputBody><ImageControls onSecureInput={()=>addSecure()} sending={model.sending||securing} disabled={model.composerDisabled} hasText={!!model.draft.trim()} acceptedIds={model.acceptedImageIds} botId={model.bot.id} audioDraft={audioDraft||dictationActive} audioEnabled={Boolean(callbacks.onSendAudio)&&!model.composerDisabled} onSendAudio={callbacks.onSendAudio} onDictateAudio={callbacks.onDictateAudio} onDictationStart={onDictationStart} onDictationText={onDictationText} onAudioDraft={onAudioDraft}><>{securePrompt?<SecurePrompt value={model.draft} name={`Message ${model.bot.name}`} disabled={model.composerDisabled||model.sending||securing||audioDraft} caret={caret} restoreSelection={dictationRange.current?.text===model.draft?dictationRange.current:undefined} onCaret={setCaret} onRange={trackSelection} onKeyDown={mentionKeyDown} renderDraft={secrets.render} onChange={text=>{setMentionIndex(0);setDismissed(false);changeDraft(text);}}/>:<PromptInputTextarea ref={textarea} id="message" rows={1} aria-label={`Message ${model.bot.name}`} placeholder={`Message ${model.bot.name}`} value={model.draft} disabled={model.composerDisabled||audioDraft}
           aria-autocomplete="list" aria-controls={choices.length ? 'bot-mentions' : undefined} aria-expanded={choices.length > 0} aria-activedescendant={choices.length ? `mention-${choices[Math.min(mentionIndex, choices.length - 1)].id}` : undefined}
           onChange={event => {selection.current={start:event.currentTarget.selectionStart,end:event.currentTarget.selectionEnd};pendingCaret.current=null;setCaret(event.currentTarget.selectionStart);setMentionIndex(0);setDismissed(false);changeDraft(event.currentTarget.value);}}
           onSelect={event => trackSelection(event.currentTarget.selectionStart,event.currentTarget.selectionEnd)}
@@ -867,7 +873,7 @@ function Chat({ model, callbacks, dockTarget, headerTarget }: { model: ChatModel
 
 /** One conversation surface for ordinary bot chat and persistent task chat. */
 export function ConversationChat({model,callbacks,loadArtifact,headerTarget=null,dockTarget=null}:{model:ChatModel;callbacks:ChatCallbacks;loadArtifact:ArtifactLoader;headerTarget?:HTMLElement|null;dockTarget?:HTMLElement|null}) {
-  return <AudioProvider load={loadArtifact}><ArtifactProvider load={loadArtifact}><KeychainProvider key={model.bot.id} botId={model.bot.id} botName={model.bot.name} request={callbacks.onContextRequest} refreshKey={model.events.filter(event=>event.type==='keychain.updated').at(-1)?.id}><Chat model={model} callbacks={callbacks} dockTarget={dockTarget} headerTarget={headerTarget}/></KeychainProvider></ArtifactProvider></AudioProvider>;
+  return <AudioProvider key={model.bot.id} botId={model.bot.id} load={loadArtifact}><ArtifactProvider load={loadArtifact}><KeychainProvider key={model.bot.id} botId={model.bot.id} botName={model.bot.name} request={callbacks.onContextRequest} refreshKey={model.events.filter(event=>event.type==='keychain.updated').at(-1)?.id}><Chat model={model} callbacks={callbacks} dockTarget={dockTarget} headerTarget={headerTarget}/></KeychainProvider></ArtifactProvider></AudioProvider>;
 }
 
 export function mountChat(element: HTMLElement, callbacks: ChatCallbacks, loadArtifact: ArtifactLoader, headerTarget: HTMLElement | null) {

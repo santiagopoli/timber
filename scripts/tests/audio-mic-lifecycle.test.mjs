@@ -29,15 +29,13 @@ const immediatePermission=()=>{
   window.MediaRecorder=class{static isTypeSupported=()=>true;state='inactive';mimeType='audio/webm;codecs=opus';constructor(){window.__recorder=this;}start(){window.__recorderStarts++;this.state='recording';}stop(){this.state='inactive';this.onstop?.();}};
 };
 async function recordAudio(page){
-  await page.getByRole('button',{name:'Add',exact:true}).click();
-  await page.getByRole('menuitem',{name:'Record audio',exact:true}).click();
+  await page.getByRole('button',{name:'Record audio',exact:true}).click();
 }
 
 test('double-clicked deferred mic permission is requested once and late stream is stopped after conversation unmount',async()=>{
   const{fixture,context,page}=await pageWithMic(deferredPermission);
   try{
-    await page.getByRole('button',{name:'Add',exact:true}).click();
-    const record=page.getByRole('menuitem',{name:'Record audio',exact:true});await record.waitFor();
+    const record=page.getByRole('button',{name:'Record audio',exact:true});await record.waitFor();
     // Dispatch twice synchronously while this actual menuitem is still mounted.
     await record.evaluate(item=>{item.click();item.click();});await page.getByText('Requesting microphone permission…').waitFor();
     assert.equal(await page.evaluate(()=>window.__micCalls),1,'two synchronous DOM clicks cannot issue a second permission request');await assertComposerLocked(page,'microphone permission is pending');
