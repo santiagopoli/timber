@@ -980,6 +980,16 @@ it('honors an explicitly configured generation limit with ChatGPT subscription i
   expect(state.calls).toHaveLength(5);
 });
 
+it('lets a computerless coordinator report remaining task work without continuing that work here',async()=>{
+ const stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+ await runInDurableObject(stub,(_,state)=>state.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)','coordinatorMode','true'));
+ await request('/submit',{text:'request-unfinished-stop coordinator-report',operationId:'coordinator-status',chatgpt:true});
+ expect(await(await request('/wait?id=coordinator-status')).json()).toMatchObject({status:'done',text:expect.stringContaining('Falta validar')});
+ const state=await(await request('/inspect')).json<{calls:unknown[];hostCalls:unknown[];toolCalls:unknown[]}>();
+ expect(state.calls).toHaveLength(2);expect(state.hostCalls).toHaveLength(1);expect(state.toolCalls).toHaveLength(0);
+ await runInDurableObject(stub,(_,state)=>expect(state.storage.sql.exec('SELECT * FROM timber_stop_nudges').toArray()).toHaveLength(0));
+});
+
 it('continues an unfinished final answer in the same durable run and hides the internal nudge', async () => {
   const namespace=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE;
   const stub=namespace.getByName(probeId);

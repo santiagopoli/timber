@@ -241,9 +241,10 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
             catalog: () => { assertActive(); return options.tools.catalog!(); },
             call: async request => {
               assertActive();const result=await options.tools.call!(request);
-              if(request.name==='create_task'&&!request.subagentId&&result.status==='completed') {
+              if(!request.subagentId&&result.status==='completed'&&(request.name==='create_task'||request.name==='message_task')) {
                 try {const value=JSON.parse(result.output??'') as {task?:{id:string;startImmediately?:boolean;status?:string}};
-                  if(value.task?.id&&value.task.startImmediately!==false&&value.task.status!=='pending')options.storage.sql.exec('INSERT OR IGNORE INTO timber_task_handoffs(operation_id,task_id) VALUES(?,?)',request.runOperationId,value.task.id);
+                  const taskId=request.name==='message_task'?request.arguments.taskId:value.task?.id;
+                  if(typeof taskId==='string'&&taskId.length>0&&(request.name==='message_task'||value.task?.startImmediately!==false&&value.task?.status!=='pending'))options.storage.sql.exec('INSERT OR IGNORE INTO timber_task_handoffs(operation_id,task_id) VALUES(?,?)',request.runOperationId,taskId);
                 }catch{/* A malformed receipt is not a successful handoff. */}
               }
               return result;
@@ -289,7 +290,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
           const operationId=live?.run?await resolveInputs(live.run.inputs):undefined;
           if(operationId && !paused(operationId) && !await stopped(operationId)) {
             const handedOff=options.storage.sql.exec('SELECT 1 FROM timber_task_handoffs WHERE operation_id=?',operationId).toArray().length>0;
-            const nudge=handedOff?undefined:stopGate.onYield(operationId,String(api.taskId),textContent(answer.content));
+            const nudge=handedOff||options.isCoordinator?.(operationId)?undefined:stopGate.onYield(operationId,String(api.taskId),textContent(answer.content));
             if(nudge)return {continue:nudge};
           }
           await maintenance.onYield(api.conversationId,Number(api.taskId));

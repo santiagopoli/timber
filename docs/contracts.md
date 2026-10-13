@@ -511,11 +511,13 @@ ephemeral `queue` for queued tasks: `reason` is `task`, `bot`, `direct_action`,
 `starting` or `scheduled`. A task holder includes `blockingTask {id,title}` from
 the same assigned bot. This read-only lease observation does not start work or
 release reservations; it is omitted for nonqueued tasks and never persisted.
-The console shows the wait reason and links to the blocking task. Tasks still
-share their assigned bot's computer and execute one at a time.
+The console shows the wait reason and links to the blocking task. New tasks use
+isolated computers and can run alongside their assigned bot and other isolated
+tasks. Previously admitted legacy tasks preserve their shared workspace and
+remain serialized on that computer.
 `GET /v1/tasks/:id/progress`
 returns a read-only snapshot: observation time, last recorded activity, elapsed
-inactivity, pending native tools/generations/compaction, recent public command
+inactivity (new user inputs do not count as execution activity), pending native tools/generations/compaction, recent public command
 activity and errors, plus conversation messages (`limit` 1–20, default 10;
 `before`/`nextCursor` page older messages). Message text is capped at 4,000
 characters and marked `truncated` when applicable; full text remains available
@@ -529,13 +531,17 @@ The host tools `list_tasks {before?}` (30 per page) and
 `message_task {taskId,text}` lets the named parent send steering to those tasks, including durable messages while queued, or explicitly continue completed/failed work. It freezes message-versus-continuation routing before dispatch, so a lost acknowledgment cannot create a second continuation. The receipt also includes a bounded passive progress snapshot (three recent messages capped at 1,200 characters, six recent activity records, eight execution records and two inference records; inspect_task retains the fuller view) for the coordinator to report the actual current step; a failed snapshot is marked unavailable without repeating the accepted instruction. Temporary agents and other task conversations cannot invoke it; cancelled tasks remain fenced.
 They resolve only tasks assigned to the calling bot and remain usable without
 `allowTaskCreation`. Task conversation text is collaborator data, not new
-instructions or authorization.
+instructions or authorization. A computerless coordinator reporting unfinished
+work, or a turn that successfully routes message_task, must end its coordinating
+turn without the unfinished-work stop gate forcing it to execute the delegated
+task itself. The gate still continues unfinished work in the task conversation.
 
 Task conversation data lives in a
 separate durable BotDO identity keyed by owner and task ID, initialized from the
-assigned bot's current configuration; the BotDO retains the assigned bot's
-computer/workspace identity, so no second computer is created. The task has its
-own transcript and run/event IDs.
+assigned bot's current configuration. It preserves the logical bot identity for
+permissions while an isolated task gets its own physical computer, seeded from
+a durable workspace checkpoint. Legacy shared tasks retain their existing
+computer. Every task has its own transcript and run/event IDs.
 
 `POST /v1/tasks/:id/start` admits the description under stable operation ID
 `task-start:<taskId>`. Queued task chats accept messages into the durable bounded inbox without claiming the computer. Only the original start/continuation input can enter Pi while the task is queued; saved messages follow once it starts. Unadmitted messages cannot prevent the scheduler from starting that original input. Expected contention does not consume delivery retry attempts.

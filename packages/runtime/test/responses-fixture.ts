@@ -4,7 +4,7 @@ export const SHARED_ALLOWANCE_MESSAGE='The ChatGPT user has reached their Subscr
 
 /** Wire-format OpenAI fixture. No model behavior, credentials, or Pi internals mocked. */
 export function responsesFixture(payload: { input: Record<string, unknown>[] }, requestNumber = 1, paid = false): Response {
-  if (JSON.stringify(payload.input).includes('request-unfinished-stop')) return unfinishedStopResponse(payload.input);
+  if (JSON.stringify(payload.input).includes('request-unfinished-stop')) return unfinishedStopResponse(payload.input,JSON.stringify(payload.input).includes('coordinator-report'));
   const userIndex = payload.input.map(item => item.role === 'user').lastIndexOf(true);
   const user = payload.input[userIndex];
   const text = JSON.stringify(user);
@@ -71,10 +71,10 @@ export function responsesFixture(payload: { input: Record<string, unknown>[] }, 
   return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
 }
 
-function unfinishedStopResponse(history: Record<string, unknown>[]): Response {
+function unfinishedStopResponse(history: Record<string, unknown>[],coordinator=false): Response {
   const toolResults=history.filter(item=>item.type==='function_call_output').length;
   const nudged=JSON.stringify(history).includes('[Timber internal continuation]');
-  const call=toolResults===0?{name:'exec',arguments:{command:'echo fixture'}}:toolResults===1&&nudged?{name:'read_file',arguments:{path:'/workspace/test.txt'}}:undefined;
+  const call=toolResults===0?(coordinator?{name:'call_tool',arguments:{name:'inspect_task',arguments:{taskId:'11111111-1111-4111-8111-111111111111'}}}:{name:'exec',arguments:{command:'echo fixture'}}):toolResults===1&&nudged?{name:'read_file',arguments:{path:'/workspace/test.txt'}}:undefined;
   const answer=toolResults===1&&!nudged
     ? 'La corrección sigue sin publicar. Falta validar y desplegar; ahora corresponde ejecutar la revisión.'
     : 'Validación y entrega completadas.';

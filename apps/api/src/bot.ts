@@ -173,6 +173,7 @@ export class BotDO extends DurableObject<Env> {
       getBot:async()=>this.currentBot(false),
       getTaskId:()=>this.taskId(),
       getTaskContext:()=>this.taskContext(),
+      isCoordinator:operationId=>{const row=this.findRun(operationId);return row?JSON.parse(row.data).coordinatorMode===true:false;},
       resolveToolOperationId:input=>this.toolOperationId(input),
       getApprovalContext:async()=>this.approvalContext(),
       onAdmissionRetry:async(operationId)=>this.admit(operationId),

@@ -6,7 +6,9 @@ export function taskProgress(sql: SqlStorage, active: boolean, now = Date.now())
   const events = sql.exec<{data:string}>(`SELECT data FROM events WHERE
     json_extract(data,'$.type') IN ('message.created','message.delta','subagent.message.delta','tool.started','tool.completed',
     'subagent.tool.started','subagent.tool.completed','subagent.message','subagent.reported',
-    'process.updated','run.failed','run.retrying') ORDER BY id DESC LIMIT 100`).toArray().map(row=>JSON.parse(row.data) as BotEvent);
+    'process.updated','run.failed','run.retrying')
+    AND (json_extract(data,'$.type')!='message.created' OR json_extract(data,'$.data.message.role')='assistant')
+    ORDER BY id DESC LIMIT 100`).toArray().map(row=>JSON.parse(row.data) as BotEvent);
   const native = sql.exec("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='pi_tasks'").toArray().length > 0;
   const execution = native ? sql.exec<{kind:string;status:string;phase:string|null;tool:string|null;subagentId:string|null}>(`SELECT
     json_extract(t.record,'$.kind') AS kind,t.status,json_extract(t.record,'$.state.checkpoint.phase') AS phase,

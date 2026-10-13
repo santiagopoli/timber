@@ -107,6 +107,8 @@ export interface PiRuntimeOptions<Env extends object> {
   getTaskId?():string|undefined;
   /** Bounded public task status/results for future turns, without waking inference. */
   getTaskContext?():string;
+  /** Trusted host scope: a coordinating turn reports work owned elsewhere. */
+  isCoordinator?(operationId:string):boolean;
   /** Host namespaces fresh effects and retains journal identities already admitted before upgrade. */
   resolveToolOperationId?(input:{taskId:string;callId:string;legacyOperationId:string}):Promise<string>;
   getApprovalContext?(): Promise<RuntimeApprovalContext>;

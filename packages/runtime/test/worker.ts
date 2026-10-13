@@ -38,6 +38,7 @@ export class HarnessProbe extends DurableObject {
     };
     this.runtime = createPiRuntime({
       models,
+      isCoordinator:()=>this.setting('coordinatorMode')==='true',
       openai:{fetch:async request=>{
         const input=await request.json<{input:Record<string,unknown>[]}>();
         if(isMemoryReview(input.input)){ctx.storage.sql.exec('INSERT INTO review_calls(input) VALUES(?)',JSON.stringify(input));return memoryReviewResponse('responses');}
@@ -126,9 +127,10 @@ export class HarnessProbe extends DurableObject {
         return JSON.parse(this.setting('approvalContext') ?? '{"active":[],"recent":[]}') as RuntimeApprovalContext;
       },
       tools: {
-        catalog: async () => [...(this.setting('allowTaskCreation')==='true'?[{name:'create_task',description:'Create independent persistent work.',inputSchema:{type:'object',properties:{title:{type:'string'},description:{type:'string'}},required:['title','description']}}]:[]),{ name: 'github_clone', description: 'Clone an authorized repository.', inputSchema: { type: 'object', properties: { repository: { type: 'string' }, path: { type: 'string' } }, required: ['repository', 'path'] } }],
+        catalog: async () => [{name:'inspect_task',description:'Read task progress.',inputSchema:{type:'object',properties:{taskId:{type:'string'}},required:['taskId']}},...(this.setting('allowTaskCreation')==='true'?[{name:'create_task',description:'Create independent persistent work.',inputSchema:{type:'object',properties:{title:{type:'string'},description:{type:'string'}},required:['title','description']}}]:[]),{ name: 'github_clone', description: 'Clone an authorized repository.', inputSchema: { type: 'object', properties: { repository: { type: 'string' }, path: { type: 'string' } }, required: ['repository', 'path'] } }],
         call: async ({ operationId, runOperationId, toolCallId, name, arguments: args }) => {
           ctx.storage.sql.exec('INSERT INTO host_calls(input) VALUES(?)', JSON.stringify({ operationId, runOperationId, toolCallId, name, arguments: args }));
+          if(name==='inspect_task')return {operationId,status:'completed',output:JSON.stringify({task:{id:args.taskId,status:'running'},progress:{observation:'recent_activity'}})};
           if(name==='create_task')return {operationId,status:'completed',output:JSON.stringify({task:{id:'11111111-1111-4111-8111-111111111111',status:'queued',startImmediately:true}})};
           return this.setting('githubConnected') === 'true'
             ? { operationId, status: 'completed', output: 'Repository cloned by the host.' }

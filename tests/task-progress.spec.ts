@@ -28,6 +28,7 @@ it('shows stale actual activity, native waits, failures and paged conversation w
   state.storage.sql.exec('INSERT INTO pi_entries VALUES(?,?)',1,JSON.stringify({model:[{content:[{id:'wait',name:'wait_subagent',arguments:{private:'native-content-canary'}}]}]}));
   state.storage.sql.exec('INSERT INTO pi_tasks VALUES(?,?,?)',2,'running',JSON.stringify({kind:'pi.tool',input:{assistant:1,callId:'wait'},state:{checkpoint:{phase:'execute',arguments:{subagentId:'child'}}}}));
  });
+ await runInDurableObject(stub,(_,state)=>state.storage.sql.exec('INSERT INTO events(source_key,data) VALUES(?,?)','new-user-input',JSON.stringify({type:'message.created',botId:bot.id,createdAt:new Date().toISOString(),data:{message:{role:'user',text:'Any update?'}}})));
  const first=await api(`/v1/tasks/${task.id}/progress?limit=2`);
  expect(first.status).toBe(200);expect(first.data).toMatchObject({lastActivityAt:at,observation:'no_recent_activity',execution:[{kind:'pi.tool',tool:'wait_subagent',subagentId:'child'}]});
  expect(first.data.idleForMs).toBeGreaterThanOrEqual(8*3_600_000);expect(first.data.messages.map((m:any)=>m.text)).toEqual(['Progress 2','Progress 3']);
