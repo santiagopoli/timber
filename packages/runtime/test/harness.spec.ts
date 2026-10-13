@@ -153,6 +153,63 @@ it('attends a new root request and spawns its own child while an earlier child i
     });
   } finally { await runInDurableObject(stub, instance => instance.releaseHeldTool?.()); }
 });
+it('steers a waiting nested agent without stopping its child or asking the user to intervene', async () => {
+  const stub = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE.getByName(probeId);
+  await runInDurableObject(stub, instance => { instance.heldTool = new Promise(resolve => { instance.releaseHeldTool = resolve; }); });
+  try {
+    await request('/submit', {text:'request-subagent-wait nested-steering',operationId:'nested-steering-parent'});
+    await expect.poll(() => runInDurableObject(stub, (_instance, state) => state.storage.sql.exec<{event:string}>('SELECT event FROM projected').toArray().map(row=>JSON.parse(row.event)).filter(event=>event.type==='subagent.tool.started'&&event.data.toolName==='wait_subagent').length)).toBe(1);
+    const parent = await runInDurableObject(stub, async instance => (await instance.runtime.subagents()).find(agent=>!agent.parentSubagentId)!);
+    await runInDurableObject(stub, instance => instance.runtime.sendSubagent(parent.id,'Here is the missing information. Respond now while your child continues.',{operationId:'nested-steering-message'}));
+    await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagentMessages(parent.id)).some(message=>message.role==='user'&&message.text.includes('missing information')))).toBe(true);
+    await expect.poll(() => runInDurableObject(stub, async instance => (await instance.runtime.subagents()).find(agent=>agent.id===parent.id)?.status)).toBe('completed');
+    await runInDurableObject(stub, async instance => {
+      expect((await instance.runtime.subagents()).find(agent=>agent.parentSubagentId===parent.id)?.status).toBe('running');
+      expect((await instance.runtime.subagentMessages(parent.id)).filter(message=>message.role==='user'&&message.text.includes('missing information'))).toHaveLength(1);
+    });
+    expect(await (await request('/wait?id=nested-steering-parent')).json()).toMatchObject({status:'done'});
+  } finally { await runInDurableObject(stub, instance => instance.releaseHeldTool?.()); }
+});
+it('repairs legacy queued follow-up reports after eviction without resubmitting them', async () => {
+  const namespace=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE;
+  let stub=namespace.getByName(probeId);
+  const original=PiHarness.prototype.enqueue;
+  try {
+    await runInDurableObject(stub,(instance,state)=>{state.storage.sql.exec('INSERT INTO config(key,value) VALUES(?,?)','holdComputerTools','true');instance.heldTool=new Promise(resolve=>{instance.releaseHeldTool=resolve;});});
+    await request('/submit',{text:'request-subagent-wait nested-steering',operationId:'legacy-wait-parent'});
+    await expect.poll(()=>runInDurableObject(stub,(_,state)=>state.storage.sql.exec<{event:string}>('SELECT event FROM projected').toArray().some(row=>{const e=JSON.parse(row.event);return e.type==='subagent.tool.started'&&e.data.toolName==='wait_subagent';}))).toBe(true);
+    const parent=await runInDurableObject(stub,async instance=>(await instance.runtime.subagents()).find(agent=>!agent.parentSubagentId)!);
+    PiHarness.prototype.enqueue=function(session,input,options){return original.call(this,session,input,{...options,...(options.operationId==='legacy-follow-up'?{whenBusy:'followUp' as const}:{})});};
+    await runInDurableObject(stub,instance=>instance.runtime.sendSubagent(parent.id,'Legacy queued information',{operationId:'legacy-follow-up'}));
+    await expect.poll(()=>runInDurableObject(stub,(_,state)=>state.storage.sql.exec<{status:string}>('SELECT status FROM pi_submissions WHERE request_id=?',JSON.stringify('legacy-follow-up')).toArray()[0]?.status)).toBe('queued');
+    PiHarness.prototype.enqueue=original;
+    await abortAllDurableObjects();stub=namespace.getByName(probeId);
+    await runInDurableObject(stub,(_,state)=>state.storage.sql.exec("UPDATE cf_agents_jobs SET time=0 WHERE capability IN ('pi-harness','botspace-subagents')"));
+    await runDurableObjectAlarm(stub);
+    await expect.poll(()=>runInDurableObject(stub,async instance=>(await instance.runtime.subagentMessages(parent.id)).some(m=>m.role==='user'&&m.text==='Legacy queued information'))).toBe(true);
+    await runInDurableObject(stub,async(instance,state)=>{
+      expect(state.storage.sql.exec('SELECT id FROM pi_submissions WHERE request_id=?',JSON.stringify('legacy-follow-up')).toArray()).toHaveLength(1);
+      expect((await instance.runtime.subagents()).find(agent=>agent.parentSubagentId===parent.id)?.status).toBe('running');
+    });
+  } finally {PiHarness.prototype.enqueue=original;await runInDurableObject(stub,instance=>instance.releaseHeldTool?.());}
+});
+it('rejects circular sibling waits and lets both agents finish', async () => {
+  const stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+  await runInDurableObject(stub,instance=>{instance.heldTool=new Promise(resolve=>{instance.releaseHeldTool=resolve;});});
+  try {
+    await request('/submit',{text:'request-subagent-peers wait-cycle',operationId:'cycle-parent'});await request('/wait?id=cycle-parent');
+    await expect.poll(()=>runInDurableObject(stub,async instance=>(await instance.runtime.subagents()).length)).toBe(2);
+    const [a,b]=await runInDurableObject(stub,instance=>instance.runtime.subagents());
+    await runInDurableObject(stub,async instance=>{
+      await instance.runtime.sendSubagent(a!.id,`request-wait-existing:${b!.id}`,{operationId:'wait-for-b'});
+      await instance.runtime.sendSubagent(b!.id,`request-wait-existing:${a!.id}`,{operationId:'wait-for-a'});
+      instance.releaseHeldTool?.();
+    });
+    await expect.poll(()=>runInDurableObject(stub,async instance=>(await instance.runtime.subagents()).every(agent=>agent.status==='completed'))).toBe(true);
+    const found=await runInDurableObject(stub,async(instance,state)=>state.storage.sql.exec<{record:string}>("SELECT record FROM pi_entries WHERE json_extract(record,'$.kind')='pi.tool-result'").toArray().some(row=>row.record.includes('Circular subagent wait')));
+    expect(found).toBe(true);
+  } finally {await runInDurableObject(stub,instance=>instance.releaseHeldTool?.());}
+});
 it('stops an older joined task without aborting the newer root input or its child', async () => {
   const stub = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE.getByName(probeId);
   await runInDurableObject(stub, instance => { instance.abortHeldTool = true; instance.heldTool = new Promise(resolve => { instance.releaseHeldTool = resolve; }); });
@@ -476,13 +533,24 @@ it.each([false, true])('continues a running exec through its process ID with can
   const state = await (await request('/inspect')).json<{toolCalls: {input: string}[]; calls: {input: string}[]; events: {event: string}[]}>();
   const tools = state.toolCalls.map(row => JSON.parse(row.input));
   expect(tools.map(tool => tool.action.type)).toEqual(['exec', cancel ? 'execCancel' : 'execPoll']);
-  expect(tools[0].action).toEqual({type: 'exec', command: 'fixture managed command', yieldMs: 1000});
+  expect(tools[0].action).toEqual({type: 'exec', command: 'fixture managed command', yieldMs: 10000});
   expect(tools[1].action.processId).toBe(tools[0].operationId);
   expect(tools[1].operationId).not.toBe(tools[0].operationId);
   const events = state.events.map(row => JSON.parse(row.event));
   expect(events).toContainEqual(expect.objectContaining({type: 'tool.completed', data: expect.objectContaining({status: 'running', processId: tools[0].operationId})}));
   expect(events).toContainEqual(expect.objectContaining({type: 'tool.completed', data: expect.objectContaining({status: cancel ? 'cancelled' : 'completed', processId: tools[0].operationId})}));
   expect(events.some(event => event.type === 'run.failed')).toBe(false);
+});
+it('accepts a nullable deadline through the actual namespaced Responses schema and native Pi validation',async()=>{
+  await request('/host-context',{mode:'automatic'});
+  await request('/submit',{text:'request-resumable-exec null-deadline',operationId:'nullable-deadline',chatgpt:true});
+  expect(await(await request('/wait?id=nullable-deadline')).json()).toMatchObject({status:'done',text:'The managed command completed.'});
+  const state=await(await request('/inspect')).json<{calls:{input:string}[];toolCalls:{input:string}[]}>();
+  const wire=JSON.parse(state.calls[0]!.input),exec=wire.tools.flatMap((namespace:{tools:{name:string}[]})=>namespace.tools).find((tool:{name:string})=>tool.name==='exec');
+  expect(exec.parameters.properties.timeoutMs.anyOf).toContainEqual({type:'null'});
+  const actions=state.toolCalls.map(row=>JSON.parse(row.input).action);
+  expect(actions).toEqual([{type:'exec',command:'fixture managed command',yieldMs:10000},{type:'execPoll',processId:expect.any(String),yieldMs:0}]);
+  expect(actions[0]).not.toHaveProperty('timeoutMs');
 });
 it('recovers after a saved running exec result by polling without launching the command again', async () => {
   const namespace = (env as unknown as {PROBE: DurableObjectNamespace<HarnessProbe>}).PROBE;
@@ -1188,4 +1256,61 @@ it('native overflow compaction recovers a safe SSE context error without replayi
   expect(state.toolCalls).toHaveLength(1);expect(state.calls).toHaveLength(9);
   for(let index=0;index<4;index++)expect(state.messages.some(message=>message.role==='user'&&message.text.startsWith(`Retained fact ${index}:`))).toBe(true);
   expect(JSON.stringify(state.calls.at(-1))).toContain('<summary>');
+});
+it('hands substantial work to one persistent task and releases the current turn without stop-gate resumption',async()=>{
+ const stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+ await runInDurableObject(stub,(_instance,state)=>state.storage.sql.exec("INSERT OR REPLACE INTO config(key,value) VALUES('allowTaskCreation','true')"));
+ await (await request('/submit',{text:'request-task-handoff',operationId:'persistent-handoff',chatgpt:true})).arrayBuffer();
+ await (await request('/wait?id=persistent-handoff')).arrayBuffer();
+ const state=await(await request('/inspect')).json<{calls:{input:string}[];hostCalls:{input:string}[];toolCalls:unknown[]}>();
+ expect(state.calls).toHaveLength(2);expect(state.hostCalls).toHaveLength(1);expect(JSON.parse(state.hostCalls[0]!.input)).toMatchObject({name:'create_task'});expect(state.toolCalls).toHaveLength(0);
+ expect(JSON.stringify(state.calls[0])).toContain('For substantial multi-step work');
+ await runInDurableObject(stub,(_instance,state)=>{
+  expect(state.storage.sql.exec("SELECT task_id FROM timber_task_handoffs WHERE operation_id='persistent-handoff'").one().task_id).toBe('11111111-1111-4111-8111-111111111111');
+  expect(state.storage.sql.exec('SELECT task_id FROM timber_stop_nudges').toArray()).toHaveLength(0);
+ });
+});
+it('task conversation instructions keep commands inside the task and expose bounded public task outcomes',async()=>{
+ const stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+ await runInDurableObject(stub,(_instance,state)=>{
+  state.storage.sql.exec("INSERT OR REPLACE INTO config(key,value) VALUES('allowTaskCreation','true')");
+  state.storage.sql.exec("INSERT OR REPLACE INTO config(key,value) VALUES('taskId','11111111-1111-4111-8111-111111111111')");
+  state.storage.sql.exec("INSERT OR REPLACE INTO config(key,value) VALUES('taskContext','Fixture existing task status: completed')");
+ });
+ await (await request('/submit',{text:'Hello task',operationId:'task-context',chatgpt:true})).arrayBuffer();await (await request('/wait?id=task-context')).arrayBuffer();
+ const state=await(await request('/inspect')).json<{calls:{input:string}[]}>();
+ expect(JSON.stringify(state.calls[0])).toContain('Do not create another global task');expect(JSON.stringify(state.calls[0])).toContain('Fixture existing task status: completed');expect(JSON.stringify(state.calls[0])).not.toContain('For substantial multi-step work');
+});
+
+it('keeps prompt cache affinity through eviction and scopes separate bot conversations independently',async()=>{
+ await request('/submit',{text:'Hello affinity',operationId:'affinity-one',chatgpt:true});await request('/wait?id=affinity-one');
+ await abortAllDurableObjects();
+ await request('/submit',{text:'Hello again',operationId:'affinity-two',chatgpt:true});await request('/wait?id=affinity-two');
+ const state=await(await request('/inspect')).json<{calls:{input:string}[]}>(),keys=state.calls.map(call=>JSON.parse(call.input).prompt_cache_key);
+ expect(keys).toHaveLength(2);expect(keys[0]).toMatch(/^[a-f0-9]{64}$/);expect(keys[1]).toBe(keys[0]);
+ const original=probeId;probeId=crypto.randomUUID();
+ await request('/submit',{text:'Hello another bot',operationId:'affinity-other',chatgpt:true});await request('/wait?id=affinity-other');
+ const other=await(await request('/inspect')).json<{calls:{input:string}[]}>();expect(JSON.parse(other.calls[0]!.input).prompt_cache_key).not.toBe(keys[0]);probeId=original;
+ const stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+ expect((await runInDurableObject(stub,instance=>instance.runtime.contextStatus())).contextWindow).toBe(128000);
+});
+it('compacts long retained conversations automatically before the advertised million-token maximum',async()=>{
+ for(let index=0;index<4;index++){
+  await request('/submit',{text:`Retained long turn ${index}: `+'verified historical context '.repeat(6500),operationId:`bounded-context-${index}`,chatgpt:true});
+  expect(await(await request(`/wait?id=bounded-context-${index}`)).json()).toMatchObject({status:'done'});
+ }
+ const stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
+ await expect.poll(async()=>{const context=await runInDurableObject(stub,instance=>instance.runtime.contextStatus());return context.compactions.some(item=>item.status==='completed'&&item.reason==='threshold');}).toBe(true);
+ const state=await(await request('/inspect')).json<{messages:{role:string;text:string}[];calls:{input:string}[]}>();
+ for(let index=0;index<4;index++)expect(state.messages.some(message=>message.role==='user'&&message.text.startsWith(`Retained long turn ${index}:`))).toBe(true);
+ expect(JSON.stringify(state.calls.at(-1))).toContain('<summary>');
+});
+
+it('recovers an SDK connection loss automatically in the same run without repeating the completed command',async()=>{
+ await request('/host-context',{mode:'automatic'});
+ await request('/submit',{text:'request-exec request-connection-error-once',operationId:'recover-connection',chatgpt:true});
+ expect(await(await request('/wait?id=recover-connection')).json()).toMatchObject({status:'done'});
+ const state=await(await request('/inspect')).json<{calls:{input:string}[];toolCalls:unknown[];events:{event:string}[]}>();
+ expect(state.toolCalls).toHaveLength(1);expect(state.calls).toHaveLength(3);expect(JSON.stringify(state.calls.at(-1))).toContain('function_call_output');
+ expect(state.events.some(row=>JSON.parse(row.event).type==='run.retrying')).toBe(true);
 });

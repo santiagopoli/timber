@@ -62,14 +62,14 @@ for(const width of [1440,390])test(`model picker selects providers before models
     if(width<760)await page.locator('#mobile-back').click();
     await page.locator('#new-bot').click();await page.locator('#bot-name').fill('Searchable models');await page.locator('#bot-model-picker').click();await bounds(page);
     assert.equal(await popup(page).getByRole('option').count(),3);await provider(page,'Anthropic').click();
-    await search(page).fill('reviewer-42');await popup(page).getByRole('option').filter({hasText:'anthropic/reviewer-42'}).click();assert.equal(await page.locator('#bot-model').inputValue(),'anthropic/reviewer-42');
+    await search(page).fill('reviewer-42');await popup(page).locator('[data-value="anthropic/reviewer-42"]').click();assert.equal(await page.locator('#bot-model').inputValue(),'anthropic/reviewer-42');
     await page.locator('#create-form [type=submit]').click();await page.locator('#bot-dialog').waitFor({state:'hidden'});assert.equal(fixture.state.bots.find(bot=>bot.name==='Searchable models').model,'anthropic/reviewer-42');
 
     if(!await page.locator('#settings-button').isVisible()){await page.locator('#panel-menu > summary').click();await page.locator('#mobile-account').click();}
     else await page.locator('#settings-button').click();
     await page.locator('#avatar-create-details > summary').click();await page.locator('#avatar-theme-kind').selectOption('image');await page.locator('#avatar-theme-model-picker').click();await bounds(page);await provider(page,'OpenAI').click();
-    await popup(page).getByText('Image API is not configured · Configuration only',{exact:true}).waitFor();
-    await popup(page).getByText('OpenAI Image API · Separately billed',{exact:true}).waitFor();await popup(page).getByText('Token pricing unavailable',{exact:true}).waitFor();assert.doesNotMatch(await popup(page).getByRole('option').innerText(),/Uses ChatGPT allowance/);
+    await popup(page).getByText('Image API is not configured',{exact:true}).waitFor();
+    await popup(page).getByRole('option').getByText('Image API',{exact:true}).waitFor();await popup(page).getByRole('option').locator('[aria-label="Input: price unavailable"]').waitFor();assert.doesNotMatch(await popup(page).getByRole('option').innerText(),/Uses ChatGPT allowance/);
     assert.equal(await popup(page).getByRole('option').getAttribute('aria-disabled'),'false','unavailable image models remain selectable for saved theme configuration');
     await page.keyboard.press('Escape');assert.ok(await page.locator('#settings-dialog').isVisible());
     assert.deepEqual(errors,[]);assert.deepEqual(fixture.state.failures,[]);
@@ -124,16 +124,22 @@ for(const width of [1440,390])test(`model prices follow subscription, paid fallb
     await page.goto(fixture.url);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('#app').waitFor();
     if(width<760)await page.locator('.bot-item').first().click();
     const trigger=page.getByRole('button',{name:/^Model settings:/});await trigger.click();
-    const settings=page.getByRole('dialog',{name:'Model settings',exact:true}),billing=settings.locator('.timber-model-billing');
-    await billing.getByText('Uses ChatGPT allowance · No per-token API charge',{exact:true}).waitFor();
-    await billing.getByText('OpenAI API fallback · USD / 1M tokens',{exact:true}).waitFor();await billing.getByText('Input $2 · Output $10 · Cached input $0.1',{exact:true}).waitFor();
-    await billing.getByText('OpenRouter fallback · USD / 1M tokens',{exact:true}).waitFor();await billing.getByText('Input $3 · Output $15 · Cached input $0.3',{exact:true}).waitFor();
-    await provider(page,'OpenAI').click();const option=settings.getByRole('option');await option.getByText('Uses ChatGPT allowance · No per-token API charge',{exact:true}).waitFor();assert.ok((await option.innerText()).includes('OpenAI API fallback'));
+    const settings=page.getByRole('dialog',{name:'Model settings',exact:true}),billing=settings.getByRole('table',{name:'Model usage and pricing'});
+    assert.equal(await billing.isVisible(),false,'detailed billing starts collapsed');
+    await provider(page,'OpenAI').click();const option=settings.getByRole('option');
+    await option.getByText('ChatGPT plan',{exact:true}).waitFor();await option.getByText('Fallback: OpenAI API',{exact:true}).waitFor();
+    await option.locator('[aria-label="Input: $2"]').waitFor();await option.locator('[aria-label="Output: $10"]').waitFor();
+    assert.equal(await option.locator('.timber-model-option-id').count(),0,'a model row does not repeat its ID');
+    assert.ok((await option.boundingBox()).height<=70,'a priced model fits in a compact two-line row');
     await bounds(page);assert.equal(await page.getByRole('dialog').count(),1,'pricing does not introduce another popup');
+    await settings.getByLabel('Usage and prices',{exact:true}).click();await billing.waitFor();
+    const plan=billing.locator('[data-source="chatgpt"]'),apiRow=billing.locator('[data-source="openai-api"]'),routerRow=billing.locator('[data-source="openrouter"]');
+    await plan.getByText('Plan allowance',{exact:true}).waitFor();
+    await apiRow.getByText('$2',{exact:true}).waitFor();await apiRow.getByText('$10',{exact:true}).waitFor();await apiRow.getByText('$0.1',{exact:true}).waitFor();await apiRow.getByText('Fallback 1',{exact:true}).waitFor();
+    await routerRow.getByText('$3',{exact:true}).waitFor();await routerRow.getByText('$0.3',{exact:true}).waitFor();await routerRow.getByText('Fallback 2',{exact:true}).waitFor();
     await settings.getByRole('switch',{name:'Fast mode'}).click();await trigger.locator('[aria-label="Fast mode"]').waitFor();
-    await billing.getByText('OpenRouter fallback unavailable with these settings',{exact:true}).waitFor();
-    assert.equal(await billing.getByText('Input $3 · Output $15 · Cached input $0.3',{exact:true}).count(),0,'an incompatible fallback is not quoted as active');
-    await billing.getByText('Input $2 · Output $10 · Cached input $0.1 · Standard rates; Fast pricing unavailable',{exact:true}).waitFor();
+    await routerRow.getByText('Fast unsupported',{exact:true}).waitFor();assert.equal(await routerRow.getByText('$3',{exact:true}).count(),0,'an incompatible fallback is not quoted as active');
+    await apiRow.getByText('Fast price unavailable',{exact:true}).waitFor();assert.equal(await apiRow.getByText('$2',{exact:true}).count(),0,'standard prices are never quoted as Fast prices');
     await settings.getByRole('switch',{name:'Fast mode'}).click();await trigger.locator('[aria-label="Fast mode"]').waitFor({state:'hidden'});
     await settings.getByRole('button',{name:'Close model settings'}).click();
     await page.route('**/v1/connections/chatgpt',route=>{
@@ -143,15 +149,43 @@ for(const width of [1440,390])test(`model prices follow subscription, paid fallb
     });
     if(!await page.locator('#settings-button').isVisible()){await page.locator('#panel-menu > summary').click();await page.locator('#mobile-account').click();}else await page.locator('#settings-button').click();
     await page.locator('#disconnect-chatgpt').click();await page.locator('#chatgpt-status').filter({hasText:'Not connected'}).waitFor();await page.getByRole('button',{name:'Close settings',exact:true}).click();
-    await trigger.click();await settings.getByText('OpenAI API · Uses API credits',{exact:true}).waitFor();
-    await billing.getByText('OpenAI API · USD / 1M tokens',{exact:true}).waitFor();assert.equal(await billing.getByText(/Uses ChatGPT allowance/).count(),0);
-    await billing.getByText('OpenRouter fallback · USD / 1M tokens',{exact:true}).waitFor();await settings.getByRole('button',{name:'Close model settings'}).click();
+    await trigger.click();await settings.locator('summary').getByText('OpenAI API',{exact:true}).waitFor();await settings.getByLabel('Usage and prices',{exact:true}).click();
+    await billing.locator('[data-source="openai-api"] td').first().filter({hasText:'$2'}).waitFor();assert.equal(await billing.getByText('Plan allowance',{exact:true}).count(),0);
+    await billing.locator('[data-source="openrouter"]').getByText('Fallback 1',{exact:true}).waitFor();await settings.getByRole('button',{name:'Close model settings'}).click();
     if(!await page.locator('#edit-bot').isVisible())await page.locator('#panel-menu > summary').click();await page.locator('#edit-bot').click();
-    await page.locator('#edit-model-help').filter({hasText:'Input $2 · Output $10 · Cached input $0.1'}).waitFor();
-    await page.locator('#edit-fast').check();await page.locator('#edit-model-help').filter({hasText:'OpenRouter fallback unavailable with these settings'}).waitFor();await page.getByRole('button',{name:'Close edit bot'}).click();
+    await page.locator('#edit-model-help').filter({hasText:'$2 in / $10 out · USD / 1M tokens'}).waitFor();
+    await page.locator('#edit-fast').check();await page.locator('#edit-model-help').filter({hasText:'Fast price unavailable'}).waitFor();await page.getByRole('button',{name:'Close edit bot'}).click();
     if(width<760)await page.locator('#mobile-back').click();await page.locator('#new-bot').click();await page.locator('#bot-model-picker').click();await provider(page,'Anthropic').click();
-    await popup(page).getByRole('option').getByText('Input $3 · Output $15 / 1M tokens (USD)',{exact:true}).waitFor();await popup(page).getByRole('option').click();
-    await page.locator('#bot-model-help').filter({hasText:'OpenRouter · USD / 1M tokens'}).waitFor();assert.doesNotMatch(await page.locator('#bot-model-help').innerText(),/ChatGPT/);
+    await popup(page).getByRole('option').locator('[aria-label="Input: $3"]').waitFor();await popup(page).getByRole('option').click();
+    await page.locator('#bot-model-help').filter({hasText:'OpenRouter · $3 in / $15 out · USD / 1M tokens'}).waitFor();assert.doesNotMatch(await page.locator('#bot-model-help').innerText(),/ChatGPT/);
     assert.deepEqual(fixture.state.failures,[]);
   }finally{await page.unrouteAll({behavior:'wait'});await context.close();await fixture.close();}
+});
+
+for(const viewport of [{width:1440,height:900},{width:390,height:700},{width:320,height:700},{width:390,height:500}])test(`compact model comparison keeps settings accessible at ${viewport.width}x${viewport.height}`,async()=>{
+  const fixture=await createConsoleFixture(),context=await browser.newContext({viewport}),page=await context.newPage();page.setDefaultTimeout(6000);
+  const base={...fixture.state.modelCatalog.models[0],reasoningEfforts:['none','minimal','low','medium','high','xhigh','max']};
+  fixture.state.modelCatalog.models=Array.from({length:16},(_,i)=>{
+    const item={...base,id:i?`reviewer-${i}`:base.id,name:i?`Reviewer ${i}`:base.name};
+    return {...item,routes:[{...item,source:'chatgpt',modelId:item.id},{...item,source:'openai-api',provider:'openai-api',modelId:item.id,contextWindow:128000,pricing:{input:2+i,output:10+i,cachedInput:.1}},{...item,source:'openrouter',provider:'openrouter',modelId:`openai/${item.id}`,contextWindow:128000,pricing:{input:3,output:15},supportsFast:false}]};
+  });
+  try{
+    await page.goto(fixture.url);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('#app').waitFor();if(viewport.width<760)await page.locator('.bot-item').first().click();
+    await page.locator('#message').fill('Keep my draft');await page.getByRole('button',{name:/^Model settings:/}).click();const settings=page.getByRole('dialog',{name:'Model settings',exact:true});
+    await provider(page,'OpenAI').click();await bounds(page);
+    assert.equal(await settings.locator('.timber-model-picker-heading').count(),1,'navigation has one header');
+    assert.equal(await settings.getByRole('table').isVisible(),false,'the price table is secondary information');
+    const list=settings.getByRole('listbox'),listBox=await list.boundingBox(),rows=await settings.getByRole('option').all();let visible=0;
+    for(const row of rows){const box=await row.boundingBox();assert.ok(box.height<=70,'each priced model uses two short lines');if(box.y>=listBox.y&&box.y+box.height<=listBox.y+listBox.height)visible++;}
+    if(viewport.height>=700)assert.ok(visible>=3,'several models are fully visible for comparison');
+    const controls=settings.getByRole('group',{name:'Reasoning effort'}),fast=settings.getByRole('switch',{name:'Fast mode'});
+    const inPanel=async locator=>{const box=await locator.boundingBox(),panel=await settings.boundingBox();assert.ok(box.y>=panel.y&&box.y+box.height<=panel.y+panel.height,'settings stay inside the visible panel');};
+    await inPanel(controls);await inPanel(fast);assert.equal(await controls.getByRole('button').count(),7);
+    const before=await controls.boundingBox();await list.evaluate(node=>{node.scrollTop=node.scrollHeight;});const after=await controls.boundingBox();assert.equal(after.y,before.y,'scrolling the catalogue does not move the settings');
+    await settings.getByLabel('Usage and prices',{exact:true}).click();await settings.getByRole('table').waitFor();await bounds(page);await inPanel(controls);await inPanel(fast);
+    assert.equal(await page.getByRole('dialog').count(),1,'billing details expand inside the existing panel');
+    await settings.getByLabel('Usage and prices',{exact:true}).focus();await page.keyboard.press('Space');await settings.getByRole('table').waitFor({state:'hidden'});
+    await search(page).fill('reviewer-15');await page.keyboard.press('Enter');await page.getByRole('button',{name:'Model settings: Reviewer 15',exact:true}).waitFor();
+    assert.equal(await page.locator('#message').inputValue(),'Keep my draft');assert.deepEqual(fixture.state.failures,[]);
+  }finally{await context.close();await fixture.close();}
 });

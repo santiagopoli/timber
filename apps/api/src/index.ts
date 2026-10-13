@@ -4,6 +4,7 @@ import type { Env } from "./env";
 import { UUID, operationId as validateOperationId, parseAction } from "./validation";
 import type { Bot } from "@botspace/contracts";
 import {modelCatalog} from './model-catalog';
+import {hostTools} from './host-tools';
 export { WorkspaceDO } from "./workspace";
 export { BotDO } from "./bot";
 export { GitHubAuthDO } from "./github";
@@ -18,9 +19,9 @@ async function discardRequestBody(request:Request):Promise<void> {
   try { await request.body.cancel(); } catch { /* A forwarded/locked stream is already owned elsewhere. */ }
 }
 
-async function beginAdmission(env:Env,botId:string,operationId:string,taskId?:string):Promise<string> {
+async function beginAdmission(env:Env,botId:string,operationId:string,taskId?:string,inbox=false):Promise<string> {
   const path=`https://workspace/tasks/bot-slot/${botId}/admissions`;
-  const response=await env.WORKSPACE.get(env.WORKSPACE.idFromName("owner")).fetch(new Request(path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId,...taskId?{taskId}:{}})}));
+  const response=await env.WORKSPACE.get(env.WORKSPACE.idFromName("owner")).fetch(new Request(path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId,...taskId?{taskId}:{},...(inbox?{inbox:true}:{})})}));
   if(!response.ok)throw new ApiError(response.status,"computer_busy","The bot's shared computer is occupied; retry when its current work finishes.");
   return (await response.json<{token:string}>()).token;
 }
@@ -50,6 +51,10 @@ export default {
     try {
       const url=new URL(request.url);
       if(url.pathname==="/health" && request.method==="GET") return json({ok:true,service:"botspace"});
+      if(url.pathname==="/health/version" && request.method==="GET") {
+        const schema=(name:string)=>hostTools.find(tool=>tool.name===name)?.inputSchema??null;
+        return json({service:"botspace",versionId:env.VERSION_METADATA?.id??null,keychainTools:{secret_request:schema('secret_request'),secure_worker_deploy:schema('secure_worker_deploy'),secure_worker_deploy_capabilities:schema('secure_worker_deploy_capabilities')}});
+      }
       // Static developer console contains no account data or credentials.
       if((url.pathname==="/" || url.pathname==="/console" || url.pathname.startsWith("/console/")) && request.method==="GET") {
         if(!env.ASSETS) throw new ApiError(404,"not_found","Console not installed.");
@@ -63,14 +68,14 @@ export default {
         const response=await env.ASSETS.fetch(new Request(assetUrl,request));
         const headers=new Headers(response.headers);
         const previewOrigin=env.PREVIEW_ORIGIN && /^https:\/\/[a-z0-9.-]+$/.test(env.PREVIEW_ORIGIN)?env.PREVIEW_ORIGIN:"";
-        headers.set("content-security-policy",`default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ${url.origin.replace(/^http/, 'ws')}; img-src 'self' blob: data:; media-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' ${previewOrigin}`);
+        headers.set("content-security-policy",`default-src 'self'; manifest-src 'self'; worker-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ${url.origin.replace(/^http/, 'ws')}; img-src 'self' blob: data:; media-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' ${previewOrigin}`);
         // A cross-origin form POST with no-referrer sends Origin: null. The
         // app ticket handoff requires our exact origin, without a path/query.
         headers.set("referrer-policy","strict-origin");
         headers.set("x-content-type-options","nosniff");
         // Always load the current shell; its fingerprinted JS/CSS retain their
         // own asset cache policy. This never reloads an active conversation.
-        if(assetUrl.pathname==="/" || headers.get("content-type")?.includes("text/html")) headers.set("cache-control","no-store");
+        if(assetUrl.pathname==="/" || assetUrl.pathname==="/sw.js" || assetUrl.pathname==="/manifest.webmanifest" || headers.get("content-type")?.includes("text/html")) headers.set("cache-control","no-store");
         return new Response(response.body,{status:response.status,headers});
       }
       // Provider callbacks are one-time, browser-bound flows. Git transport is
@@ -117,7 +122,8 @@ export default {
         requestBodyForwarded=true;return env.GITHUB.get(env.GITHUB.idFromName(owner)).fetch(internalRequest(request,"https://github/status"));
       }
       const registry=env.WORKSPACE.get(env.WORKSPACE.idFromName(owner));
-      if(url.pathname==='/v1/keychain'||url.pathname.startsWith('/v1/keychain/'))return registry.fetch(internalRequest(request,`https://workspace${url.pathname.slice(3)}`));
+      if(url.pathname==='/v1/keychain/deploy-verify'||/^\/v1\/bots\/[^/]+\/keychain\/deploy-verify$/.test(url.pathname))throw new ApiError(404,'not_found','Endpoint not found.');
+      if(url.pathname==='/v1/keychain'||url.pathname.startsWith('/v1/keychain/')){requestBodyForwarded=true;return registry.fetch(internalRequest(request,`https://workspace${url.pathname.slice(3)}${url.search}`));}
       if(url.pathname==="/v1/tasks") {
         if(request.method==="GET") return registry.fetch(new Request("https://workspace/tasks"));
         if(request.method!=="POST") throw new ApiError(405,"method_not_allowed","Method not allowed.");
@@ -126,7 +132,7 @@ export default {
         return created;
       }
       if(/^\/v1\/tasks\/[^/]+(?:\/agents\/[^/]+)?\/(?:audio|audio-messages)(?:\/|$)/.test(url.pathname))throw new ApiError(400,"audio_scope_unsupported","Audio messages are supported only in a bot's main conversation.");
-      const taskRoute=/^\/v1\/tasks\/([0-9a-f-]{36})(?:\/(messages|runs(?:\/[0-9a-f-]{36}(?:\/cancel)?)?|events|start|continue|cancel|approvals(?:\/[0-9a-f-]{36})?|agents(?:\/[^/]+\/(?:messages|cancel))?|connections(?:\/[^/]+\/connect)?))?$/.exec(url.pathname);
+      const taskRoute=/^\/v1\/tasks\/([0-9a-f-]{36})(?:\/(messages|progress|runs(?:\/[0-9a-f-]{36}(?:\/cancel)?)?|events|context(?:\/compact)?|memory(?:\/(?:search|review|entries(?:\/[A-Za-z0-9_-]{1,128}(?:\/(?:history|accept))?)?))?|keychain(?:\/(?:requests\/[0-9a-f-]{36}\/authorize|[0-9a-f-]{36}(?:\/permissions)?))?|start|continue|cancel|approvals(?:\/[0-9a-f-]{36})?|agents(?:\/[^/]+\/(?:messages|cancel))?|connections(?:\/[^/]+\/connect)?))?$/.exec(url.pathname);
       if(taskRoute) {
         const [,taskId,endpoint]=taskRoute;
         const taskResponse=await registry.fetch(`https://workspace/tasks/${taskId}`);
@@ -136,6 +142,11 @@ export default {
         if(!botResponse.ok) return botResponse;
         const {bot}=await botResponse.json<{bot:Bot}>();
         if(!endpoint) {if(request.method!=="GET")throw new ApiError(405,"method_not_allowed","Method not allowed.");return json({task});}
+        if(endpoint==='keychain'||endpoint.startsWith('keychain/')) {
+          const forwarded=internalRequest(request,`https://workspace/${endpoint}${url.search}`);
+          forwarded.headers.set('x-keychain-bot',task.botId);forwarded.headers.set('x-keychain-task',taskId);
+          requestBodyForwarded=true;return registry.fetch(forwarded);
+        }
         const stub=env.BOT.get(env.BOT.idFromName(`${owner}:task:${taskId}`));
         const headers=new Headers();headers.set("x-botspace-config",encodeURIComponent(JSON.stringify(bot)));
         headers.set("x-timber-task-id",taskId);
@@ -168,10 +179,12 @@ export default {
           return json({taskId,cancelRequested:true,confirmed:!failed&&processState.confirmed&&data.activeRuns.length===0,runCount:outcomes.length});
         }
         if(endpoint==="messages" && request.method==="POST" && task.status==="cancelled") {await discardRequestBody(request);throw new ApiError(409,"task_cancelled","Cancelled tasks cannot accept new messages.");}
-        if(endpoint==="messages" && request.method==="POST" && !["running","waiting_approval","waiting_connection"].includes(task.status)) {await discardRequestBody(request);throw new ApiError(409,"task_not_running","This task is not currently running; wait for it to start before messaging it.");}
+        if(endpoint==="messages" && request.method==="POST" && !["queued","running","waiting_approval","waiting_connection"].includes(task.status)) {await discardRequestBody(request);throw new ApiError(409,"task_not_running","Start or continue this task before messaging it.");}
         let admissionToken:string|undefined;
-        const taskInput=endpoint==="messages"||/^agents\/[^/]+\/messages$/.test(endpoint);
-        if(taskInput&&request.method==="POST")admissionToken=await beginAdmission(env,task.botId,await bodyOperationId(request),taskId);
+        // BotDO durably receipts chat input before claiming execution. A queued
+        // task must remain writable without acquiring the shared computer here.
+        const taskInput=endpoint==='messages'||/^agents\/[^/]+\/messages$/.test(endpoint);
+        if(taskInput&&request.method==="POST")admissionToken=await beginAdmission(env,task.botId,await bodyOperationId(request),taskId,endpoint==='messages');
         if(/^approvals\/[^/]+$/.test(endpoint)&&request.method==="POST")admissionToken=await beginAdmission(env,task.botId,`mutation:${crypto.randomUUID()}`,taskId);
         requestBodyForwarded=true;
         const response=await stub.fetch(new Request(`https://task/${endpoint}${url.search}`,{method:request.method,headers,body:["GET","HEAD"].includes(request.method)?undefined:request.body,redirect:"manual",signal:request.signal}));
@@ -197,7 +210,7 @@ export default {
       if(!record.ok) return record;
       const {bot}=await record.json<{bot:Bot}>();
       if(!tail && request.method==="GET") return json({bot});
-      if(tail==='/keychain'||tail.startsWith('/keychain/')){const forwarded=internalRequest(request,`https://workspace${tail}`);forwarded.headers.set('x-keychain-bot',botId);return registry.fetch(forwarded);}
+      if(tail==='/keychain'||tail.startsWith('/keychain/')){const forwarded=internalRequest(request,`https://workspace${tail}`);forwarded.headers.set('x-keychain-bot',botId);requestBodyForwarded=true;return registry.fetch(forwarded);}
       if(tail==="/avatar") return registry.fetch(internalRequest(request,`https://workspace/avatar/${botId}`,true));
       const artifact=/^\/artifacts\/([^/]+)$/.exec(tail);
       if(artifact && request.method==="GET") {
@@ -207,6 +220,10 @@ export default {
         if(stored.customMetadata?.chatAudio==='true') {
           // R2 lookup may outlive registry removal. Recheck after the await,
           // before exposing any private audio bytes from the stored stream.
+          const audioStub=env.BOT.get(env.BOT.idFromName(`${owner}:${botId}`));
+          const access=await audioStub.fetch(`https://bot/_audio-access/${artifact[1]}`,{headers:{"x-timber-internal":"audio","x-botspace-config":encodeURIComponent(JSON.stringify(bot))}});
+          if(!access.ok){await stored.body.cancel();await access.body?.cancel();throw new ApiError(404,"not_found","Artifact not found.");}
+          await access.body?.cancel();
           const live=await registry.fetch(`https://workspace/${botId}`);
           if(!live.ok) {await stored.body.cancel();return live;}
           await live.body?.cancel();

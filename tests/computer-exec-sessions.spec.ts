@@ -41,6 +41,116 @@ function machine() {
 }
 
 describe('durable execution sessions',()=>{
+  it('keeps maintenance and idle checks independent of completed command output history',async()=>{
+    const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId)),vm=machine();
+    await runInDurableObject(stub,async(instance,state)=>{
+      vm.attach(instance);
+      const target=instance as unknown as {hasActiveExecutions():Promise<boolean>;needsExecutionMaintenance():Promise<boolean>};
+      for(let i=0;i<100;i++) {
+        const processId=`old-${i}`,result={operationId:processId,processId,status:'completed',workspaceChanged:false,output:'archived-output'.repeat(1000)};
+        await state.storage.put({[`exec-session:${processId}`]:{digest:'old',bootId:'same-boot',dispatched:true,result,checkpoint:'done'},[`operation:${processId}`]:{digest:'old',processId,result}});
+      }
+      const original=state.storage.list.bind(state.storage);
+      const reads=vi.spyOn(state.storage,'list').mockImplementation(options=>{
+        expect(options?.prefix).not.toBe('exec-session:');expect(options?.prefix).not.toBe('operation:');
+        return original(options);
+      });
+      try {
+        expect(await target.hasActiveExecutions()).toBe(false);expect(await target.needsExecutionMaintenance()).toBe(false);
+        await instance.fetch(request(botId,'active',{type:'exec',command:'live-work',yieldMs:0}));
+        expect(await state.storage.get('exec-work:active')).toEqual({status:'running',checkpoint:'pending'});
+        expect(await target.hasActiveExecutions()).toBe(true);
+        vm.sessions.set('active',{operationId:'active',processId:'active',status:'completed',workspaceChanged:false,output:'recorded result'});
+        await instance.fetch(request(botId,'poll-active',{type:'execPoll',processId:'active',yieldMs:0}));
+        expect(await target.hasActiveExecutions()).toBe(false);expect(await target.needsExecutionMaintenance()).toBe(false);
+        expect(await state.storage.get('exec-work:active')).toBeUndefined();
+        expect(await state.storage.get('operation:active')).toMatchObject({result:{status:'completed',output:'recorded result'}});
+        await instance.fetch(request(botId,'write-indexed',{type:'writeFile',path:'new.txt',content:'new'}));
+        expect(await state.storage.get('operation-work:write-indexed')).toMatchObject({effect:false,checkpoint:{bootId:'same-boot'}});
+        await flush(instance,state.storage);
+        expect(await state.storage.get('operation-work:write-indexed')).toBeUndefined();
+        expect(await state.storage.get('operation:write-indexed')).toMatchObject({result:{checkpointStatus:'saved'}});
+      } finally {reads.mockRestore();}
+    });
+  });
+
+  it('migrates legacy command receipts in bounded uncached pages and preserves active recovery',async()=>{
+    const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId)),vm=machine();
+    await runInDurableObject(stub,async(instance,state)=>{
+      vm.attach(instance);await state.storage.delete('journalIndexesV1');
+      for(let i=0;i<70;i++) {
+        const processId=`legacy-${i}`,result={operationId:processId,processId,status:'completed',output:'exact legacy output',workspaceChanged:false};
+        await state.storage.put({[`exec-session:${processId}`]:{digest:'old',bootId:'same-boot',dispatched:true,result,checkpoint:'done'},[`operation:${processId}`]:{digest:'old',processId,result}});
+      }
+      const result={operationId:'legacy-active',processId:'legacy-active',status:'running',output:'retained partial'};
+      await state.storage.put({'exec-session:legacy-active':{digest:'old',bootId:'same-boot',dispatched:true,result,checkpoint:'pending'},'operation:legacy-active':{digest:'old',processId:'legacy-active',result}});
+      const target=instance as unknown as {initializeJournalIndexes():Promise<void>};
+      const original=state.storage.list.bind(state.storage),sizes:number[]=[];
+      const reads=vi.spyOn(state.storage,'list').mockImplementation(async options=>{
+        if(options?.prefix==='exec-session:'||options?.prefix==='operation:'){expect(options.limit).toBe(32);expect(options.noCache).toBe(true);}
+        const values=await original(options);sizes.push(values.size);return values;
+      });
+      try {await target.initializeJournalIndexes();}finally{reads.mockRestore();}
+      expect(sizes.filter(size=>size===32).length).toBeGreaterThanOrEqual(4);
+      expect(await state.storage.get('journalIndexesV1')).toBe(true);
+      expect([...await state.storage.list({prefix:'exec-work:'})].map(([key])=>key)).toEqual(['exec-work:legacy-active']);
+      expect(await state.storage.get('operation:legacy-69')).toMatchObject({result:{output:'exact legacy output'}});
+    });
+    await evictDurableObject(stub);
+    await runInDurableObject(stub,async(instance,state)=>{
+      vm.attach(instance);
+      vm.sessions.set('legacy-active',{operationId:'legacy-active',processId:'legacy-active',status:'completed',workspaceChanged:false,output:'retained partial and completion'});
+      const result=await (await instance.fetch(request(botId,'observe-legacy',{type:'execPoll',processId:'legacy-active',yieldMs:0}))).json<ComputerResult>();
+      expect(result).toMatchObject({status:'completed',output:'retained partial and completion'});
+      expect(vm.actions.some(action=>action.action.type==='exec')).toBe(false);
+      expect(await state.storage.get('exec-work:legacy-active')).toBeUndefined();
+    });
+  });
+
+  it.each(['operations','executions'] as const)('resumes interrupted legacy index migration from its durable %s cursor',async phase=>{
+    const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
+    await runInDurableObject(stub,async(instance,state)=>{
+      await state.storage.delete('journalIndexesV1');
+      for(let i=0;i<70;i++) {
+        const processId=`resume-${String(i).padStart(3,'0')}`,result={operationId:processId,processId,status:i===0?'running':'completed',output:'original receipt',workspaceChanged:false};
+        await state.storage.put({[`exec-session:${processId}`]:{digest:'old',bootId:'legacy-boot',dispatched:true,result,checkpoint:i===0?'pending':'done'},[`operation:${processId}`]:{digest:'old',processId,result}});
+      }
+      const target=instance as unknown as {initializeJournalIndexes():Promise<void>};
+      const original=state.storage.put.bind(state.storage);
+      let interrupted=false;
+      const fail=vi.spyOn(state.storage,'put').mockImplementation(async(...args:Parameters<DurableObjectStorage['put']>)=>{
+        await Reflect.apply(original,state.storage,args);
+        const input=args[0];
+        if(!interrupted&&typeof input==='object'&&input&&'journalIndexMigrationV1' in input) {
+          const migration=input.journalIndexMigrationV1 as {phase:string;cursor?:string};
+          if(migration.phase===phase&&migration.cursor){interrupted=true;throw new Error('Migration acknowledgement lost after page commit');}
+        }
+      });
+      try {await expect(target.initializeJournalIndexes()).rejects.toThrow('Migration acknowledgement lost');}finally{fail.mockRestore();}
+      const cursor=await state.storage.get<{phase:string;cursor:string}>('journalIndexMigrationV1');
+      expect(cursor).toEqual({phase,cursor:`${phase==='operations'?'operation:':'exec-session:'}resume-031`});
+      expect(await state.storage.get('journalIndexesV1')).toBeUndefined();
+      if(phase==='executions')expect(await state.storage.get('exec-work:resume-000')).toEqual({status:'running',checkpoint:'pending'});
+      // A retry reads the saved boundary rather than visiting page zero again.
+      const list=state.storage.list.bind(state.storage),starts:string[]=[];
+      const reads=vi.spyOn(state.storage,'list').mockImplementation(options=>{
+        if(options?.prefix===(phase==='operations'?'operation:':'exec-session:'))starts.push(options.startAfter??'');
+        return list(options);
+      });
+      try {await target.initializeJournalIndexes();}finally{reads.mockRestore();}
+      expect(starts[0]).toBe(cursor!.cursor);
+      expect(await state.storage.get('journalIndexesV1')).toBe(true);
+      expect(await state.storage.get('journalIndexMigrationV1')).toBeUndefined();
+    });
+    await evictDurableObject(stub);
+    await runInDurableObject(stub,async(_instance,state)=>{
+      expect(await state.storage.get('exec-work:resume-000')).toEqual({status:'running',checkpoint:'pending'});
+      expect(await state.storage.get('operation:resume-069')).toMatchObject({result:{output:'original receipt'}});
+      expect(await state.storage.get('journalIndexesV1')).toBe(true);
+      expect(await state.storage.getAlarm()).toBeGreaterThan(Date.now());
+    });
+  });
+
   it('settles read-only commands without checkpoint intent, uploads or a pending-save status',async()=>{
     const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId)),vm=machine();
     await runInDurableObject(stub,async(instance,state)=>{
@@ -200,6 +310,7 @@ describe('durable execution sessions',()=>{
   it.each([true,false])('recovers checkpoint attempt once when its durable pointer exists=%s',async saved=>{
     const botId=crypto.randomUUID(),stub=bindings.REAL_COMPUTER.get(bindings.REAL_COMPUTER.idFromName(botId));
     await runInDurableObject(stub,async(_instance,state)=>{
+      await state.storage.delete('journalIndexesV1');
       const result={operationId:'checkpoint-recovery',processId:'checkpoint-recovery',status:'completed',output:'known exit',exitCode:0};
       await state.storage.put({'operation:checkpoint-recovery':{digest:'known',processId:'checkpoint-recovery',result},
         'exec-session:checkpoint-recovery':{digest:'known',bootId:'previous',dispatched:true,result,checkpoint:'attempting',checkpointAttemptId:'attempt-once'},

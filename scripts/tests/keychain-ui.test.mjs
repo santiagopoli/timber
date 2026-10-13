@@ -5,8 +5,19 @@ import {chromium} from 'playwright';
 import {createConsoleFixture,TEST_TOKEN,BOT_A,BOT_B} from './console-fixture.mjs';
 let browser;
 after(async()=>{await browser?.close();});
+test('closing the keychain before adding a private input preserves editing focus on a slow device',()=>scenario(390,async({page,login,savedInline,posts})=>{
+  await login();const session=await page.context().newCDPSession(page);await session.send('Emulation.setCPUThrottlingRate',{rate:4});
+  await page.getByRole('button',{name:'Your keychain',exact:true}).click();
+  await page.getByRole('button',{name:'Add secure input',exact:true}).click();
+  const input=page.getByLabel('Private input',{exact:true});await input.waitFor();await input.fill('slow-device-fixture-value');
+  assert.equal(await page.getByRole('dialog',{name:'Your keychain',exact:true}).count(),0);
+  await commitPrivateInput(page);await savedInline();assert.equal(posts.length,1);
+  assert.equal(posts[0].entries[0].value,'slow-device-fixture-value');
+}));
 const entry=(overrides={})=>({id:'20000000-0000-4000-8000-000000000001',name:'Private input',origin:'',header:'',prefix:'',revision:1,createdAt:'2026-10-10T10:00:00Z',updatedAt:'2026-10-10T10:00:00Z',botIds:[BOT_A],...overrides});
 const request=(overrides={})=>({id:'30000000-0000-4000-8000-000000000001',name:'Example API',origin:'https://api.example.com',header:'Authorization',prefix:'Bearer ',purpose:'Read your account profile.',runId:'run-secure',nativeOperationId:'op-secure',status:'pending',createdAt:'2026-10-10T10:00:00Z',...overrides});
+// Enter intentionally disables/replaces this node; dispatch the gesture once, not a locator retry.
+async function commitPrivateInput(page){assert.equal(await page.getByLabel('Private input',{exact:true}).evaluate(node=>node===document.activeElement),true,'the inline private field retains focus before a single Enter');await page.keyboard.press('Enter');}
 async function scenario(width,work){
   browser??=await chromium.launch({headless:true,...(process.env.CONSOLE_CHROMIUM_PATH?{executablePath:process.env.CONSOLE_CHROMIUM_PATH}:{}),...(process.env.CONSOLE_CHROMIUM_ARGS?{args:JSON.parse(process.env.CONSOLE_CHROMIUM_ARGS)}:{})});
   const fixture=await createConsoleFixture(),page=await browser.newPage({viewport:{width,height:940}}),errors=[],posts=[],keychains=new Map([[BOT_A,{entries:[],requests:[]}],[BOT_B,{entries:[],requests:[]}]]);
@@ -19,6 +30,11 @@ async function scenario(width,work){
     if(req.method()==='DELETE'){data.entries=data.entries.filter(item=>item.id!==parts[5]);return json({revoked:true});}
     const body=req.postDataJSON();posts.push({botId:id,...body});
     if(failSave)return json({error:{code:'unavailable',message:'private provider error must never be rendered'}},503);
+    if(req.method()==='PATCH'){
+      const existing=data.entries.find(item=>item.id===parts[5]);
+      if(existing?.revision!==body.expectedRevision)return json({error:{code:'credential_changed',message:'Input changed'}},409);
+      data.entries=data.entries.map(item=>item.id===parts[5]?{...item,name:body.name,revision:item.revision+1}:item);return json({entries:data.entries.filter(item=>item.id===parts[5])});
+    }
     if(parts.at(-1)==='authorize'){data.requests=data.requests.map(item=>item.id===parts[6]?{...item,status:'saved'}:item);return json({entries:data.entries});}
     if(parts.at(-1)==='permissions'){data.entries=data.entries.map(item=>item.id===parts[5]?{...item,botIds:body.allowed?[...new Set([...item.botIds,body.botId])]:item.botIds.filter(id=>id!==body.botId)}:item);return json({entries:data.entries});}
     const entries=body.entries.map(({value,expectedRevision,...item})=>entry({...item,id:item.id||crypto.randomUUID(),revision:(expectedRevision??0)+1,botIds:item.id?data.entries.find(old=>old.id===item.id).botIds:[id]}));
@@ -28,16 +44,17 @@ async function scenario(width,work){
   });
   const login=async()=>{await page.goto(fixture.url);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('#app').waitFor({state:'visible'});if(width<=760)await page.locator('.bot-item').first().click();await page.getByRole('button',{name:'Add',exact:true}).waitFor();};
   const add=async()=>{await page.getByRole('button',{name:'Add',exact:true}).click();await page.getByRole('menuitem',{name:'Secure input',exact:true}).click();await page.getByLabel('Private input',{exact:true}).waitFor();};
-  const insert=async(value='ui-fixture-private-value')=>{await add();await page.getByLabel('Private input',{exact:true}).fill(value);await page.getByLabel('Private input',{exact:true}).press('Enter');await page.getByLabel('Private input',{exact:true}).waitFor({state:'hidden'});await page.locator('#message[contenteditable=true]').waitFor();};
-  try{await work({...fixture,page,posts,keychains,login,add,insert,setFailSave:value=>{failSave=value;}});assert.deepEqual(errors,[]);assert.deepEqual(fixture.state.failures,[]);}finally{await page.close();await fixture.close();}
+  const savedInline=async()=>{await page.waitForFunction(()=>{const value=document.querySelector('#message-form input[name=message]')?.value||'';return /\[private:/.test(value)&&!value.includes('[private-draft:')&&!document.querySelector('#message .timber-private-edit');});};
+  const insert=async(value='ui-fixture-private-value')=>{await add();await page.getByLabel('Private input',{exact:true}).fill(value);await commitPrivateInput(page);await savedInline();await page.locator('#message[contenteditable=true]').waitFor();};
+  try{await work({...fixture,page,posts,keychains,login,add,insert,savedInline,setFailSave:value=>{failSave=value;}});assert.deepEqual(errors,[]);assert.deepEqual(fixture.state.failures,[]);}finally{await page.close();await fixture.close();}
 }
-for(const width of [320,390,1440])test(`private inputs show text while editing and become masked inline pieces at ${width}px`,()=>scenario(width,async({page,login,add,insert,posts,state,keychains})=>{
+for(const width of [320,390,1440])test(`private inputs show text while editing and become masked inline pieces at ${width}px`,()=>scenario(width,async({page,login,add,insert,savedInline,posts,state,keychains})=>{
   await login();await page.locator('#message').fill('Mi key de Cloudflare es ');await page.locator('#message').press('End');await add();
   const input=page.getByLabel('Private input',{exact:true});await input.fill('ui-fixture-private-value');
   const appearance=await input.evaluate(el=>{const style=getComputedStyle(el);return {mask:style.webkitTextSecurity,fill:style.webkitTextFillColor,color:style.color,focused:document.activeElement===el};});assert.equal(appearance.mask,'none');assert.equal(appearance.fill,appearance.color);assert.notEqual(appearance.fill,'rgba(0, 0, 0, 0)');assert.equal(appearance.focused,true);const bounds=await input.boundingBox();assert.ok(bounds.height>=18&&bounds.height<=28&&bounds.width>34&&bounds.width<=240,'The visible field expands within a bounded width and has room for text descenders');assert.equal(await page.locator('#message .timber-private-dots').isVisible(),false);const piece=await page.locator('#message .timber-private-edit').boundingBox();assert.ok(piece.height<=32,'The entire private field, including buttons, stays one line tall');assert.equal(await page.getByRole('dialog').count(),0);assert.equal(await page.locator('#message input[type=url],#message select').count(),0);
   const snapshot=await page.evaluate(()=>({text:document.body.innerText,storage:JSON.stringify({...localStorage,...sessionStorage}),width:document.documentElement.scrollWidth,viewport:innerWidth}));assert.ok(!snapshot.text.includes('ui-fixture-private-value'));assert.ok(!snapshot.storage.includes('ui-fixture-private-value'));assert.ok(snapshot.width<=snapshot.viewport+1);
   if(process.env.CONSOLE_SCREENSHOT_DIR){await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/private-input-${width}.png`});}
-  await page.getByLabel('Private input',{exact:true}).press('Enter');await page.getByLabel('Private input',{exact:true}).waitFor({state:'hidden'});await page.locator('.timber-private-chip').waitFor();const savedPiece=await page.locator('#message .timber-private-chip').boundingBox();assert.ok(savedPiece.width<piece.width&&savedPiece.width<60,'Saved values shrink to a compact pill');assert.ok(Math.abs(savedPiece.height-piece.height)<1,'Editing and saved pills keep the same height');assert.equal(await page.locator('#message .timber-private-dots circle').count(),6);await page.locator('#message').pressSequentially(' y mi otra key es ');await insert('second-fixture-private-value');await page.locator('#message').pressSequentially('. Revisa mi cuenta.');await page.waitForFunction(()=>document.querySelector('#message').innerText.endsWith('. Revisa mi cuenta.'),null,{polling:100});
+  await commitPrivateInput(page);await savedInline();await page.locator('.timber-private-chip').waitFor();const savedPiece=await page.locator('#message .timber-private-chip').boundingBox();assert.ok(savedPiece.width<piece.width&&savedPiece.width<60,'Saved values shrink to a compact pill');assert.ok(Math.abs(savedPiece.height-piece.height)<1,'Editing and saved pills keep the same height');assert.equal(await page.locator('#message .timber-private-dots circle').count(),6);await page.locator('#message').pressSequentially(' y mi otra key es ');await insert('second-fixture-private-value');await page.locator('#message').pressSequentially('. Revisa mi cuenta.');await page.waitForFunction(()=>document.querySelector('#message').innerText.endsWith('. Revisa mi cuenta.'),null,{polling:100});
   assert.equal(await page.locator('#message .timber-private-chip').count(),2);assert.equal(await page.locator('#message .timber-private-chip svg:not(.timber-private-dots)').count(),2);assert.equal(await page.locator('#message .timber-private-chip').first().evaluate(el=>getComputedStyle(el).fontWeight),'650');assert.equal(posts.length,2);assert.equal(posts[0].entries[0].value,'ui-fixture-private-value');assert.equal(posts[0].entries[0].origin,undefined);assert.equal(posts[0].entries[0].header,undefined);
   const axes=await page.locator('#message .timber-private-chip').first().evaluate(el=>{const [lock,dots]=el.querySelectorAll('svg');const a=lock.getBoundingClientRect(),b=dots.getBoundingClientRect();return Math.abs(a.y+a.height/2-b.y-b.height/2);});assert.ok(axes<.5,'Lock and dots share the same center');
   const draft=await page.locator('#message').innerText();assert.ok(draft.startsWith('Mi key de Cloudflare es '));assert.ok(draft.endsWith('. Revisa mi cuenta.'));assert.ok(!draft.includes('[private:'));assert.ok(!draft.includes('ui-fixture-private-value'));
@@ -58,12 +75,32 @@ test('bot-requested input needs only private text and uses its durable request',
 test('bot-prepared access shows a simple destination confirmation without technical fields',()=>scenario(390,async({page,login,keychains,posts})=>{
   keychains.get(BOT_A).entries=[entry()];keychains.get(BOT_A).requests=[request({secretId:entry().id,expectedRevision:1})];await login();await page.getByText('Allow Ada to use this input with api.example.com?',{exact:true}).waitFor();assert.equal(await page.locator('[data-secure-value]').count(),0);await page.getByRole('button',{name:'Allow use',exact:true}).click();await page.getByText('Access allowed',{exact:true}).waitFor();assert.equal(posts.length,1);assert.equal(posts[0].entries,undefined);
 }));
-test('replacement checks revision and removal stays explicit',()=>scenario(1440,async({page,login,keychains,posts})=>{
-  keychains.get(BOT_A).entries=[entry()];await login();await page.getByRole('button',{name:'Your keychain',exact:true}).waitFor();await page.getByRole('button',{name:'Your keychain',exact:true}).click();await page.getByRole('button',{name:'Replace',exact:true}).click();await page.getByLabel('Private input',{exact:true}).fill('replacement-fixture-value');await page.getByLabel('Private input',{exact:true}).press('Enter');await page.getByLabel('Private input',{exact:true}).waitFor({state:'hidden'});assert.equal(posts[0].entries[0].expectedRevision,1);
+test('replacement checks revision and removal stays explicit',()=>scenario(1440,async({page,login,keychains,posts,savedInline})=>{
+  keychains.get(BOT_A).entries=[entry()];await login();await page.getByRole('button',{name:'Your keychain',exact:true}).waitFor();await page.getByRole('button',{name:'Your keychain',exact:true}).click();await page.getByRole('button',{name:'Replace',exact:true}).click();await page.getByLabel('Private input',{exact:true}).fill('replacement-fixture-value');await commitPrivateInput(page);await savedInline();assert.equal(posts[0].entries[0].expectedRevision,1);
   await page.getByRole('button',{name:'Your keychain',exact:true}).waitFor();await page.getByRole('button',{name:'Your keychain',exact:true}).click();await page.getByRole('button',{name:'Remove',exact:true}).click();assert.equal(keychains.get(BOT_A).entries.length,1);await page.getByRole('button',{name:'Confirm removal',exact:true}).click();await page.getByText('No private inputs saved.',{exact:true}).waitFor();assert.equal(keychains.get(BOT_A).entries.length,0);
 }));
+for(const width of [390,1440])test(`keychain names can be edited without the value and persist across reload at ${width}px`,()=>scenario(width,async({page,login,keychains,posts})=>{
+  keychains.get(BOT_A).entries=[entry()];await login();await page.getByRole('button',{name:'Your keychain',exact:true}).click();
+  await page.getByRole('button',{name:'Rename Private input',exact:true}).click();await page.getByRole('textbox',{name:'Name',exact:true}).fill('Cloudflare · Production');
+  assert.equal(await page.locator('[data-secure-value]').count(),0);await page.getByRole('button',{name:'Save name',exact:true}).click();await page.getByRole('button',{name:'Rename Cloudflare · Production',exact:true}).waitFor();
+  assert.equal(posts.length,1);assert.deepEqual(Object.keys(posts[0]).sort(),['botId','expectedRevision','name','operationId'].sort());assert.equal(posts[0].expectedRevision,1);assert.equal(posts[0].name,'Cloudflare · Production');assert.deepEqual(keychains.get(BOT_A).entries[0].botIds,[BOT_A]);
+  const layout=await page.locator('.timber-keychain-entry').evaluate(row=>{const name=row.querySelector('.timber-keychain-name').getBoundingClientRect(),date=row.querySelector('small').getBoundingClientRect();return {separate:date.top>=name.bottom,overflow:document.documentElement.scrollWidth>innerWidth};});assert.equal(layout.separate,true);assert.equal(layout.overflow,false);
+  if(process.env.CONSOLE_SCREENSHOT_DIR){await mkdir(process.env.CONSOLE_SCREENSHOT_DIR,{recursive:true});await page.screenshot({path:`${process.env.CONSOLE_SCREENSHOT_DIR}/keychain-names-${width}.png`});}
+  await page.reload();await page.getByRole('button',{name:'Your keychain',exact:true}).click();await page.getByRole('button',{name:'Rename Cloudflare · Production',exact:true}).waitFor();
+  await page.getByRole('button',{name:'Rename Cloudflare · Production',exact:true}).click();await page.getByRole('textbox',{name:'Name',exact:true}).fill('Cancelled name');await page.getByRole('button',{name:'Cancel',exact:true}).click();assert.equal(posts.length,1);
+  await page.getByRole('button',{name:'Insert',exact:true}).click();await page.locator('#message .timber-private-chip').waitFor();assert.ok((await page.locator('#message-form input[name=message]').inputValue()).includes(entry().id));
+}));
+test('failed naming retains the label and retries the same operation without exposing server errors',()=>scenario(390,async({page,login,keychains,posts,setFailSave})=>{
+  keychains.get(BOT_A).entries=[entry()];await login();await page.getByRole('button',{name:'Your keychain',exact:true}).click();await page.getByRole('button',{name:'Rename Private input',exact:true}).click();await page.getByRole('textbox',{name:'Name',exact:true}).fill('Cloudflare');setFailSave(true);
+  await page.getByRole('button',{name:'Save name',exact:true}).click();await page.getByText('The name could not be saved. Try again.',{exact:true}).waitFor();assert.equal(await page.getByRole('textbox',{name:'Name',exact:true}).inputValue(),'Cloudflare');assert.ok(!(await page.locator('body').innerText()).includes('private provider error'));
+  setFailSave(false);await page.getByRole('button',{name:'Save name',exact:true}).click();await page.getByRole('button',{name:'Rename Cloudflare',exact:true}).waitFor();assert.equal(posts[0].operationId,posts[1].operationId);
+}));
+test('stale name editing preserves a newer name and refreshes the keychain',()=>scenario(390,async({page,login,keychains})=>{
+  keychains.get(BOT_A).entries=[entry()];await login();await page.getByRole('button',{name:'Your keychain',exact:true}).click();await page.getByRole('button',{name:'Rename Private input',exact:true}).click();await page.getByRole('textbox',{name:'Name',exact:true}).fill('Old edit');keychains.get(BOT_A).entries=[entry({name:'Newer name',revision:2})];
+  await page.getByRole('button',{name:'Save name',exact:true}).click();await page.getByText('This input changed. Cancel and rename its latest version.',{exact:true}).waitFor();await page.getByRole('button',{name:'Cancel',exact:true}).click();await page.getByRole('button',{name:'Rename Newer name',exact:true}).waitFor();assert.equal(keychains.get(BOT_A).entries[0].name,'Newer name');
+}));
 test('failed secure saves clear private text and never expose server diagnostics or insert a reference',()=>scenario(1440,async({page,login,add,setFailSave})=>{
-  await login();setFailSave(true);await add();await page.getByLabel('Private input',{exact:true}).fill('ui-fixture-private-value');await page.getByLabel('Private input',{exact:true}).press('Enter');await page.getByText('Save could not be confirmed.',{exact:false}).waitFor();assert.equal(await page.getByLabel('Private input',{exact:true}).inputValue(),'');assert.equal(await page.locator('.timber-private-chip:not(.timber-private-edit)').count(),0);assert.ok(!await page.locator('body').innerText().then(text=>text.includes('private provider error')));
+  await login();setFailSave(true);await add();await page.getByLabel('Private input',{exact:true}).fill('ui-fixture-private-value');await commitPrivateInput(page);await page.getByText('Save could not be confirmed.',{exact:false}).waitFor();assert.equal(await page.getByLabel('Private input',{exact:true}).inputValue(),'');assert.equal(await page.locator('.timber-private-chip:not(.timber-private-edit)').count(),0);assert.ok(!await page.locator('body').innerText().then(text=>text.includes('private provider error')));
 }));
 test('removing inline input clears unsaved text',()=>scenario(1440,async({page,login,add,posts})=>{
   await login();await add();await page.getByLabel('Private input',{exact:true}).fill('unsaved-fixture-private-value');await page.getByLabel('Private input',{exact:true}).press('Escape');await add();assert.equal(await page.getByLabel('Private input',{exact:true}).inputValue(),'');assert.equal(posts.length,0);
@@ -79,14 +116,14 @@ test('owner keychain is shared between bots while access stays explicit',()=>sce
   keychains.get(BOT_A).entries=[entry()];await login();await page.locator('.bot-item').nth(1).click();await page.getByRole('button',{name:'Your keychain',exact:true}).click();await page.getByRole('heading',{name:'Your keychain',exact:true}).waitFor();assert.equal(await page.locator('.timber-keychain-entry').count(),1);await page.getByText('Bots with access · 1',{exact:true}).click();const boxes=page.locator('.timber-keychain-permissions input');assert.equal(await boxes.nth(0).isChecked(),true);assert.equal(await boxes.nth(1).isChecked(),false);await boxes.nth(1).click();await page.getByText('Bots with access · 2',{exact:true}).waitFor();assert.equal(posts[0].botId,BOT_B);assert.equal(posts[0].allowed,true);assert.equal(keychains.get(BOT_A).entries.length,1);assert.deepEqual(keychains.get(BOT_A).entries[0].botIds,[BOT_A,BOT_B]);await boxes.nth(0).click();await page.getByText('Bots with access · 1',{exact:true}).waitFor();assert.deepEqual(keychains.get(BOT_A).entries[0].botIds,[BOT_B]);
 }));
 
-test('@ works again after saving an inline input and preserves keyboard navigation',()=>scenario(1440,async({page,login,insert,posts})=>{
-  await login();await insert();await page.locator('#message').pressSequentially(' @');await page.getByRole('option',{name:/^Secure input/}).waitFor();await page.locator('#message').press('ArrowDown');await page.locator('#message').press('Enter');await page.getByLabel('Private input',{exact:true}).fill('second-menu-fixture-value');await page.getByLabel('Private input',{exact:true}).press('Enter');await page.getByLabel('Private input',{exact:true}).waitFor({state:'hidden'});assert.equal(await page.locator('#message .timber-private-chip').count(),2);assert.equal(posts.length,2);
+test('@ works again after saving an inline input and preserves keyboard navigation',()=>scenario(1440,async({page,login,insert,posts,savedInline})=>{
+  await login();await insert();await page.locator('#message').pressSequentially(' @');await page.getByRole('option',{name:/^Secure input/}).waitFor();await page.locator('#message').press('ArrowDown');await page.locator('#message').press('Enter');await page.getByLabel('Private input',{exact:true}).fill('second-menu-fixture-value');await commitPrivateInput(page);await savedInline();assert.equal(await page.locator('#message .timber-private-chip').count(),2);assert.equal(posts.length,2);
 }));
-test('leaving the inline pill saves it without adding a message or exposing its value',()=>scenario(390,async({page,login,add,posts,state})=>{
-  await login();const before=state.messages.get(BOT_A).length;await add();await page.getByLabel('Private input',{exact:true}).fill('blur-fixture-value');await page.getByRole('button',{name:'Your keychain',exact:true}).click();await page.getByRole('button',{name:'Close keychain',exact:true}).click();await page.getByLabel('Private input',{exact:true}).waitFor({state:'hidden'});assert.equal(posts.length,1);assert.equal(state.messages.get(BOT_A).length,before);assert.equal(await page.locator('#message .timber-private-chip').count(),1);assert.ok(!(await page.locator('body').innerText()).includes('blur-fixture-value'));
+test('leaving the inline pill saves it without adding a message or exposing its value',()=>scenario(390,async({page,login,add,posts,state,savedInline})=>{
+  await login();const before=state.messages.get(BOT_A).length;await add();await page.getByLabel('Private input',{exact:true}).fill('blur-fixture-value');await page.getByRole('button',{name:'Your keychain',exact:true}).click();await page.getByRole('button',{name:'Close keychain',exact:true}).click();await savedInline();assert.equal(posts.length,1);assert.equal(state.messages.get(BOT_A).length,before);assert.equal(await page.locator('#message .timber-private-chip').count(),1);assert.ok(!(await page.locator('body').innerText()).includes('blur-fixture-value'));
 }));
 
-test('blur immediately clears and masks a long visible value while its save is still pending',()=>scenario(390,async({page,login,add,posts})=>{
+test('blur immediately clears and masks a long visible value while its save is still pending',()=>scenario(390,async({page,login,add,posts,savedInline})=>{
   await page.emulateMedia({colorScheme:'dark'});await login();await add();
   const input=page.getByLabel('Private input',{exact:true}),value='fixture-only-long-value-'.repeat(60)+'\nsecond fixture line';
   await input.fill(value);
@@ -102,7 +139,51 @@ test('blur immediately clears and masks a long visible value while its save is s
     assert.equal(await pill.locator('circle').count(),6);
     assert.ok(!(await page.locator('#message-form input[name=message]').inputValue()).includes('fixture-only-long-value'));
   }finally{release();}
-  await input.waitFor({state:'hidden'});assert.equal(posts[0].entries[0].value,value);
+  await savedInline();assert.equal(posts[0].entries[0].value,value);
   await page.locator('#message .timber-private-chip').click();assert.equal(await page.locator('[data-secure-value]').count(),0);
   assert.ok(!(await page.locator('body').innerText()).includes('fixture-only-long-value'));
+}));
+
+for(const width of [390,1440])test(`delayed inline save preserves ongoing typing and selected text at ${width}px`,()=>scenario(width,async({page,login,add,savedInline,posts})=>{
+  await login();await page.locator('#message').fill('Before  after');await page.locator('#message').press('Home');for(let index=0;index<7;index++)await page.locator('#message').press('ArrowRight');await add();
+  const input=page.getByLabel('Private input',{exact:true});await input.fill('delayed-fixture-private-value');
+  let release,started;const gate=new Promise(resolve=>{release=resolve;}),saving=new Promise(resolve=>{started=resolve;});
+  await page.route('**/v1/bots/*/keychain',async route=>{if(route.request().method()==='POST'){started();await gate;}await route.fallback();});
+  try {
+    await commitPrivateInput(page);await saving;
+    assert.equal(await input.inputValue(),'','pending save immediately clears the private DOM field');
+    await page.locator('#message').pressSequentially('! typed during save');
+    assert.match(await page.locator('#message-form input[name=message]').inputValue(),/^Before \[private-draft:[a-f0-9-]+\]! typed during save after$/,'typing goes after the pending pill before the request resolves');
+    await page.locator('#message').evaluate(root=>{const text=root.lastChild,range=document.createRange();range.setStart(text,text.textContent.length-5);range.setEnd(text,text.textContent.length);getSelection().removeAllRanges();getSelection().addRange(range);});
+    assert.equal(await page.evaluate(()=>getSelection().toString()),'after');release();await savedInline();
+    assert.equal(await page.evaluate(()=>getSelection().toString()),'after','save completion preserves the selected text');
+    await page.locator('#message').pressSequentially('updated');
+    assert.equal(await page.locator('#message').textContent(),'Before ••••••! typed during save updated');
+    assert.ok(!(await page.locator('body').innerText()).includes('delayed-fixture-private-value'));assert.equal(posts.length,1);
+  }finally{release();}
+}));
+
+for(const action of ['remove','switch bot','open keychain'])test(`delayed inline save does not undo ${action}`,()=>scenario(1440,async({page,login,add,keychains})=>{
+  await login();await page.locator('#message').fill('Keep my text');await page.locator('#message').press('End');await add();
+  const input=page.getByLabel('Private input',{exact:true});await input.fill('late-fixture-private-value');
+  let release,started,finished;const gate=new Promise(resolve=>{release=resolve;}),saving=new Promise(resolve=>{started=resolve;}),response=new Promise(resolve=>{finished=resolve;});
+  await page.route('**/v1/bots/*/keychain',async route=>{if(route.request().method()==='POST'){started();await gate;await route.fallback();finished();}else await route.fallback();});
+  try {
+    await commitPrivateInput(page);await saving;
+    if(action==='remove') {
+      await page.locator('#message .timber-private-edit').evaluate(chip=>{const range=document.createRange();range.setStartAfter(chip);range.collapse(true);getSelection().removeAllRanges();getSelection().addRange(range);chip.parentElement.focus();});
+      await page.locator('#message').press('Backspace');await page.locator('#message:not([contenteditable])').waitFor();
+      await page.locator('#message').fill('My newer draft after removing the pill');
+    } else if(action==='switch bot') {
+      await page.locator('.bot-item').nth(1).click();await page.locator('#message').fill('Other bot draft');
+    } else {
+      await page.getByRole('button',{name:'Your keychain',exact:true}).click();await page.getByRole('button',{name:'Close keychain',exact:true}).focus();
+    }
+    release();await response;await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+    if(action==='remove')assert.equal(await page.locator('#message').inputValue(),'My newer draft after removing the pill');
+    else if(action==='switch bot')assert.equal(await page.locator('#message').inputValue(),'Other bot draft');
+    else assert.equal(await page.getByRole('button',{name:'Close keychain',exact:true}).evaluate(node=>document.activeElement===node),true,'late save must not steal focus from another control');
+    assert.equal(keychains.get(BOT_A).entries.length,1,'only the originally requested secure write completes');
+    assert.ok(!(await page.locator('body').innerText()).includes('late-fixture-private-value'));
+  }finally{release();}
 }));

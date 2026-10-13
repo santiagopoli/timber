@@ -46,3 +46,5 @@
 @media(prefers-reduced-motion:reduce){.timber-audio-composer *,.timber-audio-message *{scroll-behavior:auto;transition:none!important}}
 
 .timber-audio-format-note{flex-basis:100%;font-size:10px;line-height:1.45;color:var(--muted);padding:0 3px}
+
+.timber-audio-capture-note{flex-basis:100%;font-size:10px;line-height:1.45;color:var(--muted);padding:0 3px}

@@ -12,7 +12,7 @@ export interface AgentDelegation extends RunDelegation { sourceBotName: string; 
 export interface ImageAttachment { artifactId: string; mimeType: "image/png" | "image/jpeg"; size: number; }
 export interface Message { audio?: MessageAudio; attachments?: ImageAttachment[]; id: string; botId: string; runId?: string; role: "user" | "assistant" | "tool" | "system"; kind?: "progress" | "final"; text: string; provenance?: MessageProvenance; mentions?: string[]; createdAt: string; }
 export interface RunCancellation { id: string; requestedRunId: string; }
-export interface Run { admissionRetryable?: boolean; model?: string; reasoningEffort?: string; fast?: boolean; id: string; botId: string; operationId: string; status: RunStatus; delegation?: RunDelegation; subagentId?: string; parentRunId?: string; cancellation?: RunCancellation; createdAt: string; updatedAt: string; error?: string; errorCode?: string; }
+export interface Run { coordinatorMode?:boolean; admissionRetryable?: boolean; model?: string; reasoningEffort?: string; fast?: boolean; id: string; botId: string; operationId: string; status: RunStatus; delegation?: RunDelegation; subagentId?: string; parentRunId?: string; cancellation?: RunCancellation; createdAt: string; updatedAt: string; error?: string; errorCode?: string; }
 export interface Subagent { model?: string; reasoningEffort?: string; fast?: boolean; id: string; name: string; task: string; parentOperationId: string; parentSubagentId?: string; operationId: string; status: "queued" | "running" | "waiting_approval" | "waiting_connection" | "completed" | "failed" | "cancelled"; createdAt: string; updatedAt: string; result?: string; error?: string; }
 
 /** A newest-first history page plus all currently active runs, independent of pagination. */
@@ -43,17 +43,23 @@ export type ComputerAction =
 export interface ComputerResult { operationId:string;status:"running"|"completed"|"failed"|"interrupted"|"cancelled";processId?:string;processKnown?:boolean;output?:string;exitCode?:number;artifactId?:string;mimeType?:string;checkpointId?:string;checkpointStatus?:"pending"|"saved"|"failed";workspaceChanged?:boolean;error?:string; }
 export interface ComputerStatus { id:string;provider:"cloudflare";state:"stopped"|"starting"|"running"|"unavailable";capabilities:string[];lastCheckpointId?:string;error?:{code:string;message:string}; }
 export interface Approval {id:string;botId:string;runId:string;operationId:string;toolCallId?:string;action:ComputerAction;status:"pending"|"approved"|"denied"|"executing"|"completed"|"failed"|"interrupted";createdAt:string;expiresAt:string;result?:ComputerResult;}
-export interface ComputerProvider {exec(botId:string,operationId:string,action:ComputerAction):Promise<ComputerResult>;cancel(botId:string,processId:string):Promise<ComputerResult>;status(botId:string):Promise<ComputerStatus>;checkpoint(botId:string):Promise<ComputerResult>;controlled?(botId:string):Promise<boolean>;}
+export interface SecureDeployCapabilities {secureDeploy:boolean;isolationVersion?:string;privateCredentialChannel?:boolean;noShellEnv?:boolean;noBuildCredentialInheritance?:boolean;outputRedaction?:boolean;canaryVersion?:string;cliVersion?:string;cliBuildId?:string;cliDigest?:`sha256:${string}`;noAutomaticRetry?:boolean;}
+export interface SecureDeployPrivateRequest {operationId:string;authorization:unknown;pin:unknown;refs:ReadonlyArray<{id:string;revision:number;permissionEpoch:string;binding:string}>;credentials:ReadonlyArray<{refId:string;revision:number;header:string;prefix:string;value:string}>;signal?:AbortSignal;}
+export interface SecureDeployPrivateReceipt {operationId:string;status:"completed"|"failed"|"interrupted"|"rejected"|"unavailable";code:string;}
+export interface ComputerProvider {exec(botId:string,operationId:string,action:ComputerAction):Promise<ComputerResult>;cancel(botId:string,processId:string):Promise<ComputerResult>;status(botId:string):Promise<ComputerStatus>;checkpoint(botId:string):Promise<ComputerResult>;controlled?(botId:string):Promise<boolean>;secureDeployCapabilities?(botId:string,signal?:AbortSignal):Promise<SecureDeployCapabilities>;secureDeploy?(botId:string,input:SecureDeployPrivateRequest):Promise<SecureDeployPrivateReceipt>;secureDeployCancel?(botId:string,operationId:string):Promise<'cancelled'|'already_dispatched'|'unknown'>;}
+
 export interface ApiError {error:{code:string;message:string};}
 
-export interface ConnectionRequest {id:string;botId:string;runId:string;nativeOperationId?:string;provider:"github";repository?:string;permission:"read"|"write";status:"pending"|"connected"|"cancelled";createdAt:string;}
+export interface ConnectionRequest {id:string;botId:string;taskId?:string;runId:string;nativeOperationId?:string;provider:"github";repository?:string;permission:"read"|"write";status:"pending"|"connected"|"cancelled";createdAt:string;}
 
 export type {MemoryCategory,MemoryActor,MemoryState,MemorySource,MemoryEntry,MemorySaveInput,MemorySuggestionInput,MemoryForgetInput,MemoryAcceptInput,MemoryMutationResult,MemoryRevision,MemorySearchHit,MemorySearchResult,MemoryReviewStatus,MemoryLegacy,MemoryLimits,BotMemory} from './memory';
 export interface CompactionReceipt {id:string;reason:"manual"|"threshold"|"overflow";status:"running"|"completed"|"unchanged"|"failed"|"cancelled";summaryApplied:boolean;error?:string;createdAt?:string;startedAt?:string;summaryCreatedAt?:string;firstKeptEntryId?:number;summarizedEntries?:number;estimatedTokensBefore?:number;historyRetained?:true;}
 export interface BotContextStatus {automatic:true;estimatedTokens:number;activeEntries:number;contextWindow:number;compactions:CompactionReceipt[];historyRetained:true;}
 
 export type TaskStatus = "pending" | "queued" | "running" | "waiting_approval" | "waiting_connection" | "cancelling" | "completed" | "failed" | "cancelled";
-export interface Task { id:string; title:string; description:string; botId:string; botName:string; creator:"owner"|"bot"; createdByBotId?:string; sourceRunId?:string; status:TaskStatus; startImmediately:boolean; createdAt:string; updatedAt:string; lastActivity?:string; }
+export interface TaskQueue { reason:"task"|"bot"|"direct_action"|"starting"|"scheduled"; blockingTask?:{id:string;title:string}; }
+export interface Task { id:string; title:string; description:string; botId:string; botName:string; creator:"owner"|"bot"; createdByBotId?:string; sourceRunId?:string; sourceTaskId?:string; statusVersion?:number; status:TaskStatus; startImmediately:boolean; createdAt:string; updatedAt:string; lastActivity?:string; queue?:TaskQueue; }
+export interface TaskUpdate {task:Task;notificationId:string;result?:string;}
 export interface TaskPage { tasks:Task[]; }
 export * from "./avatars";
 export * from "./avatar-presets";

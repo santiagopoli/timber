@@ -102,7 +102,13 @@ export interface PiRuntimeOptions<Env extends object> {
   models?(): Promise<ModelCatalog>;
   openrouter?: {fetch(request:Request):Promise<Response>};
   openai?: {fetch(request:Request):Promise<Response>};
-  getBot(): Promise<Pick<Bot, 'name' | 'instructions' | 'model' | 'reasoningEffort' | 'fast' | 'computerApprovalMode'>>;
+  getBot(): Promise<Pick<Bot, 'name' | 'instructions' | 'model' | 'reasoningEffort' | 'fast' | 'computerApprovalMode' | 'allowTaskCreation'>>;
+  /** Global task identity supplied by the host, never by model input. */
+  getTaskId?():string|undefined;
+  /** Bounded public task status/results for future turns, without waking inference. */
+  getTaskContext?():string;
+  /** Host namespaces fresh effects and retains journal identities already admitted before upgrade. */
+  resolveToolOperationId?(input:{taskId:string;callId:string;legacyOperationId:string}):Promise<string>;
   getApprovalContext?(): Promise<RuntimeApprovalContext>;
   tools: RuntimeTools;
   onEvent?(event: RuntimeEvent): void | Promise<void>;

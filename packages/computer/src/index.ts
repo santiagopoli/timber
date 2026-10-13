@@ -6,15 +6,21 @@ import startSource from "../../../infra/computer/start.sh";
 import workspaceSource from "../../../infra/computer/workspace.py";
 import desktopSource from "../../../infra/computer/desktop_bridge.py";
 import { DesktopSessions, DesktopError } from "./live";
+import { createCloudSecureWorkerDeployProvider } from "./secure-deploy";
+import { secureDeployComputerRoute } from "./secure-deploy-do";
 
 export interface ComputerEnv {
   FILES: R2Bucket;
+  WORKSPACE?: DurableObjectNamespace;
   GITHUB?: DurableObjectNamespace;
   /** Temporary deployment mode. Installs desktop packages at cold start. */
   COMPUTER_BOOTSTRAP?: string;
 }
 
 interface OperationRecord { digest: string; result?: ComputerResult; processId?: string; conflict?:boolean; checkpoint?:{bootId:string;revision:number;warning?:string}; }
+interface OperationWork {effect:boolean;checkpoint?:{bootId:string;revision:number};}
+interface ExecutionWork {status:ComputerResult['status'];checkpoint:ExecSession['checkpoint'];}
+interface JournalIndexMigration {phase:'operations'|'executions';cursor?:string;}
 interface ExecCancellation {operationId:string;journal:boolean;}
 interface ExecSession {
   digest: string;
@@ -151,33 +157,91 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       await ctx.storage.put("internalToken", this.token);
       // If the DO was evicted during an effect, its outcome is unknown. A retry
       // with the same id receives interrupted, never replays the effect.
-      const operations = await ctx.storage.list<OperationRecord>({ prefix: "operation:" });
-      for (const [key, record] of operations) {
+      await this.initializeJournalIndexes();
+      for await (const page of this.journalPages<OperationWork>('operation-work:')) for (const [workKey] of page) {
+        const key=`operation:${workKey.slice('operation-work:'.length)}`;
+        const record=await ctx.storage.get<OperationRecord>(key);
+        if(!record){await ctx.storage.delete(workKey);continue;}
         if (!record.result && !record.processId) {
           record.result = {operationId: key.slice(10), status: "interrupted", error: "Execution was interrupted. Inspect effects before creating another operation."};
-          await ctx.storage.put(key, record);
+          await this.storeOperation(key.slice(10),record);
         }
       }
-      const sessions=await ctx.storage.list<ExecSession>({prefix:"exec-session:"});
       const retry=await ctx.storage.get<CheckpointRetry>('checkpointRetry');
-      for(const [key,session] of sessions) if(session.checkpoint==='attempting') {
-        const checkpoint=await ctx.storage.get<Checkpoint>('lastCheckpoint');
-        if(checkpoint && checkpoint.id===session.checkpointAttemptId) session.result.checkpointId=checkpoint.id;
-        else if(retry) session.result.checkpointStatus='pending';
-        else session.result.error=`${session.result.error?session.result.error+' ':''}The checkpoint outcome could not be confirmed after recovery. Retry checkpoint; do not repeat the command.`;
-        session.checkpoint='done';
-        await this.storeExecution(key.slice('exec-session:'.length),session);
+      let executionPending=false;
+      for await (const page of this.journalPages<ExecutionWork>('exec-work:')) for(const [key] of page) {
+        const processId=key.slice('exec-work:'.length),session=await ctx.storage.get<ExecSession>(`exec-session:${processId}`);
+        if(!session){await ctx.storage.delete(key);continue;}
+        if(session.checkpoint==='attempting') {
+          const checkpoint=await ctx.storage.get<Checkpoint>('lastCheckpoint');
+          if(checkpoint && checkpoint.id===session.checkpointAttemptId) session.result.checkpointId=checkpoint.id;
+          else if(retry) session.result.checkpointStatus='pending';
+          else session.result.error=`${session.result.error?session.result.error+' ':''}The checkpoint outcome could not be confirmed after recovery. Retry checkpoint; do not repeat the command.`;
+          session.checkpoint='done';
+          await this.storeExecution(processId,session);
+        }
+        if(session.checkpoint==='pending' && session.result.status!=='running') {
+          session.checkpoint='done';
+          session.result.checkpointStatus=retry?'pending':'failed';
+          await this.storeExecution(processId,session);
+        }
+        executionPending ||= session.result.status==='running' || session.checkpoint==='pending';
       }
-      for(const [key,session] of sessions) if(session.checkpoint==='pending' && session.result.status!=='running') {
-        session.checkpoint='done';
-        session.result.checkpointStatus=retry?'pending':'failed';
-        await this.storeExecution(key.slice('exec-session:'.length),session);
-      }
-      if([...sessions.values()].some(session=>session.result.status==='running' || session.checkpoint==='pending') || (retry && !retry.blocked)) await ctx.storage.setAlarm(Date.now()+1_000);
+      if(executionPending || (retry && !retry.blocked)) await ctx.storage.setAlarm(Date.now()+1_000);
       if (this.container?.running) await stage("computer_lifecycle_failed", () => this.container!.setInactivityTimeout(SAFETY_TIMEOUT_MS));
     });
   }
 
+  /** Old archives remain exact receipts; only unresolved metadata is scanned during routine work. */
+  private async *journalPages<T>(prefix:string,after?:string):AsyncGenerator<Map<string,T>> {
+    let startAfter=after;
+    while(true){
+      const page=await this.ctx.storage.list<T>({prefix,limit:32,noCache:true,...(startAfter?{startAfter}:{})});
+      if(!page.size)return;
+      yield page;
+      startAfter=[...page.keys()].at(-1);
+    }
+  }
+  private operationWork(record:OperationRecord):OperationWork|undefined {
+    const effect=!record.result&&!record.processId;
+    return effect||record.checkpoint?{effect,...(record.checkpoint?{checkpoint:{bootId:record.checkpoint.bootId,revision:record.checkpoint.revision}}:{})}:undefined;
+  }
+  private executionWork(session:ExecSession):ExecutionWork|undefined {
+    return session.result.status==='running'||session.checkpoint!=='done'?{status:session.result.status,checkpoint:session.checkpoint}:undefined;
+  }
+  private async initializeJournalIndexes():Promise<void> {
+    if(await this.ctx.storage.get('journalIndexesV1'))return;
+    let migration=await this.ctx.storage.get<JournalIndexMigration>('journalIndexMigrationV1')??{phase:'operations'};
+    // A bounded, restartable upgrade. Completed 128 KiB outputs are never loaded
+    // together; publish the version only after both full archives are indexed.
+    if(migration.phase==='operations') {
+      for await(const page of this.journalPages<OperationRecord>('operation:',migration.cursor)) {
+        const values:Record<string,OperationWork>={};
+        for(const [key,record] of page){const work=this.operationWork(record);if(work)values[`operation-work:${key.slice(10)}`]=work;}
+        // Index rows and cursor commit together, including pages containing only
+        // completed receipts. Eviction or the startup deadline resumes this page.
+        migration={phase:'operations',cursor:[...page.keys()].at(-1)};
+        await this.ctx.storage.put({...values,journalIndexMigrationV1:migration});
+      }
+      migration={phase:'executions'};
+      await this.ctx.storage.put('journalIndexMigrationV1',migration);
+    }
+    for await(const page of this.journalPages<ExecSession>('exec-session:',migration.cursor)) {
+      const values:Record<string,ExecutionWork>={};
+      for(const [key,session] of page){const work=this.executionWork(session);if(work)values[`exec-work:${key.slice('exec-session:'.length)}`]=work;}
+      migration={phase:'executions',cursor:[...page.keys()].at(-1)};
+      await this.ctx.storage.put({...values,journalIndexMigrationV1:migration});
+    }
+    await this.ctx.storage.transaction(async txn=>{await txn.put('journalIndexesV1',true);await txn.delete('journalIndexMigrationV1');});
+  }
+  private async storeOperation(operationId:string,record:OperationRecord):Promise<void> {
+    this.active();
+    await this.ctx.storage.transaction(async txn=>{
+      await txn.put(`operation:${operationId}`,record);
+      const work=this.operationWork(record);
+      if(work)await txn.put(`operation-work:${operationId}`,work);else await txn.delete(`operation-work:${operationId}`);
+    });
+  }
   private get container(): Container | undefined {
     return this.ctx.container;
   }
@@ -225,6 +289,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
     try {
+      if(path.startsWith("/secure-deploy")) return await secureDeployComputerRoute(this,request,path);
       if(path.startsWith("/workspace/") || path.startsWith("/desktop")) return await this.inspect(request);
       if(path.startsWith("/preview/")) return await this.preview(request);
       if (request.method !== "POST") throw new ComputerProviderError("computer_method_not_allowed");
@@ -389,7 +454,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       this.active();
       const reserved=await this.ctx.storage.transaction(async txn=>{
         const record=await txn.get<OperationRecord>(key);
-        if(!record) await txn.put<OperationRecord>(key,{digest});
+        if(!record)await txn.put({[key]:{digest},[`operation-work:${operationId}`]:{effect:true} satisfies OperationWork});
         return record;
       });
       if(reserved) return reserved.digest===digest
@@ -435,7 +500,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
           : {operationId,status:"interrupted",error:"Computer connection or persistence failed; the action may have completed. Inspect effects before submitting a new operation."};
       }
       this.active();
-      await this.ctx.storage.put<OperationRecord>(key, {...await this.ctx.storage.get<OperationRecord>(key),digest,result});
+      await this.storeOperation(operationId,{...await this.ctx.storage.get<OperationRecord>(key),digest,result});
       // The effect's outcome is now durable. Failure to renew its idle lifetime
       // must not replace that known result with an uncertain transport failure.
       try { await this.touch(); }
@@ -462,16 +527,23 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
 
   private async storeExecution(processId:string,session:ExecSession):Promise<void> {
     this.active();
-    const previous=await this.ctx.storage.get<OperationRecord>(`operation:${processId}`);
-    await this.ctx.storage.put({[`exec-session:${processId}`]:session,[`operation:${processId}`]:{...previous,digest:session.digest,processId,result:session.result} satisfies OperationRecord});
+    await this.ctx.storage.transaction(async txn=>{
+      const previous=await txn.get<OperationRecord>(`operation:${processId}`);
+      const record={...previous,digest:session.digest,processId,result:session.result} satisfies OperationRecord;
+      await txn.put({[`exec-session:${processId}`]:session,[`operation:${processId}`]:record});
+      const execution=this.executionWork(session),operation=this.operationWork(record);
+      if(execution)await txn.put(`exec-work:${processId}`,execution);else await txn.delete(`exec-work:${processId}`);
+      if(operation)await txn.put(`operation-work:${processId}`,operation);else await txn.delete(`operation-work:${processId}`);
+    });
   }
 
   private async hasActiveExecutions():Promise<boolean> {
-    return [...(await this.ctx.storage.list<ExecSession>({prefix:'exec-session:'})).values()].some(session=>session.result.status==='running');
+    for await(const page of this.journalPages<ExecutionWork>('exec-work:'))if([...page.values()].some(work=>work.status==='running'))return true;
+    return false;
   }
 
   private async needsExecutionMaintenance():Promise<boolean> {
-    return [...(await this.ctx.storage.list<ExecSession>({prefix:'exec-session:'})).values()].some(session=>session.result.status==='running' || session.checkpoint==='pending');
+    return (await this.ctx.storage.list<ExecutionWork>({prefix:'exec-work:',limit:1})).size>0;
   }
 
   private executionResult(session:ExecSession,operationId:string):ComputerResult {
@@ -547,7 +619,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
         const session:ExecSession={digest,bootId:health.bootId,dispatched:true,checkpoint:'pending',result:{operationId:processId,processId,status:'running',output:''}};
         await this.ctx.storage.transaction(async txn=>{
           if(await txn.get(`operation:${processId}`)) throw new ComputerProviderError('computer_idempotency_conflict');
-          await txn.put({[`exec-session:${processId}`]:session,[`operation:${processId}`]:{digest,processId,result:session.result} satisfies OperationRecord});
+          await txn.put({[`exec-session:${processId}`]:session,[`operation:${processId}`]:{digest,processId,result:session.result} satisfies OperationRecord,[`exec-work:${processId}`]:this.executionWork(session)!});
           // A crash immediately after dispatch must still wake observation,
           // even though no filesystem change has been reported yet.
           await txn.setAlarm(Date.now()+EXEC_POLL_MS);
@@ -650,7 +722,7 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
       const previous=await txn.get<CheckpointRetry>('checkpointRetry');
       const retry:CheckpointRetry=previous?.bootId===bootId?{...previous,revision,blocked:false}:{bootId,revision,attempts:0,nextAttemptAt:Date.now()};
       record.checkpoint={bootId,revision};
-      await txn.put({[`operation:${operationId}`]:record,checkpointRevision:revision,checkpointRetry:retry});
+      await txn.put({[`operation:${operationId}`]:record,[`operation-work:${operationId}`]:this.operationWork(record)!,checkpointRevision:revision,checkpointRetry:retry});
       await txn.setAlarm(Date.now()+1_000);
     });
   }
@@ -698,7 +770,9 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     this.active();
     try {
       await this.ctx.storage.put('checkpointRetry',retry);
-      for(const [key,record] of await this.ctx.storage.list<OperationRecord>({prefix:'operation:'})) {
+      for await(const page of this.journalPages<OperationWork>('operation-work:')) for(const [workKey] of page) {
+        const key=`operation:${workKey.slice('operation-work:'.length)}`,record=await this.ctx.storage.get<OperationRecord>(key);
+        if(!record)continue;
         if(record.checkpoint?.bootId!==retry.bootId || !record.result || record.result.status==='running') continue;
         const processId=key.slice('operation:'.length),result=await this.recordCheckpointFailure(processId,record.result,failure);
         if(record.processId===processId) {
@@ -717,8 +791,10 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     try {
       await this.ctx.storage.transaction(async txn=>{
         await txn.put('lastCheckpoint',checkpoint);
-        const operations=await txn.list<OperationRecord>({prefix:'operation:'});
-        for(const [key,record] of operations) {
+        const operations=await txn.list<OperationWork>({prefix:'operation-work:'});
+        for(const [workKey] of operations) {
+          const key=`operation:${workKey.slice('operation-work:'.length)}`,record=await txn.get<OperationRecord>(key);
+          if(!record)continue;
           const pending=record.checkpoint;
           if(!pending || pending.bootId!==checkpoint.bootId || pending.revision>(checkpoint.revision??-1)) continue;
           if(record.result) {
@@ -727,11 +803,11 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
             record.result={...record.result,checkpointId:checkpoint.id,checkpointStatus:'saved',error};
           }
           delete record.checkpoint;
-          await txn.put(key,record);
+          await txn.put(key,record);await txn.delete(workKey);
           const processId=key.slice('operation:'.length);
           if(record.processId===processId) {
             const session=await txn.get<ExecSession>(`exec-session:${processId}`);
-            if(session && session.result.status!=='running') {session.checkpoint='done';session.result=record.result??{...session.result,checkpointId:checkpoint.id,checkpointStatus:'saved'};await txn.put(`exec-session:${processId}`,session);}
+            if(session && session.result.status!=='running') {session.checkpoint='done';session.result=record.result??{...session.result,checkpointId:checkpoint.id,checkpointStatus:'saved'};await txn.put(`exec-session:${processId}`,session);await txn.delete(`exec-work:${processId}`);}
           }
         }
         const retry=await txn.get<CheckpointRetry>('checkpointRetry');
@@ -769,7 +845,9 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     const failure=new ComputerProviderError('computer_checkpoint_lost');
     retry.blocked=true;retry.errorCode=failure.code;
     await this.ctx.storage.put('checkpointRetry',retry);
-    for(const [key,record] of await this.ctx.storage.list<OperationRecord>({prefix:'operation:'})) {
+    for await(const page of this.journalPages<OperationWork>('operation-work:')) for(const [workKey] of page) {
+      const key=`operation:${workKey.slice('operation-work:'.length)}`,record=await this.ctx.storage.get<OperationRecord>(key);
+      if(!record)continue;
       if(record.checkpoint?.bootId!==retry.bootId || !record.result) continue;
       const result=await this.recordCheckpointFailure(key.slice('operation:'.length),record.result,failure);
       if(record.processId===key.slice('operation:'.length)) {
@@ -872,9 +950,9 @@ export class ComputerDO extends DurableObject<ComputerEnv> {
     const botId=await this.ctx.storage.get<string>('botId');
     if(botId && await this.needsExecutionMaintenance()) {
       try {
-        for(const [key,session] of await this.ctx.storage.list<ExecSession>({prefix:'exec-session:'})) {
-          if(session.result.status==='running') {
-            const processId=key.slice('exec-session:'.length);
+        for await(const page of this.journalPages<ExecutionWork>('exec-work:')) for(const [key,work] of page) {
+          if(work.status==='running') {
+            const processId=key.slice('exec-work:'.length);
             const intent=await this.ctx.storage.get<ExecCancellation|true>(`exec-cancelled:${processId}`);
             if(intent) await this.cancelExecution(botId,intent===true?processId:intent.operationId,processId,intent===true?false:intent.journal);
             await this.pollExecution(botId,processId,processId,0);
@@ -1166,6 +1244,7 @@ async function rpc<T>(binding: DurableObjectNamespace, botId: string, path: stri
 }
 
 export function createCloudComputerProvider(binding: DurableObjectNamespace): ComputerProvider {
+  const deploy=createCloudSecureWorkerDeployProvider(binding);
   return {
     exec:(botId,operationId,action) => rpc<ComputerResult>(binding,botId,"/actions",{operationId,action}),
     status:botId => rpc<ComputerStatus>(binding,botId,"/status"),
@@ -1177,6 +1256,9 @@ export function createCloudComputerProvider(binding: DurableObjectNamespace): Co
       if(!response.ok)throw new ComputerProviderError("computer_unavailable");
       return (await response.json<{controlled:boolean}>()).controlled;
     },
+    secureDeployCapabilities:(botId,signal)=>deploy.capabilities(botId,signal),
+    secureDeploy:(botId,input)=>deploy.dispatch(botId,{...(input as unknown as Parameters<typeof deploy.dispatch>[1]),signal:input.signal??new AbortController().signal}),
+    secureDeployCancel:(botId,operationId)=>deploy.cancel(botId,operationId),
     cancel:(botId,processId)=>rpc<ComputerResult>(binding,botId,'/exec/cancel',{processId}),
   };
 }
@@ -1190,3 +1272,6 @@ export function previewCloudComputer(binding:DurableObjectNamespace,botId:string
     method:request.method,headers,...(["GET","HEAD"].includes(request.method)?{}:{body:request.body}),redirect:"manual",signal:request.signal,
   }));
 }
+
+export {secureDeployCanonical,SecureDeployCoordinator,memorySecureDeployJournal,createCloudSecureWorkerDeployProvider} from './secure-deploy';
+export type {SecretRef,DeployPin,DeployCredential,DeployRequest,DeployRecord,SecureDeployAuthorization,SecureDeployReceipt,SecureDeployCapabilities,SecureDeployHost,SecureDeployAuthority,SecureDeployJournal,SecureWorkerDeployProvider,SecureDeployBinding} from './secure-deploy';

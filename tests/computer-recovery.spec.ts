@@ -35,6 +35,8 @@ describe("real ComputerDO journal recovery without a container", () => {
     const request: ComputerAction = {type: "exec", command: "external-side-effect"};
     const hash = await digest(request);
     await runInDurableObject(stub, async (_instance, state) => {
+      // These raw rows simulate the journal produced before compact indexes.
+      await state.storage.delete("journalIndexesV1");
       await state.storage.put("operation:unknown-action", {digest: hash});
     });
     await evictDurableObject(stub);

@@ -54,6 +54,7 @@ export function computerActivityInput(action: ComputerAction): DisplayInput {
 }
 
 const hostFields: Record<string, readonly string[]> = {
+  name_secret: ['name'],
   load_skill: ['name'],
   github_connect: ['repository', 'permission'],
   github_list_repositories: ['page'],
@@ -61,6 +62,7 @@ const hostFields: Record<string, readonly string[]> = {
   github_push: ['repository', 'path', 'branch'],
   github_create_pull_request: ['repository', 'head', 'base', 'draft'],
   github_list_pull_requests: ['repository', 'head'],
+  github_inspect_ci: ['repository', 'branch', 'commit', 'runId', 'jobId'],
   publish_app: ['name', 'port'],
   list_apps: [],
   remove_app: ['appId'],

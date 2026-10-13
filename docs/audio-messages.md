@@ -114,28 +114,36 @@ real WAV samples, real Chromium media playback and real Chromium MediaRecorder
 encoding; backend routes are mocked. Separate lifecycle tests cover microphone
 permission races, recorder errors and bounded capture cleanup.
 
-## Verification of this change
+## Draft cleanup and cancellation
 
-Local verification completed on **2026-10-11**, with no paid provider requests:
+A durable bot-scoped upload candidate is journaled and flushed before any R2
+write. Upload, admission, discard and cleanup serialize per audio identity.
+Unreferenced drafts expire after 24 hours; expiry fences admission even before
+the bounded 32-item cleanup runs. R2 failures keep a recoverable deletion journal
+and retry wake; a conflicting non-audio artifact is terminal and never deleted.
+DELETE creates a permanent identity tombstone and retains one final 24-hour sweep
+for an uncertain late write. Admitted audio, even with pending
+or failed transcription, cannot be discarded through this draft route. Artifact
+reads consult the tombstone as well as the live registry, so a late uncertain R2
+write cannot make a discarded original visible again.
 
-- Root `npm run typecheck`: passed (API, shared contracts, tests and console).
-- Production console build: passed, with output kept outside the repository.
-- Targeted backend aggregate: **145/145 tests across 15 suites**, covering all
-  audio suites plus API/security, owner sessions, inbox/model admission, image
-  attachments, tasks, agent messaging and console assets.
-- Playwright audio and microphone lifecycle: **9/9**, desktop and mobile.
-  Includes a real-sample 31-second PCM waveform, playback/seek/pause, original
-  audio on pending/failure, transcript controls, billing and explicit retry.
-- Native Chromium MediaRecorder regression: **3/3 serial repeats**. It encodes a
-  synthetic oscillator stream with the real browser recorder, validates the exact
-  resulting WebM bytes, uploads those same bytes, and plays/seeks/pauses them.
-  Permission races and recorder errors use controlled browser mocks; a physical
-  microphone or actual OS permission prompt was not tested.
-- Existing desktop/mobile image-composer UI regression: **6/6**, including
-  dark/light layout and narrow 320 px controls.
-- Independent targeted security review: no remaining known critical blockers.
-- Script syntax checks and `git diff --check`: passed.
+The console aborts remaining PUT/POST stages on cancellation or navigation. Abort
+is not proof that durable admission failed. A mounted cancelled draft retains its
+IDs and only an explicit send inspects the existing receipt before submission.
+Navigation reconciles canonical messages rather than replaying audio or paying
+for another attempt. Logout and lost-page cleanup rely on the durable TTL.
 
-This is not a claim that the entire repository's runtime/computer suite or a
-production smoke test ran. Deployment, project entitlement, real OpenAI billing
-and physical-device/browser coverage remain unverified.
+Microphone capture prefers WebM Opus; a browser without it captures bounded mono
+PCM16 WAV at no more than 16 kHz through native Web Audio. MP4 is never relabeled
+or admitted. Tracks, processors and contexts stop on discard, Stop run,
+navigation, hidden page, logout and unmount. Stop fences a pending microphone
+permission even before the run-cancellation response arrives. Safari hardware/OS permission testing is separate from
+synthetic-signal tests in the WebKit engine.
+
+## Delivery verification
+
+See the PR/delivery report for checks on the integrated tree and exact main/CI/
+production deployment evidence. Earlier branch-local checks are not proof of the
+current integrated tree. No fixture or browser test makes paid provider calls.
+Physical iPhone microphone/OS permissions and live transcription billing remain
+outside this fixture-based delivery verification.

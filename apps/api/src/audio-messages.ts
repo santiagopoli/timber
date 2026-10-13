@@ -6,6 +6,8 @@ import {MAX_AUDIO_BYTES, validateAudio} from './audio-formats';
 
 type AudioMessage = Message & {audio: AudioAttachment & {operationId:string;transcription:AudioTranscription}};
 type Row = {operation_id:string;audio_id:string;message_id:string;attempt_id:string;status:AudioTranscription['status'];data:string;run_id:string|null};
+type UploadRow = {audio_id:string;discarded:number;expires_at:number;next_at:number|null};
+const UPLOAD_TTL=86_400_000,CLEANUP_BATCH=32,CLEANUP_RETRY=60_000;
 type Hooks = {
   active():void;
   botId():string;
@@ -21,7 +23,7 @@ const invalid=()=>new ApiError(400,'invalid_audio_request','Audio, operation and
 export function audioId(value:unknown):string {if(typeof value!=='string'||!UUID.test(value))throw invalid();return value;}
 
 /** Only container validation; original bytes are never decoded, rewritten or public. */
-export async function uploadAudio(request:Request, files:R2Bucket, botId:string, id:string, active:()=>void, signal?:AbortSignal):Promise<Response> {
+export async function uploadAudio(request:Request, files:R2Bucket, botId:string, id:string, active:()=>void, signal?:AbortSignal, authorize?:()=>Promise<void>):Promise<Response> {
   active();
   if(request.headers.has('content-encoding') && request.headers.get('content-encoding')!=='identity')throw new ApiError(400,'audio_encoding_unsupported','Compressed HTTP uploads are not supported.');
   const reader=request.body?.getReader();if(!reader)throw new ApiError(400,'invalid_audio','An audio file is required.');
@@ -41,31 +43,96 @@ export async function uploadAudio(request:Request, files:R2Bucket, botId:string,
   const bytes=new Uint8Array(size);let offset=0;for(const block of slabs){const length=Math.min(block.length,size-offset);bytes.set(block.subarray(0,length),offset);offset+=length;}
   const {mimeType,durationMs,extension}=validateAudio(bytes,request.headers.get('content-type')??'');
   const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),b=>b.toString(16).padStart(2,'0')).join('');
-  active();const key=`bots/${botId}/artifacts/${id}`;
+  await authorize?.();active();const key=`bots/${botId}/artifacts/${id}`;
   const same=(object:R2Object|null)=>object?.customMetadata?.chatAudio==='true'&&object.customMetadata.sha256===hash&&object.httpMetadata?.contentType===mimeType;
-  const previous=await files.head(key);active();
+  const previous=await files.head(key);await authorize?.();active();
   if(previous&&!same(previous))throw new ApiError(409,'idempotency_conflict','Audio ID already identifies different content.');
   if(!previous) {
     const result=await files.put(key,bytes,{onlyIf:{etagDoesNotMatch:'*'},httpMetadata:{contentType:mimeType},customMetadata:{chatAudio:'true',sha256:hash,durationMs:String(durationMs),extension}});
     if(!result&&!same(await files.head(key)))throw new ApiError(409,'idempotency_conflict','Audio ID already identifies different content.');
   }
-  active();return json({audio:{artifactId:id,mimeType,size,durationMs}});
+  await authorize?.();active();return json({audio:{artifactId:id,mimeType,size,durationMs}});
 }
 
 /** Paid dispatch is deliberately separate from safe, deduplicated bot admission. */
 export class AudioMessages {
   private live=new Map<string,Promise<void>>();
+  private locks=new Map<string,Promise<void>>();
+  private cleanup?:Promise<void>;
   private controllers=new Set<AbortController>();
   private uploads=new Set<Promise<Response>>();
   constructor(private storage:DurableObjectStorage,private env:Env,private hooks:Hooks) {
     storage.sql.exec(`CREATE TABLE IF NOT EXISTS audio_messages(operation_id TEXT PRIMARY KEY,audio_id TEXT NOT NULL,message_id TEXT NOT NULL,attempt_id TEXT NOT NULL,status TEXT NOT NULL,data TEXT NOT NULL,run_id TEXT);
-      CREATE TABLE IF NOT EXISTS audio_attempts(attempt_id TEXT PRIMARY KEY,operation_id TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS audio_attempts(attempt_id TEXT PRIMARY KEY,operation_id TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS audio_uploads(audio_id TEXT PRIMARY KEY,discarded INTEGER NOT NULL DEFAULT 0,expires_at INTEGER NOT NULL,next_at INTEGER);
+      CREATE INDEX IF NOT EXISTS audio_uploads_cleanup ON audio_uploads(next_at);`);
+  }
+  private locked<T>(id:string,work:()=>Promise<T>):Promise<T> {
+    const result=(this.locks.get(id)??Promise.resolve()).then(work);
+    const tail=result.then(()=>{},()=>{});this.locks.set(id,tail);
+    void tail.then(()=>{if(this.locks.get(id)===tail)this.locks.delete(id);});return result;
+  }
+  private uploadRow(id:string):UploadRow|undefined {return this.storage.sql.exec<UploadRow>('SELECT * FROM audio_uploads WHERE audio_id=?',id).toArray()[0];}
+  private referenced(id:string):boolean {return !!this.storage.sql.exec('SELECT 1 FROM audio_messages WHERE audio_id=? LIMIT 1',id).toArray().length;}
+  private usable(id:string):void {
+    const row=this.uploadRow(id);
+    if(row&&(row.discarded||!this.referenced(id)&&row.expires_at<=Date.now()))throw new ApiError(410,'audio_upload_discarded','This audio draft expired or was discarded. Attach or record a new draft.');
+  }
+  access(id:string):void {audioId(id);this.hooks.active();this.usable(id);}
+  private async scheduleCleanup():Promise<void> {
+    this.hooks.active();const next=this.storage.sql.exec<{next:number|null}>('SELECT MIN(next_at) next FROM audio_uploads').one().next;
+    if(next!==null)await this.hooks.schedule('audio-transcribe:upload-cleanup',Math.max(0,next-Date.now()));
   }
   upload(request:Request,id:string):Promise<Response> {
+    audioId(id);this.hooks.active();
     if(this.uploads.size)throw new ApiError(429,'audio_upload_busy','Another audio upload is in progress. Retry this upload after it finishes.');
     const botId=this.hooks.botId(),controller=new AbortController();this.controllers.add(controller);
-    const work=uploadAudio(request,this.env.FILES,botId,id,()=>this.hooks.active(),controller.signal).finally(()=>{this.uploads.delete(work);this.controllers.delete(controller);});
+    const active=()=>{if(controller.signal.aborted)throw new ApiError(404,'not_found','Bot not found.');this.hooks.active();};
+    const work=this.locked(id,async()=>{
+      active();await this.hooks.authorize();active();this.usable(id);
+      if(!this.uploadRow(id)&&!this.referenced(id))this.storage.sql.exec('INSERT INTO audio_uploads(audio_id,expires_at,next_at) VALUES(?,?,?)',id,Date.now()+UPLOAD_TTL,Date.now()+UPLOAD_TTL);
+      // Candidate and its recovery wake must be durable before the first R2 write.
+      await this.scheduleCleanup();await this.storage.sync();active();this.usable(id);
+      return uploadAudio(request,this.env.FILES,botId,id,active,controller.signal,()=>this.hooks.authorize());
+    }).finally(()=>{this.uploads.delete(work);this.controllers.delete(controller);});
     this.uploads.add(work);return work;
+  }
+  async discard(id:string):Promise<{audioId:string;discarded:true}> {
+    audioId(id);return this.locked(id,async()=>{await this.hooks.authorize();this.hooks.active();await this.discardLocked(id);return {audioId:id,discarded:true};});
+  }
+  private async discardLocked(id:string,finalSweep=false):Promise<void> {
+    this.hooks.active();if(this.referenced(id))throw new ApiError(409,'audio_already_referenced','Saved audio messages cannot be discarded as drafts.');
+    const key=`bots/${this.hooks.botId()}/artifacts/${id}`,file=await this.env.FILES.head(key);this.hooks.active();
+    if(file&&file.customMetadata?.chatAudio!=='true')throw new ApiError(400,'invalid_audio_attachment','This artifact is not an audio draft.');
+    this.storage.sql.exec('INSERT INTO audio_uploads(audio_id,discarded,expires_at,next_at) VALUES(?,1,?,?) ON CONFLICT(audio_id) DO UPDATE SET discarded=1,next_at=excluded.next_at',id,Date.now(),Date.now());
+    // Keep a permanent tombstone, including when the R2 outcome is lost.
+    await this.storage.sync();this.hooks.active();
+    try {
+      // A missing HEAD must not erase an image admitted concurrently in the
+      // shared artifact namespace. Confirmed audio cannot be overwritten by
+      // the image uploader's conditional immutable PUT.
+      if(file)await this.env.FILES.delete(key);this.hooks.active();
+      this.storage.sql.exec('UPDATE audio_uploads SET next_at=? WHERE audio_id=?',finalSweep?null:Date.now()+UPLOAD_TTL,id);
+      await this.scheduleCleanup();
+    }
+    catch(error){this.hooks.active();this.storage.sql.exec('UPDATE audio_uploads SET next_at=? WHERE audio_id=?',Date.now()+CLEANUP_RETRY,id);await this.scheduleCleanup();throw error;}
+  }
+  processCleanup():Promise<void> {
+    this.hooks.active();if(this.cleanup)return this.cleanup;
+    const work=(async()=>{
+      const due=this.storage.sql.exec<UploadRow>('SELECT * FROM audio_uploads WHERE next_at<=? ORDER BY next_at LIMIT ?',Date.now(),CLEANUP_BATCH).toArray();
+      for(const candidate of due)await this.locked(candidate.audio_id,async()=>{
+        this.hooks.active();const row=this.uploadRow(candidate.audio_id);if(!row||row.next_at===null||row.next_at>Date.now())return;
+        if(this.referenced(row.audio_id)){this.storage.sql.exec('UPDATE audio_uploads SET next_at=NULL WHERE audio_id=?',row.audio_id);return;}
+        try {await this.discardLocked(row.audio_id,true);}
+        catch(error) {
+          this.hooks.active();
+          if(error instanceof ApiError&&error.code==='invalid_audio_attachment')this.storage.sql.exec('UPDATE audio_uploads SET discarded=1,next_at=NULL WHERE audio_id=?',row.audio_id);
+          else this.storage.sql.exec('UPDATE audio_uploads SET next_at=? WHERE audio_id=?',Date.now()+CLEANUP_RETRY,row.audio_id);
+        }
+      });
+      await this.scheduleCleanup();
+    })().finally(()=>{this.cleanup=undefined;});this.cleanup=work;return work;
   }
   private row(id:string):Row|undefined {return this.storage.sql.exec<Row>('SELECT * FROM audio_messages WHERE operation_id=?',id).toArray()[0];}
   receipt(id:string):AudioReceipt {
@@ -74,14 +141,19 @@ export class AudioMessages {
     const saved=row.run_id?this.storage.sql.exec<{data:string}>('SELECT data FROM runs WHERE id=?',row.run_id).toArray()[0]:undefined;
     return {message,transcription:message.audio.transcription,...(saved?{run:JSON.parse(saved.data) as Run}:{})};
   }
-  async create(input:Record<string,unknown>):Promise<AudioReceipt> {
+  create(input:Record<string,unknown>):Promise<AudioReceipt> {
+    const id=audioId(input.audioId);return this.locked(id,()=>this.createLocked(input));
+  }
+  private async createLocked(input:Record<string,unknown>):Promise<AudioReceipt> {
     if(Object.keys(input).some(key=>!['operationId','audioId','attemptId'].includes(key)))throw new ApiError(400,'invalid_audio_request','Audio messages accept only audio and operation identities.');
     const id=audioId(input.operationId),artifactId=audioId(input.audioId),attemptId=audioId(input.attemptId);
     this.hooks.active();let previous=this.row(id);
     if(previous){if(previous.audio_id!==artifactId||!this.storage.sql.exec('SELECT 1 FROM audio_attempts WHERE attempt_id=? AND operation_id=?',attemptId,id).toArray().length)throw new ApiError(409,'idempotency_conflict','Audio operation already identifies different input.');return this.receipt(id);}
-    const file=await this.env.FILES.head(`bots/${this.hooks.botId()}/artifacts/${artifactId}`);this.hooks.active();
+    await this.hooks.authorize();this.hooks.active();this.usable(artifactId);
+    const file=await this.env.FILES.head(`bots/${this.hooks.botId()}/artifacts/${artifactId}`);this.hooks.active();this.usable(artifactId);
     if(!file||file.customMetadata?.chatAudio!=='true')throw new ApiError(400,'invalid_audio_attachment','Audio does not belong to this bot.');
-    previous=this.row(id);if(previous)return this.create(input);
+    await this.hooks.authorize();this.hooks.active();this.usable(artifactId);
+    previous=this.row(id);if(previous)return this.createLocked(input);
     this.checkPendingCapacity();
     if(this.storage.sql.exec('SELECT 1 FROM audio_attempts WHERE attempt_id=?',attemptId).toArray().length)throw new ApiError(409,'idempotency_conflict','Attempt ID was already used.');
     const message:AudioMessage={id:crypto.randomUUID(),botId:this.hooks.botId(),role:'user',text:'',createdAt:stamp(),audio:{operationId:id,artifactId,mimeType:file.httpMetadata!.contentType as AudioAttachment['mimeType'],size:file.size,durationMs:Number(file.customMetadata.durationMs),transcription:{attemptId,status:'pending'}}};
@@ -89,6 +161,7 @@ export class AudioMessages {
       this.storage.sql.exec('INSERT INTO audio_messages(operation_id,audio_id,message_id,attempt_id,status,data) VALUES(?,?,?,?,?,?)',id,artifactId,message.id,attemptId,'pending',JSON.stringify(message));
       this.storage.sql.exec('INSERT INTO audio_attempts VALUES(?,?,?,?)',attemptId,id,'pending',stamp());
       this.hooks.save(message,true);
+      this.storage.sql.exec('UPDATE audio_uploads SET next_at=NULL WHERE audio_id=?',artifactId);
     });
     await this.schedule(id,0);return this.receipt(id);
   }
@@ -126,6 +199,7 @@ export class AudioMessages {
   }
   recover():void {
     this.hooks.active();
+    this.hooks.waitUntil(this.scheduleCleanup().catch(()=>{}));
     for(const row of this.storage.sql.exec<Row>("SELECT * FROM audio_messages WHERE status IN ('pending','dispatching') OR (status='succeeded' AND run_id IS NULL)").toArray()) {
       if(this.live.has(row.operation_id))continue;
       if(row.status==='dispatching')this.update(row,{attemptId:row.attempt_id,status:'uncertain',errorCode:'audio_transcription_uncertain',error:'The previous transcription outcome is unknown. It was not sent again. An explicit retry may incur another charge.'});
@@ -204,6 +278,6 @@ export class AudioMessages {
   }
   async stop():Promise<void> {
     for(const controller of this.controllers)controller.abort();
-    await Promise.allSettled([...this.live.values(),...this.uploads]);
+    await Promise.allSettled([...this.live.values(),...this.uploads,...this.locks.values(),...(this.cleanup?[this.cleanup]:[])]);
   }
 }

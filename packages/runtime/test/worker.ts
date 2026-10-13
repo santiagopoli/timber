@@ -28,6 +28,7 @@ export class HarnessProbe extends DurableObject {
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS child_reports(id INTEGER PRIMARY KEY AUTOINCREMENT, input TEXT)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS child_report_attempts(id INTEGER PRIMARY KEY AUTOINCREMENT, input TEXT)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY,value TEXT)');
+    if (this.setting('holdComputerTools') === 'true') this.heldTool = new Promise(resolve => { this.releaseHeldTool = resolve; });
     const models=async():Promise<ModelCatalog>=>{
       const catalog=({connected:true,defaultModel:DEFAULT_MODEL,models:[
         {id:DEFAULT_MODEL,name:'Sol fixture',provider:'openai',reasoningEfforts:['low','medium','high'],defaultReasoningEffort:'medium',supportsFast:true,fastServiceTier:'fast',contextWindow:1_050_000,inputModalities:['text','image']},
@@ -86,13 +87,13 @@ export class HarnessProbe extends DurableObject {
         let toolRequest = text.includes('request-exec') || text.includes('request-loop') || (isSubagent && !hasTool) || childTool || (!!existingAction && !hasTool) || (!!peer && !hasTool);
         const readCall = { index: 0, id: 'call-read-1', type: 'function', function: { name: 'read_file', arguments: '{"path":"/workspace/test.txt"}' } };
         const execCall = { index: text.includes('mixed') ? 1 : 0, id: 'call-fixture-1', type: 'function', function: { name: 'exec', arguments: '{"command":"echo fixture"}' } };
-        const spawnCall = { index: 0, id: text.includes('second-task') ? 'call-spawn-second' : 'call-spawn-1', type: 'function', function: { name: 'spawn_subagent', arguments: JSON.stringify({ ...(text.includes('choose-astra')?{model:'gpt-6-astra',reasoningEffort:'ultra',fast:true}:{}), name: text.includes('second-task') ? 'Second reader' : 'Reader', task: text.includes('nested') ? 'request-subagent nested' : text.includes('child-exec') ? 'child-fixture-exec' : 'child-fixture-read' }) } };
+        const spawnCall = { index: 0, id: text.includes('second-task') ? 'call-spawn-second' : 'call-spawn-1', type: 'function', function: { name: 'spawn_subagent', arguments: JSON.stringify({ ...(text.includes('choose-astra')?{model:'gpt-6-astra',reasoningEffort:'ultra',fast:true}:{}), name: text.includes('second-task') ? 'Second reader' : 'Reader', task: text.includes('nested-steering') ? 'request-subagent-wait' : text.includes('nested') ? 'request-subagent nested' : text.includes('child-exec') ? 'child-fixture-exec' : 'child-fixture-read' }) } };
         let calls = isSubagent ? [spawnCall] : isChild ? text.includes('exec') ? [execCall] : [readCall] : text.includes('request-loop') ? [readCall] : text.includes('mixed') ? [readCall, execCall] : [execCall];
         if (text.includes('request-subagent-peers') && toolResults.length === 1) {
           const toolContent = toolResults[0]!.content;
           const result = JSON.parse(typeof toolContent === 'string' ? toolContent : (toolContent as {text:string}[]).map(part => part.text).join(''));
           toolRequest = true;
-          calls = [{ ...spawnCall, id: 'call-spawn-peer', function: { name: 'spawn_subagent', arguments: JSON.stringify({ name: 'Messenger', task: `child-fixture-peer:${result.subagent.id}` }) } }];
+          calls = [{ ...spawnCall, id: 'call-spawn-peer', function: { name: 'spawn_subagent', arguments: JSON.stringify({ name: 'Messenger', task: text.includes('wait-cycle') ? 'child-fixture-read' : `child-fixture-peer:${result.subagent.id}` }) } }];
         }
         if (text.includes('request-subagent-wait') && toolResults.length === 1) {
           const toolContent = toolResults[0]!.content;
@@ -115,15 +116,18 @@ export class HarnessProbe extends DurableObject {
         ];
         return new Response(chunks.map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
       } } as unknown as Ai,
-      getBot: async () => ({ name: 'Ada', instructions: 'Your private instruction is amber-lantern.', model: this.setting('model') ?? CF_MODEL, computerApprovalMode: this.setting('approvalMode') === 'automatic' ? 'automatic' : 'ask' }),
+      getBot: async () => ({ name: 'Ada', instructions: 'Your private instruction is amber-lantern.', model: this.setting('model') ?? CF_MODEL, allowTaskCreation:this.setting('allowTaskCreation')==='true', computerApprovalMode: this.setting('approvalMode') === 'automatic' ? 'automatic' : 'ask' }),
+      getTaskId:()=>this.setting('taskId'),
+      getTaskContext:()=>this.setting('taskContext')??'',
       getApprovalContext: async () => {
         if (this.setting('approvalContext') === 'unavailable') throw new Error('fixture host context unavailable');
         return JSON.parse(this.setting('approvalContext') ?? '{"active":[],"recent":[]}') as RuntimeApprovalContext;
       },
       tools: {
-        catalog: async () => [{ name: 'github_clone', description: 'Clone an authorized repository.', inputSchema: { type: 'object', properties: { repository: { type: 'string' }, path: { type: 'string' } }, required: ['repository', 'path'] } }],
+        catalog: async () => [...(this.setting('allowTaskCreation')==='true'?[{name:'create_task',description:'Create independent persistent work.',inputSchema:{type:'object',properties:{title:{type:'string'},description:{type:'string'}},required:['title','description']}}]:[]),{ name: 'github_clone', description: 'Clone an authorized repository.', inputSchema: { type: 'object', properties: { repository: { type: 'string' }, path: { type: 'string' } }, required: ['repository', 'path'] } }],
         call: async ({ operationId, runOperationId, toolCallId, name, arguments: args }) => {
           ctx.storage.sql.exec('INSERT INTO host_calls(input) VALUES(?)', JSON.stringify({ operationId, runOperationId, toolCallId, name, arguments: args }));
+          if(name==='create_task')return {operationId,status:'completed',output:JSON.stringify({task:{id:'11111111-1111-4111-8111-111111111111',status:'queued',startImmediately:true}})};
           return this.setting('githubConnected') === 'true'
             ? { operationId, status: 'completed', output: 'Repository cloned by the host.' }
             : { status: 'pending_connection', requestId: 'connection-fixture', provider: 'github', repository: 'owner/private', permission: 'write' };

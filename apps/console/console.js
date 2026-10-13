@@ -1,3 +1,4 @@
+import './src/pwa.ts';
 import './src/styles.css';
 import { mountChat, mountToolActivity } from './src/chat.tsx';
 import { mountAgents } from './src/agents.tsx';
@@ -7,7 +8,7 @@ import {agentColor} from './src/agent-colors.ts';
 import {modelBadgeLabel} from './src/model-identity.tsx';
 import {mountModelPicker} from './src/model-picker.tsx';
 import {modelPublisherLabel} from './src/model-publisher.ts';
-import {modelUsage,modelBillingLines} from './src/model-billing.ts';
+import {modelUsage,modelBillingView} from './src/model-billing.ts';
 import {canRetryAdmission} from './src/run-recovery.ts';
 import './src/agent-colors.css';
 import { createDesktopViewer } from './src/desktop.ts';
@@ -33,7 +34,9 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   let botSummaryTimer,botSummaryLoading=false,botSummaryPending=false,botRenderKey='';
   const drafts = new Map(), draftMentions = new Map(), pendingMessages = new Map(), pendingActions = new Map(), computerPending = new Map(), stopping = new Set(), approvalWork = new Map(), approvalFeedback = new Map(), connectionWork = new Map(), appWork = new Map();
   let authenticated = false, bots = [], selected = null, currentRun = null, stoppableRun = null, generation = 0, authSession = 0;
-  let tasksView = null, showingTasks = false;
+  let tasksView = null, showingTasks = false, selectedTaskId = null;
+  let conversationTasks = [];
+  let taskProjectionSource=null,taskProjectionMessages=null,renderedTasks=[];
   let sessionController = new AbortController(), streamController, refreshTimer, progressTimer, computerStatusTimer;
   let computerStatusRequest = 0, currentPanel = 'conversation', workspaceExpanded = false, desktopFullscreen = false;
   const wideLayout = matchMedia('(min-width: 761px)'), tabletLayout = matchMedia('(max-width: 1099px)');
@@ -46,11 +49,63 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   const streamedMessages = new Map();
   const emptyList = [];
   let historyState = {cursor: null, initialized: false, loading: false, error: '', retryAt: 0, promise: null, controller: new AbortController()};
+  let eventHistory = {cursor:null,loading:false,error:'',promise:null};
   let historyRetryTimer, compactions = [], compactionsTimer, compactionsRequest = 0, compactionsLastLoaded = 0, compactionsInFlight;
   function resetConversationHistory() {
     historyState.controller.abort(); clearTimeout(historyRetryTimer); clearTimeout(compactionsTimer);
     historyState = {cursor: null, initialized: false, loading: false, error: '', retryAt: 0, promise: null, controller: new AbortController()};
+    eventHistory = {cursor:null,loading:false,error:'',promise:null};
     compactions = []; compactionsRequest++; compactionsLastLoaded = 0; compactionsInFlight = null;
+  }
+  function loadOlderEvents(version=generation) {
+    const state=eventHistory,id=selected?.id;
+    if(!id||!validView(version)||!state.cursor||document.hidden)return Promise.resolve();
+    if(state.promise)return state.promise;
+    state.loading=true;state.error='';renderMessages();
+    state.promise=(async()=>{
+      await Promise.resolve();
+      try {
+        const result=await request(`${botPath(id)}/events?${new URLSearchParams({format:'json',view:'activity',limit:'100',before:String(state.cursor)})}`,{signal:historyState.controller.signal});
+        if(!validView(version)||eventHistory!==state)return;
+        if(result.nextCursor!=null&&(!Number.isSafeInteger(Number(result.nextCursor))||Number(result.nextCursor)<=0||Number(result.nextCursor)>=Number(state.cursor)))throw new Error('Activity cursor did not advance.');
+        const retained=new Map(events.map(event=>[event.id,event]));
+        for(const event of result.events||[]) {
+          mergeConversationTask(event);
+          if(activityEvent(event)&&!retained.has(event.id))retained.set(event.id,{...event,data:redact(event.data)});
+        }
+        events=[...retained.values()].sort((a,b)=>a.id-b.id);state.cursor=result.nextCursor??null;
+      } catch(error) {if(validView(version)&&eventHistory===state&&error.name!=='AbortError')state.error=errorText(error);}
+      finally {if(validView(version)&&eventHistory===state){state.loading=false;state.promise=null;renderMessages();}}
+    })();return state.promise;
+  }
+  const activityEvent = event => ['process.updated','tool.started','tool.completed','subagent.tool.started','subagent.tool.completed','run.retrying','run.failed','run.cancellation.requested'].includes(event.type);
+  function mergeConversationTask(event) {
+    if(event.type!=='task.updated'||!event.data?.task?.id)return false;
+    const task=event.data.task,prior=conversationTasks.find(item=>item.id===task.id);
+    if(prior){
+      const versioned=Number.isSafeInteger(prior.statusVersion)&&Number.isSafeInteger(task.statusVersion);
+      if(versioned?prior.statusVersion>task.statusVersion:prior.updatedAt>task.updatedAt)return false;
+    }
+    const summary={};for(const key of ['id','title','botId','status','sourceRunId','sourceTaskId','createdAt','updatedAt','statusVersion','lastActivity'])if(task[key]!==undefined)summary[key]=task[key];
+    if(sameRecord(prior,summary))return false;
+    conversationTasks=prior?conversationTasks.map(item=>item.id===task.id?summary:item):[...conversationTasks,summary];return true;
+  }
+  async function loadConversationTasks(version=generation) {
+    const id=selected?.id;if(!id)return;
+    try {
+      const result=await request('/v1/tasks',{signal:historyState.controller.signal});
+      if(!validView(version))return;
+      for(const task of result.tasks||[])if(task.createdByBotId===id&&!task.sourceTaskId)mergeConversationTask({type:'task.updated',data:{task}});
+      renderMessages();
+    } catch(error) {if(error.name!=='AbortError'&&validView(version))$('stream-state').textContent='Task status unavailable';}
+  }
+  function visibleConversationTasks() {
+    if(taskProjectionSource!==conversationTasks||taskProjectionMessages!==messages) {
+      taskProjectionSource=conversationTasks;taskProjectionMessages=messages;
+      const visibleRuns=new Set(messages.map(message=>message.runId));
+      renderedTasks=conversationTasks.filter(task=>visibleRuns.has(task.sourceRunId)||!['completed','failed','cancelled'].includes(task.status));
+    }
+    return renderedTasks;
   }
   function mergeMessagePage(incoming, older = false) {
     indexMessages();
@@ -72,9 +127,9 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     if (state.promise) return state.promise;
     state.loading = true; state.error = ''; renderMessages();
     state.promise = (async () => {
-      await Promise.resolve(); // Publish the single-flight promise before starting the drain.
+      await Promise.resolve(); // Publish the single-flight promise before reading the page.
       try {
-        while (state.cursor && historyState === state && validView(version) && !document.hidden) {
+        if (state.cursor && historyState === state && validView(version) && !document.hidden) {
           const before = state.cursor;
           const result = await request(`${botPath(id)}/messages?${new URLSearchParams({limit: '100', before})}`, {signal: state.controller.signal});
           if (historyState !== state || !validView(version)) return;
@@ -85,8 +140,6 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
       } catch (error) {
         if (historyState !== state || !validView(version) || error.name === 'AbortError') return;
         state.error = errorText(error); state.retryAt = Date.now() + 10000;
-        clearTimeout(historyRetryTimer);
-        historyRetryTimer = setTimeout(() => {if (historyState === state && validView(version)) void loadOlderMessages(version);}, 10000);
       } finally {
         if (historyState === state && validView(version)) {state.loading = false; state.promise = null; renderMessages();}
       }
@@ -230,11 +283,12 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     onSendAudio: sendAudioMessage,
     onRetryAudio: retryAudioMessage,
     onOpenBot: openAgentBot,
+    onOpenTask: openTask,
     onOpenAgents: openAgents,
     onModelSettings:updateModelSettings,
     onRefreshModels:()=>void loadModelCatalog(),
     onContextRequest:contextRequest,
-    onHistoryNearTop:botId=>{if(selected?.id===botId)void loadOlderMessages();},
+    onHistoryNearTop:botId=>{if(selected?.id===botId){void loadOlderMessages();void loadOlderEvents();}},
     onRecovery:(botId,target)=>{if(selected?.id!==botId||!authenticated)return;const control=target==='connection'?$('settings-button'):document.querySelector(target==='model'?'.timber-model-trigger':'.timber-memory-trigger');control?.click();},
 
     onRetry: (botId, operationId) => {
@@ -256,14 +310,33 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     onRefresh: () => void loadAgents(),
     onOpenBot: openAgentBot,
   });
+  const tasksRequest = (path,options) => request(path,options);
+  function syncTaskToggle() {
+    document.body.dataset.mainView=showingTasks?'tasks':'bots';
+    $('tasks-nav').classList.toggle('active',showingTasks);
+    $('tasks-nav').setAttribute('aria-pressed',String(showingTasks));
+    $('bots-nav')?.setAttribute('aria-pressed',String(!showingTasks));
+  }
+  function taskSelected(id) {
+    selectedTaskId=id;
+    document.body.dataset.mobileView=id?'tasks':'bots';
+    history.pushState(null,'',`${location.pathname}${location.search}#tasks${id?`&task=${encodeURIComponent(id)}`:''}`);
+  }
   function setupTasksView() {
-    const props={request:(path,options)=>request(path,options),bots,onClose:()=>{if(selected){showingTasks=false;$('tasks-nav').classList.remove('active');$('global-tasks-workspace').hidden=true;$('bot-workspace').hidden=false;document.body.dataset.mobileView='bot';history.pushState(null,'',`${location.pathname}${location.search}#bot=${encodeURIComponent(selected.id)}`);}else showBotList();}};
+    const props={request:tasksRequest,bots,active:showingTasks,selectedTaskId,onSelectTask:taskSelected,onOpenBot:openAgentBot,loadArtifact:loadTaskArtifact,modelSettings:modelSettingsState(),onModelSettings:updateModelSettings,onRefreshModels:()=>void loadModelCatalog(),decorateAvatar:decorateTaskAvatar,onBotUpdated:taskBotUpdated,onOpenSettings:()=> $('settings-button').click(),listContainer:$('tasks-sidebar-root')};
     if(tasksView)tasksView.update(props);else tasksView=mountTasks($('global-tasks-root'),props);
   }
-  function openTasks(updateHistory=true) {
-    if(!authenticated)return;showingTasks=true;setupTasksView();$('empty').hidden=true;$('bot-workspace').hidden=true;$('global-tasks-workspace').hidden=false;document.body.dataset.mobileView='tasks';$('tasks-nav').classList.add('active');
-    if(updateHistory)history.pushState(null,'',`${location.pathname}${location.search}#tasks`);
+  function taskBotUpdated(bot){if(!authenticated||removedBots.has(bot.id))return;const previous=bots.find(item=>item.id===bot.id);if(!previous||previous.updatedAt>bot.updatedAt)return;bots=bots.map(item=>item.id===bot.id?bot:item);if(selected?.id===bot.id){selected=bot;updateBotHeader();}renderBots();renderMessages();}
+  function decorateTaskAvatar(node,botId){const bot=bots.find(item=>item.id===botId);if(bot){node.textContent=bot.name.slice(0,1).toUpperCase();node.dataset.agentColor=agentColor(bot.id);decorateModelAvatar(node,bot,node.classList.contains('large'));decorateGlobalAvatar(node,bot.id);}}
+  function openTasks(updateHistory=true,taskId=null) {
+    if(!authenticated)return;cancelAudioSends();showingTasks=true;selectedTaskId=taskId;chat.clear();setupTasksView();$('empty').hidden=true;$('bot-workspace').hidden=true;$('global-tasks-workspace').hidden=false;document.body.dataset.mobileView=taskId?'tasks':'bots';syncTaskToggle();
+    if(wideLayout.matches&&!taskId){botsCollapsed=false;renderLayout();}
+    desktop.setActive(false);stopComputerStatus();activity.setActive(false);agentsView.setActive(false);
+    if(updateHistory)history.pushState(null,'',`${location.pathname}${location.search}#tasks${taskId?`&task=${encodeURIComponent(taskId)}`:''}`);
   }
+  function openTask(taskId) {openTasks(true,taskId);}
+  function taskHash() {return location.hash==='#tasks'||location.hash.startsWith('#tasks&');}
+  function chosenTaskHash() {return new URLSearchParams(location.hash.slice(1)).get('task');}
   function openAgents(id) {
     selectedAgentId=id || null;
     const open=()=>{showPanel('agents');renderAgents();syncAgentHash();};
@@ -282,6 +355,14 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     history.replaceState(null, '', `${location.pathname}${location.search}#${hash}`);
   }
   const activity = mountToolActivity($('activity-tools'), loadArtifact, {onOpenBot:openAgentBot,onOpenAgents:openAgents});
+  async function loadTaskArtifact(botId,artifactId,signal) {
+    const session=authSession;
+    if(!authenticated)throw new DOMException('Session ended.','AbortError');
+    const response=await request(`${botPath(botId)}/artifacts/${encodeURIComponent(artifactId)}`,{raw:true,signal});
+    const blob=await response.blob();
+    if(!authenticated||session!==authSession)throw new DOMException('Session ended.','AbortError');
+    return blob;
+  }
   async function loadArtifact(botId, artifactId, signal) {
     if (!authenticated || selected?.id !== botId) throw new DOMException('The bot changed.', 'AbortError');
     const version = generation;
@@ -399,7 +480,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     if(node.dataset.avatarArtifact!==avatar.artifactId)node.classList.add('avatar-stale');
     void loadAvatarImage(botId,avatar).then(url=>{if(!url||!node.isConnected||selectedAvatar(botId)?.artifactId!==avatar.artifactId)return;putAvatarImage(node,avatar,url);node.classList.toggle('avatar-stale',avatarIsStale(avatar));queueMicrotask(pruneAvatarUrls);}).catch(()=>{if(selectedAvatar(botId)?.artifactId!==avatar.artifactId)return;const key=avatarKey(avatar);if(avatarLoadErrors.has(key))return;avatarLoadErrors.set(key,true);renderAvatarSettings();});
   }
-  function renderGlobalAvatars(){document.querySelectorAll('.bot-item[data-bot-id]').forEach(button=>decorateGlobalAvatar(button.querySelector('.avatar'),button.dataset.botId));if(selected)decorateGlobalAvatar($('selected-avatar'),selected.id);}
+  function renderGlobalAvatars(){document.querySelectorAll('.bot-item[data-bot-id]').forEach(button=>decorateGlobalAvatar(button.querySelector('.avatar'),button.dataset.botId));document.querySelectorAll('.timber-task-avatar[data-bot-id]').forEach(avatar=>decorateGlobalAvatar(avatar,avatar.dataset.botId));if(selected)decorateGlobalAvatar($('selected-avatar'),selected.id);}
   function avatarModelOption(option){return {id:option.id,label:option.name||option.label||option.id};}
   function avatarReasoningOptions(select,modelId,value=''){
     const model=avatarModels.vectorModels.find(model=>model.id===modelId),efforts=model?.reasoningEfforts||[];
@@ -565,11 +646,12 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     $('click-mode').checked = false; $('auto-screenshot').checked = false; document.querySelector('.screen').classList.remove('click-enabled');
   }
   function disconnect(message = '') {
+    cancelAudioSends();
     desktop.disconnect(); workspace.clear();
     clearTimeout(avatarPollTimer);avatarRequest++;avatarHistoryPage=0;avatarThemeDraft='';avatarReasoningDraft=null;avatarSettings={themes:[],selection:null,avatars:[],jobs:[]};avatarModels={connected:false,vectorModels:[],imageModels:[],imageAvailable:false};avatarLoading=false;avatarAdmissions.clear();revokeAvatarUrls();$('avatar-error').textContent='';$('avatar-status').textContent='Sign in to load avatar settings.';
 
     stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId=null; cancelStreamRender(); resetConversationHistory(); generation++; authSession++; authenticated = false; sessionController.abort(); streamController?.abort(); clearTimeout(refreshTimer); clearInterval(progressTimer); progressTimer = null;
-    showingTasks=false;if($('global-tasks-workspace'))$('global-tasks-workspace').hidden=true;tasksView?.unmount();tasksView=null;selected = null; currentRun = null; stoppableRun = null; bots = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
+    showingTasks=false;selectedTaskId=null;conversationTasks=[];syncTaskToggle();if($('global-tasks-workspace'))$('global-tasks-workspace').hidden=true;tasksView?.unmount();tasksView=null;selected = null; currentRun = null; stoppableRun = null; bots = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs.clear(); activeRunIds.clear(); streamDrafts.clear(); events = [];
     clearTimeout(botSummaryTimer);botSummaries.clear();botSummaryLoading=false;botSummaryPending=false;botRenderKey='';
     removedBots.clear(); deletionPending.clear(); deleteTarget = null; deleteBusy = false; editBotId = null; drafts.clear(); draftMentions.clear(); pendingMessages.clear(); acceptedImageIds.clear(); pendingActions.clear(); computerPending.clear(); sendBusy.clear(); stopping.clear(); approvalWork.clear(); approvalFeedback.clear(); connectionWork.clear(); appWork.clear(); closeDialogs(); clearScreen();
     chatGPTConnected = false; chatGPTAccount = null; chatGPTBusy = false;
@@ -640,7 +722,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
       if(session===authSession){botSummaryLoading=false;if(authenticated&&!document.hidden){const delay=botSummaryPending?0:30000;botSummaryPending=false;botSummaryTimer=setTimeout(()=>void refreshBotSummaries(),delay);}}
     }
   }
-  document.addEventListener('visibilitychange',()=>{if(document.hidden)clearTimeout(botSummaryTimer);else void refreshBotSummaries();});
+  document.addEventListener('visibilitychange',()=>{if(document.hidden){cancelAudioSends();clearTimeout(botSummaryTimer);}else void refreshBotSummaries();});
   window.addEventListener('focus',()=>void refreshBotSummaries());
   async function loadBots() { const session = authSession, result = await request('/v1/bots'); if (session !== authSession) return; const prior=new Map(bots.map(bot=>[bot.id,bot]));bots = result.bots.filter(bot => !removedBots.has(bot.id)).map(bot=>prior.get(bot.id)?.updatedAt>bot.updatedAt?prior.get(bot.id):bot); const refreshed=selected&&bots.find(bot=>bot.id===selected.id);if(refreshed&&refreshed.updatedAt>=selected.updatedAt&&!modelSettingsWork.has(selected.id)){selected=refreshed;updateBotHeader();}renderBots(); renderMessages();renderAgents();if(tasksView)setupTasksView();void refreshBotSummaries(); }
   const modelDescription=bot=>`${bot.model||'Model not recorded'}${bot.reasoningEffort?` · ${bot.reasoningEffort} reasoning`:''}${bot.fast?' · Fast mode':''}`;
@@ -661,7 +743,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     finally{if(session===authSession&&sequence===modelCatalogRequest){modelCatalogLoading=false;refreshModelForms();renderBots();renderMessages();}}
   }
   async function updateModelSettings(botId,settings){
-    if(!authenticated||selected?.id!==botId||modelSettingsWork.has(botId)||sendBusy.has(botId))throw new Error('Wait for the current request to finish.');
+    if(!authenticated||(!showingTasks&&selected?.id!==botId)||!bots.some(bot=>bot.id===botId)||modelSettingsWork.has(botId)||sendBusy.has(botId))throw new Error('Wait for the current request to finish.');
     const session=authSession;modelSettingsWork.add(botId);renderMessages();
     try{const {bot}=await request(botPath(botId),{method:'PATCH',body:settings});if(session!==authSession)return;if(bot?.id!==botId||bot.model!==settings.model)throw new Error('The model settings were not confirmed. Refresh and try again.');bots=bots.map(item=>item.id===bot.id?bot:item);if(selected?.id===bot.id){selected=bot;updateBotHeader();renderAgents();}renderBots();}
     finally{if(session===authSession){modelSettingsWork.delete(botId);renderMessages();}}
@@ -681,25 +763,29 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     fast.checked=Boolean(settings.fast&&choice?.supportsFast);fast.disabled=select.disabled;$(`${prefix}-fast-field`).hidden=!choice?.supportsFast;
     const effective={model:current,reasoningEffort:reasoning.value||undefined,fast:fast.checked};
     modelPickers.get(select.id).update({choices:state.choices,disabled:select.disabled,loading:state.loading,settings:effective});
-    $(`${prefix}-model-help`).textContent=[state.loading?'Loading available models…':state.error||state.message||'Subagents inherit these settings unless another model is chosen.',...(!state.loading?modelBillingLines(choice?.usage,effective):[])].join('\n');
+    const billing=modelBillingView(choice?.usage,effective),price=billing.preview.input&&billing.preview.output?`${billing.preview.input} in / ${billing.preview.output} out · USD / 1M tokens`:'';
+    $(`${prefix}-model-help`).textContent=state.loading?'Loading models…':state.error||state.message||[billing.label,billing.preview.hint,price].filter(Boolean).join(' · ');
   }
   function readModelForm(prefix){const model=$(`${prefix}-model`),reasoning=$(`${prefix}-reasoning`);return model.disabled||!model.value?{}:{model:model.value,...(!reasoning.disabled&&reasoning.value?{reasoningEffort:reasoning.value}:{}),fast:!$(`${prefix}-fast-field`).hidden&&$(`${prefix}-fast`).checked};}
   function refreshModelForms(){for(const [prefix,dialog]of [['bot','bot-dialog'],['edit','edit-dialog']])if($(dialog).open)renderModelForm(prefix,{model:$(`${prefix}-model`).value,reasoningEffort:$(`${prefix}-reasoning`).value,fast:$(`${prefix}-fast`).checked});}
   function chosenHash() { const value = new URLSearchParams(location.hash.slice(1)).get('bot'); return /^[a-f\d-]{36}$/i.test(value || '') ? value : null; }
   async function selectBot(bot, {replace = false} = {}) {
     if (removedBots.has(bot.id)) return;
+    const wasShowingTasks=showingTasks;
     document.body.dataset.mobileView = 'bot';
-    showingTasks=false;$('global-tasks-workspace').hidden=true;$('tasks-nav').classList.remove('active');
+    showingTasks=false;$('global-tasks-workspace').hidden=true;syncTaskToggle();if(tasksView)setupTasksView();
+    if(wasShowingTasks)renderLayout();
     if (wideLayout.matches && tabletLayout.matches) {botsCollapsed = true; renderLayout();}
     if (selected?.id === bot.id) {
+      if(wasShowingTasks){$('empty').hidden=true;$('bot-workspace').hidden=false;updateBotHeader();renderMessages();}
       history[replace ? 'replaceState' : 'pushState'](null, '', `${location.pathname}${location.search}#bot=${encodeURIComponent(bot.id)}`);
       if (!$('panel-computer').hidden) {desktop.setActive(true); void guarded(computerStatus);}
       return;
     }
-    desktop.disconnect(); workspace.clear();
+    cancelAudioSends();desktop.disconnect(); workspace.clear();
     if (!$('panel-files').hidden) workspace.setBot(bot.id);
     stopComputerStatus();clearTimeout(agentsTimer);agentsView.clear();subagents=[];delegations=[];agentEvents=[];collaborationEvents=[];selectedAgentId = chosenHash() === bot.id ? new URLSearchParams(location.hash.slice(1)).get('agent') : null;agentsLoading=true;agentsError=''; cancelStreamRender(); resetConversationHistory(); generation++; const version = generation; streamController?.abort(); clearTimeout(refreshTimer); clearScreen();
-    selected = bot; chatLoading = true; currentRun = null; stoppableRun = null; cursor = 0; boundary = ''; events = []; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs = new Map(); activeRunIds = new Set(); streamDrafts = new Map(); nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; runFilter = null; runRevision = 0;
+    selected = bot; chatLoading = true; currentRun = null; stoppableRun = null; cursor = 0; boundary = ''; events = []; conversationTasks=[]; messages = []; streamedMessages.clear(); approvals = []; connections = []; workspaceApps = []; runs = new Map(); activeRunIds = new Set(); streamDrafts = new Map(); nextCursor = null; olderPagesLoaded = false; loadingOlderRuns = false; runFilter = null; runRevision = 0;
     $('refresh-apps').disabled = false; $('refresh-apps').textContent = 'Refresh';
     history[replace ? 'replaceState' : 'pushState'](null, '', `${location.pathname}${location.search}#bot=${encodeURIComponent(bot.id)}`);
     $('empty').hidden = true; $('bot-workspace').hidden = false; updateBotHeader(); renderBots(); renderApps();renderAgents();syncAgentHash();if(selectedAgentId)showPanel('agents');
@@ -709,6 +795,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     $('computer-status').textContent = 'Checking…'; $('file-path').value = '.'; directoryPath = '.';
     $('file-content').value = ''; $('type-text').value = ''; $('file-list').replaceChildren(el('p', 'hint', 'No files loaded'));
     $('app-error').textContent = ''; $('approval-shortcut').hidden = true; renderCurrentRun(); renderStreamDraft(); renderProgress();
+    void loadConversationTasks(version);
     try { await Promise.all([loadMessages(version), loadRuns(version), loadApprovals(version), loadConnections(version), loadApps(version), loadAgents(version), loadCompactions(version)]); }
     finally { if (validView(version)) { chatLoading = false; renderMessages(); startStream(); if (!$('panel-computer').hidden) void guarded(computerStatus); } }
   }
@@ -739,6 +826,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     }
   }
   function renderMessages() {
+    if(showingTasks){if(tasksView)setupTasksView();return;}
     if (deferStreamRender('messages')) return;
     if (!selected || !authenticated) return;
     renderBots();
@@ -748,7 +836,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     renderedConnections = stableProjection(renderedConnections, connections.map(item => ({...item, ...connectionWork.get(`${selected.id}:${item.id}`)})));
     renderedDeliveries = stableProjection(renderedDeliveries, [...pendingMessages.values()].filter(delivery => delivery.botId === selected.id).map(delivery => ({...delivery})));
     const model = { acceptedImageIds: acceptedImageIds.get(selected.id) || emptyList, bot: selected, messages, runs: runValues(), approvals: visibleApprovals, connections: renderedConnections, events: transcriptEvents(),
-      deliveries: renderedDeliveries, draft: drafts.get(selected.id) || '', mentionBots: bots, subagents, delegations, collaborationEvents, draftMentions: draftMentions.get(selected.id) || emptyList, sending: sendBusy.has(selected.id)||modelSettingsWork.has(selected.id), loading: chatLoading,compactions,historyLoading:historyState.loading,historyHasMore:Boolean(historyState.cursor),historyError:historyState.error || undefined,modelSettings:modelSettingsState(),
+      deliveries: renderedDeliveries, draft: drafts.get(selected.id) || '', mentionBots: bots, subagents, delegations, collaborationEvents,tasks:visibleConversationTasks(), draftMentions: draftMentions.get(selected.id) || emptyList, sending: sendBusy.has(selected.id)||modelSettingsWork.has(selected.id), loading: chatLoading,compactions,historyLoading:historyState.loading||eventHistory.loading,historyHasMore:Boolean(historyState.cursor||eventHistory.cursor),historyError:historyState.error||eventHistory.error||undefined,modelSettings:modelSettingsState(),
       currentRun, runFilter, focusApproval, stream: stream ? {runId: stream[0], text: stream[1]} : null, feedback: approvalFeedback.get(selected.id) };
     chat.update(model); activity.update({...model, runFilter: null});
   }
@@ -775,47 +863,63 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
       if (validView(version) && sequence === agentsRequest && (currentPanel === 'agents' || subagents.some(agent => !terminal.has(agent.status)) || delegations.some(task => !terminal.has(task.status)))) agentsTimer=setTimeout(() => void loadAgents(version),3000);
     }
   }
-  async function sendAudioMessage(botId,file,ids) {
-    if(!authenticated||selected?.id!==botId)throw new Error('Select a bot before sending audio.');
+  const audioSends=new Map();
+  function cancelAudioSends(){for(const controller of audioSends.values())controller.abort();window.dispatchEvent(new Event('timber-audio-interrupt'));}
+  async function sendAudioMessage(botId,file,ids,signal) {
+    if(!authenticated||showingTasks||selected?.id!==botId)throw new Error('Select a bot before sending audio.');
     if(sendBusy.has(botId)||modelSettingsWork.has(botId))throw new Error('A send is already pending for this bot. Inspect its status before sending again.');
-    const session=authSession,version=generation;
-    sendBusy.add(botId);renderMessages();
+    const session=authSession,version=generation,controller=new AbortController();
+    const combined=signal?AbortSignal.any([signal,controller.signal]):controller.signal;
+    const current=()=>{if(combined.aborted||!validView(version)||showingTasks||selected?.id!==botId)throw new DOMException('Audio sending was cancelled or the conversation changed. Inspect history before retrying.','AbortError');};
+    audioSends.set(botId,controller);sendBusy.add(botId);renderMessages();
+    let accepted=false;
     try {
-      await request(`${botPath(botId)}/audio/${encodeURIComponent(ids.audioId)}`,{method:'PUT',body:file});
-      if(!validView(version)||selected?.id!==botId)throw new DOMException('The bot changed.','AbortError');
+      current();
+      // Safe read first: an earlier explicit send may have lost its receipt.
       let receipt;
-      try{receipt=await request(`${botPath(botId)}/audio-messages`,{method:'POST',body:{operationId:ids.operationId,audioId:ids.audioId,attemptId:ids.attemptId}});}
-      catch(submissionError){
-        // Resolve a lost admission receipt through the safe GET before asking the
-        // user to consider another submission. This endpoint never dispatches work.
-        try{receipt=await request(`${botPath(botId)}/audio-messages/${encodeURIComponent(ids.operationId)}`);}
-        catch{throw submissionError;}
+      try{receipt=await request(`${botPath(botId)}/audio-messages/${encodeURIComponent(ids.operationId)}`,{signal:combined});}
+      catch(error){if(error.status!==404)throw error;}
+      current();
+      if(!receipt){
+        await request(`${botPath(botId)}/audio/${encodeURIComponent(ids.audioId)}`,{method:'PUT',body:file,signal:combined});
+        current();
+        try{receipt=await request(`${botPath(botId)}/audio-messages`,{method:'POST',body:{operationId:ids.operationId,audioId:ids.audioId,attemptId:ids.attemptId},signal:combined});}
+        catch(submissionError){
+          current(); // Navigation, logout and explicit Cancel must not trigger follow-up work.
+          try{receipt=await request(`${botPath(botId)}/audio-messages/${encodeURIComponent(ids.operationId)}`,{signal:combined});}
+          catch{throw submissionError;}
+        }
       }
-      if(!validView(version)||selected?.id!==botId)throw new DOMException('The bot changed.','AbortError');
       if(!receipt?.message?.audio||receipt.message.audio.artifactId!==ids.audioId)throw new Error('The audio receipt was invalid. Refresh conversation history to inspect its status.');
-      mergeMessagePage([receipt.message]);
+      accepted=true;current();mergeMessagePage([receipt.message]);
       if(receipt.run){runs.set(receipt.run.id,receipt.run);runsValueRevision++;}
       renderMessages();if(receipt.run)renderRuns();
-    } finally {if(session===authSession){sendBusy.delete(botId);if(selected?.id===botId)renderMessages();}}
+    } catch(error) {
+      // DELETE is fenced server-side against admitted originals. It is cleanup,
+      // never an admission/transcription retry; logout/pagehide use durable TTL.
+      if(!accepted&&authenticated&&session===authSession&&(!validView(version)||showingTasks||selected?.id!==botId))void request(`${botPath(botId)}/audio/${encodeURIComponent(ids.audioId)}`,{method:'DELETE'}).catch(()=>{});
+      throw error;
+    } finally {if(audioSends.get(botId)===controller)audioSends.delete(botId);if(session===authSession){sendBusy.delete(botId);if(selected?.id===botId)renderMessages();}}
   }
   async function retryAudioMessage(botId,operationId) {
-    if(!authenticated||selected?.id!==botId)throw new Error('Select a bot before retrying audio.');
+    if(!authenticated||showingTasks||selected?.id!==botId)throw new Error('Select a bot before retrying audio.');
     if(sendBusy.has(botId)||modelSettingsWork.has(botId))throw new Error('A send is already pending for this bot. Inspect its status before sending again.');
-    const session=authSession,version=generation,attemptId=crypto.randomUUID();
-    sendBusy.add(botId);renderMessages();
+    const session=authSession,version=generation,attemptId=crypto.randomUUID(),controller=new AbortController();
+    const current=()=>{if(controller.signal.aborted||!validView(version)||showingTasks||selected?.id!==botId)throw new DOMException('The audio retry view changed. Inspect history before retrying.','AbortError');};
+    audioSends.set(botId,controller);sendBusy.add(botId);renderMessages();
     try {
-      let receipt;
-      try{receipt=await request(`${botPath(botId)}/audio-messages/${encodeURIComponent(operationId)}/retry`,{method:'POST',body:{attemptId,acknowledgePaidRetry:true}});}
+      current();let receipt;
+      try{receipt=await request(`${botPath(botId)}/audio-messages/${encodeURIComponent(operationId)}/retry`,{method:'POST',body:{attemptId,acknowledgePaidRetry:true},signal:controller.signal});}
       catch(submissionError){
-        // The retry's new attempt ID is already fixed; read status rather than
-        // risking a second paid attempt after an uncertain response.
-        try{receipt=await request(`${botPath(botId)}/audio-messages/${encodeURIComponent(operationId)}`);}
+        current();
+        try{receipt=await request(`${botPath(botId)}/audio-messages/${encodeURIComponent(operationId)}`,{signal:controller.signal});}
         catch{throw submissionError;}
       }
-      if(!validView(version)||selected?.id!==botId)throw new DOMException('The bot changed.','AbortError');
+      current();
       if(!receipt?.message?.audio||receipt.message.audio.operationId!==operationId)throw new Error('The audio retry receipt was invalid. Refresh conversation history to inspect its status.');
+      if((receipt.transcription??receipt.message.audio.transcription)?.attemptId!==attemptId)throw new Error('The new retry receipt is not confirmed. Refresh history before authorizing any new paid attempt.');
       mergeMessagePage([receipt.message]);if(receipt.run){runs.set(receipt.run.id,receipt.run);runsValueRevision++;}renderMessages();if(receipt.run)renderRuns();
-    } finally {if(session===authSession){sendBusy.delete(botId);if(selected?.id===botId)renderMessages();}}
+    } finally {if(audioSends.get(botId)===controller)audioSends.delete(botId);if(session===authSession){sendBusy.delete(botId);if(selected?.id===botId)renderMessages();}}
   }
   async function sendMessage(botId, rawText, retryOperationId, mentions = [], files = []) {
     const text = rawText.trim(); if (!authenticated || selected?.id !== botId || (!text && !files.length && !retryOperationId) || sendBusy.has(botId)||modelSettingsWork.has(botId)) return;
@@ -867,14 +971,13 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   }
   async function loadMessages(version = generation) {
     const id = selected?.id, sequence = ++messagesRequest, state = historyState; if (!id) return;
-    const result = await request(`${botPath(id)}/messages`, {signal: state.controller.signal});
+    const result = await request(`${botPath(id)}/messages?limit=100`, {signal: state.controller.signal});
     if (!validView(version) || sequence !== messagesRequest || historyState !== state) return;
     // Refresh only updates known records and appends new ones. Previously loaded
     // archive pages and messages received during this request are never dropped.
     mergeMessagePage(result.messages);
     if (!state.initialized) {state.initialized = true; state.cursor = result.nextCursor ?? null;}
     reconcileDeliveries(); renderMessages();
-    void loadOlderMessages(version);
   }
   function mergeRun(run, source = 'snapshot') {
     if (!run?.id || run.botId !== selected?.id) return false;
@@ -958,7 +1061,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     } finally { if (validView(version) && sequence === runsRequest) { if (append) loadingOlderRuns = false; $('load-more-runs').disabled = false; } }
   }
   async function cancelRun(id) {
-    if (!selected || stopping.has(id)) return; const version = generation, session = authSession, botId = selected.id; stopping.add(id); renderRuns();
+    if (!selected || stopping.has(id)) return; const version = generation, session = authSession, botId = selected.id; stopping.add(id); cancelAudioSends(); renderRuns();
     try { const { run } = await request(`${botPath(botId)}/runs/${encodeURIComponent(id)}/cancel`, { method: 'POST' }); if (validView(version)) { mergeRun(run); runRevision++; renderRuns(); scheduleRefresh(version); } }
     finally { if (session === authSession) stopping.delete(id); if (validView(version)) renderRuns(); }
   }
@@ -1168,13 +1271,20 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     try { applyStreamEvent(event, version); } finally { recordingStreamEvent = previous; }
   }
   function applyStreamEvent(event, version) {
+    if(validView(version)&&event.type==='stream.snapshot'&&Number.isSafeInteger(event.data?.latestEventId)&&event.data.latestEventId>=cursor) {
+      cursor=event.data.latestEventId;
+      streamDrafts=new Map((event.data.partials||[]).filter(item=>typeof item.runId==='string'&&typeof item.text==='string'&&activeRunIds.has(item.runId)&&!terminal.has(runs.get(item.runId)?.status)).map(item=>[item.runId,item.text]));
+      if(event.data.historyTruncated)eventHistory.cursor=event.data.nextCursor??null;
+      renderMessages();return;
+    }
     if (!validView(version) || !Number.isSafeInteger(event.id) || event.id <= cursor) return;
     if (event.type === 'computer.suspended') desktop.disconnect();
     if (['computer.action', 'computer.suspended', 'tool.started', 'tool.completed', 'process.updated', 'approval.updated'].includes(event.type)) queueComputerStatus();
     cursor = event.id;
     // Actions belong to the conversation, including after a task completes.
     // Only the separate diagnostic log is capped; SSE replay restores history.
-    if (['process.updated','tool.started','tool.completed','subagent.tool.started','subagent.tool.completed','run.retrying','run.failed','run.cancellation.requested'].includes(event.type)) events.push(event);
+    if(activityEvent(event))events.push(event);
+    if(mergeConversationTask(event))renderMessages();
     if(['subagent.created','subagent.updated','subagent.stopped','subagent.reported','subagent.message.sent','agent.named.created','delegation.updated'].includes(event.type)) {
       collaborationEvents = [...collaborationEvents, {...event,data:redact(event.data)}];
       const agent=event.data.subagent;
@@ -1189,7 +1299,11 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     if (event.data.subagentId && (event.type.startsWith('subagent.') || ['tool.started','tool.completed','process.updated'].includes(event.type))) {agentEvents = [...agentEvents, {...event,type:event.type.startsWith('subagent.')?event.type:`subagent.${event.type}`,data:redact(event.data)}];renderAgents();}
     if (event.type === 'bot.created' || event.type === 'agent.bot_created' || event.type === 'agent.named.created' || event.type === 'tool.completed' && event.data.toolName === 'create_bot') void guarded(loadBots);
     const row = el('article', 'event'), title = el('div', 'event-title'); title.append(el('span', '', event.type.replaceAll('.', ' · ')), el('span', 'muted', `#${event.id} · ${time(event.createdAt)}`));
-    const detail = el('details'); detail.append(el('summary', '', 'Event details')); const serialized = JSON.stringify(redact(event.data), null, 2); detail.append(el('pre', '', serialized.length > 8000 ? `${serialized.slice(0, 8000)}\n…` : serialized)); row.append(title, detail); $('activity-list').prepend(row); while ($('activity-list').children.length > 200) $('activity-list').lastElementChild.remove();
+    const detail = el('details'); detail.append(el('summary', '', 'Event details'));
+    // Diagnostic JSON is rarely opened. Do not repeatedly redact/serialize large
+    // command output for every streamed update while its panel is hidden.
+    detail.addEventListener('toggle',()=>{if(detail.open&&detail.children.length===1){const serialized=JSON.stringify(redact(event.data),null,2);detail.append(el('pre','',serialized.length>8000?`${serialized.slice(0,8000)}\n…`:serialized));}});
+    row.append(title, detail); $('activity-list').prepend(row); while ($('activity-list').children.length > 200) $('activity-list').lastElementChild.remove();
     $('event-count').textContent = String($('activity-list').children.length);
     if (event.type === 'message.created') {
       const message = event.data.message;
@@ -1233,7 +1347,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     while (!signal.aborted && validView(version)) {
       $('stream-state').textContent = cursor ? 'Reconnecting…' : 'Connecting…';
       try {
-        const response = await request(`${botPath(id)}/events?after=${cursor}`, { signal, raw: true }); if (!response.body) throw new Error('Streaming unavailable.');
+        const response = await request(`${botPath(id)}/events?after=${cursor}${cursor===0?'&tail=100':''}`, { signal, raw: true }); if (!response.body) throw new Error('Streaming unavailable.');
         if (signal.aborted || !validView(version)) { await response.body.cancel().catch(() => {}); return; }
         $('stream-state').textContent = '● Live'; $('reconnect-stream').hidden = true; delay = 1000;
         const reader = response.body.getReader(), decoder = new TextDecoder(); let pending = '', dataLines = [];
@@ -1254,13 +1368,13 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   function finishComputer(id, pending) { if (computerPending.get(id) === pending) computerPending.delete(id); renderProgress(); }
   function warning(message) { $('computer-warning').textContent = message; $('computer-warning').hidden = false; }
   function stopComputerStatus() { clearTimeout(computerStatusTimer); computerStatusTimer = null; computerStatusRequest++; }
-  function queueComputerStatus() { if (!selected || !authenticated || $('panel-computer').hidden) return; clearTimeout(computerStatusTimer); computerStatusTimer = setTimeout(() => { computerStatusTimer = null; void guarded(computerStatus); }, 250); }
+  function queueComputerStatus() { if (!selected || !authenticated || showingTasks || document.hidden || $('panel-computer').hidden) return; clearTimeout(computerStatusTimer); computerStatusTimer = setTimeout(() => { computerStatusTimer = null; void guarded(computerStatus); }, 250); }
   async function computerStatus() {
-    const version = generation, id = selected?.id; if (!id || !authenticated || $('panel-computer').hidden) return;
+    const version = generation, id = selected?.id; if (!id || !authenticated || showingTasks || $('panel-computer').hidden) return;
     clearTimeout(computerStatusTimer); computerStatusTimer = null; const sequence = ++computerStatusRequest;
     try {
       const { computer } = await request(`${botPath(id)}/computer`);
-      if (!validView(version) || sequence !== computerStatusRequest || $('panel-computer').hidden) return;
+      if (!validView(version) || showingTasks || sequence !== computerStatusRequest || $('panel-computer').hidden) return;
       const diagnostic = computer.error?.message ? `${computer.error.message}${computer.error.code ? ` (${computer.error.code})` : ''}` : computer.state === 'unavailable' ? 'Computer health could not be confirmed. Refresh status to check again.' : '';
       $('computer-status').textContent = `${statusLabel(computer.state)} · ${computer.provider}${computer.lastCheckpointId ? ' · checkpoint available' : ''}${diagnostic ? ` · ${diagnostic}` : ''}`;
       if (computer.state === 'starting') computerStatusTimer = setTimeout(() => { computerStatusTimer = null; void guarded(computerStatus); }, 1500);
@@ -1425,9 +1539,9 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     $('current-panel').textContent = ({computer:'Computer',files:'Files',apps:'Apps',agents:'Agents',runs:'Runs',activity:'Activity'})[currentPanel] || '';
     $('current-panel').hidden = !open || docked;
     $('back-to-chat').hidden = !open || docked;
-    desktop.setActive(currentPanel === 'computer');
-    activity.setActive(authenticated && currentPanel === 'activity');
-    agentsView.setActive(authenticated && currentPanel === 'agents');
+    desktop.setActive(!showingTasks && currentPanel === 'computer');
+    activity.setActive(authenticated && !showingTasks && currentPanel === 'activity');
+    agentsView.setActive(authenticated && !showingTasks && currentPanel === 'agents');
     syncChatDock();
   }
   function showPanel(name, focus = false) {
@@ -1470,7 +1584,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     void loadModelCatalog();
     void loadAvatarSettings();
     void chatGPTTask(loadChatGPT);
-    if(location.hash==='#tasks'){openTasks(false);return;}
+    if(taskHash()){openTasks(false,chosenTaskHash());return;}
     const bot = bots.find(item => item.id === chosenHash()) || (!matchMedia('(max-width: 760px)').matches ? bots[0] : null);
     // Restore layout before the workspace becomes interactive. Late initial reads
     // must not close a menu or change the panel the user has already opened.
@@ -1479,9 +1593,12 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     else {botsCollapsed = false; showBotList(false);}
   }
   function showBotList(updateHistory = true) {
-    showingTasks=false;$('global-tasks-workspace').hidden=true;$('tasks-nav').classList.remove('active');
+    showingTasks=false;$('global-tasks-workspace').hidden=true;syncTaskToggle();if(tasksView)setupTasksView();
     $('bot-workspace').hidden=!selected;$('empty').hidden=Boolean(selected);
     document.body.dataset.mobileView = 'bots';
+    if(selected)renderMessages();
+    activity.setActive(Boolean(selected)&&wideLayout.matches&&currentPanel==='activity');
+    agentsView.setActive(Boolean(selected)&&wideLayout.matches&&currentPanel==='agents');
     desktop.setActive(false); stopComputerStatus();
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
     if (updateHistory) history.pushState(null, '', `${location.pathname}${location.search}#bots`);
@@ -1511,8 +1628,9 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     finally {button.disabled = false;}
   });
   $('bot-search').addEventListener('input', renderBots); $('reload-bots').addEventListener('click', () => guarded(loadBots));
-  const navigateHistory = () => {if(location.hash==='#tasks'){openTasks(false);return;}const bot = bots.find(item => item.id === chosenHash()); if (bot) void guarded(() => selectBot(bot, {replace: true})); else showBotList(false);};
+  const navigateHistory = () => {if(taskHash()){openTasks(false,chosenTaskHash());return;}const bot = bots.find(item => item.id === chosenHash()); if (bot) void guarded(() => selectBot(bot, {replace: true})); else showBotList(false);};
   $('tasks-nav').addEventListener('click',()=>openTasks());
+  $('bots-nav')?.addEventListener('click',()=>showBotList());
   window.addEventListener('hashchange', navigateHistory); window.addEventListener('popstate', navigateHistory);
   $('mobile-back')?.addEventListener('click', () => showBotList());
   $('mobile-account')?.addEventListener('click', () => $('settings-button').click());
@@ -1587,11 +1705,11 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   $('disconnect-github').addEventListener('click', () => {void disconnectGitHub();});
   window.addEventListener('focus', () => {if (authenticated && $('settings-dialog').open) void loadGitHubStatus(); if (authenticated && selected && connections.some(item => item.status === 'pending')) void guarded(() => Promise.all([loadConnections(), loadRuns()]));});
   document.addEventListener('visibilitychange', () => { desktop.setActive(!$('panel-computer').hidden && (!matchMedia('(max-width: 760px)').matches || document.body.dataset.mobileView === 'bot')); });
-  window.addEventListener('pagehide', () => {cancelStreamRender();clearTimeout(compactionsTimer);clearTimeout(historyRetryTimer);stopComputerStatus(); streamController?.abort();});
-  window.addEventListener('pageshow', event => {if (event.persisted && authenticated) {startStream(); void guarded(loadBots);void loadOlderMessages();void loadCompactions();}});
+  window.addEventListener('pagehide', () => {cancelAudioSends();cancelStreamRender();clearTimeout(compactionsTimer);clearTimeout(historyRetryTimer);stopComputerStatus(); streamController?.abort();});
+  window.addEventListener('pageshow', event => {if (event.persisted && authenticated) {startStream(); void guarded(loadBots);void loadCompactions();}});
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {clearTimeout(compactionsTimer);clearTimeout(historyRetryTimer);}
-    else if (authenticated && selected) {void loadOlderMessages();void loadCompactions();} if(!document.hidden&&authenticated&&$('settings-dialog').open)void loadAvatarSettings();
+    else if (authenticated && selected) {void loadCompactions();} if(!document.hidden&&authenticated&&$('settings-dialog').open)void loadAvatarSettings();
   });
   let viewportFrame = 0;
   const updateViewport = () => {

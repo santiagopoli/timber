@@ -1,5 +1,6 @@
 import type { ComputerResult, SecretMetadata, SecureInputRequest } from '@botspace/contracts';
 export type {SecretMetadata,SecureInputRequest} from '@botspace/contracts';
+export type SecureWorkerDeployEnvelope={version:1;ownerId:string;botId:string;taskId?:string;runId:string;nativeOperationId:string;operationId:string;pin:{repository:string;commit:string;artifactDigest:`sha256:${string}`;artifactPath:string;accountId:string;workerName:string;destination:string;planId?:string;planRevision?:number};planId:string;planRevision:number;refs:Array<{id:string;revision:number;permissionEpoch:string;binding:string}>;expiresAt:number;signature:string};
 import {ApiError} from './errors';
 import {object, operationId, string, UUID} from './validation';
 
@@ -17,8 +18,11 @@ export function secretDestination(value:unknown):string {
   if(url.protocol!=='https:' || url.username || url.password || url.search || url.hash || url.pathname!=='/' || url.port || !/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}$/.test(url.hostname) || /(?:^|\.)(?:localhost|local|internal|test|invalid|onion)$/.test(url.hostname)) return invalid('Use a public HTTPS origin without a path, credentials or port.');
   return url.origin;
 }
+function secretName(value:unknown):string {
+  const name=string(value,'name',80).trim();if(!name||/[\x00-\x1f\x7f]/.test(name))invalid('Use a short, single-line name.');return name;
+}
 function metadata(value:Record<string,unknown>,unbound=false) {
-  const name=string(value.name??'Private input','name',80).trim();if(!name)invalid('Give the private input a name.');
+  const name=secretName(value.name??'Private input');
   if(unbound&&!value.origin)return {name,origin:'',header:'',prefix:''};
   const origin=secretDestination(value.origin),header=string(value.header??'Authorization','header',80);
   if(!/^[A-Za-z][A-Za-z0-9-]{0,79}$/.test(header)||/^(?:accept|host|cookie|set-cookie|content-.+|connection|transfer-encoding|proxy-.+|sec-.+|cf-.+|x-forwarded-.+)$/i.test(header))invalid('Use an authentication header such as Authorization or X-API-Key.');
@@ -34,6 +38,7 @@ export class OwnerKeychain {
   constructor(private storage:DurableObjectStorage,private ownerId:string,private master:string|undefined,private active:()=>void) {
     storage.sql.exec(`CREATE TABLE IF NOT EXISTS keychain_entries(id TEXT PRIMARY KEY,data TEXT NOT NULL,envelope TEXT);
       CREATE TABLE IF NOT EXISTS keychain_writes(operation_id TEXT PRIMARY KEY,digest TEXT NOT NULL,data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS keychain_names(operation_id TEXT PRIMARY KEY,digest TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS secure_input_requests(id TEXT PRIMARY KEY,operation_id TEXT UNIQUE NOT NULL,data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS keychain_grants(secret_id TEXT NOT NULL,bot_id TEXT NOT NULL,data TEXT NOT NULL,signature TEXT NOT NULL,PRIMARY KEY(secret_id,bot_id));
       CREATE TABLE IF NOT EXISTS keychain_calls(operation_id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,result TEXT);`);
@@ -55,16 +60,30 @@ export class OwnerKeychain {
   private matches(entry:SecretMetadata,grant:Record<string,unknown>){return entry.origin===grant.origin&&entry.header===grant.header&&entry.prefix===grant.prefix;}
   private async prepareGrant(entry:SecretMetadata,botId:string){const data=JSON.stringify({secretId:entry.id,botId,origin:entry.origin,header:entry.header,prefix:entry.prefix,epoch:crypto.randomUUID()});return {data,signature:await this.digest(['permission',data])};}
   private writeGrant(id:string,botId:string,grant:{data:string;signature:string}){this.storage.sql.exec('INSERT INTO keychain_grants(secret_id,bot_id,data,signature) VALUES(?,?,?,?) ON CONFLICT(secret_id,bot_id) DO UPDATE SET data=excluded.data,signature=excluded.signature',id,botId,grant.data,grant.signature);}
-  list(botId?:string):SecretMetadata[] {
-    return this.storage.sql.exec<Row>('SELECT id,data,envelope FROM keychain_entries WHERE envelope IS NOT NULL ORDER BY rowid DESC').toArray().map(row=>{
-      const entry:SecretMetadata=JSON.parse(row.data),botIds=this.storage.sql.exec<{bot_id:string;data:string}>('SELECT bot_id,data FROM keychain_grants WHERE secret_id=?',entry.id).toArray().filter(grant=>this.matches(entry,JSON.parse(grant.data))).map(grant=>grant.bot_id);
-      return {...entry,botIds};
-    }).filter(entry=>!botId||entry.botIds.includes(botId));
+  /** Owner metadata and bot listings share the same signed-grant policy.
+   * Listing never decrypts a value or changes access. Recheck every snapshot
+   * after all awaited verification so an earlier grant cannot become stale. */
+  async list(botId?:string):Promise<SecretMetadata[]> {
+    const snapshots=this.storage.sql.exec<Row>('SELECT id,data,envelope FROM keychain_entries WHERE envelope IS NOT NULL ORDER BY rowid DESC').toArray().map(row=>({
+      row,
+      grants:this.storage.sql.exec<{bot_id:string;data:string;signature:string}>('SELECT bot_id,data,signature FROM keychain_grants WHERE secret_id=?',row.id).toArray(),
+    })).filter(snapshot=>!botId||snapshot.grants.some(grant=>grant.bot_id===botId));
+    const verified=await Promise.all(snapshots.map(async snapshot=>Promise.all(snapshot.grants.map(async grant=>{
+      try{await this.requireAccess(snapshot.row.id,grant.bot_id);return true;}catch{return false;}
+    }))));
+    this.active();
+    return snapshots.flatMap((snapshot,index)=>{
+      const current=this.row(snapshot.row.id);if(!current?.envelope)return [];
+      const unchanged=current.data===snapshot.row.data&&current.envelope===snapshot.row.envelope;
+      const botIds=unchanged?snapshot.grants.filter((grant,grantIndex)=>{
+        const latest=this.grantRow(snapshot.row.id,grant.bot_id);
+        return verified[index][grantIndex]&&latest?.data===grant.data&&latest.signature===grant.signature;
+      }).map(grant=>grant.bot_id):[];
+      const entry={...JSON.parse(current.data) as SecretMetadata,botIds};
+      return !botId||botIds.includes(botId)?[entry]:[];
+    });
   }
-  async permitted(botId:string):Promise<SecretMetadata[]> {
-    const entries=this.list(botId),allowed=await Promise.all(entries.map(async entry=>{try{await this.requireAccess(entry.id,botId);return true;}catch{return false;}}));
-    return entries.filter((_entry,index)=>allowed[index]);
-  }
+  async permitted(botId:string):Promise<SecretMetadata[]> {return this.list(botId);}
   async requireAccess(id:string,botId:string):Promise<string>{
     const stored=this.row(id),grant=this.grantRow(id,botId);
     if(!stored?.envelope||!grant||JSON.parse(grant.data).secretId!==id||JSON.parse(grant.data).botId!==botId||!this.matches(JSON.parse(stored.data),JSON.parse(grant.data))||grant.signature!==await this.digest(['permission',grant.data]))throw new ApiError(403,'credential_access_denied','This bot does not have permission to use that private input. Ask the owner to grant access from their keychain.');
@@ -84,17 +103,17 @@ export class OwnerKeychain {
   request(id:string):SecureInputRequest|undefined {const row=this.storage.sql.exec<{data:string}>('SELECT data FROM secure_input_requests WHERE id=?',id).toArray()[0];return row?JSON.parse(row.data):undefined;}
   setRequest(item:SecureInputRequest):void {this.storage.sql.exec('UPDATE secure_input_requests SET data=? WHERE id=?',JSON.stringify(item),item.id);}
   hasPending(runId:string):boolean {return this.storage.sql.exec("SELECT id FROM secure_input_requests WHERE json_extract(data,'$.runId')=? AND json_extract(data,'$.status')='pending' LIMIT 1",runId).toArray().length>0;}
-  requestInput(op:string,args:Record<string,unknown>,runId:string,nativeOperationId:string,botId?:string):SecureInputRequest {
+  requestInput(op:string,args:Record<string,unknown>,runId:string,nativeOperationId:string,botId?:string,taskId?:string):SecureInputRequest {
     this.root();
     const details={...metadata(args,true),purpose:string(args.purpose,'purpose',500),...(args.secretId?{secretId:string(args.secretId,'secretId',36)}:{})};
     const secret=details.secretId?this.row(details.secretId):undefined;
-    if(secret&&!args.name)details.name=(JSON.parse(secret.data) as SecretMetadata).name;
+    if(secret){const existingName=(JSON.parse(secret.data) as SecretMetadata).name;if(existingName!=='Private input'||!args.name)details.name=existingName;}
     if(details.secretId&&!secret?.envelope)throw new ApiError(404,'credential_unavailable','Private input is unavailable or revoked.');
     if(details.secretId&&!details.origin)invalid('The agent must configure an HTTPS destination before requesting access.');
     const prior=this.storage.sql.exec<{data:string}>('SELECT data FROM secure_input_requests WHERE operation_id=?',op).toArray()[0];
-    if(prior) {const item:SecureInputRequest=JSON.parse(prior.data);if(Object.entries(details).some(([k,v])=>item[k as keyof SecureInputRequest]!==v))throw new ApiError(409,'idempotency_conflict','Secure request changed.');return item;}
+    if(prior) {const item:SecureInputRequest=JSON.parse(prior.data);if(item.taskId!==taskId||Object.entries(details).some(([k,v])=>item[k as keyof SecureInputRequest]!==v))throw new ApiError(409,'idempotency_conflict','Secure request changed.');return item;}
     if(this.storage.sql.exec<{n:number}>("SELECT COUNT(*) AS n FROM secure_input_requests WHERE json_extract(data,'$.status')='pending'").one().n>=16)throw new ApiError(429,'keychain_full','Too many pending secure inputs.');
-    const item:SecureInputRequest={...details,...(botId?{botId,...(details.secretId?{permissionEpoch:this.permissionEpoch(details.secretId,botId)}:{})}:{}),...(secret?{expectedRevision:(JSON.parse(secret.data) as SecretMetadata).revision}:{}),id:crypto.randomUUID(),runId,nativeOperationId,status:'pending',createdAt:now()};
+    const item:SecureInputRequest={...details,...(taskId?{taskId}:{}),...(botId?{botId,...(details.secretId?{permissionEpoch:this.permissionEpoch(details.secretId,botId)}:{})}:{}),...(secret?{expectedRevision:(JSON.parse(secret.data) as SecretMetadata).revision}:{}),id:crypto.randomUUID(),runId,nativeOperationId,status:'pending',createdAt:now()};
     this.storage.sql.exec('INSERT INTO secure_input_requests(id,operation_id,data) VALUES(?,?,?)',item.id,op,JSON.stringify(item));return item;
   }
   /** Batch encryption completes before an atomic commit. The caller fences Stop/deletion
@@ -120,7 +139,7 @@ export class OwnerKeychain {
     this.active();
     return this.storage.transactionSync(()=>{
       const again=replay();if(again)return again;
-      if(this.list().length+prepared.filter(item=>item.expectedRevision===undefined).length>100)throw new ApiError(429,'keychain_full','Your keychain can store up to 100 private inputs.');
+      if(this.storage.sql.exec<{n:number}>('SELECT COUNT(*) AS n FROM keychain_entries WHERE envelope IS NOT NULL').one().n+prepared.filter(item=>item.expectedRevision===undefined).length>100)throw new ApiError(429,'keychain_full','Your keychain can store up to 100 private inputs.');
       for(const {entry,expectedRevision} of prepared){const stored=this.row(entry.id);if(expectedRevision===undefined?Boolean(stored):!stored?.envelope||JSON.parse(stored.data).revision!==expectedRevision)throw new ApiError(409,'credential_changed','Credential changed or was revoked. Refresh the keychain.');}
       const result=prepared.map(item=>item.entry);
       // The caller must be able to reject stale requests before any write commits.
@@ -131,6 +150,98 @@ export class OwnerKeychain {
       return result;
     });
   }
+  async rename(op:string,id:string,input:Record<string,unknown>,check:()=>void|Promise<void>=()=>{},botId?:string):Promise<SecretMetadata> {
+    const name=secretName(input.name),revision=input.expectedRevision;
+    if(!UUID.test(id)||!Number.isInteger(revision)||Number(revision)<1)invalid('Renaming requires the input ID and current revision.');
+    const permission=botId?await this.requireAccess(id,botId):undefined;
+    const key=`${botId??'owner'}:${op}`,digest=await this.digest(['rename',id,name,revision]);this.active();
+    const replay=()=>{const prior=this.storage.sql.exec<{digest:string}>('SELECT digest FROM keychain_names WHERE operation_id=?',key).toArray()[0];if(prior&&prior.digest!==digest)throw new ApiError(409,'idempotency_conflict','This rename operation has already been used with different data.');return !!prior;};
+    const stored=this.row(id);if(!stored?.envelope)throw new ApiError(404,'credential_unavailable','Private input is unavailable or revoked.');
+    const entry:SecretMetadata=JSON.parse(stored.data);
+    if(replay())return entry;
+    if(entry.revision!==revision)throw new ApiError(409,'credential_changed','Private input changed. Refresh the keychain.');
+    if(botId&&entry.name!=='Private input')return entry;
+    if(botId&&name==='Private input')invalid('Choose a descriptive name from the conversation.');
+    const envelope:Envelope=JSON.parse(stored.envelope),updated={...entry,name,revision:entry.revision+1,updatedAt:now()};
+    const clear=new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:decode(envelope.iv),additionalData:this.aad(entry)},await this.encryptionKey(),decode(envelope.ciphertext)));
+    const iv=crypto.getRandomValues(new Uint8Array(12));let encrypted:ArrayBuffer;
+    try{encrypted=await crypto.subtle.encrypt({name:'AES-GCM',iv,additionalData:this.aad(updated)},await this.encryptionKey(),clear);}finally{clear.fill(0);}
+    await check();this.active();
+    return this.storage.transactionSync(()=>{
+      const latest=this.row(id);
+      if(botId&&this.permissionEpoch(id,botId)!==permission)throw new ApiError(409,'credential_changed','Permission changed.');
+      if(replay()&&latest?.envelope)return JSON.parse(latest.data) as SecretMetadata;
+      if(!latest?.envelope||latest.envelope!==stored.envelope)throw new ApiError(409,'credential_changed','Private input changed or was removed.');
+      const result={...updated,...((JSON.parse(latest.data) as SecretMetadata).lastUsedAt?{lastUsedAt:(JSON.parse(latest.data) as SecretMetadata).lastUsedAt}:{})};
+      this.storage.sql.exec('UPDATE keychain_entries SET data=?,envelope=? WHERE id=?',JSON.stringify(result),JSON.stringify({iv:encode(iv),ciphertext:encode(new Uint8Array(encrypted))}),id);
+      this.storage.sql.exec('INSERT INTO keychain_names(operation_id,digest) VALUES(?,?)',key,digest);
+      return result;
+    });
+  }
+  async fingerprint(value:unknown):Promise<string>{return this.digest(['timber.secure-deploy.fingerprint.v1',value]);}
+  /** Host-only synchronous final fence, returned only to the owner coordinator. No plaintext is resolved. */
+  async deployReferenceFence(refs:readonly {id:string;revision:number}[],botId:string):Promise<()=>void> {
+    const snapshots=refs.map(ref=>{
+      const row=this.row(ref.id),grant=this.grantRow(ref.id,botId);
+      if(!row?.envelope||!grant||JSON.parse(row.data).revision!==ref.revision)throw new ApiError(409,'credential_changed','Deploy reference changed.');
+      return {ref,row,grant};
+    });
+    for(const x of snapshots)await this.requireAccess(x.ref.id,botId);
+    const guard=()=>{
+      this.active();
+      for(const x of snapshots){const row=this.row(x.ref.id),grant=this.grantRow(x.ref.id,botId);if(row?.data!==x.row.data||row?.envelope!==x.row.envelope||grant?.data!==x.grant.data||grant?.signature!==x.grant.signature)throw new ApiError(409,'credential_changed','Deploy reference changed.');}
+    };
+    guard();return guard;
+  }
+  async secureWorkerDeployEnvelope(input:{ownerId:string;botId:string;taskId?:string;runId:string;nativeOperationId:string;operationId:string;pin:SecureWorkerDeployEnvelope['pin'];planId:string;planRevision:number;expiresAt:number;refs:readonly {id:string;revision:number}[]}):Promise<SecureWorkerDeployEnvelope>{
+    this.root();if(input.ownerId!==this.ownerId||!UUID.test(input.botId)||input.taskId!==undefined&&!UUID.test(input.taskId)||!UUID.test(input.runId)||typeof input.nativeOperationId!=='string'||!/^[A-Za-z0-9:_.-]{1,160}$/.test(input.nativeOperationId)||!UUID.test(input.planId)||!Number.isSafeInteger(input.planRevision)||input.planRevision<1||!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.operationId))throw new ApiError(400,'deploy_invalid_request','Invalid deploy identity.');
+    const pin=Object.freeze({...input.pin});if(!/^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/.test(pin.repository)||pin.repository.split('/').some(x=>x==='.'||x==='..'||x.includes('..'))||!/^([a-f0-9]{40}|[a-f0-9]{64})$/.test(pin.commit)||!/^([A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+$/.test(pin.artifactPath)||pin.artifactPath.startsWith('.')||pin.artifactPath.split('/').some(x=>!x||x==='.'||x==='..')||!/^sha256:[a-f0-9]{64}$/.test(pin.artifactDigest)||!/^[a-f0-9]{32}$/.test(pin.accountId)||!/^[a-z0-9][a-z0-9-]{0,62}$/.test(pin.workerName)||pin.destination!==`https://api.cloudflare.com/client/v4/accounts/${pin.accountId}/workers/scripts/${pin.workerName}`)throw new ApiError(400,'deploy_invalid_pin','Invalid pinned Worker destination.');
+    if(!Array.isArray(input.refs)||input.refs.length<1||input.refs.length>4||new Set(input.refs.map(x=>x.id)).size!==input.refs.length)throw new ApiError(400,'deploy_invalid_request','Invalid deploy references.');
+    const snapshots=input.refs.map(ref=>{if(!UUID.test(ref.id)||!Number.isSafeInteger(ref.revision)||ref.revision<1)throw new ApiError(400,'deploy_invalid_request','Invalid secret reference.');const row=this.row(ref.id);if(!row?.envelope)throw new ApiError(404,'credential_unavailable','A deploy reference is missing or revoked.');const metadata=JSON.parse(row.data) as SecretMetadata;if(metadata.revision!==ref.revision)throw new ApiError(409,'credential_changed','A deploy reference revision is stale.');const grant=this.grantRow(ref.id,input.botId);if(!grant)throw new ApiError(403,'credential_access_denied','A deploy reference is not permitted.');return{ref:{id:ref.id,revision:ref.revision},row,metadata,grant,grantData:JSON.parse(grant.data) as {epoch:string;origin:string;header:string;prefix:string}}});
+    for(const x of snapshots){const epoch=await this.requireAccess(x.ref.id,input.botId);if(epoch!==x.grantData.epoch)throw new ApiError(409,'credential_changed','Deploy permission changed.');const allowed=x.metadata.origin==='https://api.cloudflare.com'&&((x.metadata.header.toLowerCase()==='authorization'&&x.metadata.prefix==='Bearer ')||(['x-auth-key','x-auth-email'].includes(x.metadata.header.toLowerCase())&&x.metadata.prefix===''));if(!allowed)throw new ApiError(409,'secure_deploy_credential_scope','Deploy reference is not configured for Cloudflare API authentication.');}
+    const headers=snapshots.map(x=>x.metadata.header.toLowerCase());const valid=(headers.length===1&&headers[0]==='authorization'&&snapshots[0].metadata.prefix==='Bearer ')||(headers.length===2&&headers.includes('x-auth-key')&&headers.includes('x-auth-email')&&snapshots.every(x=>x.metadata.prefix===''));if(!valid)throw new ApiError(409,'secure_deploy_credential_scope','Use one Cloudflare bearer token or the legacy key and email pair.');
+    const refs=await Promise.all(snapshots.map(async x=>({id:x.ref.id,revision:x.ref.revision,permissionEpoch:x.grantData.epoch,binding:await this.digest(['timber.deploy-entry-binding.v1',x.row.data,x.row.envelope,x.grant.data,x.grant.signature])})));const expiresAt=input.expiresAt;if(!Number.isSafeInteger(expiresAt)||expiresAt<=Date.now()||expiresAt>Date.now()+60_000)throw new ApiError(409,'deploy_authorization_changed','Deploy authorization expiry is invalid.');
+    const payload={version:1 as const,ownerId:input.ownerId,botId:input.botId,...(input.taskId?{taskId:input.taskId}:{}),runId:input.runId,nativeOperationId:input.nativeOperationId,operationId:input.operationId,pin,planId:input.planId,planRevision:input.planRevision,refs,expiresAt};const signature=await this.digest(['timber.secure-worker-deploy.v1',payload]);
+    this.active();if(Date.now()>=expiresAt)throw new ApiError(409,'deploy_authorization_changed','Deploy authorization expired.');
+    for(const x of snapshots){const row=this.row(x.ref.id),grant=this.grantRow(x.ref.id,input.botId);if(row?.envelope!==x.row.envelope||row?.data!==JSON.stringify(x.metadata)||!grant||grant.data!==x.grant.data||grant.signature!==x.grant.signature||this.permissionEpoch(x.ref.id,input.botId)!==x.grantData.epoch)throw new ApiError(409,'credential_changed','A signed deploy reference changed.');}
+    return{...payload,refs,signature};
+  }
+  async assertSecureDeployEnvelopeCurrent(envelope:SecureWorkerDeployEnvelope):Promise<void> {
+    if(!envelope||envelope.version!==1||envelope.ownerId!==this.ownerId||!UUID.test(envelope.botId)||!UUID.test(envelope.runId)||typeof envelope.nativeOperationId!=='string'||!/^[A-Za-z0-9:_.-]{1,160}$/.test(envelope.nativeOperationId)||envelope.taskId!==undefined&&!UUID.test(envelope.taskId)||!UUID.test(envelope.planId)||!Number.isSafeInteger(envelope.planRevision)||envelope.planRevision<1||typeof envelope.operationId!=='string'||!Array.isArray(envelope.refs)||envelope.expiresAt<=Date.now())throw new ApiError(409,'deploy_authorization_changed','Deploy authorization expired.');
+    const snapshots=envelope.refs.map(ref=>{
+      const row=this.row(ref.id),grant=this.grantRow(ref.id,envelope.botId);
+      if(!row?.envelope||!grant||JSON.parse(row.data).revision!==ref.revision)throw new ApiError(409,'credential_changed','Deploy authorization changed.');
+      return {ref,row,grant};
+    });
+    const {signature,...payload}=envelope;
+    if(signature!==await this.digest(['timber.secure-worker-deploy.v1',payload]))throw new ApiError(409,'deploy_authorization_changed','Deploy signature is invalid.');
+    for(const x of snapshots){
+      if(await this.requireAccess(x.ref.id,envelope.botId)!==x.ref.permissionEpoch||x.ref.binding!==await this.digest(['timber.deploy-entry-binding.v1',x.row.data,x.row.envelope,x.grant.data,x.grant.signature]))throw new ApiError(409,'credential_changed','Deploy authorization changed.');
+    }
+    this.active();
+    if(envelope.expiresAt<=Date.now())throw new ApiError(409,'deploy_authorization_changed','Deploy authorization expired.');
+    for(const x of snapshots){const row=this.row(x.ref.id),grant=this.grantRow(x.ref.id,envelope.botId);if(row?.data!==x.row.data||row?.envelope!==x.row.envelope||grant?.data!==x.grant.data||grant?.signature!==x.grant.signature)throw new ApiError(409,'credential_changed','Deploy authorization changed.');}
+  }
+  /** Resolve selected values only for the private Computer deploy request. Plaintext never returns to a tool result or journal. */
+  async withSecureWorkerDeployCredentials<T>(envelope:SecureWorkerDeployEnvelope,send:(credentials:Array<{refId:string;revision:number;header:string;prefix:string;value:string}>)=>Promise<T>):Promise<T>{
+    await this.assertSecureDeployEnvelopeCurrent(envelope);
+    const rows=envelope.refs.map(ref=>{const row=this.row(ref.id);if(!row?.envelope||!this.grantRow(ref.id,envelope.botId))throw new ApiError(409,'credential_changed','Deploy authorization changed.');const metadata=JSON.parse(row.data) as SecretMetadata;return{ref,row,metadata};});
+    const credentials:Array<{refId:string;revision:number;header:string;prefix:string;value:string}>=[];
+    try {
+      for(const item of rows){
+        const wrapped:Envelope=JSON.parse(item.row.envelope!);
+        const clear=new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:decode(wrapped.iv),additionalData:this.aad(item.metadata)},await this.encryptionKey(),decode(wrapped.ciphertext)));
+        let value:string;try{value=new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(clear);}finally{clear.fill(0);}
+        if(!value||value.length>8192||/[\x00-\x1f\x7f]/.test(value))throw new ApiError(422,'credential_format','A Cloudflare credential has an unsupported format.');
+        credentials.push({refId:item.ref.id,revision:item.ref.revision,header:item.metadata.header,prefix:item.metadata.prefix,value});
+      }
+      // Recheck after decryption awaits and immediately before crossing the private DO channel.
+      await this.assertSecureDeployEnvelopeCurrent(envelope);
+      this.active();
+      return await send(credentials);
+    } finally {for(const item of credentials)item.value='';}
+  }
+  async verifySecureWorkerDeployEnvelope(envelope:SecureWorkerDeployEnvelope):Promise<boolean>{try{await this.assertSecureDeployEnvelopeCurrent(envelope);return true;}catch{return false}}
   revoke(id:string):void {const stored=this.row(id);if(!stored)throw new ApiError(404,'not_found','Credential not found.');this.storage.sql.exec('UPDATE keychain_entries SET envelope=NULL WHERE id=?',id);this.storage.sql.exec('DELETE FROM keychain_grants WHERE secret_id=?',id);}
   async authorize(request:SecureInputRequest,commit:(entries:SecretMetadata[],replay:boolean)=>void):Promise<SecretMetadata[]> {
     if(request.botId&&request.secretId&&await this.requireAccess(request.secretId,request.botId)!==request.permissionEpoch)throw new ApiError(409,'credential_changed','Permission changed.');
@@ -143,56 +254,70 @@ export class OwnerKeychain {
     return this.save({operationId:`authorize:${request.id}`,entries:[{id:entry.id,expectedRevision:request.expectedRevision,name:request.name,origin:request.origin,header:request.header,prefix:request.prefix,value}]},(entries,replay)=>{if(!replay&&request.botId&&request.secretId&&this.permissionEpoch(request.secretId,request.botId)!==request.permissionEpoch)throw new ApiError(409,'credential_changed','Permission changed.');commit(entries,replay);},request.botId,true);
   }
   async call(op:string,args:Record<string,unknown>,signal:AbortSignal,canDispatch:()=>void|Promise<void>=()=>{},botId?:string):Promise<ComputerResult> {
-    const id=string(args.secretId,'secretId',36),path=string(args.path,'path',2000),method=String(args.method??'GET').toUpperCase();
+    const primary=string(args.secretId,'secretId',36),additional=args.additionalSecretIds===undefined?[]:args.additionalSecretIds;
+    if(!Array.isArray(additional)||additional.length>3||additional.some(id=>typeof id!=='string'||id.length>36)||new Set([primary,...additional]).size!==1+additional.length)invalid('Use one to four distinct private input references.');
+    const ids=[primary,...additional as string[]],path=string(args.path,'path',2000),method=String(args.method??'GET').toUpperCase();
     if(!['GET','POST','PUT','PATCH','DELETE'].includes(method))invalid('Unsupported HTTP method.');
     if(!path.startsWith('/')||path.startsWith('//')||path.includes('\\')||/[\x00-\x20\x7f]/.test(path))invalid('Use an absolute path within the authorized origin.');
     const payload=args.body===undefined?undefined:string(args.body,'body',32_000,0);if(method==='GET'&&payload!==undefined)invalid('GET cannot include a body.');
-    const stored=this.row(id);if(!stored?.envelope)throw new ApiError(404,'credential_unavailable','Credential is unavailable or revoked.');
-    const permission=botId?await this.requireAccess(id,botId):undefined;
-    const entry:SecretMetadata=JSON.parse(stored.data);
-    if(!entry.origin)throw new ApiError(409,'credential_unconfigured','Use configure_secret to prepare this private input for the intended service. The user only confirms access; do not ask them to configure headers or URLs.');
-    const url=new URL(path,entry.origin);if(url.origin!==entry.origin||url.hash)invalid('The destination must match the authorized origin.');
+    const snapshots=await Promise.all(ids.map(async id=>{
+      const stored=this.row(id);if(!stored?.envelope)throw new ApiError(404,'credential_unavailable','Credential is unavailable or revoked.');
+      const entry:SecretMetadata=JSON.parse(stored.data);
+      if(!entry.origin)throw new ApiError(409,'credential_unconfigured','Use configure_secret to prepare this private input for the intended service. The user only confirms access; do not ask them to configure headers or URLs.');
+      const permission=botId?await this.requireAccess(id,botId):undefined;
+      return {id,stored,entry,permission};
+    }));
+    const origin=snapshots[0].entry.origin;
+    if(snapshots.some(item=>item.entry.origin!==origin))invalid('All private inputs must be approved for the same HTTPS origin.');
+    const managedHeaders=snapshots.map(item=>item.entry.header.toLowerCase());
+    if(new Set(managedHeaders).size!==managedHeaders.length)invalid('Each private input must use a unique authentication header.');
+    const url=new URL(path,origin);if(url.origin!==origin||url.hash)invalid('The destination must match the authorized origin.');
     const headers:Record<string,string>={accept:'application/json',...(payload===undefined?{}:{'content-type':'application/json'})};
     const publicHeaders=args.headers===undefined?{}:object(args.headers);
     if(Object.keys(publicHeaders).length>16)invalid('Use at most 16 public headers.');
+    const publicHeaderNames=new Set<string>();
     for(const [name,value] of Object.entries(publicHeaders)) {
-      if(!/^[A-Za-z][A-Za-z0-9-]{0,79}$/.test(name)||name.toLowerCase()===entry.header.toLowerCase()||/^(?:authorization|cookie|set-cookie|host|content-.+|connection|transfer-encoding|proxy-.+|sec-.+|cf-.+|x-forwarded-.+)$/i.test(name)||typeof value!=='string'||value.length>1000||/[^\x20-\x7e]/.test(value))invalid('Use public API configuration headers only. Authentication headers are managed by the keychain.');
+      const normalizedName=name.toLowerCase();if(publicHeaderNames.has(normalizedName))invalid('Public header names must be unique case-insensitively.');publicHeaderNames.add(normalizedName);
+      if(!/^[A-Za-z][A-Za-z0-9-]{0,79}$/.test(name)||managedHeaders.includes(normalizedName)||/^(?:authorization|cookie|set-cookie|host|content-.+|connection|transfer-encoding|proxy-.+|sec-.+|cf-.+|x-forwarded-.+)$/i.test(name)||typeof value!=='string'||value.length>1000||/[^\x20-\x7e]/.test(value))invalid('Use public API configuration headers only. Authentication headers are managed by the keychain.');
       headers[name.toLowerCase()]=value as string;
     }
-    const digest=await this.digest(args);this.active();signal.throwIfAborted();
+    const digest=await this.digest(['secret_request.v2',args]);this.active();signal.throwIfAborted();
     const prior=this.storage.sql.exec<{fingerprint:string;result:string|null}>('SELECT fingerprint,result FROM keychain_calls WHERE operation_id=?',op).toArray()[0];
     if(prior){if(prior.fingerprint!==digest)throw new ApiError(409,'idempotency_conflict','Request arguments changed.');return prior.result?JSON.parse(prior.result):{operationId:op,status:'interrupted',error:'The authenticated request may have been sent. Inspect the service before making another request.'};}
-    const envelope:Envelope=JSON.parse(stored.envelope);
-    const clear=await crypto.subtle.decrypt({name:'AES-GCM',iv:decode(envelope.iv),additionalData:this.aad(entry)},await this.encryptionKey(),decode(envelope.ciphertext));
-    const value=new TextDecoder().decode(clear);
-    if(/[^\x20-\x7e]/.test(value)||value.length>8192)throw new ApiError(422,'credential_format','This private input cannot be used as a single HTTP authentication header. Request the specific API key in a new secure input.');
-    this.active();signal.throwIfAborted();
-    await canDispatch();signal.throwIfAborted();
-    if(botId&&this.permissionEpoch(id,botId)!==permission)throw new ApiError(409,'credential_changed','Permission was revoked before dispatch.');
-    if(this.row(id)?.envelope!==stored.envelope)throw new ApiError(409,'credential_changed','Credential changed before the request was sent.');
-    // No await between the second replay fence and dispatch registration.
+    // Decrypt and validate every value before dispatch. Plaintext exists only in this stack frame.
+    const credentials=await Promise.all(snapshots.map(async item=>{
+      const envelope:Envelope=JSON.parse(item.stored.envelope!);
+      const clear=new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:decode(envelope.iv),additionalData:this.aad(item.entry)},await this.encryptionKey(),decode(envelope.ciphertext)));
+      const value=new TextDecoder().decode(clear);clear.fill(0);
+      if(/[^\x20-\x7e]/.test(value)||value.length>8192)throw new ApiError(422,'credential_format','A private input cannot be used as a single HTTP authentication header. Request the specific API key in a new secure input.');
+      return {value,header:item.entry.header,prefix:item.entry.prefix};
+    }));
+    this.active();signal.throwIfAborted();await canDispatch();this.active();signal.throwIfAborted();
+    // Recheck every signed grant, revision/envelope and task fence after the last await.
+    for(const item of snapshots){
+      if(botId&&this.permissionEpoch(item.id,botId)!==item.permission)throw new ApiError(409,'credential_changed','Permission was revoked before dispatch.');
+      const latest=this.row(item.id);if(!latest?.envelope||latest.envelope!==item.stored.envelope||latest.data!==item.stored.data)throw new ApiError(409,'credential_changed','A private input changed before the request was sent.');
+    }
     if(this.storage.sql.exec('SELECT operation_id FROM keychain_calls WHERE operation_id=?',op).toArray().length)return {operationId:op,status:'interrupted',error:'This authenticated request is already being handled.'};
     this.storage.sql.exec('INSERT INTO keychain_calls(operation_id,fingerprint) VALUES(?,?)',op,digest);
-    let result:ComputerResult;
-    const timeout=new AbortController(),timer=setTimeout(()=>timeout.abort(),30_000);
+    let result:ComputerResult;const timeout=new AbortController(),timer=setTimeout(()=>timeout.abort(),30_000);
     try {
-      const response=await fetch(url,{method,headers:{...headers,[entry.header]:entry.prefix+value},body:payload,redirect:'manual',signal:AbortSignal.any([signal,timeout.signal])});
+      const injected={...headers};for(let i=0;i<credentials.length;i++)injected[credentials[i].header]=credentials[i].prefix+credentials[i].value;
+      const response=await fetch(url,{method,headers:injected,body:payload,redirect:'manual',signal:AbortSignal.any([signal,timeout.signal])});
       if(response.status>=300&&response.status<400){await response.body?.cancel();result={operationId:op,status:'failed',error:'The service redirected the request. Credentials were not forwarded.'};}
       else {
         const reader=response.body?.getReader();let output='',size=0;const decoder=new TextDecoder();
         if(reader)while(true){const chunk=await reader.read();if(chunk.done)break;size+=chunk.value.length;if(size>64_000){await reader.cancel();throw new Error('Response too large');}output+=decoder.decode(chunk.value,{stream:true});}output+=decoder.decode();
-        const variants=[value,encode(encoder.encode(value)),encodeURIComponent(value),JSON.stringify(value).slice(1,-1)];
-        const redact=(text:string)=>{for(const token of variants.filter(Boolean).sort((a,b)=>b.length-a.length))text=text.split(token).join('[redacted]');return text;};
-        // Service-issued tokens are also excluded when providers return JSON credentials.
+        const variants=new Set<string>();for(const credential of credentials){const value=credential.value;for(const raw of [value,credential.prefix+value]){const bytes=encoder.encode(raw),base64=encode(bytes),percent=encodeURIComponent(raw);for(const v of [raw,base64,base64.replace(/=+$/,''),base64.replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''),Array.from(bytes,byte=>byte.toString(16).padStart(2,'0')).join(''),Array.from(bytes,byte=>byte.toString(16).padStart(2,'0')).join('').toUpperCase(),percent,percent.replace(/%[0-9A-F]{2}/g,token=>token.toLowerCase()),JSON.stringify(raw).slice(1,-1)])if(v)variants.add(v);}}
+        const redact=(text:string)=>{for(const token of [...variants].sort((a,b)=>b.length-a.length))text=text.split(token).join('[redacted]');return text;};
         try{output=JSON.stringify(JSON.parse(output),(key,v)=>/token|secret|password|authorization|api[_-]?key|private[_-]?key|cookie/i.test(key)?'[redacted]':typeof v==='string'?redact(v):v);}catch{output=redact(output);}
         output=redact(output);
         result={operationId:op,status:response.ok?'completed':'failed',output:JSON.stringify({status:response.status,body:output}),...(!response.ok?{error:`The service returned HTTP ${response.status}.`}:{})};
       }
     }catch{result={operationId:op,status:'interrupted',error:'The authenticated request could not be confirmed. It may have reached the service; inspect its state before retrying.'};}
-    finally{clearTimeout(timer);}
-    this.active();
-    this.storage.sql.exec('UPDATE keychain_calls SET result=? WHERE operation_id=?',JSON.stringify(result),op);
-    const latest=this.row(id);if(latest?.envelope===stored.envelope)this.storage.sql.exec('UPDATE keychain_entries SET data=? WHERE id=?',JSON.stringify({...entry,lastUsedAt:now()}),id);
+    finally{clearTimeout(timer);for(const credential of credentials)(credential as {value:string}).value='';}
+    this.active();this.storage.sql.exec('UPDATE keychain_calls SET result=? WHERE operation_id=?',JSON.stringify(result),op);
+    for(const item of snapshots){const latest=this.row(item.id);if(latest?.envelope===item.stored.envelope)this.storage.sql.exec('UPDATE keychain_entries SET data=? WHERE id=?',JSON.stringify({...JSON.parse(latest.data) as SecretMetadata,lastUsedAt:now()}),item.id);}
     return result;
   }
 }

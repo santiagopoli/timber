@@ -277,7 +277,7 @@ test('1200 mixed-Markdown messages stay seamless while live updates perform boun
   } finally {await context.close(); await fixture.close();}
 });
 
-// The realistic backend returns only the newest 500 messages. Verify older
+// The client requests only the newest 100 messages. Verify older
 // pages are reached automatically while scrolling, without a user load-more
 // control, and prepending a delayed page preserves the reader's existing anchor.
 for (const width of [320, 1440]) test(`archive cursor pages join seamlessly without losing live messages or the reading anchor at ${width}px`, {skip: BASELINE}, async () => {
@@ -311,15 +311,17 @@ for (const width of [320, 1440]) test(`archive cursor pages join seamlessly with
     if (width === 320) await selectBot(page, BOT_A);
     await page.locator(selector(1199)).waitFor({state: 'attached'});
     await page.locator('#stream-state').filter({hasText: 'Live'}).waitFor({state: 'attached'});
-    await moveToHistory(page, 700);
+    assert.equal(await page.locator('[data-message-id^="long-history-"]').count(),100,'initial load renders only the recent page');
+    assert.equal(requests.length,1,'initial scroll/follow does not drain the archive');
+    await moveToHistory(page, 1100);
     // At the top of the retained recent page, a normal upward scroll initiates
-    // the archive request; eager background fetch is equally valid.
+    // the archive request; each further upward gesture requests one page.
     await page.locator('#messages').evaluate(node => {node.dispatchEvent(new WheelEvent('wheel', {deltaY: -600, bubbles: true})); node.scrollTop = 0; node.dispatchEvent(new Event('scroll'));});
     await page.waitForFunction(() => document.querySelector('#messages')?.scrollTop === 0);
     for (let attempt = 0; !firstOlderRequested && attempt < 50; attempt++) await page.waitForTimeout(100);
     assert.equal(firstOlderRequested, true, 'older history loads from ordinary scrolling without a load-more action');
     await settle(page);
-    const before = await anchor(page, 700);
+    const before = await anchor(page, 1100);
     // The live stream is independent of the delayed archive response.
     const live = {id: 'archive-live-message', botId: BOT_A, role: 'assistant', text: 'Live answer received while an older archive page is in flight.', createdAt: stamp(1300)};
     fixture.state.messages.get(BOT_A).push(live);
@@ -327,19 +329,21 @@ for (const width of [320, 1440]) test(`archive cursor pages join seamlessly with
     await page.locator('[data-message-id="archive-live-message"]').waitFor({state: 'attached'});
     await page.locator('#message').fill('Draft while the archive loads.');
     releaseOlder();
-    await page.locator(selector(200)).waitFor({state: 'attached'});
+    await page.locator(selector(1000)).waitFor({state: 'attached'});
     await settle(page);
-    const after = await anchor(page, 700);
+    const after = await anchor(page, 1100);
     assert.ok(Math.abs(after.top - before.top) <= 2, `prepending older page keeps the existing reading anchor (${before.top} -> ${after.top})`);
     assert.equal(await page.locator('[data-message-id="archive-live-message"]').count(), 1, 'older snapshot cannot drop or duplicate a live message');
     assert.equal(await page.locator('#message').inputValue(), 'Draft while the archive loads.');
-    await moveToHistory(page, 200);
-    await page.locator('#messages').evaluate(node => {node.scrollTop = 0; node.dispatchEvent(new Event('scroll'));});
-    await page.locator(selector(0)).waitFor({state: 'attached'});
+    assert.equal(requests.filter(request=>request.before).length,1,'settling, typing and live messages cannot drain more archive pages');
+    for (const nextOldest of Array.from({length:10},(_,index)=>900-index*100)) {
+      await page.locator('#messages').evaluate(node => {node.dispatchEvent(new WheelEvent('wheel',{deltaY:-600,bubbles:true}));node.scrollTop=0;node.dispatchEvent(new Event('scroll'));});
+      await page.locator(selector(nextOldest)).waitFor({state:'attached'});await settle(page);
+    }
     assert.equal(await page.locator('[data-message-id^="long-history-"]').count(), MESSAGE_COUNT, 'all archived messages are retained');
     assert.deepEqual(await page.locator('[data-message-id^="long-history-"]').evaluateAll(nodes => nodes.map(node => node.dataset.messageId)), history.slice(0, MESSAGE_COUNT).map(message => message.id));
     assert.equal(await page.getByRole('button', {name: /load (?:more|older)|show older messages/i}).count(), 0);
-    assert.ok(requests.some(request => request.before === '701') && requests.some(request => request.before === '201'), 'opaque rowid cursors are passed unchanged');
+    assert.ok(requests.some(request => request.before === '1101') && requests.some(request => request.before === '1001') && requests.some(request => request.before === '101'), 'opaque rowid cursors are passed unchanged');
     await moveToHistory(page, 0);
     await page.locator(selector(0)).getByRole('button', {name: 'Copy message', exact: true}).click();
     assert.equal(await page.evaluate(() => navigator.clipboard.readText()), markdown(0));
@@ -352,4 +356,87 @@ for (const width of [320, 1440]) test(`archive cursor pages join seamlessly with
     assert.deepEqual(fixture.state.failures, []);
     console.log(`LONG_HISTORY_ARCHIVE ${JSON.stringify({width, requests})}`);
   } finally {releaseOlder(); await context.close(); await fixture.close();}
+});
+
+for (const width of [320,1440]) test(`large historical outputs remain copyable with bounded render nodes and no reloads at ${width}px`, async () => {
+  const fixture=await createConsoleFixture(), browser=await consoleBrowser();
+  const context=await browser.newContext({viewport:{width,height:844},...(width===320?{isMobile:true,hasTouch:true}:{})});
+  const page=await context.newPage(), errors=[], crashes=[];
+  page.setDefaultTimeout(30000);page.on('pageerror',error=>errors.push(error.message));page.on('crash',()=>crashes.push('browser page crashed'));
+  await page.addInitScript(()=>{globalThis.__documentLifetimeMarker=crypto.randomUUID();});
+  const source=Array.from({length:6000},(_,index)=>`const item_${index} = "historical file line ${index}";`).join('\n');
+  const date='2026-10-05T10:00:00.000Z',run={id:'large-output-run',botId:BOT_A,operationId:'large-output-request',status:'completed',createdAt:date,updatedAt:date};
+  try {
+    fixture.state.runs.set(BOT_A,[run]);fixture.state.messages.set(BOT_A,[{id:'large-output-user',botId:BOT_A,runId:run.id,role:'user',text:'Inspect the large files without changing them.',createdAt:date}]);
+    fixture.state.messages.set(BOT_B,[{id:'other-bot-large',botId:BOT_B,role:'assistant',text:'An isolated conversation.',createdAt:date}]);
+    for(let index=0;index<24;index++)fixture.state.emit(BOT_A,'tool.completed',{operationId:`large-file-${index}`,toolName:'read_file',input:{path:`history/file-${index}.js`},result:{status:'completed',output:source,exitCode:0}},run.id);
+    await context.grantPermissions(['clipboard-read','clipboard-write'],{origin:new URL(fixture.url).origin});
+    const start=performance.now();await page.goto(fixture.url);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();
+    await page.locator('#app').waitFor({state:'visible'});
+    const lifetimeMarker=await page.evaluate(()=>globalThis.__documentLifetimeMarker);
+    if(width===320)await selectBot(page,BOT_A);
+    await page.locator('[data-tool-operation-id="large-file-23"]').waitFor({state:'attached'});await settle(page);
+    const metrics={width,initialLoadMs:performance.now()-start,sourceBytes:source.length,tools:24,collapsedNodes:await page.locator('#messages').evaluate(node=>node.querySelectorAll('*').length)};
+    for(let index=0;index<4;index++) {
+      const row=page.locator(`[data-tool-operation-id="large-file-${index}"]`);
+      await row.locator('summary').click();await row.locator('.timber-tool-output pre').waitFor();
+      assert.equal(await row.locator('.timber-tool-output pre').textContent(),source.slice(0,65536),'bounded preview retains exact source including line breaks');
+    }
+    await settle(page);
+    metrics.expandedNodes=await page.locator('#messages').evaluate(node=>node.querySelectorAll('*').length);
+    metrics.outputNodes=await page.locator('[data-tool-operation-id="large-file-0"] .timber-tool-output').evaluate(node=>node.querySelectorAll('*').length);
+    await page.locator('[data-tool-operation-id="large-file-0"] .timber-tool-output button[aria-label="Copy code"]').click();
+    assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),source,'copy keeps the entire file beyond the 64 KiB preview');
+    await page.locator('#message').fill('Keep my draft while switching.');
+    for(let round=0;round<3;round++) {
+      await selectBot(page,BOT_B);await page.locator('[data-message-id="other-bot-large"]').waitFor();
+      assert.equal(await page.locator('[data-tool-operation-id^="large-file-"]').count(),0,'large output DOM is released when switching away');
+      await selectBot(page,BOT_A);await page.locator('[data-tool-operation-id="large-file-23"]').waitFor({state:'attached'});
+      assert.equal(await page.locator('#message').inputValue(),'Keep my draft while switching.');
+    }
+    console.log(`LARGE_OUTPUT_METRICS ${JSON.stringify(metrics)}`);
+    assert.deepEqual(errors,[]);assert.deepEqual(crashes,[]);assert.equal(await page.evaluate(()=>globalThis.__documentLifetimeMarker),lifetimeMarker,'long-output browsing must never reload the page');
+    if(!BASELINE) {
+      assert.ok(metrics.outputNodes<=20,`large file preview creates a bounded number of elements (${metrics.outputNodes})`);
+      assert.ok(metrics.expandedNodes-metrics.collapsedNodes<=200,'opening large files must not create one element per line or token');
+    }
+  } finally {await context.close();await fixture.close();}
+});
+
+for (const width of [320,1440]) test(`large Markdown/code messages preserve exact copy with bounded DOM at ${width}px`, async () => {
+  const fixture=await createConsoleFixture(),browser=await consoleBrowser(),context=await browser.newContext({viewport:{width,height:844}}),page=await context.newPage();
+  const errors=[],crashes=[];page.on('pageerror',error=>errors.push(error.message));page.on('crash',()=>crashes.push('crashed'));page.setDefaultTimeout(30000);
+  await page.addInitScript(()=>{globalThis.__documentLifetimeMarker=crypto.randomUUID();});
+  const code=Array.from({length:1500},(_,index)=>`const historic_${index} = "complete-code-${index}";`).join('\n');
+  const codeText=`A large code answer.\n\n\`\`\`javascript\n${code}\n\`\`\`\n\nThe whole source remains available.`;
+  const hugeText=`| Row | Source |\n| --- | --- |\n${Array.from({length:12000},(_,index)=>`| ${index} | complete-long-table-marker-${index} |`).join('\n')}`;
+  const date='2026-10-05T10:00:00.000Z';
+  fixture.state.messages.set(BOT_A,[{id:'large-code-answer',botId:BOT_A,role:'assistant',text:codeText,createdAt:date},{id:'huge-table-answer',botId:BOT_A,role:'assistant',text:hugeText,createdAt:date}]);
+  try {
+    await context.grantPermissions(['clipboard-read','clipboard-write'],{origin:new URL(fixture.url).origin});
+    const start=performance.now();await page.goto(fixture.url);await page.locator('#token').fill(TEST_TOKEN);await page.locator('#connect-form button').click();await page.locator('#app').waitFor();
+    if(width===320)await selectBot(page,BOT_A);
+    await page.locator('[data-message-id="huge-table-answer"]').waitFor({state:'attached'});await settle(page);
+    const lifetime=await page.evaluate(()=>globalThis.__documentLifetimeMarker),metrics={width,initialLoadMs:performance.now()-start,codeCharacters:code.length,tableCharacters:hugeText.length,nodes:await page.locator('#messages').evaluate(node=>node.querySelectorAll('*').length)};
+    if(!BASELINE) {
+      assert.ok(metrics.nodes<200,'a large response cannot create a token/line/cell element for every source fragment');
+      assert.equal(await page.locator('[data-message-id="large-code-answer"] [data-large-code]').count(),1);
+      assert.equal(await page.locator('[data-message-id="huge-table-answer"] [data-large-message]').textContent(),hugeText,'oversized message retains all readable text');
+    }
+    for(const [id,text] of [['large-code-answer',codeText],['huge-table-answer',hugeText]]) {
+      await page.locator(`[data-message-id="${id}"]`).getByRole('button',{name:'Copy message',exact:true}).click();
+      assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),text,'copy preserves full source including Markdown syntax');
+    }
+    assert.equal(await page.evaluate(()=>window.find('complete-long-table-marker-11999',false,false,true)),true,'the end of a huge message remains native-find accessible');
+    await page.locator('#message').fill('A responsive draft after the oversized answer.');
+    const run={id:'large-response-live',botId:BOT_A,operationId:'large-response-live-operation',status:'running',createdAt:'2026-10-05T10:01:00.000Z',updatedAt:'2026-10-05T10:01:00.000Z'};
+    fixture.state.runs.set(BOT_A,[run]);fixture.state.emit(BOT_A,'run.updated',{run},run.id);
+    fixture.state.emit(BOT_A,'runtime.snapshot',{busy:true,partialText:codeText},run.id);
+    await page.locator('#streaming-text').filter({hasText:'large code answer'}).waitFor({state:'attached'});
+    fixture.state.emit(BOT_A,'message.delta',{delta:'\n\nNew live finding survives the large history.'},run.id);
+    await page.locator('#streaming-text').filter({hasText:'New live finding'}).waitFor({state:'attached'});
+    assert.equal(await page.locator('#message').inputValue(),'A responsive draft after the oversized answer.');
+    assert.equal(await page.evaluate(()=>globalThis.__documentLifetimeMarker),lifetime);assert.deepEqual(errors,[]);assert.deepEqual(crashes,[]);
+    console.log(`LARGE_RESPONSE_METRICS ${JSON.stringify(metrics)}`);
+  } finally {await context.close();await fixture.close();}
 });

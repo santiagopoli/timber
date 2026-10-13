@@ -259,4 +259,20 @@ def main():
     print("PASS desktop: authenticated live framebuffer, visible cursor, enforced observation, native pointer and keyboard, agent hover, double-click deduplication and drag/release")
 
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        # This standalone synthetic-image fixture runs via docker exec/stdin.
+        # Preserve the original failure while publishing a redacted check annotation.
+        import traceback
+        frames = traceback.extract_tb(error.__traceback__)
+        own_frames = [frame for frame in frames if frame.filename == __file__]
+        line = own_frames[-1].lineno if own_frames else 1
+        message = f"{type(error).__name__}: {error}"
+        token = os.environ.get("BOTSPACE_COMPUTER_TOKEN")
+        if token:
+            message = message.replace(token, "[redacted]")
+        message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::error file=infra/computer/smoke_desktop.py,line={line},title=Computer desktop smoke failed::{message}", flush=True)
+        raise

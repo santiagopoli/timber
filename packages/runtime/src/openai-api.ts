@@ -4,15 +4,16 @@ import {createProvider} from '@earendil-works/pi-ai/models';
 import {classifyModelFailure} from '@botspace/contracts';
 import {RESPONSES_URL,type ConfiguredModel} from './chatgpt.js';
 import type {PiRuntimeOptions} from './types.js';
+import {inferenceCacheKey} from './inference-policy.js';
 
 /** Ordinary paid Responses API, independently identified from the ChatGPT plan. */
-export function createOpenAIProvider(transport:PiRuntimeOptions<object>['openai'],available:()=>readonly ConfiguredModel[]) {
+export function createOpenAIProvider(transport:PiRuntimeOptions<object>['openai'],available:()=>readonly ConfiguredModel[],cacheScope?:()=>Promise<string>) {
   const run=(model:Model<'openai-responses'>,context:TranscriptContext,options?:SimpleStreamOptions)=>{
     const configured=model as ConfiguredModel,settings=configured.timberSettings??{model:model.id};
     return streamSimple({...model,id:settings.model},context,{
-      apiKey:'sk-timber-host-owned-api-transport',env:{},signal:options?.signal,maxRetries:0,cacheRetention:'none',
+      apiKey:'sk-timber-host-owned-api-transport',env:{},signal:options?.signal,maxRetries:0,cacheRetention:'short',
       timeoutMs:options?.timeoutMs??1_800_000,maxTokens:options?.maxTokens??4096,
-      onPayload:value=>{
+      onPayload:async value=>{
         const payload=value as Record<string,unknown>;
         if(!Array.isArray(payload.input))throw new Error('model_request_invalid');
         const input=payload.input.map(value=>{
@@ -22,7 +23,8 @@ export function createOpenAIProvider(transport:PiRuntimeOptions<object>['openai'
           const {namespace:_namespace,...flat}=item;return flat;
         });
         const {reasoning:_reasoning,service_tier:_tier,...base}=payload;
-        return {...base,model:settings.model,input,store:false,stream:true,
+        const cacheKey=cacheScope?await inferenceCacheKey(await cacheScope(),options?.sessionId):undefined;
+        return {...base,model:settings.model,input,store:false,stream:true,...(cacheKey?{prompt_cache_key:cacheKey}:{}),
           ...(settings.reasoningEffort?{reasoning:{effort:settings.reasoningEffort}}:{}),
           ...(settings.fast?{service_tier:configured.timberCapability?.fastServiceTier??'priority'}:{})};
       },

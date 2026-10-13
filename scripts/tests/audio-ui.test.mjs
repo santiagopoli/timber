@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
+import {createServer,request as httpRequest} from 'node:http';
+import {existsSync} from 'node:fs';
+import {webkit} from 'playwright';
 import {build} from 'esbuild';
 import {readFile,writeFile} from 'node:fs/promises';
 import {pathToFileURL} from 'node:url';
@@ -8,8 +11,8 @@ import {createConsoleFixture,BOT_A,BOT_B,TEST_TOKEN} from './console-fixture.mjs
 import {makeToneWav} from './audio-wav.mjs';
 
 const consoleBrowser=createConsoleBrowser(),date='2026-10-05T10:00:00.000Z',wav=makeToneWav(),longWav=makeToneWav({durationSeconds:31,sampleRate:8000,amplitudeModulationHz:0.1});
-async function connectedPage({width=1280,height=900,initScript}={}){
-  const fixture=await createConsoleFixture(),browser=await consoleBrowser(),loginWidth=width<600?1280:width;
+async function connectedPage({width=1280,height=900,initScript,browser:providedBrowser,fixture:providedFixture}={}){
+  const fixture=providedFixture||await createConsoleFixture(),browser=providedBrowser||await consoleBrowser(),loginWidth=width<600?1280:width;
   const context=await browser.newContext({viewport:{width:loginWidth,height}});if(initScript)await context.addInitScript(initScript);
   const page=await context.newPage();page.setDefaultTimeout(6000);
   // The shared fixture CSP predates audio. Production permits blob-backed media.
@@ -102,7 +105,7 @@ test('pending status leaves original audio message visible and playable',async()
   }finally{await context.close();await fixture.close();}
 });
 
-test('a pending audio send stays bot-scoped after switching conversations and preserves newer drafts',async()=>{
+test('leaving an admitted audio send aborts local transport, reconciles saved audio and preserves other drafts',async()=>{
   const {fixture,context,page}=await connectedPage();let release;
   const gate=new Promise(resolve=>{release=resolve;});
   try{
@@ -110,67 +113,69 @@ test('a pending audio send stays bot-scoped after switching conversations and pr
     await page.route(`**/v1/bots/${BOT_A}/audio-messages`,async route=>{
       const body=route.request().postDataJSON();calls.submissions.push(body);
       const message=audioMessage({...body,status:'pending'});
-      fixture.state.messages.get(BOT_A).push(message);
+      fixture.state.messages.get(BOT_A).push(message); // durable before cancelled response
       await gate;
-      await route.fulfill({status:202,contentType:'application/json',body:JSON.stringify({message})});
+      await route.fulfill({status:202,contentType:'application/json',body:JSON.stringify({message})}).catch(()=>{});
     });
     await chooseTone(page);
     const submitted=page.waitForRequest(request=>request.method()==='POST'&&request.url().endsWith('/audio-messages'));
     await confirmSend(page);await submitted;
-    // Leaving the conversation unmounts its audio draft, not its pending send.
     await page.locator(`[data-bot-id="${BOT_B}"]`).click();await page.locator('#selected-name').filter({hasText:'Linus'}).waitFor();
     await page.locator('#message').fill('Independent text for Linus');await page.getByRole('button',{name:'Send message'}).click();
-    await page.locator('[data-message-id]').filter({hasText:'Independent text for Linus'}).waitFor();
-    await page.locator('#message').fill('Linus next draft');
-    await page.locator(`[data-bot-id="${BOT_A}"]`).click();await page.locator('#selected-name').filter({hasText:'Ada'}).waitFor();
-    await page.locator('#message').fill('Ada next draft');
-    assert.equal(await page.getByRole('button',{name:'Send message'}).isDisabled(),true);
-    assert.equal(await page.getByRole('button',{name:'Attach audio file'}).isDisabled(),true);
-    await page.locator('#message-form').dispatchEvent('submit');
-    assert.equal(calls.submissions.length,1,'returning to the bot cannot start a duplicate paid admission');
-    assert.equal(fixture.state.calls.filter(call=>call.method==='POST'&&call.path===`/v1/bots/${BOT_A}/messages`).length,0);
-    await page.locator(`[data-bot-id="${BOT_B}"]`).click();await page.locator('#selected-name').filter({hasText:'Linus'}).waitFor();
-    const completed=page.waitForResponse(response=>response.request().method()==='POST'&&response.url().endsWith('/audio-messages'));
-    release();await completed;
-    assert.equal(await page.locator('#message').inputValue(),'Linus next draft');
-    assert.equal(await page.locator('.timber-audio-message').count(),0,'late receipt never appears in another bot conversation');
+    await page.locator('[data-message-id]').filter({hasText:'Independent text for Linus'}).waitFor();await page.locator('#message').fill('Linus next draft');
+    release();
+    assert.equal(await page.locator('#message').inputValue(),'Linus next draft');assert.equal(await page.locator('.timber-audio-message').count(),0,'cancelled response never appears in another bot conversation');
     await page.locator(`[data-bot-id="${BOT_A}"]`).click();await page.locator('#selected-name').filter({hasText:'Ada'}).waitFor();
     await page.locator('.timber-audio-message[data-transcription-status="pending"]').waitFor();
-    assert.equal(await page.locator('#message').inputValue(),'Ada next draft');
-    assert.equal(await page.getByRole('button',{name:'Send message'}).isDisabled(),false);
-    assert.equal(calls.uploads.length,1);assert.equal(calls.submissions.length,1);
+    assert.equal(await page.locator('.timber-audio-draft').count(),0,'unmount discards local blob without cancelling a durable audio message');
+    await page.locator('#message').fill('Ada next draft');assert.equal(await page.locator('#message').inputValue(),'Ada next draft');
+    assert.equal(calls.uploads.length,1);assert.equal(calls.submissions.length,1,'navigation never automatically rePOSTs or retranscribes');
+    await page.locator(`[data-bot-id="${BOT_B}"]`).click();await page.locator('#selected-name').filter({hasText:'Linus'}).waitFor();assert.equal(await page.locator('#message').inputValue(),'Linus next draft');
   }finally{release();await context.close();await fixture.close();}
 });
 
-test('a pending paid retry remains fenced after its message is remounted',async()=>{
-  const {fixture,context,page}=await connectedPage();let release;
-  const gate=new Promise(resolve=>{release=resolve;});
+test('navigation aborts a paid retry transport without replaying its durable pending attempt or blocking text drafts',async()=>{
+  const {fixture,context,page}=await connectedPage();let release,markCommitted,markLateHandled;
+  const gate=new Promise(resolve=>{release=resolve;}),committed=new Promise(resolve=>{markCommitted=resolve;}),lateHandled=new Promise(resolve=>{markLateHandled=resolve;});
   try{
     const calls=await installAudioMocks(page);await chooseTone(page);await confirmSend(page);
     await page.locator('.timber-audio-message[data-transcription-status="failed"]').waitFor();
     const original=audioMessage({...calls.submissions[0]});fixture.state.messages.get(BOT_A).push(original);
+    const retryRequests=[];
+    page.on('request',request=>{if(request.url().includes(`/audio-messages/${original.audio.operationId}`))retryRequests.push({method:request.method(),url:request.url()});});
     await page.route(`**/v1/bots/${BOT_A}/audio-messages/*/retry`,async route=>{
-      const body=route.request().postDataJSON();calls.retries.push(body);await gate;
-      await route.fulfill({status:202,contentType:'application/json',body:JSON.stringify({message:original})});
+      const body=route.request().postDataJSON();calls.retries.push(body);
+      // Model the actual durable boundary: a new attempt can be committed before
+      // the owner navigates away and aborts receipt transport. Abort is not undo.
+      original.audio.transcription={attemptId:body.attemptId,status:'pending'};
+      markCommitted();await gate;
+      try{await route.fulfill({status:202,contentType:'application/json',body:JSON.stringify({message:original})});}catch{}finally{markLateHandled();}
     });
     await page.getByRole('button',{name:'Retry transcription'}).click();
     const submitted=page.waitForRequest(request=>request.method()==='POST'&&request.url().endsWith('/retry'));
-    await page.getByRole('dialog').getByRole('button',{name:'Confirm paid retry'}).click();await submitted;
-    await page.locator(`[data-bot-id="${BOT_B}"]`).click();await page.locator('#selected-name').filter({hasText:'Linus'}).waitFor();
-    await page.locator('#message').fill('Linus draft during Ada retry');
+    await page.getByRole('dialog').getByRole('button',{name:'Confirm paid retry'}).click();await submitted;await committed;
+    assert.equal(await page.getByRole('button',{name:'Retry transcription'}).isDisabled(),true,'the in-flight paid attempt is not repeatable before navigation');
+    const aborted=page.waitForEvent('requestfailed',{predicate:request=>request.method()==='POST'&&request.url().endsWith('/retry')});
+    await page.locator(`[data-bot-id="${BOT_B}"]`).click();const failedRequest=await aborted;
+    assert.match(failedRequest.failure()?.errorText||'',/abort|cancel/i,'navigation aborts the actual paid-retry fetch');
+    await page.locator('#selected-name').filter({hasText:'Linus'}).waitFor();await page.locator('#message').fill('Linus draft during Ada retry');
+    const canonical=page.waitForResponse(response=>response.request().method()==='GET'&&new URL(response.url()).pathname===`/v1/bots/${BOT_A}/messages`);
     await page.locator(`[data-bot-id="${BOT_A}"]`).click();await page.locator('#selected-name').filter({hasText:'Ada'}).waitFor();
-    const retry=page.getByRole('button',{name:'Retry transcription'});await retry.waitFor();
-    assert.equal(await retry.isDisabled(),true,'the bot-level fence survives the local retry state being unmounted');
-    await retry.evaluate(node=>node.click());
-    assert.equal(calls.retries.length,1,'no second paid attempt is dispatched');
-    await page.locator('#message').fill('Ada next draft during retry');
-    assert.equal(await page.getByRole('button',{name:'Send message'}).isDisabled(),true);
-    const completed=page.waitForResponse(response=>response.request().method()==='POST'&&response.url().endsWith('/retry'));
-    release();await completed;
-    await page.getByRole('button',{name:'Send message'}).waitFor();
-    await page.waitForFunction(()=>!document.querySelector('button[aria-label="Send message"]')?.disabled);
-    assert.equal(await page.locator('#message').inputValue(),'Ada next draft during retry');
-    assert.equal(calls.retries.length,1);assert.notEqual(calls.retries[0].attemptId,calls.submissions[0].attemptId);
+    const saved=(await(await canonical).json()).messages.find(message=>message.id===original.id);
+    assert.equal(saved.audio.transcription.status,'pending');assert.equal(saved.audio.transcription.attemptId,calls.retries[0].attemptId);assert.notEqual(saved.audio.transcription.attemptId,calls.submissions[0].attemptId);
+    await page.locator('.timber-audio-message[data-transcription-status="pending"]').waitFor();
+    assert.equal(await page.getByRole('button',{name:'Retry transcription'}).count(),0,'canonical pending transcription exposes no enabled or bypassable paid-retry control');
+    assert.equal(await page.getByRole('dialog').count(),0,'no stale paid-retry consent stays open after navigation');
+    await page.locator('#message').fill('Ada next draft during retry');assert.equal(await page.getByRole('button',{name:'Send message'}).isEnabled(),true,'transport cancellation releases text admission independently of pending transcription');
+    // Handle the late mock locally; an aborted fetch has no response to await.
+    release();await lateHandled;
+    assert.deepEqual(retryRequests,[{method:'POST',url:failedRequest.url()}],'abort never triggers automatic receipt GET, paid rePOST or follow-up request');
+    assert.equal(calls.retries.length,1);
+    await page.locator(`[data-bot-id="${BOT_B}"]`).click();await page.locator('#selected-name').filter({hasText:'Linus'}).waitFor();assert.equal(await page.locator('#message').inputValue(),'Linus draft during Ada retry');
+    await page.locator(`[data-bot-id="${BOT_A}"]`).click();await page.locator('#selected-name').filter({hasText:'Ada'}).waitFor();assert.equal(await page.locator('#message').inputValue(),'Ada next draft during retry');
+    assert.equal(await page.getByRole('button',{name:'Send message'}).isEnabled(),true);await page.getByRole('button',{name:'Send message'}).click();await page.locator('[data-message-id]').filter({hasText:'Ada next draft during retry'}).waitFor();
+    assert.equal(fixture.state.calls.filter(call=>call.method==='POST'&&call.path===`/v1/bots/${BOT_A}/messages`&&call.body.text==='Ada next draft during retry').length,1,'next text draft is submitted exactly once after cancellation');
+    assert.equal(calls.retries.length,1);assert.deepEqual(retryRequests,[{method:'POST',url:failedRequest.url()}],'subsequent navigation and text send never retranscribe or poll the aborted attempt');
   }finally{release();await context.close();await fixture.close();}
 });
 
@@ -265,4 +270,120 @@ test('real Chromium MediaRecorder WebM draft passes the shared server audio vali
     await page.evaluate(async()=>{try{window.__oscillator?.stop();}catch{}await window.__audioContext?.close();}).catch(()=>{});
     await context.close();await fixture.close();
   }
+});
+
+// Playwright WebKit does not intercept every native Blob PUT. Keep this tiny
+// raw-body HTTP adapter local to the native-engine tests: the shared fixture
+// intentionally parses its ordinary writes as JSON and is not an audio server.
+async function createNativePcmFixture(){
+  const fixture=await createConsoleFixture(),upstream=new URL(fixture.url),{validateAudio}=await sharedAudioValidator();
+  const calls={uploads:[],submissions:[],retries:[],downloads:[]},stored=new Map(),receipts=new Map(),failures=[];
+  const prefix=`/v1/bots/${BOT_A}`,server=createServer(async(request,response)=>{
+    const path=new URL(request.url,'http://native-pcm-fixture').pathname;
+    const uploadMatch=path.match(new RegExp(`^${prefix}/audio/([^/]+)$`)),receiptMatch=path.match(new RegExp(`^${prefix}/audio-messages/([^/]+)$`)),artifactMatch=path.match(new RegExp(`^${prefix}/artifacts/([^/]+)$`));
+    if(!uploadMatch&&!receiptMatch&&!artifactMatch&&path!==`${prefix}/audio-messages`){
+      const forwarded=httpRequest(new URL(request.url,upstream),{method:request.method,headers:{...request.headers,host:upstream.host}},upstreamResponse=>{response.writeHead(upstreamResponse.statusCode,upstreamResponse.headers);upstreamResponse.pipe(response);});
+      forwarded.on('error',error=>{if(!response.headersSent)response.writeHead(502);response.end();failures.push(String(error));});response.on('close',()=>forwarded.destroy());request.pipe(forwarded);return;
+    }
+    const json=(body,status=200)=>{response.writeHead(status,{'content-type':'application/json','cache-control':'no-store'}).end(JSON.stringify(body));};
+    try{
+      const session=/(?:^|;\s*)timber_fixture_session=([^;]+)/.exec(request.headers.cookie||'')?.[1];
+      if(!fixture.state.sessions.has(session)||request.headers['x-timber-client']!=='console'||request.headers.authorization)return json({},401);
+      if(receiptMatch)return request.method==='GET'?(receipts.has(receiptMatch[1])?json(receipts.get(receiptMatch[1])):json({},404)):json({},405);
+      if(artifactMatch){const original=stored.get(artifactMatch[1]);if(!original)return json({},404);calls.downloads.push(path);response.writeHead(200,{'content-type':'audio/wav','cache-control':'private, no-store'}).end(original.body);return;}
+      if(uploadMatch&&request.method!=='PUT')return json({},405);
+      if(!uploadMatch&&request.method!=='POST')return json({},405);
+      const chunks=[];let byteCount=0;
+      for await(const chunk of request){byteCount+=chunk.length;if(byteCount<=20_000_000)chunks.push(chunk);}
+      if(byteCount>20_000_000)return json({},413);
+      const bytes=Buffer.concat(chunks);
+      if(uploadMatch){
+        const contentType=request.headers['content-type'];if(contentType!=='audio/wav')return json({},415);
+        const metadata=validateAudio(new Uint8Array(bytes),contentType);stored.set(uploadMatch[1],{body:bytes,metadata});
+        calls.uploads.push({url:path,bodySize:bytes.length,contentType,body:bytes});return json({audio:{id:uploadMatch[1]}},201);
+      }
+      const body=JSON.parse(bytes.toString('utf8')),original=stored.get(body.audioId);if(!original)return json({},404);
+      calls.submissions.push(body);
+      const message=audioMessage({...body,status:'pending'});message.audio={...message.audio,size:original.body.length,durationMs:original.metadata.durationMs};
+      const receipt={message};receipts.set(body.operationId,receipt);fixture.state.messages.get(BOT_A).push(message);return json(receipt,202);
+    }catch(error){failures.push(String(error));return json({},500);}
+  });
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  return{...fixture,url:`http://127.0.0.1:${server.address().port}/console/`,audioCalls:calls,audioFailures:failures,close:async()=>{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));await fixture.close();}};
+}
+
+// These tests run the engine's real Web Audio graph and PCM encoder with a
+// synthetic sine stream at the permission boundary. They do NOT claim OS mic
+// permission, physical iPhone/Safari hardware, or paid transcription coverage.
+for(const engine of ['chromium','webkit'])test(`real ${engine} Web Audio PCM fallback validates, plays, seeks and uploads only after review (synthetic mic)`,{skip:engine==='webkit'&&!existsSync(process.env.CONSOLE_WEBKIT_PATH||webkit.executablePath())?'WebKit executable not installed; Chromium native Web Audio + MP4-only capability mocks cover fallback, not Safari hardware':false},async()=>{
+  const nativePcmMic=()=>{
+    window.__micCalls=0;window.__mp4RecorderCalls=0;window.__recordingStream=null;
+    const Context=window.AudioContext||window.webkitAudioContext;
+    // Force the negotiation outcome of Safari releases that offer only MP4.
+    window.MediaRecorder=class{static isTypeSupported=type=>type==='audio/mp4';constructor(){window.__mp4RecorderCalls++;throw new Error('MP4 output is outside the upload contract');}};
+    const NativeFile=window.File;window.File=class extends NativeFile{constructor(...args){super(...args);if(String(args[1]).startsWith('Recording-')&&String(args[1]).endsWith('.wav'))window.__actualPcmFile=this;}};
+    Object.defineProperty(navigator,'mediaDevices',{configurable:true,value:{getUserMedia:async constraints=>{
+      window.__micCalls++;if(!constraints?.audio||constraints.video!==false)throw new Error('Expected audio-only capture');
+      const context=new Context();await context.resume();const destination=context.createMediaStreamDestination(),oscillator=context.createOscillator();
+      oscillator.frequency.value=440;oscillator.connect(destination);oscillator.start();window.__sourceContext=context;window.__oscillator=oscillator;window.__recordingStream=destination.stream;return destination.stream;
+    }}});
+  };
+  const browser=engine==='webkit'?await webkit.launch({headless:true,...(process.env.CONSOLE_WEBKIT_PATH?{executablePath:process.env.CONSOLE_WEBKIT_PATH}:{})}):undefined;
+  const nativeFixture=await createNativePcmFixture();
+  const{fixture,context,page}=await connectedPage({browser,initScript:nativePcmMic,fixture:nativeFixture});
+  const audioTraffic=[],browserErrors=[];
+  page.on('request',request=>{if(request.url().includes('/audio'))audioTraffic.push({event:'request',method:request.method(),path:new URL(request.url()).pathname});});
+  page.on('response',response=>{if(response.url().includes('/audio'))audioTraffic.push({event:'response',method:response.request().method(),path:new URL(response.url()).pathname,status:response.status()});});
+  page.on('requestfailed',request=>{if(request.url().includes('/audio'))audioTraffic.push({event:'failed',method:request.method(),path:new URL(request.url()).pathname,error:request.failure()?.errorText});});
+  page.on('pageerror',error=>browserErrors.push(error.message));
+  try{
+    const calls=fixture.audioCalls;
+    assert.equal(await page.evaluate(()=>window.__micCalls),0);await page.getByRole('button',{name:'Start recording audio'}).click();await page.getByRole('button',{name:'Stop recording'}).waitFor();
+    await page.waitForTimeout(900);await page.getByRole('button',{name:'Stop recording'}).click();await page.locator('.timber-audio-draft').waitFor();
+    assert.equal(await page.evaluate(()=>window.__mp4RecorderCalls),0);assert.match(await page.locator('.timber-audio-draft').innerText(),/Recording-.*\.wav/);
+    const exactClip=Buffer.from(await page.evaluate(async()=>{const bytes=new Uint8Array(await window.__actualPcmFile.arrayBuffer());return btoa(Array.from(bytes,byte=>String.fromCharCode(byte)).join(''));}),'base64');
+    const{validateAudio}=await sharedAudioValidator(),metadata=validateAudio(new Uint8Array(exactClip),'audio/wav');
+    assert.equal(metadata.mimeType,'audio/wav');assert.ok(metadata.durationMs>=400&&metadata.durationMs<=5000,`native PCM duration ${metadata.durationMs}ms is plausible`);assert.ok(exactClip.length<=20_000_000);
+    assert.ok(await page.evaluate(()=>window.__recordingStream.getTracks().every(track=>track.readyState==='ended')),'native capture tracks ended immediately after Stop');
+    const player=page.locator('.timber-audio-draft .timber-audio-player');await page.waitForFunction(()=>document.querySelector('.timber-audio-draft .timber-audio-player')?.dataset.waveform==='decoded');
+    assert.ok(await player.locator('.timber-audio-wave i').evaluateAll(nodes=>nodes.some(node=>parseFloat(node.style.height)>0)),'native captured samples produce actual waveform peaks');
+    await player.getByRole('button',{name:'Play audio'}).click();await player.getByRole('button',{name:'Pause audio'}).waitFor();await player.getByRole('slider',{name:'Seek audio'}).fill('0.3');
+    assert.ok(await page.locator('.timber-audio-draft audio').evaluate(audio=>audio.currentTime>=0.25));await player.getByRole('button',{name:'Pause audio'}).click();assert.equal(await page.locator('.timber-audio-draft audio').evaluate(audio=>audio.paused),true);
+    assert.equal(calls.uploads.length,0);assert.equal(calls.submissions.length,0);await page.getByRole('button',{name:'Review & send'}).click();await page.getByRole('dialog').waitFor();assert.equal(calls.uploads.length,0,'even native PCM remains local before consent');
+    await page.getByRole('dialog').getByRole('button',{name:'Send audio'}).click();
+    try{await page.locator('.timber-audio-message[data-transcription-status="pending"]').waitFor();}
+    catch(error){
+      // Preserve the original assertion and deadline; diagnose the failed engine
+      // without recording credentials, binary payloads or adding network work.
+      try{
+        const diagnostics={engine,version:page.context().browser().version(),audioTraffic,browserErrors,fixtureFailures:fixture.state.failures,audioFailures:fixture.audioFailures,uploads:calls.uploads.map(({bodySize,contentType})=>({bodySize,contentType})),submissions:calls.submissions,state:await page.evaluate(()=>({
+          abortSignalAny:typeof AbortSignal.any,visibility:document.visibilityState,hash:location.hash,
+          pcmFile:{size:window.__actualPcmFile?.size,type:window.__actualPcmFile?.type,isBlob:window.__actualPcmFile instanceof Blob},
+          composer:document.querySelector('.timber-audio-composer')?.innerText,appError:document.querySelector('#app-error')?.textContent,
+          messageStatuses:Array.from(document.querySelectorAll('.timber-audio-message'),node=>node.dataset.transcriptionStatus),
+        }))};
+        const diagnosticPath=`/tmp/timber-voice-${engine}-pcm-send-failure-${process.pid}.json`;await writeFile(diagnosticPath,JSON.stringify(diagnostics,null,2));console.error(`Native PCM send diagnostics: ${diagnosticPath}\n${JSON.stringify(diagnostics,null,2)}`);
+      }catch(diagnosticError){console.error('Native PCM diagnostics could not be collected:',diagnosticError.message);}
+      throw error;
+    }
+    assert.equal(calls.uploads.length,1);assert.equal(calls.submissions.length,1);assert.deepEqual(calls.uploads[0].body,exactClip);assert.equal(calls.uploads[0].contentType,'audio/wav');assert.equal(await page.evaluate(()=>window.__micCalls),1);assert.deepEqual(fixture.audioFailures,[]);assert.deepEqual(fixture.state.failures,[],'native binary writes never reach the JSON-only shared fixture');
+  }finally{await page.evaluate(async()=>{try{window.__oscillator?.stop();}catch{}await window.__sourceContext?.close();}).catch(()=>{});await context.close();await fixture.close();await browser?.close();}
+});
+
+test('Cancel audio aborts an in-flight upload without automatic admission and retains stable draft ids',async()=>{
+  const{fixture,context,page}=await connectedPage();let release;const gate=new Promise(resolve=>{release=resolve;});
+  try{
+    const calls=await installAudioMocks(page),uploadIds=[];
+    await page.route(`**/v1/bots/${BOT_A}/audio/*`,async route=>{
+      if(route.request().method()!=='PUT')return route.fulfill({status:404,contentType:'application/json',body:'{}'});
+      uploadIds.push(route.request().url().split('/').at(-1));if(uploadIds.length===1)await gate;
+      await route.fulfill({status:201,contentType:'application/json',body:'{"audio":{}}'}).catch(()=>{});
+    });
+    await chooseTone(page);const uploading=page.waitForRequest(request=>request.method()==='PUT'&&request.url().includes('/audio/'));await confirmSend(page);await uploading;
+    const cancel=page.getByRole('button',{name:'Cancel audio'});assert.equal(await cancel.isEnabled(),true,'upload can be cancelled while busy');await cancel.click();
+    await page.locator('.timber-audio-error').filter({hasText:'status may be unknown'}).waitFor();assert.equal(calls.submissions.length,0,'aborted upload cannot flow into an automatic paid POST');assert.equal(await page.locator('.timber-audio-draft').count(),1,'cancelled send keeps local audio for an inspected explicit retry');
+    release();await page.waitForFunction(()=>!document.querySelector('.timber-audio-draft-actions button:last-child')?.disabled);
+    await confirmSend(page);await page.locator('.timber-audio-message[data-transcription-status="failed"]').waitFor();
+    assert.equal(uploadIds.length,2);assert.equal(uploadIds[0],uploadIds[1],'explicit retry reuses the same immutable audio id');assert.equal(calls.submissions.length,1);
+  }finally{release();await context.close();await fixture.close();}
 });

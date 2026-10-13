@@ -36,7 +36,11 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
 - GET /v1/keychain -> {entries:SecretMetadata[],requests:SecureInputRequest[]}.
   The keychain belongs to the authenticated owner, independently of bots. Metadata
   includes names, approved destinations, revisions, timestamps and permitted
-  botIds. There is no endpoint for reading a private value. The bot-context alias
+  botIds. Owner metadata and list_secrets verify the same signed grant identity
+  and format, and fence changes after awaited verification. Invalid grants are
+  not advertised as access; the owner still sees the saved entry. Listing does
+  not decrypt values or change grants. There is no endpoint for reading a private
+  value. The bot-context alias
   /v1/bots/:id/keychain returns the same owner entries and that bot's requests.
 - POST /v1/keychain {operationId,entries:[{value,name?,origin?,header?,prefix?,id?,expectedRevision?}],requestId?}
   -> {entries:SecretMetadata[]}. Accepts one to four opaque private text values,
@@ -56,6 +60,16 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   admission and checks the original run/native-operation fence. A stopped request
   cannot resume. If Stop races an already committed save, the owner's saved input
   remains but the bot stays stopped. Continuations contain references only.
+- PATCH /v1/keychain/:secretId {name,expectedRevision,operationId}
+  -> {entries:SecretMetadata[]}. Rename an existing input without resubmitting or
+  revealing its value. Names are nonempty single-line labels up to 80 characters.
+  The encrypted value is re-bound to the new name and revision atomically with a
+  durable receipt. IDs, approved destinations and bot grants stay unchanged.
+  Stale revisions, revocation and conflicting operation retries are rejected.
+  The route also has a /v1/bots/:id/keychain/:secretId alias.
+  The name_secret tool can name a permitted input still called "Private input",
+  using the conversation's context; it preserves every existing nondefault name.
+  It requires a live named-bot run and rechecks permission before committing.
 - POST /v1/keychain/:secretId/permissions {botId,allowed:boolean}
   -> {entries:SecretMetadata[]}. Only the authenticated owner can grant or revoke
   bot access. The target must be a live registered bot. Grants are signed and
@@ -92,21 +106,29 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   R2 checkpoints, API responses or operation journals. BotDO stores only request
   metadata; the host's internal check/resume routes are blocked at the gateway.
 
-  Host tools request_secret, configure_secret, list_secrets and secret_request
+  Host tools request_secret, configure_secret, name_secret, list_secrets and secret_request
   work with public references only. request_secret is a durable pending_connection
   wait with provider keychain. list_secrets returns only permitted entries;
   temporary subagents must ask their parent to perform authenticated work.
-  secret_request accepts single-line ASCII header values up to 8192 characters,
-  injects one header at the approved origin, accepts bounded public API headers
-  that cannot override authentication, disallows redirects and journals dispatch
-  before network I/O. A recovered or uncertain call is never sent again
-  automatically. The host checks task liveness, permission and revocation before
-  dispatch. Only bounded response text is returned; exact, URL/base64/JSON-encoded
-  echoes and common JSON credential fields are redacted. Provider exceptions and
-  redirect bodies are hidden. This filter is defense in depth, not a guarantee
-  against a malicious authorized service encoding data in an arbitrary form.
-  This API supports header credentials, not browser-password filling, generated
-  .env files, shell injection or app-wide provider billing configuration.
+  secret_request accepts a required `secretId` and up to three distinct
+  `additionalSecretIds` (four references total), each already permitted to this
+  bot and configured for the exact same HTTPS origin. Every reference is checked
+  for permission, signed grant epoch, revision, envelope and valid header value
+  before dispatch; all saved headers/prefixes are injected independently. Managed
+  headers must be unique case-insensitively, and public headers are rejected if
+  they collide with any managed authentication header or protected transport
+  headers. Inputs, public headers, body and response are bounded. Redirects are
+  never followed. A keyed operation fingerprint (including reference IDs and
+  public request data, never plaintext) is journaled before network I/O. A
+  recovered or uncertain call is never sent again automatically. The host checks
+  task liveness, permission and revocation for every reference immediately before
+  dispatch. Only bounded response text is returned; each secret, its configured
+  header value/prefix, and common URL/base64/JSON-escaped variants plus common
+  JSON credential fields are redacted. Provider exceptions and redirect bodies
+  are hidden. This filter is defense in depth, not a guarantee against a malicious
+  authorized service encoding data in an arbitrary form. This API supports HTTP
+  header credentials, not browser-password filling, generated .env files, shell
+  injection or app-wide provider billing configuration.
 
   The console offers Add → Secure input and Secure input in the @ dropdown.
   The locked pill shows the value while its field is focused, growing to a bounded
@@ -114,7 +136,9 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   the pill contracts to six centered dots, with no reveal control. Selected existing text
   can be converted directly with Make selection secure (or Add → Secure input).
   Owners write around pills, insert multiple inputs and reuse entries from their
-  shared Keychain. The keychain lets them grant/revoke bots, replace a value or
+  shared Keychain. Names can be edited directly in Keychain; unnamed entries are
+  named proactively by the agent when their purpose is clear from the conversation.
+  The keychain lets owners grant/revoke bots, replace a value or
   explicitly remove it for all bots. Internal [private:UUID] references are rendered
   as locked dots in composer and transcript. Unsaved placeholders cannot be sent
   to the backend. The agent prepares credential format from surrounding text.
@@ -152,7 +176,12 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   and cached-input tokens. ChatGPT entries show subscription allowance separately
   from conditional paid fallback rates. Missing prices are unknown, never zero;
   Fast does not inherit standard-tier prices as a Fast quote. The selected model
-  shows the complete ordered billing routes and settings-incompatible fallbacks.
+  uses compact model rows with aligned input/output prices and one unit legend.
+  IDs are available as row titles rather than repeated beneath the name. Reasoning
+  and Fast stay in the selected-model footer; a collapsed inline “Usage & prices”
+  table exposes cached-input rates, ordered billing routes and incompatible
+  fallbacks without opening another popover. Only the model list scrolls during
+  comparison, leaving the settings in view.
   Image-avatar API billing stays separate and has no inferred token price.
 - GET /v1/bots -> {bots:Bot[]}
 - POST /v1/bots {name,instructions?,model?,reasoningEffort?,fast?,computerApprovalMode?,allowNamedAgents?,allowTaskCreation?} -> 201 {bot:Bot}
@@ -176,6 +205,10 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   read the next older page; null means no older page remains. Stable SQLite rowid
   pagination preserves older page boundaries while new messages arrive and does
   not depend on timestamps. No messages are deleted by context compaction.
+  The console initially reads at most 100 messages. Older pages load one at a
+  time on an explicit upward reading gesture or the earlier-history control;
+  opening, refreshing or returning to a tab never drains the archive. Already
+  loaded pages retain chronological order, copy and browser find behavior.
   Assistant messages may carry `kind: "progress" | "final"`. Progress is public
   assistant commentary accompanying native tool calls; it is durably deduplicated
   by its native message identity. Final answers are deduplicated by their native
@@ -197,6 +230,18 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   and consistent with encoded audio. Audio downloads recheck live membership
   after the R2 lookup before returning bytes. See [audio-messages.md](audio-messages.md) for the
   intentionally limited codec/container subset and provider billing.
+- DELETE /v1/bots/:id/audio/:audioId discards an unreferenced draft upload.
+  A durable tombstone fences late uploads/admissions under that identity; already
+  referenced originals return 409 and remain playable. Pending upload candidates
+  are journaled before R2 writes. Unreferenced uploads expire after 24 hours and
+  are cleaned in bounded recoverable batches; expiry also fences new admission.
+  Artifact reads reject discarded identities even if an uncertain late R2 write
+  exists. Non-audio artifact conflicts never delete those artifacts or keep a
+  perpetual cleanup wake.
+  Cancellation of an HTTP request does not prove whether durable admission
+  happened. The console aborts remaining stages, preserves a mounted draft and
+  stable IDs, and inspects the operation receipt on explicit send retry.
+  No cancelled request silently creates another operation or paid attempt.
 - POST /v1/bots/:id/audio-messages `{audioId,operationId,attemptId}` -> 202
   `{message,transcription,run?}`. All three IDs are UUIDs. The original audio
   message is durable before transcription; repeated identical requests return its
@@ -316,6 +361,20 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
 - POST /v1/bots/:id/runs/:runId/cancel -> {run:Run}
 - GET /v1/bots/:id/events?after=cursor -> SSE id, event=event, JSON BotEvent.
   Reconnect fetches durable events >cursor; no credentials in URL.
+  Optional `tail=1..100` applies only to an initial `after=0` connection. It
+  replays that many newest events chronologically, then a synthetic
+  `stream.snapshot` with `latestEventId`, complete active `partials`,
+  `historyTruncated` and an older-history `nextCursor`. This snapshot has no SSE
+  id and does not create a durable event. Clients replace partials at its cursor
+  boundary before appending later deltas. Reconnects retain exact after-cursor
+  semantics. SSE pumps bound each queued chunk to 128 KiB, except a single
+  intact larger event, rather than batching many large outputs into one buffer.
+  `GET /events?format=json&limit=1..100&before=<positive cursor>` returns
+  `{events,nextCursor}` with a newest-first page delivered in chronological
+  order. Optional `view=activity` uses an indexed filter for task updates,
+  tools, processes, retries, failures and Stop, excluding text deltas. The
+  default JSON view retains every event type. Invalid views, limits or cursors
+  return 400; both views preserve owner/conversation isolation and full archives.
   Tool completion events can include both `operationId` (stable computer effect
   identity) and `toolCallId` (native call identity). Clients merge these explicit
   aliases for display; neither identical command text nor event names prove
@@ -339,10 +398,20 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
   operation identity. File bodies and typed text are omitted; common command
   credential forms and URL credentials/query values are masked. This summary is
   presentation data and is never used to execute or retry an action.
-  The console renders started/completed events directly in both the conversation
+  The console renders started/completed events directly in their conversation
   and Activity, independent of transcript refresh. Command/parameters, status
   and a bounded output/error preview remain visible with details closed. Streaming
   text does not evict tool records from the separate bounded activity history.
+  Substantial work handed to a global task renders only a linked status pill in
+  the originating chat; its command activity remains in the task conversation.
+  Large code/output previews use a plain code node rather than thousands of
+  syntax spans. Messages above 256 KiB retain their exact text as plain text;
+  copying preserves the complete original Markdown, outputs and line endings.
+  Diagnostic JSON renders only when its disclosure is opened.
+  A private-input save masks its field immediately and moves the caret after the
+  pending pill. On acknowledgement only that pill is replaced, preserving newer
+  public draft text, selection and focus. Removing it, changing bots or opening
+  another control during the save never reinstates it or steals focus.
   The conversation header represents active work only. Terminal failures and
   cancellation appear once after that task's activity; they do not label the bot
   or the entire conversation. Continue submits a new explicit request using the
@@ -387,27 +456,57 @@ JSON dates are ISO8601; camelCase fields; errors {error:{code,message}}.
 - GET /v1/bots/:id/artifacts/:artifactId -> authenticated bytes. All file access
   scoped to bot prefix. Generated HTML/SVG are attachments, never same-origin code.
 
+## Secure Worker deployment
+
+The owner-managed `/v1/keychain/deploy-plans` API pins bot, repository/commit metadata, a relative `artifactPath`, exact SHA-256 bundle digest, Cloudflare account/Worker destination and one permitted bearer credential reference or the legacy key/email pair at exact revisions. `secure_worker_deploy` accepts only `{planId,expectedRevision}`. v1 deploys only an already-bundled JavaScript Worker module; it does not run repo build hooks/scripts, arbitrary Wrangler config/plugins/arguments, non-JS assets, Timber infrastructure or the production deployment pipeline. The ComputerProvider has a dedicated private deploy method, not a generic `ComputerAction` or shell path. It submits a short-lived signed metadata-only authorization and reference-bound credentials to the bot's ComputerDO private route. After any container startup await, ComputerDO asks the owner WorkspaceDO to verify that signed authorization against the live plan, grants, reference revisions and original run/native Stop fence; it then forwards to the private container channel without another await. The internal authority route is blocked at the public API gateway. Credential decryption happens only in a scoped callback just before that request; values never enter generic exec, storage, journal, transcript, events or logs. The trusted root controller snapshots the bounded regular workspace artifact, checks its digest, then sends that exact artifact and allowlisted auth values to a dedicated isolated deploy UID; ordinary workspace shell/PTY/browser processes cannot inspect its environment. A synthetic cross-UID process-environment canary gates readiness; an owner-only `/v1/keychain/deploy-capabilities?botId=...` reports the actual Computer image result without credentials. Durable operation reservations, owner/run/Stop/revision fences, one dispatch and uncertain-no-retry recovery apply. See [secure-deploy.md](secure-deploy.md); rollout and live validation remain separate.
+
 ## Global tasks
 
 Tasks are owner-scoped records in WorkspaceDO. `GET /v1/tasks` is passive;
 `POST /v1/tasks` accepts `{operationId,title,description,botId,startImmediately?}`
 and returns `{task}` (201 for a new task; an identical idempotent replay returns
 200). `startImmediately` defaults to true; false leaves the task pending.
-`GET /v1/tasks/:id` returns task metadata. Task conversation data lives in a
+`GET /v1/tasks/:id` returns task metadata. Task list/detail reads include an
+ephemeral `queue` for queued tasks: `reason` is `task`, `bot`, `direct_action`,
+`starting` or `scheduled`. A task holder includes `blockingTask {id,title}` from
+the same assigned bot. This read-only lease observation does not start work or
+release reservations; it is omitted for nonqueued tasks and never persisted.
+The console shows the wait reason and links to the blocking task. Tasks still
+share their assigned bot's computer and execute one at a time.
+`GET /v1/tasks/:id/progress`
+returns a read-only snapshot: observation time, last recorded activity, elapsed
+inactivity, pending native tools/generations/compaction, recent public command
+activity and errors, plus conversation messages (`limit` 1–20, default 10;
+`before`/`nextCursor` page older messages). Message text is capped at 4,000
+characters and marked `truncated` when applicable; full text remains available
+through `/messages`. `no_recent_activity` means at least five minutes without
+recorded activity, not a claim that work failed. A read does not submit input,
+restart tasks or take a computer lease. Native prompts and tool arguments are
+not returned.
+
+The host tools `list_tasks {before?}` (30 per page) and
+`inspect_task {taskId,before?,limit?}` are available to computerless coordinators.
+`message_task {taskId,text}` lets the named parent send steering to those tasks, including durable messages while queued, or explicitly continue completed/failed work. It freezes message-versus-continuation routing before dispatch, so a lost acknowledgment cannot create a second continuation. Temporary agents and other task conversations cannot invoke it; cancelled tasks remain fenced.
+They resolve only tasks assigned to the calling bot and remain usable without
+`allowTaskCreation`. Task conversation text is collaborator data, not new
+instructions or authorization.
+
+Task conversation data lives in a
 separate durable BotDO identity keyed by owner and task ID, initialized from the
 assigned bot's current configuration; the BotDO retains the assigned bot's
 computer/workspace identity, so no second computer is created. The task has its
 own transcript and run/event IDs.
 
 `POST /v1/tasks/:id/start` admits the description under stable operation ID
-`task-start:<taskId>`. `POST /v1/tasks/:id/messages`, `GET /messages`, `GET
+`task-start:<taskId>`. Queued task chats accept messages into the durable bounded inbox without claiming the computer. Only the original start/continuation input can enter Pi while the task is queued; saved messages follow once it starts. Unadmitted messages cannot prevent the scheduler from starting that original input. Expected contention does not consume delivery retry attempts.
+`POST /v1/tasks/:id/messages`, `GET /messages`, `GET
 /runs`, and `GET /events` expose the task conversation. `POST /continue {operationId,text}` explicitly continues a completed or failed task in the same chat with a newly generated native input ID, never by replaying `task-start` or old computer actions. Identical continuation receipts deduplicate; different instructions under the same ID conflict. `POST /cancel` cancels its
 active runs and permanently fences subsequent starts and continuations. Cancelled tasks cannot Continue in this version; create a new task. Task-scoped `/approvals`,
 `/approvals/:approvalId`, `/agents`, `/agents/:agentId/messages`,
 `/agents/:agentId/cancel`, `/runs/:runId`, `/runs/:runId/cancel` and `/connections`
 reuse the isolated conversation’s decision/run APIs; decisions are never applied
 to the assigned bot’s ordinary chat. A per-assigned-bot durable slot blocks
-task starts while the ordinary bot has an active run; ordinary bot messages are durably receipted in the existing bounded backlog while a task holds the slot, but cannot enter Pi until their conversation atomically acquires an `@bot` execution lease. Expected contention uses the existing Lifecycle capacity wake without consuming delivery-failure attempts. Unadmitted backlog alone never prevents a future lease. Owner direct mutations retain exact validated queued intentions and return explicit 202 queued receipts; no task chat is admitted as ordinary bot steering while the shared computer is occupied. Other tasks remain durably `queued` and are admitted FIFO by the WorkspaceDO alarm
+task starts while the ordinary bot has an active run; ordinary bot messages are durably receipted in the existing bounded backlog while a task holds the slot, and ordinary computer-capable runs cannot enter Pi until their conversation atomically acquires an `@bot` execution lease. Task-enabled main chat can enter the computerless coordinator mode below without claiming that slot. Expected contention uses the existing Lifecycle capacity wake without consuming delivery-failure attempts. Unadmitted backlog alone never prevents a future lease. Owner direct mutations retain exact validated queued intentions and return explicit 202 queued receipts; no task chat is admitted as ordinary bot steering while the shared computer is occupied. Other tasks remain durably `queued` and are admitted FIFO by the WorkspaceDO alarm
 once run and managed-process termination is confirmed. No browser polling is
 needed to release an idle lease or start queued tasks. Snapshot-based release is
 fenced by lease token/generation, pending admissions, unacknowledged native
@@ -426,6 +525,56 @@ host run; model-supplied source IDs are ignored. Bot-created tasks accept `start
 behind their creating conversation and start through the durable scheduler when
 its shared computer is idle; false explicitly saves a pending task. Task list pagination, reassignment, and task
 user-deletion are not available.
+
+When allowed, the agent uses `create_task` for substantial multi-step work,
+finishes its brief handoff to release the shared computer, and keeps short
+answers in the main chat. Task runtimes are told to execute their assigned work
+rather than recursively handing it off. New console-created bots default to
+allowing task creation; existing explicit permissions remain unchanged.
+Bot-created tasks persist `sourceRunId`, optional `sourceTaskId`, and a monotonic
+`statusVersion`. A durable FIFO outbox sends `task.updated {task,notificationId}`
+to the originating bot or task conversation on real state changes. Exact IDs
+deduplicate notifications across retries and eviction. A terminal outcome can
+append one attributed assistant result without starting another inference run;
+a cancelled originating run never receives an implicit continuation.
+
+While a task owns its bot's computer slot, an allowed bot's new ordinary input
+can be admitted as a persisted `Run.coordinatorMode` turn. It may answer,
+inspect allowlisted metadata and create another task, but computer tools and
+service mutations fail before any effect. These turns do not claim/release the
+task's lease or count as computer execution holders. Their Stop fences their own
+work without cancelling the independent task. Ordinary execution admission and
+all task/computer effects retain exact lease fencing.
+
+The console's main segmented Bots/Tasks selector swaps the same list area and
+matching row presentation. Tasks have deep links `#tasks&task=<id>` and mount the
+same conversation/composer components as bot chat, including inline approvals,
+command activity, failures, image messages and task-scoped agent dialogs. The
+compact task state occupies the conversation-header status area; description,
+assignment, timestamps and pending Start stay behind the Task details button.
+Task chat has bounded history pages and live SSE. Archive pages merge with
+recent activity, and retries preserve each original message's receipt identity.
+Hidden task views stop polling and streaming. The parent chat restores the latest
+status pills from the passive registry and ignores stale status versions.
+
+Task conversations expose the same context and individual-memory routes under
+`/v1/tasks/:id/context` and `/v1/tasks/:id/memory`; these operate on the isolated
+task runtime, never the assigned bot's ordinary context or notes. Model selection
+continues to inherit the assigned bot's settings. Images upload and download
+through that bot's existing artifact routes; task messages validate the same
+image ownership and input limits. Explicit task continuation retains validated
+image IDs or mentions in its durable queued input and operation fingerprint;
+text-only receipts keep their prior fingerprint. As in ordinary chat, a single
+input cannot combine images and mentions. Delegation results return to the exact
+originating task conversation, with the existing cancellation fences.
+
+The `/v1/tasks/:id/keychain` aliases retain the owner's encrypted keychain and
+assigned-bot grants, while listing and fulfilling requests for that task only.
+Secure request receipts and GitHub consent flows carry an optional host-assigned
+`taskId`; check, resume and callback delivery validate the assigned bot and address
+that task's Durable Object. Legacy receipts without a task ID address ordinary
+bot chat. A sibling task cannot fulfill a request through its alias, and Stop,
+revocation and original run/native-operation checks still fence continuation.
 
 ## Console sessions
 The cookie `__Host-timber_session` is Secure, HttpOnly, SameSite=Strict, host-only
@@ -575,6 +724,16 @@ screenshot, click, move, doubleClick, drag, type, key, scroll, navigate, checkpo
 Cloud provider and ComputerDO concrete implementation live under packages/computer. Container HTTP
 server and image live in infra/computer. Agree export names with API agent.
 
+ComputerDO stores compact durable work indexes alongside operation and exec
+receipts. Recovery, active-execution checks and checkpoint maintenance read
+unresolved work instead of hydrating all historical command outputs. Legacy
+journals migrate in pages of 32 with storage caching disabled. Each page saves
+its migration phase/cursor atomically so interrupted startup resumes without
+reading already indexed pages. Operation IDs,
+full outputs and saved checkpoint receipts remain intact. Bot recovery likewise
+uses indexed active approval queries, and cancellation traverses only the
+selected run's descendants rather than parsing the complete run archive.
+
 Mouse coordinates are integers in the 1280×800 desktop. `move` positions the pointer
 without clicking; `doubleClick` sends two clicks 100 ms apart. `drag` holds the chosen
 button from `{fromX,fromY}` to `{toX,toY}` over `durationMs` (100–2000, default 500),
@@ -584,13 +743,28 @@ images reject before journaling and never report a simulated result. They share
 the usual GUI approval policy and human-control exclusion. Pi exposes
 `desktop_move`, `desktop_double_click` and `desktop_drag`.
 
+The secure Computer image runs generic shell/PTY/desktop operations as UID 10001,
+not root. Project dependencies/tools (npm and Python virtual environments/pip)
+remain installable under the current host approval policy; system packages are
+installed by the image build, never by regaining root from a workspace shell.
+The shipped image includes Node/npm, Python, virtual environments/pip, ripgrep,
+jq and patch. Shared development VMs may still run as root, but must report
+private credential execution unsupported. Python packages should use a virtual
+environment; dependency directories and caches are not durable workspace
+checkpoints, keeping project setup reproducible.
+
+
 Pi `exec {command,timeoutMs?,yieldMs?}` starts a managed process with no default
-execution deadline. `timeoutMs`, when explicitly supplied, is a positive safe
+execution deadline. Pi accepts an omitted or `null` timeout, normalized to no
+host deadline. Its provider-visible schema explicitly includes `null`, so a
+provider requiring every property does not force the model to invent a number.
+`timeoutMs`, when explicitly supplied as a number, is a positive safe
 integer; there is no 120-second maximum. Its expiry terminates the process group
 and retains output and the terminal outcome. `yieldMs` is an integer from 0 to
-30,000, default 1,000; it limits how long a request waits for output and never
-terminates a process. These values have the same meaning for direct computer API
-clients and Pi tools.
+30,000; it limits how long a request waits for output and never terminates a
+process. Pi waits 10,000 ms by default (also for `null`) to reduce unnecessary
+model/poll round trips; direct computer API clients retain their 1,000 ms default.
+The host still receives only validated integers and an absent deadline.
 
 A response with `status:"running"` includes `processId`, equal to the initial
 exec operation ID. It confirms the command continues in the computer. Pi exposes
@@ -654,10 +828,14 @@ after fixing an actionable archive problem, without repeating the command.
 
 Computer operation IDs accept 1–160 ASCII letters, digits, dots, colons, hyphens
 or underscores. Runtime adapters must map opaque model call IDs into this space
-before requesting approval or invoking a computer. Pi preserves existing valid
-`pi-tool:<taskId>:<callId>` IDs for journal compatibility; incompatible IDs use
-a deterministic SHA-256 mapping in a separate namespace. Never strip characters
-or truncate IDs, which could merge distinct operations. Stored interrupted
+before requesting approval or invoking a computer. New Pi effects use a SHA-256
+identity scoped to the host conversation, native task and provider call, pinned
+durably before dispatch. Independent task conversations sharing a computer or
+workspace cannot reuse each other's receipts. Exact indexed local admission
+records preserve IDs already dispatched before upgrade, including legacy
+`pi-tool:<taskId>:<callId>` identities and pending or uncertain approvals.
+Completion events use the same pinned mapping. Never strip characters or
+truncate IDs, which could merge distinct operations. Stored interrupted
 approvals are not rewritten or replayed by this mapping change.
 
 Computer actions from the model pass through host policy. The bot configuration
@@ -781,6 +959,14 @@ present that decision. A native steering input also releases `wait_subagent` wit
 `{status:"yielded",reason:"new_input",subagent}`. Only that read-only observer
 ends: the child and its durable delivery keep running. The completed tool round
 then lets the parent attend to the input, including creating another child.
+Messages to temporary agents enter Pi as `steer`, including child results and
+sibling messages. They are placed at the next tool boundary; a waiting agent
+releases its observer to read them while other agents continue. Recovery
+promotes only existing queued Timber delivery receipts from the former
+`followUp` mode to `steer`, preserving input and effect IDs. Native waits depend
+on the target input's settlement, not on its result notification finishing.
+A durable dependency graph rejects circular agent waits before blocking.
+
 Public `subagent.reported` events contain the message body in `text`, with
 `contentFormat:"plain"` and sender identity in `subagentId`/`subagentName`.
 Model-only attribution stays separate so the UI shows the sender once. Legacy
@@ -898,6 +1084,22 @@ recipient; a plain `@` string never grants authority to choose a different bot.
 
 
 ## Host tools and GitHub connection
+`github_inspect_ci {repository,branch?,commit?,runId?,jobId?}` is a read-only
+host capability, including for computerless coordinating turns. Without a run
+ID it lists ten recent runs, optionally for a branch/full SHA. With a run ID it
+returns up to 30 job states, step details for the selected/first failed/current
+job, and a failed job's log tail; an
+explicit job ID must belong to that returned run. Log downloads retain at most
+16,000 characters, cap total bytes at 8 MB, and never forward GitHub credentials
+to a signed log redirect. Only HTTPS GitHub Actions/Azure log hosts are accepted.
+The source bot's installed repository grant is checked before reading and again
+before returning. Disconnect/deletion/reinstallation fences results. CI reads
+do not hold the integration mutation lock while fetching logs and never restart
+jobs or execute commands. Public repo CI uses unauthenticated reads after the
+connected account confirms repository visibility; private repo CI requires the
+existing GitHub App/user authorization to include Actions read permission.
+Verification success and deployment success are returned as separate job states.
+
 The host advertises a small catalog through runtime-independent `catalog` / `call`
 ports. Pi implements native `list_tools` and `call_tool`; neither engine nor skill
 owns provider credentials. Standard Agent Skills sources live in `skills/*/SKILL.md`
@@ -1236,3 +1438,31 @@ is rejected. Candidate identities precede PUT; pointer replacement and old-objec
 GC admission commit atomically. Deletion stops the target runtime before avatar
 drain, never awaiting another bot’s avatar. Receipts are compact and terminal
 private snapshots are cleared; status/next-time and GC scheduling are indexed.
+
+
+## Inference liveness and working context
+
+OpenAI Responses requests use stable opaque prompt cache affinity per durable
+conversation, isolated across bot and task computers and retained through eviction.
+The ChatGPT proxy derives its `session_id` header from that host hash; it does not
+forward arbitrary client headers or retain provider-side conversation history.
+Native Pi uses a working context window of at most 128,000 tokens, bounded by the
+model's actual smaller window. Threshold compaction preserves the full archive and
+recent verbatim context, and runs before a million-token catalogue limit is reached.
+
+Inference connections watch elapsed time without headers or stream bytes. The
+stream silence allowance is 180 seconds, 240 seconds over 50,000 estimated tokens,
+and 300 seconds over 100,000; named reasoning models and high reasoning settings
+have at least 600 seconds. Each received chunk resets this allowance, so active
+reasoning can exceed it. The existing 30-minute total inference ceiling remains.
+This applies only to model inference; command/process deadlines are unchanged.
+Expired connections fail through native Pi's inference retry policy, preserving
+recorded tool effects. Explicit Stop stays an abort.
+
+`timber_inference_requests` stores at most 201 recent connection records with
+source, stage, start/last-progress times, bytes, HTTP status, estimated input size
+and idle-expiry status; no prompts, model output, cache keys or credentials.
+Task progress and private production diagnostics expose those stages to distinguish
+a request waiting for headers from an active stream and a dead connection.
+The policy follows Hermes' separation of total and stale-stream budgets and Codex's
+per-session cache affinity.

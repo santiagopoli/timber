@@ -2,6 +2,7 @@
   "$schema": "../../node_modules/wrangler/config-schema.json",
   "name": "timber-api",
   "main": "src/index.ts",
+  "version_metadata": { "binding": "VERSION_METADATA" },
   "compatibility_date": "2026-10-05",
   "compatibility_flags": [
     "nodejs_compat"

@@ -63,12 +63,12 @@ export function activityIdentity(name: string, command = '') {
   return {Icon: WrenchIcon, label: 'Tool'};
 }
 
-export function ActivityCode({code, language='text', compact=false, copyText=code}: {code:string;language?:string;compact?:boolean;copyText?:string}) {
+export function ActivityCode({code, language='text', compact=false, copyText=code, highlight=true}: {code:string;language?:string;compact?:boolean;copyText?:string;highlight?:boolean}) {
   const [wrap, setWrap] = useState(false), [copyError, setCopyError] = useState('');
   const limit = compact ? 2_000 : 65_536, visible = code.length > limit ? code.slice(0,limit) : code;
   // The full source remains available to Copy even when rendering is bounded.
   return <div className={`timber-code${compact ? ' is-compact' : ''}${wrap ? ' is-wrapped' : ''}`}>
-    <CodeBlock code={visible} copyText={copyText} language={languageName(language) as BundledLanguage} style={{contentVisibility:'visible',containIntrinsicSize:'none'}}>
+    <CodeBlock code={visible} highlight={highlight} copyText={copyText} language={languageName(language) as BundledLanguage} style={{contentVisibility:'visible',containIntrinsicSize:'none'}}>
       {!compact && <CodeBlockHeader><span>{language === 'text' ? 'Text' : languageName(language)}</span><div className="timber-code-actions">
         {copyError && <span role="status">{copyError}</span>}
         <Button type="button" variant="ghost" size="icon-sm" aria-label="Wrap lines" aria-pressed={wrap} title="Wrap lines" onClick={()=>setWrap(!wrap)}><WrapTextIcon/></Button>
@@ -81,7 +81,7 @@ export function ActivityCode({code, language='text', compact=false, copyText=cod
 
 function MarkdownCode({children,compact}: {children?:ReactNode;compact?:boolean}) {
   if (isValidElement<{children?:ReactNode;className?:string}>(children) && typeof children.props.children === 'string') {
-    return <ActivityCode compact={compact} code={children.props.children.replace(/\n$/, '')} language={/language-(\S+)/.exec(children.props.className || '')?.[1] || 'text'}/>;
+    return <ActivityCode compact={compact} highlight={!compact} code={children.props.children.replace(/\n$/, '')} language={/language-(\S+)/.exec(children.props.className || '')?.[1] || 'text'}/>;
   }
   return <pre>{children}</pre>;
 }
@@ -94,5 +94,5 @@ export function ActivityOutput({format, compact=false, source=format.code}: {for
   if (format.language === 'markdown') return <div className={`timber-tool-markdown${compact ? ' is-compact' : ''}`}>
     <MessageResponse className="timber-markdown" mode="static" skipHtml plugins={{}} components={{img:()=>null,a:compact ? ({children})=><span>{children}</span> : undefined,pre:({children})=><MarkdownCode compact={compact} children={children}/>}} controls={false} linkSafety={{enabled:false}} urlTransform={defaultUrlTransform}>{visible.slice(0,65_536)}</MessageResponse>
   </div>;
-  return <ActivityCode code={visible} copyText={source} language={format.language} compact={compact}/>;
+  return <ActivityCode code={visible} copyText={source} language={format.language} compact={compact} highlight={!compact}/>;
 }

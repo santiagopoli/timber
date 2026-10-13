@@ -144,21 +144,40 @@ function AudioConsent({open,onCancel,onConfirm,retrying=false}:{open:boolean;onC
   </dialog>;
 }
 
-export function AudioComposer({textPresent,imagePresent,sending,onSend,onDraftState}:{textPresent:boolean;imagePresent:boolean;sending:boolean;onSend:(file:File,ids:{operationId:string;audioId:string;attemptId:string})=>Promise<void>;onDraftState?:(value:boolean)=>void} ){
-  const recorder=useRef<MediaRecorder|null>(null),stream=useRef<MediaStream|null>(null),chunks=useRef<BlobPart[]>([]),chunkBytes=useRef(0),timer=useRef<number|undefined>(undefined);
-  const mounted=useRef(false),captureGeneration=useRef(0),selectionGeneration=useRef(0),captureBusy=useRef(false),recordingNow=useRef(false),discardRecording=useRef(false),recordingFailure=useRef(''),elapsedSeconds=useRef(0),finishCapture=useRef<(()=>void)|null>(null);
+// Safari may offer only MP4 MediaRecorder output. Do not label those bytes as
+// WebM or relax validation: record mono PCM16 WAV via Web Audio instead.
+const WEBM_OPUS='audio/webm;codecs=opus',PCM_CAPTURE_RATE=16_000,PCM_PROCESS_FRAMES=4096;
+function captureContextConstructor():typeof AudioContext|undefined{
+  if(typeof window==='undefined')return undefined;
+  return window.AudioContext||(window as Window & {webkitAudioContext?:typeof AudioContext}).webkitAudioContext;
+}
+function captureFormat():'webm'|'wav'|null{
+  try{if(typeof MediaRecorder!=='undefined'&&MediaRecorder.isTypeSupported(WEBM_OPUS))return 'webm';}catch{/* Never fall back to an unspecified codec. */}
+  const Context=captureContextConstructor();return Context&&typeof Context.prototype.createScriptProcessor==='function'?'wav':null;
+}
+function pcmWaveHeader(frames:number,rate:number):ArrayBuffer{
+  const header=new Uint8Array(44),view=new DataView(header.buffer),tag=(at:number,value:string)=>{for(let i=0;i<value.length;i++)header[at+i]=value.charCodeAt(i);};
+  tag(0,'RIFF');view.setUint32(4,36+frames*2,true);tag(8,'WAVE');tag(12,'fmt ');view.setUint32(16,16,true);view.setUint16(20,1,true);view.setUint16(22,1,true);view.setUint32(24,rate,true);view.setUint32(28,rate*2,true);view.setUint16(32,2,true);view.setUint16(34,16,true);tag(36,'data');view.setUint32(40,frames*2,true);return header.buffer;
+}
+
+export function AudioComposer({textPresent,imagePresent,sending,onSend,onDraftState}:{textPresent:boolean;imagePresent:boolean;sending:boolean;onSend:(file:File,ids:{operationId:string;audioId:string;attemptId:string},signal?:AbortSignal)=>Promise<void>;onDraftState?:(value:boolean)=>void} ){
+  const captureStop=useRef<((reason?:string)=>void)|null>(null),sendController=useRef<AbortController|null>(null);
+  const mounted=useRef(false),captureGeneration=useRef(0),selectionGeneration=useRef(0),captureBusy=useRef(false);
   const [draft,setDraft]=useState<Blob|null>(null),idsRef=useRef<{operationId:string;audioId:string;attemptId:string}|null>(null),[draftName,setDraftName]=useState(''),[durationMs,setDurationMs]=useState(0),[recording,setRecording]=useState(false),[requesting,setRequesting]=useState(false),[selecting,setSelecting]=useState(false),[elapsed,setElapsed]=useState(0),[error,setError]=useState(''),[consent,setConsent]=useState<'send'|'retry'|null>(null),[busy,setBusy]=useState(false);
-  const clearTimer=()=>{clearInterval(timer.current);timer.current=undefined;};
-  const stopTracks=(target:MediaStream|null)=>{if(!target)return;for(const track of target.getTracks()){try{track.stop();}catch{}}if(stream.current===target)stream.current=null;};
   const inAudioFlow=Boolean(draft||recording||requesting||selecting);
   useEffect(()=>onDraftState?.(inAudioFlow),[inAudioFlow,onDraftState]);
-  useEffect(()=>{mounted.current=true;return()=>{
-    mounted.current=false;captureGeneration.current++;selectionGeneration.current++;captureBusy.current=false;recordingNow.current=false;discardRecording.current=true;clearTimer();chunks.current=[];chunkBytes.current=0;
-    const active=recorder.current,acquired=stream.current;stopTracks(acquired);if(active&&active.state!=='inactive'){try{active.stop();}catch{}}recorder.current=null;finishCapture.current=null;
-  };},[]);
-  // If normal composer content appears during an audio draft/recording, keep
-  // the one-audio-message invariant by discarding the capture before admission.
-  useEffect(()=>{if((!textPresent&&!imagePresent)||!captureBusy.current)return;const reason='Audio recording was stopped because the composer is no longer audio-only.';captureGeneration.current++;captureBusy.current=false;recordingNow.current=false;discardRecording.current=true;recordingFailure.current=reason;chunks.current=[];chunkBytes.current=0;clearTimer();const active=recorder.current;const acquired=stream.current;stopTracks(acquired);if(active&&active.state!=='inactive'){try{active.stop();}catch{finishCapture.current?.();}}else finishCapture.current?.();if(mounted.current){setRequesting(false);setRecording(false);setError(reason);}},[textPresent,imagePresent]);
+  useEffect(()=>{
+    mounted.current=true;
+    const interrupt=()=>captureStop.current?.('Recording discarded because you left the active conversation.');
+    const visibility=()=>{if(document.visibilityState!=='visible')interrupt();};
+    // Cancel before the asynchronous logout request, not just eventual unmount.
+    const logout=(event:MouseEvent)=>{if(event.target instanceof Element&&event.target.closest('#disconnect'))interrupt();};
+    document.addEventListener('visibilitychange',visibility);document.addEventListener('click',logout,true);
+    window.addEventListener('pagehide',interrupt);window.addEventListener('hashchange',interrupt);window.addEventListener('timber-audio-interrupt',interrupt);
+    return()=>{mounted.current=false;sendController.current?.abort();captureStop.current?.('Recording discarded.');captureGeneration.current++;selectionGeneration.current++;document.removeEventListener('visibilitychange',visibility);document.removeEventListener('click',logout,true);window.removeEventListener('pagehide',interrupt);window.removeEventListener('hashchange',interrupt);window.removeEventListener('timber-audio-interrupt',interrupt);};
+  },[]);
+  // Audio is one standalone input; new normal-composer content cancels capture.
+  useEffect(()=>{if(textPresent||imagePresent)captureStop.current?.('Audio recording was stopped because the composer is no longer audio-only.');},[textPresent,imagePresent]);
   const eligible=!textPresent&&!imagePresent;
   const openPicker=()=>{if(!eligible||sending||busy||requesting||selecting)return;setSelecting(true);onDraftState?.(true);const input=document.createElement('input');input.type='file';input.accept='audio/wav,audio/mpeg,audio/webm,.wav,.mp3,.webm';input.addEventListener('change',()=>{void choose(input.files?.[0]);input.remove();},{once:true});input.addEventListener('cancel',()=>{if(mounted.current)setSelecting(false);input.remove();},{once:true});input.click();};
   const choose=async(file?:File)=>{
@@ -167,45 +186,113 @@ export function AudioComposer({textPresent,imagePresent,sending,onSend,onDraftSt
     try{const bytes=new Uint8Array(await file.arrayBuffer()),valid=validateAudio(bytes,file.type||'');if(!mounted.current||generation!==selectionGeneration.current)return;setDraft(file);idsRef.current={operationId:crypto.randomUUID(),audioId:crypto.randomUUID(),attemptId:crypto.randomUUID()};setDraftName(file.name||`Recording.${valid.extension}`);setDurationMs(valid.durationMs);setSelecting(false);}
     catch(reason){if(!mounted.current||generation!==selectionGeneration.current)return;setDraft(null);idsRef.current=null;setDraftName('');setDurationMs(0);setSelecting(false);setError(reason instanceof AudioValidationError?reason.message:'This audio format could not be checked safely.');}
   };
-  const canRecord=typeof navigator!=='undefined'&&!!navigator.mediaDevices?.getUserMedia&&typeof MediaRecorder!=='undefined'&&MediaRecorder.isTypeSupported('audio/webm;codecs=opus');
+  const format=captureFormat(),canRecord=typeof navigator!=='undefined'&&!!navigator.mediaDevices?.getUserMedia&&Boolean(format);
   const start=async()=>{
-    if(!eligible||sending||busy||captureBusy.current||recordingNow.current||!mounted.current)return;
-    const generation=++captureGeneration.current;captureBusy.current=true;discardRecording.current=false;recordingFailure.current='';setError('');setRequesting(true);onDraftState?.(true);
-    let acquired:MediaStream|null=null,r:MediaRecorder|null=null,finished=false;
-    const finish=()=>{
-      if(finished)return;finished=true;clearTimer();if(acquired)stopTracks(acquired);if(recorder.current===r)recorder.current=null;if(finishCapture.current===finish)finishCapture.current=null;
-      const live=mounted.current&&generation===captureGeneration.current;if(generation===captureGeneration.current){recordingNow.current=false;captureBusy.current=false;if(live){setRecording(false);setRequesting(false);}}
-      const discard=discardRecording.current||!live;discardRecording.current=false;const reason=recordingFailure.current;recordingFailure.current='';const pieces=chunks.current;chunks.current=[];chunkBytes.current=0;
-      if(!live)return;if(discard){if(reason)setError(reason);return;}const clip=new Blob(pieces,{type:r?.mimeType||'audio/webm'});if(!clip.size){setError('No audio was captured. Try recording again.');return;}setSelecting(true);onDraftState?.(true);void choose(new File([clip],`Recording-${new Date().toISOString().replaceAll(':','-')}.webm`,{type:clip.type}));
+    if(!eligible||sending||busy||captureBusy.current||!mounted.current||document.visibilityState!=='visible'||!canRecord||!format)return;
+    const generation=++captureGeneration.current;captureBusy.current=true;setError('');setRequesting(true);onDraftState?.(true);
+    // Capture-local buffers prevent a stale onstop/permission grant from clearing
+    // a newer recording's state or publishing into another conversation's draft.
+    let acquired:MediaStream|null=null,r:MediaRecorder|null=null,ctx:AudioContext|null=null,source:MediaStreamAudioSourceNode|null=null,processor:ScriptProcessorNode|null=null,silence:GainNode|null=null;
+    let pieces:BlobPart[]=[],bytes=0,frames=0,rate=PCM_CAPTURE_RATE,timer:number|undefined,finished=false,stopping=false,startedAt=0;
+    const live=()=>mounted.current&&generation===captureGeneration.current;
+    const release=()=>{
+      clearInterval(timer);timer=undefined;
+      if(acquired){for(const track of acquired.getTracks()){try{track.stop();}catch{}}acquired=null;}
+      if(processor){processor.onaudioprocess=null;processor.disconnect();processor=null;}source?.disconnect();source=null;silence?.disconnect();silence=null;
+      if(ctx){ctx.onstatechange=null;void ctx.close().catch(()=>{});ctx=null;}
     };
-    const fail=(message:string)=>{
-      if(!mounted.current||generation!==captureGeneration.current||!captureBusy.current){if(acquired)stopTracks(acquired);return;}
-      if(discardRecording.current&&recordingFailure.current)return;discardRecording.current=true;recordingFailure.current=message;chunks.current=[];chunkBytes.current=0;clearTimer();if(acquired)stopTracks(acquired);setError(message);
-      try{if(r&&r.state!=='inactive')r.stop();else finish();}catch{finish();}
+    const finish=(reason?:string)=>{
+      if(finished)return;finished=true;release();if(captureStop.current===stopCapture)captureStop.current=null;
+      if(!live()){pieces=[];return;}
+      captureBusy.current=false;setRecording(false);setRequesting(false);
+      if(reason){pieces=[];setError(reason);return;}
+      if(format==='wav')pieces.unshift(pcmWaveHeader(frames,rate));
+      const clip=new Blob(pieces,{type:format==='wav'?'audio/wav':r?.mimeType||WEBM_OPUS});pieces=[];
+      if(!bytes){setError('No audio was captured. Try recording again.');return;}
+      setSelecting(true);onDraftState?.(true);void choose(new File([clip],`Recording-${new Date().toISOString().replaceAll(':','-')}.${format}`,{type:clip.type}));
     };
+    const stopCapture=(reason?:string)=>{
+      if(finished||(stopping&&!reason))return;stopping=true;
+      // Release immediately, even while MediaRecorder flushes its final chunk.
+      release();
+      if(reason){if(r){r.ondataavailable=null;r.onstop=null;r.onerror=null;}finish(reason);captureGeneration.current++;}
+      if(r&&r.state!=='inactive'){try{r.stop();}catch{finish('The browser could not finish this recording.');}}
+      else finish();
+    };
+    captureStop.current=stopCapture;
+    const fail=(reason:string)=>{if(live()&&!finished)stopCapture(reason);};
     try{
-      acquired=await navigator.mediaDevices.getUserMedia({audio:true});
-      if(!mounted.current||generation!==captureGeneration.current){stopTracks(acquired);return;}
-      stream.current=acquired;r=new MediaRecorder(acquired,{mimeType:'audio/webm;codecs=opus'});recorder.current=r;chunks.current=[];chunkBytes.current=0;elapsedSeconds.current=0;
-      r.ondataavailable=e=>{if(!e.data.size||discardRecording.current||!mounted.current||generation!==captureGeneration.current)return;if(chunkBytes.current+e.data.size>MAX_AUDIO_BYTES){fail('Recording stopped because audio reached the 20 MB limit. Start a shorter recording.');return;}chunks.current.push(e.data);chunkBytes.current+=e.data.size;};
-      r.onerror=()=>fail('The browser could not finish this recording.');r.onstop=finish;finishCapture.current=finish;r.start(250);
-      recordingNow.current=true;setRecording(true);setElapsed(0);setRequesting(false);
-      timer.current=window.setInterval(()=>{if(!mounted.current||generation!==captureGeneration.current)return;if(elapsedSeconds.current>=599){setElapsed(600);stop();return;}elapsedSeconds.current++;setElapsed(elapsedSeconds.current);},1000);
-    }catch(reason){if(acquired)stopTracks(acquired);if(r){r.ondataavailable=null;r.onerror=null;r.onstop=null;}if(recorder.current===r)recorder.current=null;if(generation===captureGeneration.current){captureBusy.current=false;recordingNow.current=false;finishCapture.current=null;if(mounted.current){setRecording(false);setRequesting(false);setError(reason instanceof Error&&reason.name==='NotAllowedError'?'Microphone permission was not granted. You can still choose an audio file.':'Microphone recording is unavailable in this browser.');}}}
+      if(format==='wav'){
+        // Create/resume in the Record gesture, before awaiting permission. A
+        // ScriptProcessor avoids new worklet URLs/CSP requirements on Safari.
+        const Context=captureContextConstructor()!;ctx=new Context();
+        void ctx.resume().catch(()=>fail('The browser could not start audio capture.'));
+      }
+      acquired=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1},video:false});
+      if(!live()||finished){release();return;}
+      if(document.visibilityState!=='visible'){stopCapture('Recording discarded because this tab is no longer visible.');return;}
+      if(format==='webm'){
+        r=new MediaRecorder(acquired,{mimeType:WEBM_OPUS});
+        r.ondataavailable=e=>{if(!e.data.size||finished||!live())return;if(bytes+e.data.size>MAX_AUDIO_BYTES){fail('Recording stopped because audio reached the 20 MB limit. Start a shorter recording.');return;}pieces.push(e.data);bytes+=e.data.size;};
+        r.onerror=()=>fail('The browser could not finish this recording.');r.onstop=()=>finish();r.start(250);
+      }else{
+        const context=ctx!;if(!Number.isFinite(context.sampleRate)||context.sampleRate<8000||context.sampleRate>192000)throw new Error('Unsupported capture sample rate');
+        rate=Math.min(PCM_CAPTURE_RATE,context.sampleRate);
+        const maxFrames=Math.min(Math.floor((MAX_AUDIO_BYTES-44)/2),Math.floor(rate*MAX_AUDIO_DURATION_MS/1000)),ratio=context.sampleRate/rate;
+        // Streaming area-average resampling carries fractional weights between
+        // callbacks without retaining Float32 source buffers. Mono 16 kHz PCM
+        // uses 19.2 MB at 10 minutes, below the independent 20 MB cap.
+        let weight=0,sum=0;
+        source=context.createMediaStreamSource(acquired);processor=context.createScriptProcessor(PCM_PROCESS_FRAMES,1,1);silence=context.createGain();silence.gain.value=0;
+        processor.onaudioprocess=event=>{
+          if(finished||stopping||!live())return;
+          if(document.visibilityState!=='visible'){stopCapture('Recording discarded because this tab is no longer visible.');return;}
+          const input=event.inputBuffer.getChannelData(0);
+          if(input.length>PCM_PROCESS_FRAMES){fail('The browser returned an unsupported audio capture buffer.');return;}
+          const output=new Uint8Array(Math.min(maxFrames-frames,Math.ceil(input.length/ratio)+1)*2),view=new DataView(output.buffer);let count=0;
+          for(let i=0;i<input.length&&frames+count<maxFrames;i++){
+            const sample=Number.isFinite(input[i])?Math.max(-1,Math.min(1,input[i])):0;let left=1;
+            while(left>0&&frames+count<maxFrames){const take=Math.min(left,ratio-weight);sum+=sample*take;weight+=take;left-=take;
+              if(weight>=ratio-1e-9){const value=Math.max(-1,Math.min(1,sum/ratio));view.setInt16(count*2,Math.round(value*(value<0?32768:32767)),true);count++;sum=0;weight=0;}
+            }
+          }
+          if(count){const chunk=output.subarray(0,count*2);pieces.push(chunk);frames+=count;bytes+=chunk.byteLength;}
+          if(frames>=maxFrames)stopCapture();
+        };
+        source.connect(processor);processor.connect(silence);silence.connect(context.destination);
+        await context.resume();if(!live()||finished){release();return;}
+        if(context.state!=='running')throw new Error('Capture audio context did not start');
+        context.onstatechange=()=>{if(context.state!=='running')fail('Recording discarded because audio capture was suspended.');};
+      }
+      if(!live()||finished)return;
+      startedAt=performance.now();setRecording(true);setElapsed(0);setRequesting(false);
+      timer=window.setInterval(()=>{if(!live()||finished)return;const seconds=Math.floor((performance.now()-startedAt)/1000);setElapsed(Math.min(seconds,MAX_AUDIO_DURATION_MS/1000));if(seconds>=MAX_AUDIO_DURATION_MS/1000)stopCapture();},250);
+    }catch(reason){release();if(live()&&!finished)stopCapture(reason instanceof Error&&reason.name==='NotAllowedError'?'Microphone permission was not granted. You can still choose an audio file.':'Microphone recording is unavailable in this browser.');}
   };
-  const stop=()=>{clearTimer();const active=recorder.current;if(active&&active.state!=='inactive'){try{active.stop();}catch{finishCapture.current?.();}}else finishCapture.current?.();};
+  const stop=()=>captureStop.current?.();
   const remove=()=>{selectionGeneration.current++;setDraft(null);idsRef.current=null;setDraftName('');setDurationMs(0);setError('');};
-  const doSend=async()=>{if(!draft||busy||sending)return;setBusy(true);setConsent(null);setError('');try{const ext=draftName.split('.').pop()||'audio',file=new File([draft],draftName||`audio.${ext}`,{type:draft.type}),ids=idsRef.current||{operationId:crypto.randomUUID(),audioId:crypto.randomUUID(),attemptId:crypto.randomUUID()};idsRef.current=ids;await onSend(file,ids);if(mounted.current)remove();}catch(reason){if(mounted.current)setError(reason instanceof Error?reason.message:'Audio was not sent. Inspect its status before retrying.');}finally{if(mounted.current)setBusy(false);}};
+  const cancelAudio=()=>{if(sendController.current){sendController.current.abort();setConsent(null);setError('Audio send cancelled. Its status may be unknown if already submitted. Refresh the conversation before explicitly retrying; cancellation cannot undo a stored message.');return;}remove();};
+  const doSend=async()=>{
+    if(!draft||busy||sending||!eligible||sendController.current)return;
+    const controller=new AbortController();sendController.current=controller;setBusy(true);setConsent(null);setError('');
+    try{
+      const ext=draftName.split('.').pop()||'audio',file=new File([draft],draftName||`audio.${ext}`,{type:draft.type}),ids=idsRef.current||{operationId:crypto.randomUUID(),audioId:crypto.randomUUID(),attemptId:crypto.randomUUID()};idsRef.current=ids;
+      await onSend(file,ids,controller.signal);
+      if(mounted.current&&!controller.signal.aborted)remove();
+    }catch(reason){if(mounted.current)setError(controller.signal.aborted?'Audio send cancelled. Its status may be unknown if already submitted. Refresh the conversation before explicitly retrying; cancellation cannot undo a stored message.':reason instanceof Error?reason.message:'Audio was not sent. Inspect its status before retrying.');}
+    finally{if(sendController.current===controller)sendController.current=null;if(mounted.current)setBusy(false);}
+  };
   return <div className="timber-audio-composer" data-audio-ready={Boolean(draft)}>
     {!draft&&!recording&&<div className="timber-audio-tools" title={!eligible?'Clear text and image attachments to send audio as its own message.':undefined}><Button type="button" variant="ghost" disabled={!eligible||sending||busy||requesting||selecting} onClick={openPicker} aria-label="Attach audio file"><UploadIcon aria-hidden="true"/>Audio file</Button>
       {canRecord?<Button type="button" variant="ghost" disabled={!eligible||sending||busy||requesting||selecting} onClick={()=>void start()} aria-label="Start recording audio"><MicIcon aria-hidden="true"/>{requesting?'Requesting microphone…':'Record'}</Button>:eligible?<span className="timber-audio-browser-note">Microphone recording is not supported here. Choose a WAV, MP3 or WebM Opus file.</span>:null}
       {/* Keep disabled tools compact so ordinary drafts do not shrink the model comparison panel. */}
+      {eligible&&canRecord&&format==='wav'&&<span className="timber-audio-capture-note">Records as PCM WAV in this browser. Recording stops when you leave or hide this conversation.</span>}
       {eligible&&<span className="timber-audio-format-note">WAV, MP3, or WebM Opus · up to 20 MB and 10 minutes. M4A/MP4 and Ogg are not supported.</span>}
     </div>}
     {selecting&&<p className="timber-audio-state" role="status">Checking audio file…</p>}
     {requesting&&!recording&&<p className="timber-audio-state" role="status">Requesting microphone permission…</p>}
-    {recording&&<div className="timber-audio-recording" role="status"><span className="timber-audio-recording-dot"/><span>Recording · {formatTime(elapsed)}</span><Button type="button" variant="outline" onClick={stop}><SquareIcon aria-hidden="true"/>Stop recording</Button><Button type="button" variant="ghost" onClick={()=>{discardRecording.current=true;recordingFailure.current='Recording discarded.';stop();}}>Discard</Button></div>}
-    {draft&&<div className="timber-audio-draft"><div><AudioLinesIcon aria-hidden="true"/><span>{draftName}</span><span>{formatTime(durationMs/1000)}</span></div><Player blob={draft} durationMs={durationMs} mimeType={draft.type}/><p>OpenAI API transcription · about $0.003/minute published estimate, billed separately; actual charges may vary. Sending audio also starts your bot.</p><div className="timber-audio-draft-actions"><Button type="button" variant="outline" disabled={busy||sending} onClick={remove}><Trash2Icon aria-hidden="true"/>Cancel audio</Button><Button type="button" disabled={busy||sending||!eligible} onClick={()=>setConsent('send')}>{busy||sending?'Sending…':'Review & send'}</Button></div></div>}
+    {recording&&<div className="timber-audio-recording" role="status"><span className="timber-audio-recording-dot"/><span>Recording · {formatTime(elapsed)}</span><Button type="button" variant="outline" onClick={stop}><SquareIcon aria-hidden="true"/>Stop recording</Button><Button type="button" variant="ghost" onClick={()=>{captureStop.current?.('Recording discarded.');}}>Discard</Button></div>}
+    {draft&&<div className="timber-audio-draft"><div><AudioLinesIcon aria-hidden="true"/><span>{draftName}</span><span>{formatTime(durationMs/1000)}</span></div><Player blob={draft} durationMs={durationMs} mimeType={draft.type}/><p>OpenAI API transcription · about $0.003/minute published estimate, billed separately; actual charges may vary. Sending audio also starts your bot.</p><div className="timber-audio-draft-actions"><Button type="button" variant="outline" disabled={sending&&!busy} onClick={cancelAudio}><Trash2Icon aria-hidden="true"/>Cancel audio</Button><Button type="button" disabled={busy||sending||!eligible} onClick={()=>setConsent('send')}>{busy||sending?'Sending…':'Review & send'}</Button></div></div>}
     {error&&<p className="timber-audio-error" role="alert">{error}</p>}
     <AudioConsent open={consent==='send'} onCancel={()=>setConsent(null)} onConfirm={()=>void doSend()}/>
   </div>;
