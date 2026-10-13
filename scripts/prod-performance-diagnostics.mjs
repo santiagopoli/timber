@@ -8,7 +8,7 @@ export const PERFORMANCE_TASKS = `SELECT t.id,json_extract(t.data,'$.status') AS
  (SELECT COUNT(*) FROM computer_admissions a WHERE a.bot_id=CASE WHEN json_extract(t.data,'$.computerMode')='isolated' THEN 'task:'||t.id ELSE b.id END) AS admissions,
  (SELECT COUNT(*) FROM computer_admissions a WHERE a.bot_id=CASE WHEN json_extract(t.data,'$.computerMode')='isolated' THEN 'task:'||t.id ELSE b.id END AND a.payload IS NOT NULL) AS pinned_effects
  FROM tasks t JOIN bots b ON b.id=json_extract(t.data,'$.botId') LEFT JOIN task_slots s ON s.bot_id=CASE WHEN json_extract(t.data,'$.computerMode')='isolated' THEN 'task:'||t.id ELSE b.id END
- WHERE lower(json_extract(b.data,'$.name'))='polibot' ORDER BY t.rowid DESC LIMIT 6`;
+ ORDER BY (json_extract(t.data,'$.status') IN ('queued','running','waiting_approval','waiting_connection','cancelling')) DESC,t.rowid DESC LIMIT 6`;
 export const PERFORMANCE_REQUESTS = `SELECT source,phase,started_at,last_progress_at,bytes,http_status,idle,estimated_tokens FROM timber_inference_requests ORDER BY id DESC LIMIT 20`;
 export function summarizeInferenceRequests(records){return records.slice(0,20).map(row=>({source:allow(new Set(['chatgpt','openai-api','openrouter']),row.source),phase:allow(new Set(['request','streaming','completed','failed','cancelled']),row.phase),startedAt:count(row.started_at)===null?null:new Date(row.started_at).toISOString(),lastProgressAt:count(row.last_progress_at)===null?null:new Date(row.last_progress_at).toISOString(),bytes:count(row.bytes),httpStatus:count(row.http_status),idleTimeout:row.idle===1,estimatedTokens:count(row.estimated_tokens)}));}
 export const PERFORMANCE_RUNS = `SELECT json_extract(data,'$.createdAt') AS created_at,

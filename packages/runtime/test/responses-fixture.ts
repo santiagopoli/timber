@@ -8,6 +8,7 @@ export function responsesFixture(payload: { input: Record<string, unknown>[] }, 
   const userIndex = payload.input.map(item => item.role === 'user').lastIndexOf(true);
   const user = payload.input[userIndex];
   const text = JSON.stringify(user);
+  if(text.includes('request-retained-output')||text.includes('request-read-retained-output:')) return retainedOutputResponse(payload.input);
   if(text.includes('request-wire-allowance')) {
     const error={message:SHARED_ALLOWANCE_MESSAGE,...(text.includes('foreign-code')?{code:'unrecognized_fixture_usage_code'}:{})};
     const named=text.includes('named'),nested=text.includes('nested');
@@ -143,4 +144,21 @@ function multistepResponse(history: Record<string, unknown>[], mode: 'recovery' 
   });
   events.push({ type: 'response.completed', response });
   return new Response(events.map((event, sequence_number) => `event: ${event.type}\ndata: ${JSON.stringify({ ...event, sequence_number })}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
+}
+
+function retainedOutputResponse(history: Record<string, unknown>[]): Response {
+  const userIndex=history.map(item=>item.role==='user').lastIndexOf(true),user=history[userIndex];
+  const raw=typeof user?.content==='string'?user.content:Array.isArray(user?.content)?user.content.map(part=>part.text??'').join(''):'';
+  const readOnly=raw.startsWith('request-read-retained-output:')?JSON.parse(raw.slice('request-read-retained-output:'.length)):undefined;
+  const results = history.slice(userIndex+1).filter(item=>item.type==='function_call_output');
+  const preview = readOnly??(results[0] ? JSON.parse(String(results[0].output)).outputPreview : undefined);
+  const call = readOnly ? results.length===0 ? {name:'read_tool_output', arguments:{toolCallId:preview.toolCallId,timestamp:preview.timestamp,offset:8000,limit:4000}} : undefined : results.length===0 ? {name:'exec', arguments:{command:'echo large output'}}
+    : results.length===1 ? {name:'read_tool_output', arguments:{toolCallId:preview.toolCallId, timestamp:preview.timestamp, offset:8000, limit:4000}} : undefined;
+  const item = call ? {type:'function_call', id:`fc_output_${results.length}`, call_id:`call_output_${results.length}`, name:call.name, namespace:TOOL_NAMESPACE, arguments:JSON.stringify(call.arguments), status:'completed'}
+    : {type:'message', id:'msg_output', role:'assistant', status:'completed', content:[{type:'output_text',text:'Read the retained output without rerunning.',annotations:[]}]};
+  const response={id:'resp_output',object:'response',status:'completed',output:[item],usage:{input_tokens:10,output_tokens:8,total_tokens:18}};
+  const events=[{type:'response.created',response:{...response,output:[],status:'in_progress'}},
+    {type:'response.output_item.added',output_index:0,item:{...item,...(call?{arguments:''}:{content:[]})}},
+    {type:'response.output_item.done',output_index:0,item}, {type:'response.completed',response}];
+  return new Response(events.map(event=>`data: ${JSON.stringify(event)}\n\n`).join(''),{headers:{'content-type':'text/event-stream'}});
 }

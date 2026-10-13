@@ -114,3 +114,17 @@ test('queued child delivery diagnostics distinguish an idle recipient without di
   const busy=summarizePerformance({deliveries:db.prepare(PERFORMANCE_DELIVERIES).all()},window).deliveries[0];assert.equal(busy.recipientActiveTasks,1);
  }finally{db.close();}
 });
+
+test('includes active tasks from every bot before newer completed history without exporting names',()=>{
+ const db=new DatabaseSync(':memory:');
+ try {
+  db.exec('CREATE TABLE bots(id TEXT,data TEXT);CREATE TABLE tasks(id TEXT,data TEXT);CREATE TABLE task_slots(bot_id TEXT,task_id TEXT,updated_at INTEGER);CREATE TABLE computer_admissions(bot_id TEXT,payload TEXT)');
+  db.prepare('INSERT INTO bots VALUES(?,?)').run('named',JSON.stringify({name:'private-other-bot'}));
+  db.prepare('INSERT INTO bots VALUES(?,?)').run('root',JSON.stringify({name:'Polibot'}));
+  for(const [id,botId,status] of [['working','named','running'],['waiting','named','queued'],['new-complete','root','completed']])
+   db.prepare('INSERT INTO tasks VALUES(?,?)').run(id,JSON.stringify({botId,status,createdAt:created,updatedAt:updated,title:'private-task-canary'}));
+  const rows=db.prepare(PERFORMANCE_TASKS).all();
+  assert.deepEqual(rows.map(row=>row.id),['waiting','working','new-complete']);
+  assert.doesNotMatch(JSON.stringify(rows.map(performanceTaskMetadata)),/private|named|working|waiting/);
+ } finally {db.close();}
+});

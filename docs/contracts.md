@@ -1391,9 +1391,23 @@ OpenAI Responses requests use stable opaque prompt cache affinity per durable
 conversation, isolated across bot and task computers and retained through eviction.
 The ChatGPT proxy derives its `session_id` header from that host hash; it does not
 forward arbitrary client headers or retain provider-side conversation history.
-Native Pi uses a working context window of at most 128,000 tokens, bounded by the
+Native Pi uses a working context window of at most 96,000 tokens, bounded by the
 model's actual smaller window. Threshold compaction preserves the full archive and
 recent verbatim context, and runs before a million-token catalogue limit is reached.
+With Pi's defaults, background compaction begins around 47,616 tokens and blocking
+compaction around 79,616; the newest 20,000 tokens stay verbatim. Smaller models
+retain their smaller provider window. User-selected reasoning and Fast settings
+are unchanged.
+
+For inference only, large `exec`, `exec_poll` and `read_file` outputs receive a
+12,000-character head/tail preview. Status, exit code, errors and process identities
+remain intact. Native entries and the public transcript retain the complete result.
+`read_tool_output` reads bounded pages using the preview's native call identity and
+timestamp from the calling conversation only, including after eviction or compaction.
+It never reruns the action. Host tool catalogues and screenshot images are unchanged.
+Independent read-only tool rounds use Pi's native parallel mode; any command,
+write, desktop action, host-service action, memory mutation or agent coordination
+call makes its whole round sequential, preserving ordering and decision fences.
 
 Inference connections watch elapsed time without headers or stream bytes. The
 stream silence allowance is 180 seconds, 240 seconds over 50,000 estimated tokens,

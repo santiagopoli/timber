@@ -9,7 +9,7 @@ it('uses durable host/session affinity without exposing their identities or shar
  expect(await inferenceCacheKey('private-bot-scope')).toBeUndefined();
 });
 it('limits the native working set while preserving small provider windows and their catalogue objects',()=>{
- const model={id:'large-model',contextWindow:1_050_000};expect(workingContextModel(model).contextWindow).toBe(128_000);expect(model.contextWindow).toBe(1_050_000);
+ const model={id:'large-model',contextWindow:1_050_000};expect(workingContextModel(model).contextWindow).toBe(96_000);expect(model.contextWindow).toBe(1_050_000);
  expect(workingContextModel({contextWindow:32_000}).contextWindow).toBe(32_000);
  expect(inferenceIdleMs({model:'gpt-6.1-sol'},120000)).toBe(600000);
  expect(inferenceIdleMs({model:'ordinary',reasoning:{effort:'max'}},100)).toBe(600000);

@@ -7,10 +7,66 @@ import { createStopGate } from '../src/stop-gate.js';
 import { PiHarness } from 'agents/harness/pi';
 import {configure,ROOT_CONVERSATION_ID} from '@earendil-works/pi-durable';
 import {SHARED_ALLOWANCE_MESSAGE} from './responses-fixture.js';
+import {retainedOutputTool} from '../src/tool-context.js';
+import type {ToolExecutionApi, ConversationId} from '@earendil-works/pi-durable';
 let probeId: string;
 beforeEach(() => { probeId = crypto.randomUUID(); });
 const request = (path: string, input?: unknown) => exports.default.fetch(`https://test${path}`, { headers: { 'content-type': 'application/json', 'x-probe-id': probeId }, ...(input ? { method: 'POST', body: JSON.stringify(input) } : {}) });
 afterEach(async () => { await reset(); });
+it('admits independent reads together while keeping a mixed read/command round in order', async () => {
+  const namespace = (env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE;
+  let stub = namespace.getByName(probeId);
+  await runInDurableObject(stub, (instance,state)=>{
+    state.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)','holdComputerTools','true');
+    state.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)','approvalMode','automatic');
+  });
+  await abortAllDurableObjects();stub=namespace.getByName(probeId);
+  await request('/submit',{text:'request-read-batch',operationId:'parallel-reads'});
+  await expect.poll(()=>runInDurableObject(stub,(_instance,state)=>state.storage.sql.exec<{n:number}>('SELECT COUNT(*) AS n FROM tool_calls').one().n)).toBe(2);
+  await runInDurableObject(stub,instance=>instance.releaseHeldTool?.());
+  expect(await(await request('/wait?id=parallel-reads')).json()).toMatchObject({status:'done'});
+  probeId=crypto.randomUUID();stub=namespace.getByName(probeId);
+  await runInDurableObject(stub,(_instance,state)=>{
+    state.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)','holdComputerTools','true');
+    state.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)','approvalMode','automatic');
+  });
+  await abortAllDurableObjects();stub=namespace.getByName(probeId);
+  await request('/submit',{text:'request-read-batch-mixed',operationId:'ordered-command'});
+  await expect.poll(()=>runInDurableObject(stub,(_instance,state)=>state.storage.sql.exec<{n:number}>('SELECT COUNT(*) AS n FROM tool_calls').one().n)).toBe(1);
+  await runInDurableObject(stub,async(instance,state)=>{
+    expect(state.storage.sql.exec<{input:string}>('SELECT input FROM tool_calls').one().input).toContain('readFile');
+    instance.releaseHeldTool?.();
+  });
+  expect(await(await request('/wait?id=ordered-command')).json()).toMatchObject({status:'done'});
+  await runInDurableObject(stub,(_instance,state)=>expect(state.storage.sql.exec<{input:string}>('SELECT input FROM tool_calls ORDER BY id').toArray().map(row=>JSON.parse(row.input).action.type)).toEqual(['readFile','exec']));
+});
+it('previews large command output, retrieves its middle without replay, and retains the archive across eviction',async()=>{
+  const namespace=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE;
+  let stub=namespace.getByName(probeId);
+  const output='START'+'x'.repeat(9000)+'RETAINED_MIDDLE'+'y'.repeat(9000)+'END';
+  await runInDurableObject(stub,(_instance,state)=>state.storage.sql.exec('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)','toolOutput',output));
+  await request('/host-context',{mode:'automatic'});
+  await request('/submit',{text:'request-retained-output',operationId:'large-result',chatgpt:true});
+  expect(await(await request('/wait?id=large-result')).json()).toMatchObject({status:'done'});
+  const state=await(await request('/inspect')).json<{calls:{input:string}[];toolCalls:unknown[];messages:{role:string;text:string}[]}>();
+  expect(state.toolCalls).toHaveLength(1);
+  expect(state.calls).toHaveLength(3);
+  expect(state.calls[1]!.input).toContain('outputPreview');expect(state.calls[1]!.input).not.toContain('RETAINED_MIDDLE');
+  expect(state.calls[2]!.input).toContain('RETAINED_MIDDLE');
+  expect(state.messages.some(message=>message.role==='tool'&&message.text.includes('RETAINED_MIDDLE'))).toBe(true);
+  const preview=JSON.parse(JSON.parse(state.calls[1]!.input).input.find((item:{type:string})=>item.type==='function_call_output').output).outputPreview;
+  await abortAllDurableObjects();stub=namespace.getByName(probeId);
+  await request('/submit',{text:'request-read-retained-output:'+JSON.stringify(preview),operationId:'read-after-eviction',chatgpt:true});
+  expect(await(await request('/wait?id=read-after-eviction')).json()).toMatchObject({status:'done'});
+  const recovered=await(await request('/inspect')).json<{calls:{input:string}[];toolCalls:unknown[]}>();
+  expect(recovered.toolCalls).toHaveLength(1);expect(recovered.calls.at(-1)!.input).toContain('RETAINED_MIDDLE');
+  await runInDurableObject(stub,async(instance,durable)=>{
+    // SQL routes only within the caller's own conversation, including after eviction.
+    const tool=retainedOutputTool({sql:durable.storage.sql,storage:()=>{throw new Error('foreign output must never be read');},authorize:async()=>{}});
+    const result=await tool.execute({...preview,offset:8000,limit:4000},{conversationId:999 as ConversationId} as ToolExecutionApi,{});
+    expect(result.isError).toBe(true);
+  });
+});
 async function configureLimits(limits: { maxGenerations?: number; maxToolCalls?: number }) {
   const stub = (env as unknown as { PROBE: DurableObjectNamespace<HarnessProbe> }).PROBE.getByName(probeId);
   await runInDurableObject(stub, (_instance, state) => {
@@ -1292,7 +1348,7 @@ it('keeps prompt cache affinity through eviction and scopes separate bot convers
  await request('/submit',{text:'Hello another bot',operationId:'affinity-other',chatgpt:true});await request('/wait?id=affinity-other');
  const other=await(await request('/inspect')).json<{calls:{input:string}[]}>();expect(JSON.parse(other.calls[0]!.input).prompt_cache_key).not.toBe(keys[0]);probeId=original;
  const stub=(env as unknown as {PROBE:DurableObjectNamespace<HarnessProbe>}).PROBE.getByName(probeId);
- expect((await runInDurableObject(stub,instance=>instance.runtime.contextStatus())).contextWindow).toBe(128000);
+ expect((await runInDurableObject(stub,instance=>instance.runtime.contextStatus())).contextWindow).toBe(96000);
 });
 it('compacts long retained conversations automatically before the advertised million-token maximum',async()=>{
  for(let index=0;index<4;index++){
