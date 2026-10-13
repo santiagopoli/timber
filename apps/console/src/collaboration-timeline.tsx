@@ -210,7 +210,7 @@ export function collectCollaboration(model:CollaborationModel,scopeSubagentId?:s
     if((model.knownTasks??model.tasks)&&!task)continue;
     const started=dispatchStarts.get(identity);
     correlation(event);if(started)correlation(started);
-    items.set(`task-message:${identity}`,{key:`task-message:${identity}`,runId:rootRun(event.runId),createdAt:started?.createdAt||event.createdAt,taskMessage:{taskId,title:task?.title||'Task',text:text(input.text),status:event.type!=='tool.completed'?'sending':failed?String(result.status):queued?'queued':'accepted',label:event.type!=='tool.completed'?'Sending message':failed?'Message not sent':'Message sent',error:failed?text(result.error)|| (result.status==='interrupted'?'The message was interrupted.':result.status==='cancelled'?'The message was cancelled.':'The task could not receive this message.'):undefined}});
+    items.set(`task-message:${identity}`,{key:`task-message:${identity}`,runId:rootRun(event.runId),createdAt:started?.createdAt||event.createdAt,taskMessage:{taskId,title:task?.title||'Task',text:text(input.text),status:event.type!=='tool.completed'?'sending':failed?String(result.status):queued?'queued':'accepted',label:event.type!=='tool.completed'?'Sending message':failed?result.status==='interrupted'?'Delivery unconfirmed':'Message not sent':'Message sent',error:failed?text(result.error)|| (result.status==='interrupted'?'No delivery receipt was confirmed. Check the task before resending.':result.status==='cancelled'?'The message was cancelled.':'The task could not receive this message.'):undefined}});
   }
   return {items:[...items.values()].filter(item=>!model.runFilter||item.runId===model.runFilter),toolIdentities};
 }

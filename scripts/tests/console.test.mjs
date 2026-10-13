@@ -267,6 +267,12 @@ for(const width of [320,390,1440])test(`task message pills are explicit, dedupli
     await page.locator(`.timber-task-pill-wrap[data-linked-task-id="${task.id}"][data-task-status="failed"]`).waitFor();
     const failedPill=page.locator(`.timber-task-pill-wrap[data-linked-task-id="${task.id}"][data-task-status="failed"]`);await failedPill.locator('button').first().click();
     assert.equal(await failedPill.getByText('Task is no longer accepting messages.',{exact:true}).count(),1);
+    state.emit(BOT_A,'tool.completed',{operationId:'task-unconfirmed-message',toolName:'message_task',input:{taskId:task.id,text:'Inspect existing work'},result:{status:'interrupted',error:'The delivery receipt could not be confirmed.'}},run.id);
+    const unconfirmed=page.locator(`.timber-task-pill-wrap[data-linked-task-id="${task.id}"][data-task-status="interrupted"]`);
+    await unconfirmed.getByText(/Delivery unconfirmed/).waitFor();
+    assert.doesNotMatch(await unconfirmed.innerText(),/Message not sent/);
+    await unconfirmed.locator('button').first().click();
+    await unconfirmed.getByText('The delivery receipt could not be confirmed.',{exact:true}).waitFor();
     assert.equal(state.calls.some(call=>call.method==='POST'&&call.path.endsWith('/messages')),false,'event rendering never submits or replays a message');
     await selectBot(page,BOT_B);
     assert.equal(await page.locator('.timber-task-pill-wrap').count(),0,'task pills are isolated to the canonical owning bot conversation');

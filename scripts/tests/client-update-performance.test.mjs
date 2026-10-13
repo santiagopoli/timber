@@ -268,16 +268,21 @@ test('bounded SSE bootstrap replaces partials at its cursor boundary and never r
 test('task status pills deduplicate replay and ignore stale versions while keeping stable metadata',async()=>{
   const h=harness(),task={id:'task-a',title:'Build the app',botId:'bot-a',createdByBotId:'bot-a',sourceRunId:'run-a',status:'queued',statusVersion:1,createdAt:'2026-10-01T00:00:00Z',updatedAt:'2026-10-01T00:00:00Z'};
   h.run(`messages=[${JSON.stringify(message('source',{role:'user'}))}];`);
+  // Status events update tasks already verified by the owner-scoped listing.
+  h.run(`request=async()=>({tasks:[${JSON.stringify(task)}]});`);
+  await h.run('loadConversationTasks()');
   event(h,1,'task.updated',{task});h.flushFrame();
   assert.equal(h.models.at(-1).tasks.length,1);
   const first=h.models.at(-1).tasks;
   event(h,2,'task.updated',{task});h.flushFrame();assert.equal(h.run('visibleConversationTasks()'),first,'unchanged replay retains the projection');
+  h.run(`request=async()=>({tasks:[${JSON.stringify(task)},${JSON.stringify({...task,id:'task-b',title:'Verify the app'})}]});`);
+  await h.run('loadConversationTasks()');
   event(h,3,'task.updated',{task:{...task,id:'task-b',title:'Verify the app'}});h.flushFrame();
   event(h,4,'task.updated',{task:{...task,status:'completed',statusVersion:3,updatedAt:'2026-10-01T00:00:03Z'}});h.flushFrame();
   event(h,5,'task.updated',{task:{...task,status:'running',statusVersion:2,updatedAt:'2026-10-01T00:00:04Z'}});h.flushFrame();
   assert.equal(h.run('conversationTasks[0].status'),'completed','lower durable version never reverses terminal status');
   assert.deepEqual(Array.from(h.models.at(-1).tasks,item=>item.id),['task-a','task-b'],'sibling pills retain their order when one status changes');
-  h.run(`request=async()=>({tasks:[${JSON.stringify(task)},${JSON.stringify({...task,id:'nested',sourceTaskId:'task-a'})}]});`);
+  h.run(`request=async()=>({tasks:[${JSON.stringify(task)},${JSON.stringify({...task,id:'task-b',title:'Verify the app'})},${JSON.stringify({...task,id:'nested',sourceTaskId:'task-a'})}]});`);
   await h.run('loadConversationTasks()');
   assert.equal(h.models.at(-1).tasks.length,2,'nested tasks belong to their originating task chat');
   assert.equal(h.models.at(-1).tasks[0].createdAt,task.createdAt,'status changes keep their original timeline anchor');
