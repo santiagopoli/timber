@@ -302,3 +302,6 @@
 .timber-composer .timber-dictate:disabled{opacity:.35;cursor:default}
 .timber-composer .timber-dictate:focus-visible{outline:2px solid var(--ink);outline-offset:-2px}
 @media(max-width:600px){.timber-composer .timber-dictate{width:44px;height:44px;min-width:44px;min-height:44px;margin:5px 0}}
+
+/* Sent audio is the player itself, not a second padded message card. */
+.timber-message.is-user>.timber-message-content.timber-audio-content{padding:0;border:0;border-radius:0;background:transparent;box-shadow:none}

@@ -26,8 +26,6 @@
 .timber-audio-track input[type=range]:focus-visible{opacity:.18;outline:2px solid var(--ink);outline-offset:2px;border-radius:8px}
 .timber-audio-times{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:10px;font-variant-numeric:tabular-nums;line-height:1.2}
 .timber-audio-icon{display:flex;justify-content:center;color:var(--muted)}.timber-audio-icon svg{width:17px;height:17px}
-.timber-audio-original{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:10px;line-height:1.4;min-width:0}.timber-audio-original>span{overflow-wrap:anywhere}
-.timber-audio-original svg{width:13px;height:13px;flex:none}
 .timber-audio-text-button{border:0;padding:6px 0;background:transparent;color:var(--ink);font:inherit;font-size:11px;text-decoration:underline;text-underline-offset:3px;cursor:pointer;min-height:32px;width:fit-content}
 .timber-audio-transcription{min-width:0}
 .timber-audio-state{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:11px;margin:0}
@@ -52,3 +50,12 @@
 .timber-audio-composer>.timber-audio-recording{padding:0 2px;background:transparent}
 .timber-audio-composer[data-audio-mode=dictation] .timber-audio-recording{border:0}
 @media(max-width:600px){.timber-audio-composer>.timber-audio-state button,.timber-audio-recording button,.timber-audio-draft-actions button{min-height:44px;min-width:44px}}
+
+/* Reserve a separate corner cell: the touch target never covers seek or volume. */
+.timber-audio-player.has-transcript{grid-template-columns:38px minmax(0,1fr) 22px 44px;column-gap:6px}
+.timber-audio-transcript-toggle{display:flex;align-items:flex-end;justify-content:center;align-self:end;width:44px;height:44px;padding:4px;border:0;border-radius:8px;background:transparent;color:var(--muted);cursor:pointer}
+.timber-audio-transcript-toggle svg{width:15px;height:15px;flex:none}
+.timber-audio-transcript-toggle:hover{color:var(--ink)}
+.timber-audio-transcript-toggle:focus-visible{outline:2px solid var(--ink);outline-offset:-2px}
+.timber-audio-player>.timber-audio-error{grid-column:1/-1}
+@media(max-width:600px){.timber-audio-player.has-transcript{grid-template-columns:42px minmax(0,1fr) 20px 44px}}
