@@ -1703,6 +1703,37 @@ export class BotDO extends DurableObject<Env> {
     if(continuation)await this.admit(continuation);
   }
   private async executeHostTool(input:RuntimeHostToolRequest):Promise<RuntimeToolResult> {
+    // Pi records thrown tool errors as plain text. Publish the safe host receipt
+    // as well, so activity can explain failures and correlate them by call ID.
+    const publishFailure=(result:ComputerResult,sourceKey=`tool:${input.operationId}`)=>{
+      const row=this.findRun(input.runOperationId);
+      if(!row)return;
+      const run=JSON.parse(row.data) as Run;
+      this.emit('tool.completed',{operationId:input.operationId,toolName:input.name,
+        ...(input.toolCallId?{toolCallId:input.toolCallId}:{}),
+        ...(input.subagentId||run.subagentId?{subagentId:input.subagentId??run.subagentId}:{}),result},run.id,sourceKey);
+    };
+    try {
+      const result=await this.dispatchHostTool(input);
+      if(result.status==='failed'||result.status==='interrupted')publishFailure(result);
+      return result;
+    } catch(error) {
+      // Match the HTTP boundary: never copy arbitrary exceptions or stacks into
+      // the transcript. Preserve public policy errors for both Pi and the UI.
+      const response=errorResponse(error);
+      const {error:publicError}=await response.json<{error:{code:string;message:string}}>();
+      if(publicError.code==='internal_error') {
+        // A lost acknowledgment can follow durable acceptance. This observation
+        // is not a terminal effect receipt and must not fence a later receipt.
+        const result:ComputerResult={operationId:input.operationId,status:'interrupted',error:'The tool response could not be confirmed. Inspect the task or delegation before sending another message. (internal_error)'};
+        publishFailure(result,`tool-error:${input.operationId}`);
+        return result;
+      }
+      publishFailure({operationId:input.operationId,status:'failed',error:`${publicError.message} (${publicError.code})`});
+      throw new ApiError(response.status,publicError.code,publicError.message);
+    }
+  }
+  private async dispatchHostTool(input:RuntimeHostToolRequest):Promise<RuntimeToolResult> {
     this.active();
     input=await this.childToolInput(input);
     validateHostArguments(input.name,input.arguments);
@@ -1711,7 +1742,7 @@ export class BotDO extends DurableObject<Env> {
     const run=JSON.parse(row.data) as Run;
     if(row.native_operation_id!==input.runOperationId || terminal.has(run.status) || this.taskStopped() || input.signal.aborted) return {operationId:input.operationId,status:'interrupted',error:'Run is no longer active.'};
     if(input.name==='create_task'&&(input.subagentId||run.subagentId))return {operationId:input.operationId,status:'failed',error:'Temporary agents must ask their named parent to create persistent tasks.'};
-    if(run.coordinatorMode&&!['create_task','list_tasks','inspect_task','message_task','list_bots','list_secrets','load_skill','github_inspect_ci'].includes(input.name))return {operationId:input.operationId,status:'failed',error:'This chat turn can answer, inspect metadata and create tasks. Perform service or computer actions in a persistent task.'};
+    if(run.coordinatorMode&&!['create_task','list_tasks','inspect_task','message_task','send_to_bot','list_bots','list_secrets','load_skill','github_inspect_ci'].includes(input.name))return {operationId:input.operationId,status:'failed',error:'This chat turn can answer, inspect metadata and create tasks. Perform service or computer actions in a persistent task.'};
     await this.currentBot(!run.coordinatorMode);
     this.active();
     if(this.getRunRow(run.id).native_operation_id!==input.runOperationId || terminal.has(this.getRun(run.id).status) || this.taskStopped() || input.signal.aborted) return {operationId:input.operationId,status:'interrupted',error:'Run is no longer active.'};

@@ -2,7 +2,7 @@ import { env, exports } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { AgentDelegation, Bot, Message, Run } from "@botspace/contracts";
-import type { AgentRuntime } from "../packages/runtime/src/types";
+import type { AgentRuntime, RuntimeHostToolRequest, RuntimeToolResult } from "../packages/runtime/src/types";
 import type { Env } from "../apps/api/src/env";
 
 const bindings = env as unknown as Env;
@@ -74,6 +74,48 @@ async function delivered(bot: Bot, delegation: AgentDelegation): Promise<AgentDe
 }
 
 describe("durable communication between named bots", () => {
+  it('records early policy denials and sanitizes unexpected host exceptions',async()=>{
+    const {bot,run}=await source();
+    await runInDurableObject(stubFor(bot),async(instance,state)=>{
+      const host=instance as unknown as {executeHostTool(input:RuntimeHostToolRequest):Promise<RuntimeToolResult>;dispatchHostTool(input:RuntimeHostToolRequest):Promise<RuntimeToolResult>};
+      const row=state.storage.sql.exec<{data:string}>('SELECT data FROM runs WHERE id=?',run.id).one();
+      state.storage.sql.exec('UPDATE runs SET data=? WHERE id=?',JSON.stringify({...JSON.parse(row.data),coordinatorMode:true}),run.id);
+      const input:RuntimeHostToolRequest={name:'create_bot',arguments:{name:'Blocked'},operationId:'early-denial',runOperationId:run.operationId,toolCallId:'denied-call',signal:new AbortController().signal};
+      expect(await host.executeHostTool(input)).toMatchObject({status:'failed'});
+      const dispatch=host.dispatchHostTool;
+      host.dispatchHostTool=async()=>{throw new Error('private-exception-canary');};
+      try {expect(await host.executeHostTool({...input,operationId:'unexpected-error'})).toMatchObject({status:'interrupted',error:expect.stringContaining('could not be confirmed')});}
+      finally {host.dispatchHostTool=dispatch;}
+      const events=state.storage.sql.exec<{data:string}>('SELECT data FROM events').toArray().map(row=>JSON.parse(row.data));
+      for(const [operationId,status] of [['early-denial','failed'],['unexpected-error','interrupted']])expect(events).toContainEqual(expect.objectContaining({data:expect.objectContaining({operationId,result:expect.objectContaining({status,error:expect.any(String)})})}));
+      expect(state.storage.sql.exec('SELECT 1 FROM events WHERE source_key=?','tool:unexpected-error').toArray()).toHaveLength(0);
+      expect(JSON.stringify(events)).not.toContain('private-exception-canary');
+    });
+  });
+  it("lets computerless coordinators send once and records actionable rejected messages", async () => {
+    const {bot,run}=await source(), target=await create();
+    await hold(target);
+    await runInDurableObject(stubFor(bot),(_,state)=>{
+      const row=state.storage.sql.exec<{data:string}>('SELECT data FROM runs WHERE id=?',run.id).one();
+      state.storage.sql.exec('UPDATE runs SET data=? WHERE id=?',JSON.stringify({...JSON.parse(row.data),coordinatorMode:true}),run.id);
+    });
+    const operationId=crypto.randomUUID();
+    const call=(botId:string,op=operationId)=>runInDurableObject(stubFor(bot),async instance=>{
+      const host=instance as unknown as {executeHostTool(input:RuntimeHostToolRequest):Promise<RuntimeToolResult>};
+      return host.executeHostTool({name:'send_to_bot',arguments:{botId,text:'Check this independently'},operationId:op,runOperationId:run.operationId,toolCallId:`call:${op}`,signal:new AbortController().signal});
+    });
+    const first=await call(target.id),second=await call(target.id);
+    expect(first.status).toBe('completed');expect(second.status).toBe('completed');
+    expect((await tasks(bot))).toHaveLength(1);
+    const failedOp=crypto.randomUUID();
+    await expect(call(crypto.randomUUID(),failedOp)).rejects.toMatchObject({status:404});
+    await runInDurableObject(stubFor(bot),(_,state)=>{
+      const events=state.storage.sql.exec<{data:string}>('SELECT data FROM events').toArray().map(row=>JSON.parse(row.data));
+      const failure=events.find(event=>event.type==='tool.completed'&&event.data.operationId===failedOp);
+      expect(failure).toMatchObject({runId:run.id,data:{toolName:'send_to_bot',toolCallId:`call:${failedOp}`,result:{status:'failed',error:expect.stringContaining('not found')}}});
+      expect(JSON.stringify(failure)).not.toContain('Check this independently');
+    });
+  });
   it("delivers once with trusted provenance, source lineage, and an independently visible target run", async () => {
     const {bot, run} = await source(), target = await create();
     await hold(target);
