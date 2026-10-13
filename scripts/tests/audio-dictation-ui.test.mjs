@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {after,test} from 'node:test';
 import {existsSync} from 'node:fs';
+import {createServer,request as httpRequest} from 'node:http';
 import {webkit} from 'playwright';
 import {createConsoleBrowser} from './console-browser.mjs';
 import {createConsoleFixture,BOT_A,BOT_B,TEST_TOKEN} from './console-fixture.mjs';
@@ -12,7 +13,7 @@ const chromiumBrowser=createConsoleBrowser();let webkitOpening;
 after(async()=>{if(webkitOpening)await(await webkitOpening).close();});
 const browserFor=engine=>engine==='chromium'?chromiumBrowser():(webkitOpening??=webkit.launch({headless:true,...(process.env.CONSOLE_WEBKIT_PATH?{executablePath:process.env.CONSOLE_WEBKIT_PATH}:{})}));
 const date='2026-10-05T10:00:00.000Z',TASK_A='10000000-0000-4000-8000-000000000091',TASK_B='10000000-0000-4000-8000-000000000092',transcript='spoken words';
-const fixtureMocks=new WeakMap();
+const fixtureMocks=new WeakMap(),fixtureBackends=new WeakMap();
 const deferred=()=>{let resolve;const promise=new Promise(done=>{resolve=done;});return{promise,resolve};};
 const json=(route,value,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify(value)});
 function syntheticPcmMic(){
@@ -63,10 +64,48 @@ async function installTasks(page){
     return json(route,{});
   });
 }
+async function createRawAudioFixture(){
+  const fixture=await createConsoleFixture(),originalURL=fixture.url,originalClose=fixture.close,originalOrigin=new URL(originalURL).origin;
+  assert.equal(new URL(originalURL).protocol,'http:');assert.equal(new URL(originalURL).hostname,'127.0.0.1','upstream fixture must remain loopback');
+  const backend={mock:null};
+  // WebKit's interception protocol does not expose Blob PUT postDataBuffer.
+  // Capture actual browser-sent bytes at a loopback HTTP front end instead;
+  // every other request still runs the existing console fixture unchanged.
+  const server=createServer(async(incoming,response)=>{
+    let target;try{target=new URL(incoming.url,originalURL);}catch{response.writeHead(400).end('Invalid fixture path');return;}
+    // Reject absolute/network-path external targets before forwarding any
+    // request, headers or cookies; the raw fixture is never an open proxy.
+    if(target.origin!==originalOrigin){response.writeHead(400).end('Fixture origin only');return;}
+    const path=target.pathname;
+    if(incoming.method==='PUT'&&/^\/v1\/(bots|tasks)\/[^/]+\/(audio|dictation-audio)\/[^/]+$/.test(path)){
+      try{
+        assert.ok(backend.mock,'raw upload must belong to an installed dictation fixture');
+        const session=/(?:^|;\s*)timber_fixture_session=([^;]+)/.exec(incoming.headers.cookie||'')?.[1];
+        assert.ok(session&&fixture.state.sessions.has(session)&&!fixture.state.rejectAuth,'raw audio uses the current authenticated fixture session');
+        assert.equal(incoming.headers['x-timber-client'],'console');assert.equal(incoming.headers.authorization,undefined);assert.equal(incoming.headers['content-type'],'audio/wav');
+        let size=0;const chunks=[];
+        for await(const chunk of incoming){size+=chunk.length;assert.ok(size<=20_000_000,'wire audio stays within 20MB');chunks.push(chunk);}
+        const bytes=Buffer.concat(chunks);assert.ok(bytes.length>44,'wire upload contains WAV samples');assert.equal(bytes.toString('ascii',0,4),'RIFF');assert.equal(bytes.toString('ascii',8,12),'WAVE');
+        backend.mock.uploads.push({path,bytes,contentType:incoming.headers['content-type'],headers:{...incoming.headers}});
+        response.writeHead(201,{'content-type':'application/json','cache-control':'no-store'}).end(JSON.stringify({audio:{artifactId:path.split('/').at(-1),mimeType:'audio/wav',size:bytes.length,durationMs:1024}}));
+      }catch(error){fixture.state.failures.push(String(error));incoming.resume();response.writeHead(500,{'content-type':'application/json'}).end(JSON.stringify({error:{code:'fixture_raw_upload_failed',message:'Raw WAV fixture assertion failed.'}}));}
+      return;
+    }
+    const upstream=httpRequest(target,{method:incoming.method,headers:{...incoming.headers,host:target.host}},received=>{
+      response.writeHead(received.statusCode,received.headers);received.pipe(response);
+    });
+    upstream.on('error',error=>{if(!response.destroyed){fixture.state.failures.push(String(error));if(!response.headersSent)response.writeHead(502);response.end();}});
+    incoming.on('aborted',()=>upstream.destroy());response.on('close',()=>upstream.destroy());incoming.pipe(upstream);
+  });
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  fixture.url=`http://127.0.0.1:${server.address().port}/console/`;fixture.state.consoleOrigin=new URL(fixture.url).origin;
+  fixture.close=async()=>{server.closeAllConnections();try{await new Promise(resolve=>server.close(resolve));}finally{await originalClose();}};
+  return{fixture,backend};
+}
 async function connectedPage(engine,{tasks=false,initialHistory,viewport={width:1280,height:900}}={}){
-  const fixture=await createConsoleFixture(),browser=await browserFor(engine),context=await browser.newContext({serviceWorkers:'block',viewport});
+  const{fixture,backend}=await createRawAudioFixture(),browser=await browserFor(engine),context=await browser.newContext({serviceWorkers:'block',viewport});
   if(initialHistory)fixture.state.messages.set(BOT_A,initialHistory);
-  await context.addInitScript(syntheticPcmMic);const page=await context.newPage();page.setDefaultTimeout(6000);
+  await context.addInitScript(syntheticPcmMic);const page=await context.newPage();page.setDefaultTimeout(6000);fixtureBackends.set(page,backend);
   const traffic=[],external=[],errors=[];
   page.on('request',request=>{const url=new URL(request.url());if(url.pathname.startsWith('/v1/'))traffic.push({method:request.method(),path:url.pathname});});
   page.on('pageerror',error=>errors.push(error.message));
@@ -93,13 +132,13 @@ async function connectedPage(engine,{tasks=false,initialHistory,viewport={width:
 async function installDictationMocks(page,{hold=false,status='succeeded',text=transcript}={}){
   const gate=deferred(),submitted=deferred(),handled=deferred(),calls={uploads:[],posts:[],checks:[],deletes:[],discards:[],unexpected:[]};let currentStatus=status,currentText=text;
   const receipt=body=>({operationId:body.operationId,audioId:body.audioId,transcription:{attemptId:body.attemptId,status:currentStatus,...(currentStatus==='succeeded'?{text:currentText}:{}),...(currentStatus==='uncertain'?{errorCode:'transcription_uncertain',error:'Provider result is unknown; inspect the existing attempt.'}:{})}});
-  fixtureMocks.set(page,[...(fixtureMocks.get(page)||[]),calls]);
+  fixtureMocks.set(page,[...(fixtureMocks.get(page)||[]),calls]);fixtureBackends.get(page).mock=calls;
   // Registered after tasks: only audio/dictation requests are claimed here.
   await page.route(/\/v1\/(?:bots|tasks)\/[^/]+\/(?:dictations(?:\/[^/]+)?|(?:audio|dictation-audio)\/[^/]+|audio-messages(?:\/[^/]+)?)$/,async route=>{
     const request=route.request(),path=new URL(request.url()).pathname,method=request.method();
     if(/\/audio-messages(?:\/|$)/.test(path)){calls.unexpected.push({path,method});return json(route,{error:{code:'fixture_wrong_voice_mode',message:'Dictation must not create an audio message.'}},500);}
     if(/^\/v1\/(bots|tasks)\/[^/]+\/(audio|dictation-audio)\/[^/]+$/.test(path)){
-      if(method==='PUT'){const bytes=request.postDataBuffer();calls.uploads.push({path,bytes,contentType:request.headers()['content-type'],headers:request.headers()});return json(route,{audio:{artifactId:path.split('/').at(-1),mimeType:'audio/wav',size:bytes.length,durationMs:1024}},201);}
+      if(method==='PUT')return route.continue(); // Actual raw Blob reaches only the file-local loopback WAV handler.
       if(method==='DELETE'){calls.discards.push({path,method});return json(route,{discarded:true});}return json(route,{},404);
     }
     if(!/^\/v1\/(bots|tasks)\/[^/]+\/dictations(?:\/[^/]+)?$/.test(path))return route.fallback();

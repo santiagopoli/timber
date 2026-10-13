@@ -70,7 +70,10 @@ it('a live coordinator neither blocks the next task nor stops its independent ru
   const {approvals}=await api<{approvals:Array<{id:string}>}>(`/v1/tasks/${task.id}/approvals`);
   await api(`/v1/tasks/${task.id}/approvals/${approvals[0]!.id}`,{decision:'approve'});
   await expect.poll(async()=> (await api<{activeRuns:Run[]}>(`/v1/tasks/${task.id}/runs`)).activeRuns.length).toBe(0);
-  const registry=bindings.WORKSPACE.get(bindings.WORKSPACE.idFromName('owner'));expect(await runDurableObjectAlarm(registry)).toBe(true);
+  const registry=bindings.WORKSPACE.get(bindings.WORKSPACE.idFromName('owner'));
+  // Task completion is visible before the workspace persists its scheduler alarm.
+  await expect.poll(()=>runInDurableObject(registry,(_,state)=>state.storage.getAlarm())).not.toBeNull();
+  expect(await runDurableObjectAlarm(registry)).toBe(true);
   await expect.poll(async()=> (await api<{activeRuns:Run[]}>(`/v1/tasks/${next.id}/runs`)).activeRuns.some(run=>run.status==='waiting_approval')).toBe(true);
   const stopped=api(`/v1/bots/${bot.id}/runs/${chat.run.id}/cancel`,{});release();await stopped;
   expect((await api<{activeRuns:Run[]}>(`/v1/tasks/${next.id}/runs`)).activeRuns.some(run=>run.status==='waiting_approval')).toBe(true);
