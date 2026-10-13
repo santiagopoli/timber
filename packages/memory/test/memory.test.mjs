@@ -319,3 +319,11 @@ test('undo discarded suggestions never promotes them into model context', () => 
  assert.equal(restored.state,'suggested');assert.equal(service.selectContext('bot','español'),'');
  assert.equal(service.overview('bot').suggestions.length,1);
 });
+
+test('restoring the forgotten revision of a discarded proposal does not accept it', () => {
+ const {service}=fixture(),suggestion=service.suggest('bot',note('proposal'),review).entry;
+ const forgotten=service.forget('bot',{operationId:'discard',id:suggestion.id,expectedRevision:1},author).entry;
+ const restored=service.restore('bot',{operationId:'restore-discarded',id:suggestion.id,expectedRevision:forgotten.revision,revision:forgotten.revision}).entry;
+ assert.equal(restored.state,'suggested');assert.equal(service.selectContext('bot','español'),'');
+ assert.equal(service.overview('bot').entries.length,0);assert.equal(service.overview('bot').suggestions.length,1);
+});

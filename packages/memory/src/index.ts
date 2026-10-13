@@ -268,7 +268,10 @@ export function createMemoryService(storage: MemoryStorage) {
         const row=[...sql.exec('SELECT data FROM timber_memory_history WHERE scope=? AND id=? AND revision=?',scope,input.id,input.revision)][0];
         if(!row)return invalid('Memory revision not found.');
         const historical=(JSON.parse(String(row.data)) as MemoryRevision).entry;
-        const targetState=historical.state==='suggested'?'suggested':'active';
+        const beforeForget=historical.state==='forgotten'?[...sql.exec('SELECT data FROM timber_memory_history WHERE scope=? AND id=? AND revision=?',scope,input.id,input.revision-1)][0]:undefined;
+        // A discarded proposal remains a proposal even when restoring its
+        // forgotten revision. Restore must not implicitly approve that text.
+        const targetState=historical.state==='suggested'||(beforeForget&&(JSON.parse(String(beforeForget.data)) as MemoryRevision).entry.state==='suggested')?'suggested':'active';
         validateSave({operationId:input.operationId,category:historical.category,title:historical.title,content:historical.content,pinned:historical.pinned},{actor:'user',sources:[{kind:'user'}]});
         const entries=all(scope);
         if(targetState==='suggested') {
