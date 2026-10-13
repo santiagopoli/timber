@@ -120,6 +120,8 @@ export const PRIVATE_EXECUTION_REPEATS = `SELECT json_group_array(json_object('c
  MIN(json_extract(data,'$.createdAt')) AS first_at,MAX(json_extract(data,'$.createdAt')) AS last_at
  FROM events WHERE json_extract(data,'$.type')='tool.started' AND json_extract(data,'$.data.actionType')='exec'
  GROUP BY json_extract(data,'$.data.input.command') ORDER BY n DESC LIMIT 15)`;
+export const PRIVATE_PROGRESS_HOURS = `SELECT json_group_array(json_object('at',json_extract(data,'$.createdAt'),'role',json_extract(data,'$.role'),'kind',json_extract(data,'$.kind'),'text',substr(json_extract(data,'$.text'),1,600))) AS detail,'text' AS detail_type FROM (
+ SELECT data FROM messages WHERE rowid IN (SELECT MAX(rowid) FROM messages WHERE json_extract(data,'$.role') IN ('user','assistant') GROUP BY substr(json_extract(data,'$.createdAt'),1,13),json_extract(data,'$.role')) ORDER BY rowid DESC LIMIT 10)`;
 export function selectedTaskQuery(prefix) {
  if(!prefix)return PERFORMANCE_TASKS;
  if(!/^[a-f0-9]{8}$/.test(prefix))throw new Error('durable_diagnostics_invalid_task');
@@ -284,7 +286,7 @@ export async function collectDurable({env=process.env,fetcher=fetch,now=Date.now
       const goalQuery=PRIVATE_PROGRESS_GOAL.replace("lower(json_extract(b.data,'$.name'))='polibot'",`t.id='${selectedTasks[0].id}'`);
       const evidence=[...(await query(bot,selectedName,PRIVATE_PROGRESS_MESSAGES)),...(await query(bot,selectedName,PRIVATE_PROGRESS_FAILURES)),...(await query(workspace,'owner',goalQuery))];
       encryptedDiagnostic=encryptDetails(evidence,recipient,window);
-      encryptedExecution=encryptDetails([...(await query(bot,selectedName,PRIVATE_EXECUTION_RECENT)),...(await query(bot,selectedName,PRIVATE_EXECUTION_REPEATS))],recipient,window);
+      encryptedExecution=encryptDetails([...(await query(bot,selectedName,PRIVATE_EXECUTION_RECENT)),...(await query(bot,selectedName,PRIVATE_EXECUTION_REPEATS)),...(await query(bot,selectedName,PRIVATE_PROGRESS_HOURS))],recipient,window);
     }
     return {source:'durable_performance_fixed_select',window,root,tasks,backgroundAvatars,...(encryptedDiagnostic?{encryptedDiagnostic,encryptedExecution}:{}),limitation:'Latest 12 runs, 60 tools/native tasks and 40 model responses per conversation; Polibot chat and six tasks across all bots, prioritizing active work. Plaintext contains only allowlisted metadata. Optional task evidence is encrypted exclusively for the supplied recipient; no native prompts, private reasoning or secret storage is queried.'};
   }
