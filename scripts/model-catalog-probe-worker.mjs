@@ -40,7 +40,7 @@ export default {
     try {
       if(path==='/queue') {
         const workspace=env.WORKSPACE.get(env.WORKSPACE.idFromName('owner'));
-        const {bots}=await (await workspace.fetch('https://workspace/bots')).json();
+        const {bots}=await (await workspace.fetch('https://workspace/')).json();
         if(!Array.isArray(bots))throw new Error('invalid state');
         const values=await Promise.all(bots.slice(0,20).map(async bot=>{
           if(!/^[a-f0-9-]{36}$/.test(bot.id))throw new Error('invalid bot');

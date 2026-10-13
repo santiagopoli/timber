@@ -40,3 +40,11 @@ test('queue projections distinguish model admission failures from computer holde
   assert.deepEqual(value,{bot:'12345678',activeProcesses:1,pendingCancellations:0,lease:'owner_action',runs:[{status:'queued',error:'model_catalog_unavailable',coordinator:false},{status:'unknown',error:'other',coordinator:false}]});
   assert.doesNotMatch(JSON.stringify(value),/private-canary/);
 });
+test('queue probe uses passive registry and bot routes with scheduler headers',async()=>{
+  const id='12345678-1234-1234-1234-123456789012',calls=[];
+  const workspace={async fetch(url){calls.push(url);if(url==='https://workspace/')return Response.json({bots:[{id,instructions:'private-canary'}]});assert.equal(url,`https://workspace/tasks/bot-slot/${id}`);return Response.json({holder:'@bot'});}};
+  const env={PROBE_TOKEN_SHA256:hash,WORKSPACE:{idFromName(name){assert.equal(name,'owner');return name;},get(){return workspace;}},BOT:{idFromName(name){assert.equal(name,`owner:${id}`);return name;},get(){return {async fetch(request){assert.equal(request.method,'GET');assert.equal(request.headers.get('x-timber-internal'),'scheduler');calls.push(request.url);return Response.json(request.url.endsWith('/summary')?{summary:{activeProcesses:0,pendingCancellations:0,lastMessage:'private-canary'}}:{activeRuns:[{status:'queued',errorCode:'model_catalog_unavailable',text:'private-canary'}]});}};}}};
+  const result=await worker.fetch(new Request('https://probe.test/queue',{headers:{authorization:`Bearer ${token}`}}),env);
+  assert.equal(result.status,200);assert.deepEqual(await result.json(),{bots:[{bot:'12345678',activeProcesses:0,pendingCancellations:0,lease:'bot',runs:[{status:'queued',error:'model_catalog_unavailable',coordinator:false}]}]});
+  assert.deepEqual(calls,['https://workspace/','https://bot/summary','https://bot/runs',`https://workspace/tasks/bot-slot/${id}`]);
+});
