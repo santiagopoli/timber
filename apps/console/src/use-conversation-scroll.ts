@@ -51,6 +51,13 @@ export function useConversationScroll() {
     const nearBottom = () => node.scrollHeight - node.clientHeight - node.scrollTop <= 4;
     const resized = () => {
       if (!node.clientHeight) return;
+      const previous = measured.current, maximum = Math.max(0, node.scrollHeight - node.clientHeight);
+      // Composer review/toolbar changes can resize before an upward scroll is
+      // observed. Respect that newer reading intent before writing a follow
+      // position; ordinary browser clamping lands at maximum and still follows.
+      if (following.current && previous.height > 0 && !nearBottom() && node.scrollTop < Math.min(previous.top, maximum) - 1) {
+        setFollowing(false); measure(); return;
+      }
       if (following.current) node.scrollTop = node.scrollHeight;
       else {
         const previous = anchor.current;

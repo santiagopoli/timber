@@ -6,7 +6,7 @@ export function remapDraftPosition(previous:string,next:string,position:number):
   // Two disjoint boundary edits can preserve the complete old draft. Follow
   // that intact span instead of treating it as one wholesale replacement.
   const retained=previous.length?next.indexOf(previous):-1;
-  if(retained>=0)return retained+at;
+  if(retained>0&&retained+previous.length<next.length)return at===previous.length?next.length:retained+at;
   let start=0,end=0;
   while(start<previous.length&&start<next.length&&previous[start]===next[start])start++;
   while(end<previous.length-start&&end<next.length-start&&previous[previous.length-1-end]===next[next.length-1-end])end++;

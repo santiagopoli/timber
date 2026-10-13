@@ -666,7 +666,10 @@ function Composer({ model, callbacks }: { model: ChatModel; callbacks: ChatCallb
     const focused=document.activeElement===editor||Boolean(editor?.contains(document.activeElement));
     const start=input?.selectionStart??selection.current.start,end=input?.selectionEnd??selection.current.end;
     const map=(position:number)=>position>=inserted.position?position+inserted.length:position;
-    const range={text:inserted.text,start:map(start),end:map(end),direction:input?.selectionDirection??'none' as const,focus:focused};
+    const activeRange=window.getSelection();
+    let secureDirection:'forward'|'backward'|'none'='none';
+    if(activeRange?.anchorNode&&activeRange.focusNode&&editor?.contains(activeRange.anchorNode)&&editor.contains(activeRange.focusNode))secureDirection=(activeRange.anchorNode===activeRange.focusNode?activeRange.anchorOffset>activeRange.focusOffset:Boolean(activeRange.anchorNode.compareDocumentPosition(activeRange.focusNode)&Node.DOCUMENT_POSITION_PRECEDING))?'backward':'forward';
+    const range={text:inserted.text,start:map(start),end:map(end),direction:input?.selectionDirection??secureDirection,focus:focused};
     dictationRange.current=range;dictationAnchor.current=null;pendingCaret.current=null;
     selection.current={start:range.start,end:range.end};setCaret(range.start);setDismissed(true);
     latestDraft.current=inserted.text;callbacks.onDraft(current.bot.id,inserted.text,current.draftMentions);
