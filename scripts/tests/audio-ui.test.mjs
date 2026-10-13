@@ -45,10 +45,16 @@ async function installAudioMocks(page,{initialStatus='failed'}={}){
   await page.route(`**/v1/bots/${BOT_A}/artifacts/*`,async route=>{calls.downloads.push(route.request().url());await route.fulfill({status:200,contentType:'audio/wav',headers:{'cache-control':'private, no-store'},body:wav});});
   return calls;
 }
-async function chooseTone(page,name='tone.wav'){
-  const chooser=page.waitForEvent('filechooser');await page.getByRole('button',{name:'Attach audio file'}).click();await(await chooser).setFiles({name,mimeType:'audio/wav',buffer:wav});await page.locator('.timber-audio-draft').waitFor();
+async function audioMenu(page,name){
+  await page.getByRole('button',{name:'Add',exact:true}).click();
+  return page.getByRole('menuitem',{name,exact:true});
 }
-async function confirmSend(page){await page.getByRole('button',{name:'Review & send'}).click();await page.getByRole('dialog').getByRole('button',{name:'Send audio'}).click();}
+async function attachAudio(page){await(await audioMenu(page,'Attach audio')).click();}
+async function recordAudio(page){await(await audioMenu(page,'Record audio')).click();}
+async function chooseTone(page,name='tone.wav'){
+  const chooser=page.waitForEvent('filechooser');await attachAudio(page);await(await chooser).setFiles({name,mimeType:'audio/wav',buffer:wav});await page.locator('.timber-audio-draft').waitFor();
+}
+async function confirmSend(page){await page.getByRole('button',{name:'Send audio',exact:true}).click();await page.getByRole('dialog').getByRole('button',{name:'Send audio'}).click();}
 
 test('desktop draft/upload, decoded waveform, browser playback seek/pause and explicit paid retry',async()=>{
   const {fixture,context,page}=await connectedPage();
@@ -58,7 +64,7 @@ test('desktop draft/upload, decoded waveform, browser playback seek/pause and ex
     assert.equal(await page.locator('.timber-audio-draft audio').count(),1);assert.equal(calls.uploads.length,0,'file selection is local draft only');
     await page.getByRole('button',{name:'Cancel audio'}).click();assert.equal(await page.locator('.timber-audio-draft').count(),0);assert.equal(calls.uploads.length,0,'cancel never uploads');
 
-    await chooseTone(page);await page.getByRole('button',{name:'Review & send'}).click();const consent=page.getByRole('dialog');
+    await chooseTone(page);await page.getByRole('button',{name:'Send audio',exact:true}).click();const consent=page.getByRole('dialog');
     await consent.waitFor();assert.match(await consent.innerText(),/billing is separate and actual charges may vary/);assert.equal(calls.uploads.length,0,'no paid request before consent');
     await consent.getByRole('button',{name:'Cancel'}).click();assert.equal(calls.uploads.length,0,'declining consent retains local draft only');await confirmSend(page);
     let message=page.locator('.timber-audio-message[data-transcription-status="failed"]');await message.waitFor();
@@ -84,14 +90,39 @@ test('desktop draft/upload, decoded waveform, browser playback seek/pause and ex
   }finally{await context.close();await fixture.close();}
 });
 
+for(const width of [320,390,1280])test(`idle ${width}px composer keeps audio in Add and a single compact microphone toolbar`,async()=>{
+  const{fixture,context,page}=await connectedPage({width,height:844});
+  try{
+    const add=page.getByRole('button',{name:'Add',exact:true}),mic=page.getByRole('button',{name:'Dictate text',exact:true}),send=page.getByRole('button',{name:'Send message',exact:true});
+    assert.equal(await add.count(),1,'audio reuses the existing Add control');assert.equal(await mic.count(),1);
+    assert.equal(await page.locator('.timber-audio-tools,.timber-audio-format-note,.timber-audio-capture-note').count(),0,'no permanent audio row or format disclaimer');
+    assert.equal(await page.getByRole('button',{name:'Record audio',exact:true}).count(),0,'voice-note recording is secondary, not a duplicate primary microphone');
+    assert.equal(await page.getByRole('button',{name:'Send audio',exact:true}).count(),0);
+    assert.equal(await page.locator('#message').evaluate(node=>node===document.activeElement),false,'idle composer does not autofocus');
+    const geometry=await page.evaluate(()=>{const row=document.querySelector('.timber-composer-row'),rect=node=>node?.getBoundingClientRect().toJSON();return{width:innerWidth,scrollWidth:document.documentElement.scrollWidth,row:rect(row),controls:['Add','Dictate text','Send message'].map(label=>rect(row?.querySelector(`button[aria-label="${label}"]`)))}});
+    assert.equal(geometry.scrollWidth,geometry.width);assert.ok(geometry.row.width<=width);
+    assert.ok(geometry.controls.every(Boolean),'microphone is in the same existing control row as Add and Send');
+    const[addRect,micRect,sendRect]=geometry.controls;
+    assert.ok(addRect.x<micRect.x&&micRect.x<sendRect.x,'toolbar order is Add / microphone / Send');
+    assert.ok(Math.max(...geometry.controls.map(rect=>rect.y+rect.height/2))-Math.min(...geometry.controls.map(rect=>rect.y+rect.height/2))<=1,'controls share a single row');
+    if(width<768)assert.ok(geometry.controls.every(rect=>rect.width>=44&&rect.height>=44),'mobile controls have 44px touch targets');
+    await add.click();
+    for(const name of ['Secure input','Attach images','Attach audio','Record audio'])assert.equal(await page.getByRole('menuitem',{name,exact:true}).isVisible(),true,`${name} remains in Add`);
+    assert.equal(await page.locator('#message').evaluate(node=>node===document.activeElement),false,'opening Add does not focus the draft or summon a mobile keyboard');
+    await page.keyboard.press('Escape');
+    assert.equal(await page.locator('#message').evaluate(node=>node===document.activeElement),false,'closing Add does not autofocus the draft');
+    assert.equal(fixture.state.calls.filter(call=>call.method==='POST'&&/\/(messages|audio-messages|dictations|continue|runs)(?:\/|$)/.test(call.path)).length,0,'idle controls never send or transcribe');
+  }finally{await context.close();await fixture.close();}
+});
+
 test('mobile permission is click-initiated, tracks are released on discard, and layout has no horizontal overflow',async()=>{
   const fakeMic=()=>{window.__micCalls=0;window.__trackStops=0;Object.defineProperty(navigator,'mediaDevices',{configurable:true,value:{getUserMedia:async()=>{window.__micCalls++;return{getTracks:()=>[{stop(){window.__trackStops++;}}]};}}});window.MediaRecorder=class{static isTypeSupported=()=>true;state='inactive';mimeType='audio/webm;codecs=opus';start(){this.state='recording';}stop(){this.state='inactive';this.onstop?.();}};};
   const {fixture,context,page}=await connectedPage({width:390,height:844,initScript:fakeMic});
   try{
     await installAudioMocks(page);assert.equal(await page.evaluate(()=>window.__micCalls),0,'page load never asks for microphone permission');
-    await page.getByRole('button',{name:'Start recording audio'}).click();await page.getByRole('button',{name:'Stop recording'}).waitFor();assert.equal(await page.evaluate(()=>window.__micCalls),1,'getUserMedia follows explicit user click');
+    await recordAudio(page);await page.getByRole('button',{name:'Stop recording'}).waitFor();assert.equal(await page.evaluate(()=>window.__micCalls),1,'getUserMedia follows explicit user click');
     await page.getByRole('button',{name:'Discard'}).click();await page.waitForFunction(()=>window.__trackStops===1);assert.equal(await page.evaluate(()=>window.__trackStops),1,'discard stops every acquired track');
-    const geometry=await page.evaluate(()=>({width:innerWidth,scrollWidth:document.documentElement.scrollWidth,tools:document.querySelector('.timber-audio-tools')?.getBoundingClientRect().toJSON()}));
+    const geometry=await page.evaluate(()=>({width:innerWidth,scrollWidth:document.documentElement.scrollWidth,tools:document.querySelector('.timber-composer-row')?.getBoundingClientRect().toJSON()}));
     assert.equal(geometry.scrollWidth,geometry.width);assert.ok(geometry.tools);assert.ok(geometry.tools.width<=390);
   }finally{await context.close();await fixture.close();}
 });
@@ -184,7 +215,9 @@ test('regular text chat still submits through existing messages API',async()=>{
   try{
     await page.locator('#message').fill('Text chat regression remains intact.');
     assert.equal(await page.locator('.timber-audio-format-note').count(),0,'audio details do not expand an ordinary text composer');
-    assert.ok((await page.locator('.timber-audio-tools').boundingBox()).height<=52,'disabled audio controls stay on one compact row');
+    assert.equal(await page.locator('.timber-audio-tools').count(),0,'text drafts never add an idle audio row');
+    assert.ok((await page.locator('.timber-composer-row').boundingBox()).height<=52,'existing composer controls stay on one compact row');
+    assert.equal(await page.getByRole('button',{name:'Dictate text',exact:true}).isEnabled(),true,'dictation remains available alongside a text draft');
     await page.getByRole('button',{name:'Send message'}).click();
     await page.waitForFunction(()=>document.querySelectorAll('[data-message-id]').length>=3);
     assert.ok(fixture.state.calls.some(call=>call.path.endsWith('/messages')&&call.method==='POST'&&call.body.text==='Text chat regression remains intact.'));
@@ -210,7 +243,7 @@ test('31-second PCM WAV produces a real waveform within the 10-minute/20-MB limi
   const {fixture,context,page}=await connectedPage();
   try{
     const calls=await installAudioMocks(page);
-    const chooser=page.waitForEvent('filechooser');await page.getByRole('button',{name:'Attach audio file'}).click();
+    const chooser=page.waitForEvent('filechooser');await attachAudio(page);
     await(await chooser).setFiles({name:'long-tone-31s.wav',mimeType:'audio/wav',buffer:longWav});
     const draft=page.locator('.timber-audio-draft');await draft.waitFor();assert.match(await draft.innerText(),/long-tone-31s\.wav/);
     await page.waitForFunction(()=>document.querySelector('.timber-audio-draft .timber-audio-player')?.dataset.waveform==='decoded');
@@ -218,7 +251,7 @@ test('31-second PCM WAV produces a real waveform within the 10-minute/20-MB limi
     const bars=await player.locator('.timber-audio-wave i').evaluateAll(nodes=>nodes.map(node=>parseFloat(node.style.height)));
     assert.equal(bars.length,56);assert.ok(Math.max(...bars)-Math.min(...bars)>10,'31-second PCM samples produce signal-derived bars');
     assert.match(await draft.innerText(),/0:31/);assert.equal(calls.uploads.length,0);assert.equal(calls.submissions.length,0);assert.equal(calls.retries.length,0,'long local WAV selection is not a paid call');
-    await page.getByRole('button',{name:'Review & send'}).click();await page.getByRole('dialog').waitFor();
+    await page.getByRole('button',{name:'Send audio',exact:true}).click();await page.getByRole('dialog').waitFor();
     assert.equal(calls.uploads.length,0);assert.equal(calls.submissions.length,0,'no paid route is called before consent');
     await page.getByRole('dialog').getByRole('button',{name:'Cancel'}).click();await page.getByRole('button',{name:'Cancel audio'}).click();
     assert.equal(await draft.count(),0);assert.equal(calls.uploads.length,0);assert.equal(calls.submissions.length,0);
@@ -239,7 +272,7 @@ test('real Chromium MediaRecorder WebM draft passes the shared server audio vali
   try{
     const calls=await installAudioMocks(page,{initialStatus:'pending'});
     assert.equal(await page.evaluate(()=>window.__micCalls),0,'permission mock is not invoked during page initialization');
-    await page.getByRole('button',{name:'Start recording audio'}).click();
+    await recordAudio(page);
     await page.getByRole('button',{name:'Stop recording'}).waitFor();
     assert.equal(await page.evaluate(()=>window.__micCalls),1,'record button is the only permission-request entry point');
     assert.equal(await page.evaluate(()=>MediaRecorder.isTypeSupported('audio/webm;codecs=opus')),true,'this test requires actual Chromium WebM/Opus MediaRecorder support');
@@ -338,7 +371,7 @@ for(const engine of ['chromium','webkit'])test(`real ${engine} Web Audio PCM fal
   page.on('pageerror',error=>browserErrors.push(error.message));
   try{
     const calls=fixture.audioCalls;
-    assert.equal(await page.evaluate(()=>window.__micCalls),0);await page.getByRole('button',{name:'Start recording audio'}).click();await page.getByRole('button',{name:'Stop recording'}).waitFor();
+    assert.equal(await page.evaluate(()=>window.__micCalls),0);await recordAudio(page);await page.getByRole('button',{name:'Stop recording'}).waitFor();
     await page.waitForTimeout(900);await page.getByRole('button',{name:'Stop recording'}).click();await page.locator('.timber-audio-draft').waitFor();
     assert.equal(await page.evaluate(()=>window.__mp4RecorderCalls),0);assert.match(await page.locator('.timber-audio-draft').innerText(),/Recording-.*\.wav/);
     const exactClip=Buffer.from(await page.evaluate(async()=>{const bytes=new Uint8Array(await window.__actualPcmFile.arrayBuffer());return btoa(Array.from(bytes,byte=>String.fromCharCode(byte)).join(''));}),'base64');
@@ -349,7 +382,7 @@ for(const engine of ['chromium','webkit'])test(`real ${engine} Web Audio PCM fal
     assert.ok(await player.locator('.timber-audio-wave i').evaluateAll(nodes=>nodes.some(node=>parseFloat(node.style.height)>0)),'native captured samples produce actual waveform peaks');
     await player.getByRole('button',{name:'Play audio'}).click();await player.getByRole('button',{name:'Pause audio'}).waitFor();await player.getByRole('slider',{name:'Seek audio'}).fill('0.3');
     assert.ok(await page.locator('.timber-audio-draft audio').evaluate(audio=>audio.currentTime>=0.25));await player.getByRole('button',{name:'Pause audio'}).click();assert.equal(await page.locator('.timber-audio-draft audio').evaluate(audio=>audio.paused),true);
-    assert.equal(calls.uploads.length,0);assert.equal(calls.submissions.length,0);await page.getByRole('button',{name:'Review & send'}).click();await page.getByRole('dialog').waitFor();assert.equal(calls.uploads.length,0,'even native PCM remains local before consent');
+    assert.equal(calls.uploads.length,0);assert.equal(calls.submissions.length,0);await page.getByRole('button',{name:'Send audio',exact:true}).click();await page.getByRole('dialog').waitFor();assert.equal(calls.uploads.length,0,'even native PCM remains local before consent');
     await page.getByRole('dialog').getByRole('button',{name:'Send audio'}).click();
     try{await page.locator('.timber-audio-message[data-transcription-status="pending"]').waitFor();}
     catch(error){
@@ -382,7 +415,7 @@ test('Cancel audio aborts an in-flight upload without automatic admission and re
     await chooseTone(page);const uploading=page.waitForRequest(request=>request.method()==='PUT'&&request.url().includes('/audio/'));await confirmSend(page);await uploading;
     const cancel=page.getByRole('button',{name:'Cancel audio'});assert.equal(await cancel.isEnabled(),true,'upload can be cancelled while busy');await cancel.click();
     await page.locator('.timber-audio-error').filter({hasText:'status may be unknown'}).waitFor();assert.equal(calls.submissions.length,0,'aborted upload cannot flow into an automatic paid POST');assert.equal(await page.locator('.timber-audio-draft').count(),1,'cancelled send keeps local audio for an inspected explicit retry');
-    release();await page.waitForFunction(()=>!document.querySelector('.timber-audio-draft-actions button:last-child')?.disabled);
+    release();await page.waitForFunction(()=>Array.from(document.querySelectorAll('.timber-composer-row button')).some(node=>node.getAttribute('aria-label')==='Send audio'&&!node.disabled));
     await confirmSend(page);await page.locator('.timber-audio-message[data-transcription-status="failed"]').waitFor();
     assert.equal(uploadIds.length,2);assert.equal(uploadIds[0],uploadIds[1],'explicit retry reuses the same immutable audio id');assert.equal(calls.submissions.length,1);
   }finally{release();await context.close();await fixture.close();}

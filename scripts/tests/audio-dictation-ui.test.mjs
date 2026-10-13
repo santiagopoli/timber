@@ -103,9 +103,11 @@ async function createRawAudioFixture(){
   return{fixture,backend};
 }
 async function connectedPage(engine,{tasks=false,initialHistory,viewport={width:1280,height:900}}={}){
-  const{fixture,backend}=await createRawAudioFixture(),browser=await browserFor(engine),context=await browser.newContext({serviceWorkers:'block',viewport});
+  const{fixture,backend}=await createRawAudioFixture();let context,page;
+  try {
+  const browser=await browserFor(engine);context=await browser.newContext({serviceWorkers:'block',viewport});
   if(initialHistory)fixture.state.messages.set(BOT_A,initialHistory);
-  await context.addInitScript(syntheticPcmMic);const page=await context.newPage();page.setDefaultTimeout(6000);fixtureBackends.set(page,backend);
+  await context.addInitScript(syntheticPcmMic);page=await context.newPage();page.setDefaultTimeout(6000);fixtureBackends.set(page,backend);
   const traffic=[],external=[],errors=[];
   page.on('request',request=>{const url=new URL(request.url());if(url.pathname.startsWith('/v1/'))traffic.push({method:request.method(),path:url.pathname});});
   page.on('pageerror',error=>errors.push(error.message));
@@ -128,6 +130,14 @@ async function connectedPage(engine,{tasks=false,initialHistory,viewport={width:
       throw error;
     }
   }};return env;
+  } catch(error) {
+    // Initialization can fail before the scenario owns env. Always release the
+    // context and both loopback servers; preserve the original assertion.
+    let ui;try{ui={view:await page.locator('body').getAttribute('data-main-view'),loginError:await page.locator('#login-error').textContent(),messageCount:await page.locator('#message').count()};}catch{ui={closed:true};}
+    error.message+=`\nFixture initialization diagnostics: ${JSON.stringify(ui)}`;
+    try{await context?.close();}finally{await fixture.close();}
+    console.error(error.message);throw error;
+  }
 }
 async function installDictationMocks(page,{hold=false,status='succeeded',text=transcript}={}){
   const gate=deferred(),submitted=deferred(),handled=deferred(),calls={uploads:[],posts:[],checks:[],deletes:[],discards:[],unexpected:[]};let currentStatus=status,currentText=text;
@@ -164,21 +174,21 @@ async function selectRange(page,start,end=start){await draft(page).evaluate((nod
 async function expectDraft(page,text){await page.waitForFunction(text=>Array.from(document.querySelectorAll('#message')).find(node=>node.offsetParent!==null&&!node.disabled)?.value===text,text);assert.equal(await draft(page).inputValue(),text);}
 async function settle(page){await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));}
 async function beginPcm(page){
-  await page.getByRole('button',{name:'Start dictation',exact:true}).click();await page.getByRole('button',{name:'Stop recording',exact:true}).waitFor();
+  assert.match(await page.getByRole('button',{name:'Dictate text',exact:true}).getAttribute('title'),/separately billed.*nothing is sent/i,'dictation billing and explicit message-send distinction are available contextually');
+  await page.getByRole('button',{name:'Dictate text',exact:true}).click();await page.getByRole('button',{name:'Stop recording',exact:true}).waitFor();
   await page.evaluate(()=>{for(let chunk=0;chunk<12;chunk++){const data=Float32Array.from({length:4096},(_,i)=>Math.sin((chunk*4096+i)*2*Math.PI*440/48000)*(0.15+chunk/30));window.__pcmProcessor.onaudioprocess?.({inputBuffer:{getChannelData:()=>data}});}});
 }
-async function stopForReview(page){
-  await page.getByRole('button',{name:'Stop recording',exact:true}).click();await page.locator('.timber-audio-draft').waitFor();
-  assert.equal(await page.evaluate(()=>window.__trackStops),1,'Stop immediately releases microphone');assert.equal(await page.evaluate(()=>window.__contextCloses),1,'Stop closes capture context');
-  assert.ok(await page.evaluate(()=>window.__pcmProcessor.disconnected&&window.__pcmSource.disconnected&&window.__pcmGain.disconnected));
-  await page.waitForFunction(()=>document.querySelector('.timber-audio-draft .timber-audio-player')?.dataset.waveform==='decoded');
-  assert.ok(await page.locator('.timber-audio-draft .timber-audio-wave i').evaluateAll(nodes=>nodes.some(node=>parseFloat(node.style.height)>0)),'review has signal-derived WAV peaks');
-}
-async function transcribe(page){
-  const review=page.locator('.timber-audio-draft');
-  assert.match(await review.innerText(),/Nothing is sent to your bot until you send the draft/i);assert.match(await review.innerText(),/billed separately/i);
-  await review.getByRole('button',{name:'Transcribe into draft',exact:true}).click();
-  assert.equal(await page.getByRole('dialog').count(),0,'dictation does not add a second transcription confirmation modal');
+async function stopForTranscription(page,mock){
+  const released=await page.evaluate(()=>({tracks:window.__trackStops+1,contexts:window.__contextCloses+1}));
+  await page.getByRole('button',{name:'Stop recording',exact:true}).click();
+  await page.waitForFunction(({tracks,contexts})=>window.__trackStops===tracks&&window.__contextCloses===contexts,released);
+  assert.ok(await page.evaluate(()=>window.__pcmProcessor.disconnected&&window.__pcmSource.disconnected&&window.__pcmGain.disconnected),'Stop disconnects all PCM capture nodes');
+  assert.equal(await page.getByRole('dialog').count(),0,'Stop transcribes directly without a consent or review modal');
+  assert.equal(await page.locator('.timber-audio-draft').count(),0,'dictation never creates a voice-note preview');
+  await mock.waitSubmitted();
+  assert.equal(mock.calls.posts.length,1,'Stop submits exactly one transcription, not a message');
+  assert.equal(mock.calls.uploads.length,1);
+  assertWavUpload(mock,mock.calls.posts[0].path.replace(/\/dictations$/,''));
 }
 function assertNoAdmission(env,mock){
   assert.deepEqual(mock.calls.unexpected,[],'never uses audio-messages');
@@ -203,7 +213,7 @@ for(const engine of ['chromium','webkit']){
     try{
       assert.equal(await page.evaluate(()=>window.__micCalls),0);await draft(page).fill('Existing draft');await selectRange(page,14);await beginPcm(page);
       assert.equal(await draft(page).isEnabled(),true,'capture keeps text editable');assert.equal(await page.getByRole('button',{name:'Send message',exact:true}).isDisabled(),true);
-      await stopForReview(page);assert.equal(mock.calls.uploads.length,0);assert.equal(mock.calls.posts.length,0,'Stop is local review only');await transcribe(page);await expectDraft(page,`Existing draft ${transcript}`);
+      assert.equal(mock.calls.uploads.length,0);assert.equal(mock.calls.posts.length,0,'capture remains local until Stop');await stopForTranscription(page,mock);await expectDraft(page,`Existing draft ${transcript}`);
       assert.equal(await page.locator('.timber-audio-draft').count(),0);assert.equal(await page.locator('.timber-audio-message').count(),0);assert.equal(await page.getByRole('button',{name:'Send message',exact:true}).isEnabled(),true);
       await selectRange(page,(await draft(page).inputValue()).length);await page.keyboard.type(' edited');await expectDraft(page,`Existing draft ${transcript} edited`);
       assertWavUpload(mock,`/v1/bots/${BOT_A}`);assertNoAdmission(env,mock);assert.equal(await page.evaluate(()=>window.__recorderStarts),0);
@@ -211,12 +221,12 @@ for(const engine of ['chromium','webkit']){
   });
   scenario('selected original words survive; transcript inserts after selection end with separation',async()=>{
     const env=await connectedPage(engine),mock=await installDictationMocks(env.page),{page}=env;
-    try{await draft(page).fill('alpha selected omega');await selectRange(page,6,14);await beginPcm(page);await stopForReview(page);await transcribe(page);await expectDraft(page,`alpha selected ${transcript} omega`);assertNoAdmission(env,mock);}catch(error){await env.recordFailure(error);throw error;}finally{mock.release();await env.close();}
+    try{await draft(page).fill('alpha selected omega');await selectRange(page,6,14);await beginPcm(page);await stopForTranscription(page,mock);await expectDraft(page,`alpha selected ${transcript} omega`);assertNoAdmission(env,mock);}catch(error){await env.recordFailure(error);throw error;}finally{mock.release();await env.close();}
   });
   scenario('concurrent edits before/after anchor and active user selection are retained',async()=>{
     const env=await connectedPage(engine),mock=await installDictationMocks(env.page,{hold:true}),{page}=env;
     try{
-      await draft(page).fill('alpha selected omega');await selectRange(page,6,14);await beginPcm(page);await stopForReview(page);await transcribe(page);await mock.waitSubmitted();
+      await draft(page).fill('alpha selected omega');await selectRange(page,6,14);await beginPcm(page);await stopForTranscription(page,mock);await mock.waitSubmitted();
       assert.equal(await draft(page).isEnabled(),true,'transcription keeps text editable');assert.equal(await page.getByRole('button',{name:'Send message',exact:true}).isDisabled(),true);
       await selectRange(page,0);await page.keyboard.type('PRE ');await selectRange(page,(await draft(page).inputValue()).length);await page.keyboard.type(' POST');await expectDraft(page,'PRE alpha selected omega POST');await selectRange(page,19,24);
       mock.release();await mock.waitHandled();await expectDraft(page,`PRE alpha selected ${transcript} omega POST`);
@@ -225,13 +235,13 @@ for(const engine of ['chromium','webkit']){
   });
   scenario('late insertion never refocuses after user moves to another control',async()=>{
     const env=await connectedPage(engine),mock=await installDictationMocks(env.page,{hold:true}),{page}=env;
-    try{await draft(page).fill('keep');await selectRange(page,4);await beginPcm(page);await stopForReview(page);await transcribe(page);await mock.waitSubmitted();await page.locator('#settings-button').focus();mock.release();await mock.waitHandled();await expectDraft(page,`keep ${transcript}`);assert.equal(await page.locator('#settings-button').evaluate(node=>node===document.activeElement),true);assertNoAdmission(env,mock);}catch(error){await env.recordFailure(error);throw error;}finally{mock.release();await env.close();}
+    try{await draft(page).fill('keep');await selectRange(page,4);await beginPcm(page);await stopForTranscription(page,mock);await mock.waitSubmitted();await page.locator('#settings-button').focus();mock.release();await mock.waitHandled();await expectDraft(page,`keep ${transcript}`);assert.equal(await page.locator('#settings-button').evaluate(node=>node===document.activeElement),true);assertNoAdmission(env,mock);}catch(error){await env.recordFailure(error);throw error;}finally{mock.release();await env.close();}
   });
   scenario('Enter is newline during capture/transcription; explicit Send posts exactly one normal message',async()=>{
     const env=await connectedPage(engine),mock=await installDictationMocks(env.page,{hold:true}),{page}=env;
     try{
       await draft(page).fill('Existing draft suffix');await selectRange(page,14);await beginPcm(page);await selectRange(page,21);await page.keyboard.press('Enter');await page.keyboard.type('live');await expectDraft(page,'Existing draft suffix\nlive');
-      await stopForReview(page);await transcribe(page);await mock.waitSubmitted();await selectRange(page,(await draft(page).inputValue()).length);await page.keyboard.press('Enter');await page.keyboard.type('pending');await expectDraft(page,'Existing draft suffix\nlive\npending');assertNoAdmission(env,mock);
+      await stopForTranscription(page,mock);await mock.waitSubmitted();await selectRange(page,(await draft(page).inputValue()).length);await page.keyboard.press('Enter');await page.keyboard.type('pending');await expectDraft(page,'Existing draft suffix\nlive\npending');assertNoAdmission(env,mock);
       mock.release();await mock.waitHandled();const expected=`Existing draft ${transcript} suffix\nlive\npending`;await expectDraft(page,expected);assertNoAdmission(env,mock);await selectRange(page,expected.length);await page.keyboard.type(' edited');await page.getByRole('button',{name:'Send message',exact:true}).click();await page.locator('[data-message-id]').filter({hasText:`${expected} edited`}).waitFor();
       const sends=env.fixture.state.calls.filter(call=>call.method==='POST'&&call.path===`/v1/bots/${BOT_A}/messages`);assert.equal(sends.length,1);assert.equal(sends[0].body.text,`${expected} edited`);assert.equal(env.fixture.state.runs.get(BOT_A).length,1);assert.equal(mock.calls.posts.length,1);assert.deepEqual(mock.calls.unexpected,[]);
     }catch(error){await env.recordFailure(error);throw error;}finally{mock.release();await env.close();}
@@ -243,14 +253,14 @@ for(const engine of ['chromium','webkit']){
   scenario('pending cancel aborts transport and fences a late successful receipt',async()=>{
     const env=await connectedPage(engine),mock=await installDictationMocks(env.page,{hold:true}),{page}=env;
     try{
-      await draft(page).fill('original draft');await selectRange(page,14);await beginPcm(page);await stopForReview(page);await transcribe(page);const body=await mock.waitSubmitted();await draft(page).fill('newer user draft');await page.getByRole('button',{name:'Cancel dictation',exact:true}).click();await page.waitForFunction(()=>window.__dictationAborts>0);await expectDraft(page,'newer user draft');
+      await draft(page).fill('original draft');await selectRange(page,14);await beginPcm(page);await stopForTranscription(page,mock);const body=await mock.waitSubmitted();await draft(page).fill('newer user draft');await page.getByRole('button',{name:'Cancel dictation',exact:true}).click();await page.waitForFunction(()=>window.__dictationAborts>0);await expectDraft(page,'newer user draft');
       mock.release();await mock.waitHandled();await settle(page);await expectDraft(page,'newer user draft');assert.equal(await page.locator('.timber-audio-draft').count(),0);assert.equal(mock.calls.posts.length,1);assert.equal(mock.calls.uploads.length,1);assert.equal(mock.calls.checks.length,1,'only the pre-dispatch receipt lookup; cancel does not recover or retry');assert.ok(mock.calls.deletes.every(call=>call.path.endsWith(`/dictations/${body.operationId}`)));assertNoAdmission(env,mock);
     }catch(error){await env.recordFailure(error);throw error;}finally{mock.release();await env.close();}
   });
   for(const destination of ['bot','task'])scenario(`navigation to another ${destination} fences pending success and preserves destination draft`,async()=>{
     const env=await connectedPage(engine,{tasks:destination==='task'}),mock=await installDictationMocks(env.page,{hold:true}),{page}=env;
     try{
-      await draft(page).fill('Ada original draft');await selectRange(page,18);await beginPcm(page);await stopForReview(page);await transcribe(page);await mock.waitSubmitted();
+      await draft(page).fill('Ada original draft');await selectRange(page,18);await beginPcm(page);await stopForTranscription(page,mock);await mock.waitSubmitted();
       if(destination==='bot'){await page.locator(`#bot-list button[data-bot-id="${BOT_B}"]`).click();await page.locator('#selected-name').filter({hasText:'Linus'}).waitFor();}else await openTask(page);
       await draft(page).fill('independent destination draft');await page.waitForFunction(()=>window.__dictationAborts>0);mock.release();await mock.waitHandled();await settle(page);await expectDraft(page,'independent destination draft');assert.equal(await page.locator('.timber-audio-draft').count(),0);assertNoAdmission(env,mock);
       if(destination==='task')await returnToBots(page);else{await page.locator(`#bot-list button[data-bot-id="${BOT_A}"]`).click();await page.locator('#selected-name').filter({hasText:'Ada'}).waitFor();}await expectDraft(page,'Ada original draft');assert.equal(mock.calls.posts.length,1);
@@ -259,7 +269,7 @@ for(const engine of ['chromium','webkit']){
   for(const sessionEnd of ['logout','expired session'])scenario(`${sessionEnd} aborts pending dictation; new login cannot consume late success`,async()=>{
     const env=await connectedPage(engine),mock=await installDictationMocks(env.page,{hold:true}),logoutGate=deferred(),{page}=env;
     try{
-      await draft(page).fill('old session draft');await beginPcm(page);await stopForReview(page);await transcribe(page);await mock.waitSubmitted();
+      await draft(page).fill('old session draft');await beginPcm(page);await stopForTranscription(page,mock);await mock.waitSubmitted();
       if(sessionEnd==='logout'){
         await page.route('**/v1/session',async route=>{if(route.request().method()!=='DELETE')return route.fallback();await logoutGate.promise;return route.continue();});await page.locator('#disconnect').evaluate(node=>node.click());await page.waitForFunction(()=>window.__dictationAborts>0);assert.equal(await page.locator('.timber-audio-draft').count(),0,'cancel precedes session DELETE acknowledgement');logoutGate.resolve();
       }else{env.fixture.state.rejectAuth=true;await page.locator('#refresh-history').evaluate(node=>node.click());}
@@ -270,7 +280,7 @@ for(const engine of ['chromium','webkit']){
   scenario('uncertain never auto-retries paid work; explicit status check keeps original operation/attempt',async()=>{
     const env=await connectedPage(engine),mock=await installDictationMocks(env.page,{status:'uncertain'}),{page}=env;
     try{
-      await draft(page).fill('keep uncertain draft');await selectRange(page,20);await beginPcm(page);await stopForReview(page);await page.clock.install();await transcribe(page);const body=await mock.waitSubmitted();await page.getByRole('button',{name:'Check transcription status',exact:true}).waitFor();await page.clock.fastForward(30000);await expectDraft(page,'keep uncertain draft');assert.equal(mock.calls.posts.length,1);assert.equal(mock.calls.uploads.length,1);assert.equal(mock.calls.checks.length,1,'only the original pre-dispatch lookup; no automatic uncertain polling/retry');assertNoAdmission(env,mock);
+      await draft(page).fill('keep uncertain draft');await selectRange(page,20);await beginPcm(page);await page.clock.install();await stopForTranscription(page,mock);const body=await mock.waitSubmitted();await page.getByRole('button',{name:'Check transcription status',exact:true}).waitFor();await page.clock.fastForward(30000);await expectDraft(page,'keep uncertain draft');assert.equal(mock.calls.posts.length,1);assert.equal(mock.calls.uploads.length,1);assert.equal(mock.calls.checks.length,1,'only the original pre-dispatch lookup; no automatic uncertain polling/retry');assertNoAdmission(env,mock);
       mock.setReceipt('succeeded');await page.getByRole('button',{name:'Check transcription status',exact:true}).click();await expectDraft(page,`keep uncertain draft ${transcript}`);assert.deepEqual(mock.calls.checks,[{path:`/v1/bots/${BOT_A}/dictations/${body.operationId}`,method:'GET'},{path:`/v1/bots/${BOT_A}/dictations/${body.operationId}`,method:'GET'}]);assert.equal(mock.calls.posts.length,1);assert.equal(mock.calls.uploads.length,1);assert.equal(mock.calls.posts[0].body.attemptId,body.attemptId);assertNoAdmission(env,mock);
     }catch(error){await env.recordFailure(error);throw error;}finally{mock.release();await env.close();}
   });
@@ -291,7 +301,7 @@ for(const engine of ['chromium','webkit']){
       await editor.evaluate(node=>{node.focus();const range=document.createRange();range.selectNode(node.querySelector('.timber-private-chip'));getSelection().removeAllRanges();getSelection().addRange(range);node.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true,key:'ArrowRight'}));});
       await beginPcm(page);assert.equal(await editor.getAttribute('contenteditable'),'true');
       await editor.evaluate(node=>{node.focus();const range=document.createRange();range.selectNodeContents(node);range.collapse(false);getSelection().removeAllRanges();getSelection().addRange(range);node.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true,key:'End'}));});
-      await editor.pressSequentially(' live');await stopForReview(page);await transcribe(page);
+      await editor.pressSequentially(' live');await stopForTranscription(page,mock);
       const expected=`before ${reference} ${transcript} after live`;
       await page.waitForFunction(text=>document.querySelector('#message-form input[name=message]')?.value===text,expected);assert.equal(await hidden.inputValue(),expected);
       assert.equal(await editor.locator('.timber-private-chip').count(),1);assert.equal(await editor.locator('.timber-private-chip').getAttribute('data-secure-ref'),reference);
@@ -328,10 +338,10 @@ for(const engine of ['chromium','webkit']){
   scenario('task composer uses isolated dictation routes and fences task-to-task navigation',async()=>{
     const env=await connectedPage(engine,{tasks:true}),mock=await installDictationMocks(env.page),{page}=env;
     try{
-      await draft(page).fill('ordinary bot draft');await openTask(page);await draft(page).fill('task draft');await selectRange(page,10);await beginPcm(page);await stopForReview(page);await transcribe(page);await expectDraft(page,`task draft ${transcript}`);assertWavUpload(mock,`/v1/tasks/${TASK_A}`);assertNoAdmission(env,mock);
+      await draft(page).fill('ordinary bot draft');await openTask(page);await draft(page).fill('task draft');await selectRange(page,10);await beginPcm(page);await stopForTranscription(page,mock);await expectDraft(page,`task draft ${transcript}`);assertWavUpload(mock,`/v1/tasks/${TASK_A}`);assertNoAdmission(env,mock);
       const pending=await installDictationMocks(page,{hold:true});
       try{
-        await selectRange(page,(await draft(page).inputValue()).length);await beginPcm(page);await page.getByRole('button',{name:'Stop recording',exact:true}).click();await page.locator('.timber-audio-draft').waitFor();await transcribe(page);await pending.waitSubmitted();await openTask(page,TASK_B);await draft(page).fill('sibling task draft');await page.waitForFunction(()=>window.__dictationAborts>0);
+        await selectRange(page,(await draft(page).inputValue()).length);await beginPcm(page);await stopForTranscription(page,pending);await pending.waitSubmitted();await openTask(page,TASK_B);await draft(page).fill('sibling task draft');await page.waitForFunction(()=>window.__dictationAborts>0);
         pending.release();await pending.waitHandled();await settle(page);await expectDraft(page,'sibling task draft');assert.equal(pending.calls.posts[0].path,`/v1/tasks/${TASK_A}/dictations`);assertNoAdmission(env,pending);await returnToBots(page);await expectDraft(page,'ordinary bot draft');assert.equal(await page.locator('.timber-audio-message').count(),0);
       }finally{pending.release();}
     }catch(error){await env.recordFailure(error);throw error;}finally{mock.release();await env.close();}

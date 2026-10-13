@@ -7,20 +7,24 @@ its existing `OPENAI_API_KEY`; no credential is returned to the browser.
 
 ## Two explicit destinations
 
-**Dictate** captures a recording, stops the microphone, and offers local review
-with **Transcribe into draft**. The transcript is inserted into the editable
-composer without sending anything to the bot. Existing text and selected words
-are preserved, as are concurrent edits and opaque private-input references.
-Enter inserts a newline. Only normal explicit **Send** submits the user-edited
-text. Dictation is available in main bot and task composers; it creates no audio
-conversation card, message, submission or run. The transcription itself uses the
-separately billed provider described below, with a visible notice before the
-explicit Transcribe action; there is no second dictation confirmation modal.
+The single primary **Dictate text** microphone sits beside **+ / Send** in the
+existing compact toolbar, in both bot and task composers. Starting it explicitly
+selects text transcription; its contextual tooltip discloses separate API billing.
+**Stop recording** releases the microphone, validates the recording, and transcribes
+immediately into the editable draft, without a review row, mode selector or modal.
+It never sends a message. Existing text and selected words are preserved, as are
+concurrent edits and opaque private-input references. Enter inserts a newline;
+only explicit **Send** submits the user-edited text. Dictation creates no audio
+conversation card, message, submission or run. Active status, Cancel and errors
+are contextual; no permanent format/billing disclaimer expands the idle composer.
 
-**Record / Attach audio** is the existing main-conversation audio-message flow.
-It retains original playback and explicitly sends an audio message before normal
-bot admission after transcription. Tasks do not support audio messages. These
-modes share validated capture/upload machinery, not their durable destination.
+For a bot conversation, the existing **+** menu also provides **Attach audio** and
+secondary **Record audio**, alongside its existing image and secure-input actions.
+These create a local voice-note attachment with playback. Only the toolbar's
+explicit **Send audio** and separate paid-send consent send an audio message; Stop
+alone never sends. Tasks do not support audio messages and expose only primary
+text dictation. Both destinations reuse validated capture/upload machinery,
+not their durable destination.
 
 Draft dictation results stay scoped to the original bot/task/navigation/session.
 Cancel and Stop immediately release capture and abort pending transport where
@@ -69,7 +73,7 @@ are machine-generated and can contain errors; users can expand them independentl
 of playback. A failed or empty transcription is never substituted with invented
 text and never sends an empty prompt to the bot.
 
-Microphone permission is requested only after an explicit Record action, never on
+Microphone permission is requested only after an explicit Dictate text or Record audio action, never on
 page load. Recording stops and its tracks are released when discarded, completed,
 or when leaving that conversation. Late permission grants after leaving release
 the acquired tracks without starting capture. Concurrent permission requests are
