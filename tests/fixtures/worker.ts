@@ -1,3 +1,4 @@
+export {DevicesDO} from '../../apps/api/src/devices';
 import { DurableObject } from "cloudflare:workers";
 import type { ComputerAction, ComputerResult } from "@botspace/contracts";
 import { ChatGPTAuthDO } from "../../apps/api/src/chatgpt";
@@ -9,7 +10,11 @@ export { GitHubAuthDO } from "../../apps/api/src/github";
 export class KeylessChatGPTAuthDO extends ChatGPTAuthDO {
   constructor(ctx: DurableObjectState, env: Env) {super(ctx, {...env, CHATGPT_CREDENTIAL_KEY: undefined});}
 }
-export {default, BotDO} from "../../apps/api/src/index";
+export {default} from "../../apps/api/src/index";
+import {BotDO as ProductionBotDO} from '../../apps/api/src/bot';
+export class BotDO extends ProductionBotDO {
+  constructor(ctx:DurableObjectState,env:Env){super(ctx,{...env,AI:{run:async()=>{throw new Error('Unexpected live Workers AI inference in fixture');}} as unknown as Ai});}
+}
 /** Legacy scheduler fixtures remain shared; isolation cases opt into the production default. */
 export class WorkspaceDO extends ProductionWorkspaceDO {
   protected newTaskComputerMode():"shared"|"isolated" {return computerFixtureControl.isolatedTasks?'isolated':'shared';}

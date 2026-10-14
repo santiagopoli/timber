@@ -16,3 +16,5 @@ __pycache__/
 .local/
 test-results/
 apps/console/dist/
+
+apps/console/public/runner/

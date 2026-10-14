@@ -101,6 +101,7 @@ export async function createConsoleFixture({port = 0} = {}) {
       if (path === '/v1/connections/github/connect' && request.method === 'POST') return json({url: '/github-connect', connected: false});
       if (path === '/v1/connections/github') {if (request.method === 'DELETE') state.githubConnected = false; return json({connected: state.githubConnected});}
       if (path === '/v1/connections/chatgpt') return json({connected: true, status: 'verified', model: 'gpt-6.1-sol', verifiedAt: date});
+      if(path==='/v1/devices')return json({devices:[]});
       if(path==='/v1/models')return state.modelsError?json({error:state.modelsError},503):json(state.modelCatalog);
       if (path === '/v1/bots') {
         if (request.method === 'GET') return json({bots: state.bots.filter(bot => !state.deletingBots.has(bot.id))});

@@ -1,18 +1,20 @@
 import type {MessageAudio} from './audio';
+import type {ExecutionTarget} from './devices';
+export * from './devices';
 export type {AudioAttachment,AudioTranscription,MessageAudio} from './audio';
 export * from './models.js';
 export * from './model-catalog.js';
 export * from './model-errors.js';
 export type RunStatus = "queued" | "running" | "waiting_approval" | "waiting_connection" | "completed" | "failed" | "cancelled" | "interrupted";
 export type ComputerApprovalMode = "ask" | "automatic";
-export interface Bot { id: string; name: string; instructions: string; runtime: "pi"; model: string; reasoningEffort?: string; fast?: boolean; computerApprovalMode?: ComputerApprovalMode; allowNamedAgents?: boolean; allowTaskCreation?: boolean; createdByBotId?: string; createdAt: string; updatedAt: string; }
+export interface Bot { id: string; name: string; instructions: string; runtime: "pi"; model: string; reasoningEffort?: string; fast?: boolean; computerApprovalMode?: ComputerApprovalMode; allowNamedAgents?: boolean; allowTaskCreation?: boolean; executionTarget?:ExecutionTarget; createdByBotId?: string; createdAt: string; updatedAt: string; }
 export interface MessageProvenance { kind: "bot" | "mention" | "delegation_result"; sourceBotId: string; sourceBotName: string; sourceRunId?: string; delegationId?: string; }
 export interface RunDelegation { id: string; sourceBotId: string; sourceRunId: string; path: string[]; }
 export interface AgentDelegation extends RunDelegation { sourceBotName: string; targetBotId: string; targetBotName: string; targetRunId?: string; status: RunStatus; createdAt: string; updatedAt: string; error?: string; }
 export interface ImageAttachment { artifactId: string; mimeType: "image/png" | "image/jpeg"; size: number; }
 export interface Message { audio?: MessageAudio; attachments?: ImageAttachment[]; id: string; botId: string; runId?: string; role: "user" | "assistant" | "tool" | "system"; kind?: "progress" | "final"; text: string; provenance?: MessageProvenance; mentions?: string[]; createdAt: string; }
 export interface RunCancellation { id: string; requestedRunId: string; }
-export interface Run { coordinatorMode?:boolean; admissionRetryable?: boolean; model?: string; reasoningEffort?: string; fast?: boolean; id: string; botId: string; operationId: string; status: RunStatus; delegation?: RunDelegation; subagentId?: string; parentRunId?: string; cancellation?: RunCancellation; createdAt: string; updatedAt: string; error?: string; errorCode?: string; }
+export interface Run { executionTarget?:ExecutionTarget; coordinatorMode?:boolean; admissionRetryable?: boolean; model?: string; reasoningEffort?: string; fast?: boolean; id: string; botId: string; operationId: string; status: RunStatus; delegation?: RunDelegation; subagentId?: string; parentRunId?: string; cancellation?: RunCancellation; createdAt: string; updatedAt: string; error?: string; errorCode?: string; }
 export interface Subagent { model?: string; reasoningEffort?: string; fast?: boolean; id: string; name: string; task: string; parentOperationId: string; parentSubagentId?: string; operationId: string; status: "queued" | "running" | "waiting_approval" | "waiting_connection" | "completed" | "failed" | "cancelled"; createdAt: string; updatedAt: string; result?: string; error?: string; }
 
 /** A newest-first history page plus all currently active runs, independent of pagination. */
@@ -42,7 +44,7 @@ export type ComputerAction =
  | {type:"checkpoint"};
 /** An exec receipt may still be running; processId remains stable across polls and cancellation. */
 export interface ComputerResult { operationId:string;status:"running"|"completed"|"failed"|"interrupted"|"cancelled";processId?:string;processKnown?:boolean;output?:string;exitCode?:number;artifactId?:string;mimeType?:string;checkpointId?:string;checkpointStatus?:"pending"|"saved"|"failed";workspaceChanged?:boolean;error?:string; }
-export interface ComputerStatus { id:string;provider:"cloudflare";state:"stopped"|"starting"|"running"|"unavailable";capabilities:string[];lastCheckpointId?:string;error?:{code:string;message:string}; }
+export interface ComputerStatus { id:string;provider:"cloudflare"|"device";state:"stopped"|"starting"|"running"|"unavailable";capabilities:string[];deviceId?:string;workspaceId?:string;lastCheckpointId?:string;error?:{code:string;message:string}; }
 export interface Approval {id:string;botId:string;runId:string;operationId:string;toolCallId?:string;action:ComputerAction;status:"pending"|"approved"|"denied"|"executing"|"completed"|"failed"|"interrupted";createdAt:string;expiresAt:string;result?:ComputerResult;}
 export interface SecureDeployCapabilities {secureDeploy:boolean;isolationVersion?:string;privateCredentialChannel?:boolean;noShellEnv?:boolean;noBuildCredentialInheritance?:boolean;outputRedaction?:boolean;canaryVersion?:string;cliVersion?:string;cliBuildId?:string;cliDigest?:`sha256:${string}`;noAutomaticRetry?:boolean;}
 export interface SecureDeployPrivateRequest {operationId:string;authorization:unknown;pin:unknown;refs:ReadonlyArray<{id:string;revision:number;permissionEpoch:string;binding:string}>;credentials:ReadonlyArray<{refId:string;revision:number;header:string;prefix:string;value:string}>;signal?:AbortSignal;}
@@ -59,7 +61,7 @@ export interface BotContextStatus {automatic:true;estimatedTokens:number;activeE
 
 export type TaskStatus = "pending" | "queued" | "running" | "waiting_approval" | "waiting_connection" | "cancelling" | "completed" | "failed" | "cancelled";
 export interface TaskQueue { reason:"task"|"bot"|"direct_action"|"starting"|"scheduled"; blockingTask?:{id:string;title:string}; }
-export interface Task { id:string; title:string; description:string; botId:string; botName:string; creator:"owner"|"bot"; createdByBotId?:string; sourceRunId?:string; sourceTaskId?:string; statusVersion?:number; status:TaskStatus; startImmediately:boolean; createdAt:string; updatedAt:string; lastActivity?:string; queue?:TaskQueue; computerMode?:"shared"|"isolated"; }
+export interface Task { id:string; title:string; description:string; botId:string; botName:string; creator:"owner"|"bot"; createdByBotId?:string; sourceRunId?:string; sourceTaskId?:string; statusVersion?:number; status:TaskStatus; startImmediately:boolean; createdAt:string; updatedAt:string; lastActivity?:string; queue?:TaskQueue; computerMode?:"shared"|"isolated"; executionTarget?:ExecutionTarget; }
 export interface TaskUpdate {task:Task;notificationId:string;result?:string;}
 export interface TaskPage { tasks:Task[]; }
 export * from "./avatars";

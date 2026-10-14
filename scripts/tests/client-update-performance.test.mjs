@@ -24,6 +24,11 @@ function harness() {
     mountToolActivity: () => ({update: value => activityModels.push(value), clear() {}, setActive() {}}),
     mountAgents: () => ({update: value => agentModels.push(value), clear() {}, setActive() {}}),
     mountModelPicker: () => ({update() {}}),
+    // Machine islands have their own browser coverage. Keep these mounts inert
+    // while executing the real transcript/event orchestration below.
+    mountExecutionTarget: () => ({update() {}, unmount() {}}),
+    mountDevices: () => ({update() {}, unmount() {}}),
+    machinesFrom: () => [], targetLabel: () => 'Cloud',
     modelUsage: () => ({routes: []}), modelBillingView: () => ({label:'Usage unknown',preview:{},rows:[]}),
     createDesktopViewer: () => ({disconnect() {}, setActive() {}}), mountWorkspaceExplorer: () => ({clear() {}}),
     agentColor: () => 'blue', modelBadgeLabel: () => 'M', hasBotMention: () => false, canRetryAdmission: run => run.admissionRetryable,

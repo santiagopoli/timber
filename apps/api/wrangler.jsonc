@@ -2,7 +2,9 @@
   "$schema": "../../node_modules/wrangler/config-schema.json",
   "name": "timber-api",
   "main": "src/index.ts",
-  "version_metadata": { "binding": "VERSION_METADATA" },
+  "version_metadata": {
+    "binding": "VERSION_METADATA"
+  },
   "compatibility_date": "2026-10-05",
   "compatibility_flags": [
     "nodejs_compat"
@@ -46,6 +48,10 @@
       {
         "name": "GITHUB",
         "class_name": "GitHubAuthDO"
+      },
+      {
+        "name": "DEVICES",
+        "class_name": "DevicesDO"
       }
     ]
   },
@@ -68,6 +74,12 @@
       "tag": "v3-github",
       "new_sqlite_classes": [
         "GitHubAuthDO"
+      ]
+    },
+    {
+      "tag": "v4-owned-machines",
+      "new_sqlite_classes": [
+        "DevicesDO"
       ]
     }
   ],

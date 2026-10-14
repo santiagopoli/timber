@@ -11,5 +11,5 @@ export default defineConfig({
     }},
     cloudflareTest({wrangler: {configPath: "./tests/wrangler.jsonc"}}),
   ],
-  test: {include: ["tests/**/*.spec.ts", "packages/runtime/test/**/*.test.ts"], testTimeout: 15_000},
+  test: {exclude:["packages/runtime/test/local-runtime.test.ts"], include: ["tests/**/*.spec.ts", "packages/runtime/test/**/*.test.ts"], testTimeout: 15_000},
 });

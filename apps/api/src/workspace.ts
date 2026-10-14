@@ -1,8 +1,10 @@
+import {deviceRequest} from './devices';
 import { DurableObject } from "cloudflare:workers";
 import type { Bot, ModelSettings,Task,TaskUpdate } from "@botspace/contracts";
 import type { Env } from "./env";
 import { ApiError, errorResponse, json } from "./errors";
-import { body, parseBotInput, parseMessage, parseAction, operationId, UUID } from "./validation";
+import { body, parseBotInput, parseMessage, parseAction, parseExecutionTarget, operationId, UUID } from "./validation";
+import {validateDeviceTarget} from './device-target';
 import { AgentCoordinator } from "./agent-coordination";
 import { AvatarCoordinator } from "./avatars";
 import {OwnerKeychainCoordinator} from './owner-keychain';
@@ -73,6 +75,7 @@ export class WorkspaceDO extends DurableObject<Env> {
   }
   private async cleanupOnce(id:string):Promise<void> {
     try {
+      if(this.env.DEVICES)await deviceRequest(this.env,`/bots/${id}/revoke`,{});
       const pendingTasks=this.ctx.storage.sql.exec<{task_id:string}>("SELECT task_id FROM bot_task_deletions WHERE bot_id=? AND completed=0 ORDER BY task_id",id).toArray();
       for(const item of pendingTasks) {
         const taskRow=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",item.task_id).toArray()[0];
@@ -629,7 +632,7 @@ export class WorkspaceDO extends DurableObject<Env> {
         const sourceRow=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",sourceId).toArray()[0];if(!sourceRow)throw new ApiError(404,"not_found","Task creator bot not found.");
         const source=JSON.parse(sourceRow.data) as Bot;if(source.allowTaskCreation!==true)throw new ApiError(403,"task_creation_not_allowed","The owner has not allowed this bot to create tasks.");
         if(typeof input.operationId!=="string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.operationId) || typeof input.title!=="string" || !input.title.trim() || input.title.length>160 || typeof input.description!=="string" || input.description.length>32000 || input.startImmediately!==undefined && typeof input.startImmediately!=="boolean") throw new ApiError(400,"invalid_request","Invalid task details.");
-        const fingerprint=JSON.stringify({sourceId,sourceRunId:input.sourceRunId,sourceTaskId:input.sourceTaskId??null,title:input.title.trim(),description:input.description,startImmediately:input.startImmediately!==false});
+        const fingerprint=JSON.stringify({sourceId,sourceRunId:input.sourceRunId,sourceTaskId:input.sourceTaskId??null,title:input.title.trim(),description:input.description,startImmediately:input.startImmediately!==false,...(input.executionTarget===undefined?{}:{executionTarget:parseExecutionTarget(input.executionTarget)})});
         const existing=this.ctx.storage.sql.exec<{task_id:string;fingerprint:string}>("SELECT task_id,fingerprint FROM task_operations WHERE operation_id=?",`bot-task:${sourceId}:${input.operationId}`).toArray()[0];
         if(existing){if(existing.fingerprint!==fingerprint)throw new ApiError(409,"operation_id_conflict","operationId was already used for another task.");const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",existing.task_id).toArray()[0];return json({task:JSON.parse(row.data)});}
         const sourceTaskId=input.sourceTaskId;
@@ -644,14 +647,26 @@ export class WorkspaceDO extends DurableObject<Env> {
         const sourceDO=this.env.BOT.get(this.env.BOT.idFromName(sourceTaskId?`owner:task:${sourceTaskId}`:`owner:${sourceId}`));
         const receipt=await sourceDO.fetch(`https://bot/runs/${input.sourceRunId}`,{headers:{"x-botspace-config":encodeURIComponent(JSON.stringify(source)),...(sourceTaskId?{"x-timber-task-id":sourceTaskId as string}:{})}});
         if(!receipt.ok)return receipt;
-        const {run}=await receipt.json<{run:{botId:string;status:string;cancellation?:unknown}}>();
+        const {run}=await receipt.json<{run:{botId:string;status:string;cancellation?:unknown;executionTarget?:import("@botspace/contracts").ExecutionTarget}}>();
         if(run.botId!==sourceId||run.cancellation||!["queued","running","waiting_approval","waiting_connection"].includes(run.status))throw new ApiError(409,"run_inactive","The task creator run is no longer active.");
         checkSourceTask();
         const currentSource=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",sourceId).toArray()[0];
         if(!currentSource||(JSON.parse(currentSource.data) as Bot).allowTaskCreation!==true)throw new ApiError(403,"task_creation_not_allowed","The owner has not allowed this bot to create tasks.");
         const raced=this.ctx.storage.sql.exec<{task_id:string;fingerprint:string}>("SELECT task_id,fingerprint FROM task_operations WHERE operation_id=?",`bot-task:${sourceId}:${input.operationId}`).toArray()[0];
         if(raced){if(raced.fingerprint!==fingerprint)throw new ApiError(409,"operation_id_conflict","operationId was already used for another task.");return json({task:JSON.parse(this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",raced.task_id).one().data)});}
-        const now=new Date().toISOString(),task={id:crypto.randomUUID(),title:input.title.trim(),description:input.description,botId:source.id,botName:source.name,creator:"bot",createdByBotId:source.id,sourceRunId:input.sourceRunId,...(sourceTaskId?{sourceTaskId}:{}),computerMode:this.newTaskComputerMode(),status:"pending",startImmediately:input.startImmediately!==false,createdAt:now,updatedAt:now};
+        const executionTarget=input.executionTarget===undefined?run.executionTarget??source.executionTarget??{kind:'cloud' as const}:parseExecutionTarget(input.executionTarget);
+        await validateDeviceTarget(this.env,executionTarget,source.id,true);
+        const finalReceipt=await sourceDO.fetch(`https://bot/runs/${input.sourceRunId}`,{headers:{"x-botspace-config":encodeURIComponent(JSON.stringify(source)),...(sourceTaskId?{"x-timber-task-id":sourceTaskId as string}:{})}});
+        if(!finalReceipt.ok)return finalReceipt;
+        const finalRun=(await finalReceipt.json<{run:{status:string;cancellation?:unknown}}>()).run;
+        if(finalRun.cancellation||!["queued","running","waiting_approval","waiting_connection"].includes(finalRun.status))throw new ApiError(409,"run_inactive","The task creator run is no longer active.");
+        checkSourceTask();
+        const finalSource=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",sourceId).toArray()[0];
+        if(!finalSource||(JSON.parse(finalSource.data) as Bot).allowTaskCreation!==true)throw new ApiError(403,"task_creation_not_allowed","Task creation was revoked.");
+        const finalDuplicate=this.ctx.storage.sql.exec<{task_id:string;fingerprint:string}>("SELECT task_id,fingerprint FROM task_operations WHERE operation_id=?",`bot-task:${sourceId}:${input.operationId}`).toArray()[0];
+        if(finalDuplicate){if(finalDuplicate.fingerprint!==fingerprint)throw new ApiError(409,"operation_id_conflict","operationId was already used for another task.");return json({task:JSON.parse(this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",finalDuplicate.task_id).one().data)});}
+
+        const now=new Date().toISOString(),task={id:crypto.randomUUID(),title:input.title.trim(),description:input.description,botId:source.id,botName:source.name,creator:"bot",executionTarget,createdByBotId:source.id,sourceRunId:input.sourceRunId,...(sourceTaskId?{sourceTaskId}:{}),computerMode:this.newTaskComputerMode(),status:"pending",startImmediately:input.startImmediately!==false,createdAt:now,updatedAt:now};
         if(task.startImmediately)task.status="queued";
         this.ctx.storage.transactionSync(()=>{this.saveTask(task);this.ctx.storage.sql.exec("INSERT INTO task_operations(operation_id,task_id,fingerprint) VALUES(?,?,?)",`bot-task:${sourceId}:${input.operationId}`,task.id,fingerprint);});
         await this.rearmDeletion();
@@ -666,12 +681,18 @@ export class WorkspaceDO extends DurableObject<Env> {
         if(typeof input.botId!=="string" || !UUID.test(input.botId)) throw new ApiError(400,"invalid_request","botId must be a UUID.");
         if(input.startImmediately!==undefined && typeof input.startImmediately!=="boolean") throw new ApiError(400,"invalid_request","startImmediately must be a boolean.");
         const existing=this.ctx.storage.sql.exec<{task_id:string;fingerprint:string}>("SELECT task_id,fingerprint FROM task_operations WHERE operation_id=?",input.operationId).toArray()[0];
-        const fingerprint=JSON.stringify({title:input.title.trim(),description:input.description,botId:input.botId,startImmediately:input.startImmediately!==false});
+        const fingerprint=JSON.stringify({title:input.title.trim(),description:input.description,botId:input.botId,startImmediately:input.startImmediately!==false,...(input.executionTarget===undefined?{}:{executionTarget:parseExecutionTarget(input.executionTarget)})});
         if(existing) {if(existing.fingerprint!==fingerprint) throw new ApiError(409,"operation_id_conflict","operationId was already used for another task."); const row=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",existing.task_id).toArray()[0]; if(!row) throw new ApiError(404,"not_found","Task not found.");const saved=JSON.parse(row.data) as {status:string;startImmediately?:boolean};if(saved.status==="queued"&&saved.startImmediately){await this.rearmDeletion();await this.reconcileComputerSlots();const fresh=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",existing.task_id).toArray()[0];return json({task:JSON.parse(fresh.data)});}return json({task:saved});}
         const botRow=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",input.botId).toArray()[0];
         if(!botRow) throw new ApiError(404,"not_found","Assigned bot not found.");
         const bot=JSON.parse(botRow.data) as Bot, now=new Date().toISOString();
-        const task={id:crypto.randomUUID(),title:input.title.trim(),description:input.description,botId:bot.id,botName:bot.name,creator:"owner",computerMode:this.newTaskComputerMode(),status:input.startImmediately===false?"pending":"queued",startImmediately:input.startImmediately!==false,createdAt:now,updatedAt:now};
+        const executionTarget=input.executionTarget===undefined?bot.executionTarget??{kind:'cloud' as const}:parseExecutionTarget(input.executionTarget);
+        await validateDeviceTarget(this.env,executionTarget,bot.id,true);
+        if(!this.ctx.storage.sql.exec("SELECT id FROM bots WHERE id=?",bot.id).toArray().length)throw new ApiError(404,"not_found","Assigned bot not found.");
+        const raced=this.ctx.storage.sql.exec<{task_id:string;fingerprint:string}>("SELECT task_id,fingerprint FROM task_operations WHERE operation_id=?",input.operationId).toArray()[0];
+        if(raced){if(raced.fingerprint!==fingerprint)throw new ApiError(409,"operation_id_conflict","operationId was already used for another task.");return json({task:JSON.parse(this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",raced.task_id).one().data)});}
+
+        const task={id:crypto.randomUUID(),title:input.title.trim(),description:input.description,botId:bot.id,botName:bot.name,creator:"owner",executionTarget,computerMode:this.newTaskComputerMode(),status:input.startImmediately===false?"pending":"queued",startImmediately:input.startImmediately!==false,createdAt:now,updatedAt:now};
         this.ctx.storage.transactionSync(()=>{this.saveTask(task);this.ctx.storage.sql.exec("INSERT INTO task_operations(operation_id,task_id,fingerprint) VALUES(?,?,?)",input.operationId,task.id,fingerprint);});
         if(task.status==="queued"){await this.rearmDeletion();await this.reconcileComputerSlots();}
         const saved=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM tasks WHERE id=?",task.id).toArray()[0];
@@ -899,10 +920,11 @@ export class WorkspaceDO extends DurableObject<Env> {
       }
       if(path==="/" && request.method==="POST") {
         const input=parseBotInput(await body(request));
+        if(input.executionTarget)await validateDeviceTarget(this.env,input.executionTarget);
         const requested:ModelSettings={model:input.model??this.env.BOTSPACE_DEFAULT_MODEL??"gpt-6.1-sol",...(input.reasoningEffort===undefined?{}:{reasoningEffort:input.reasoningEffort}),...(input.fast===undefined?{}:{fast:input.fast})};
         const settings=input.model!==undefined || input.reasoningEffort!==undefined || input.fast!==undefined?await this.modelSettings(requested):requested;
         const now=new Date().toISOString();
-        const bot:Bot={id:crypto.randomUUID(),name:input.name!,instructions:input.instructions??"",...settings,runtime:"pi",computerApprovalMode:input.computerApprovalMode??"ask",allowNamedAgents:input.allowNamedAgents??false,allowTaskCreation:input.allowTaskCreation??false,createdAt:now,updatedAt:now};
+        const bot:Bot={id:crypto.randomUUID(),name:input.name!,instructions:input.instructions??"",...settings,runtime:"pi",computerApprovalMode:input.computerApprovalMode??"ask",allowNamedAgents:input.allowNamedAgents??false,allowTaskCreation:input.allowTaskCreation??false,...(input.executionTarget?{executionTarget:input.executionTarget}:{}),createdAt:now,updatedAt:now};
         this.ctx.storage.sql.exec("INSERT INTO bots (id,data) VALUES (?,?)",bot.id,JSON.stringify(bot));
         return json({bot},201);
       }
@@ -917,6 +939,11 @@ export class WorkspaceDO extends DurableObject<Env> {
           const current=this.ctx.storage.sql.exec<{data:string}>("SELECT data FROM bots WHERE id=?",id).toArray()[0];
           if(!current) throw new ApiError(404,"not_found","Bot not found.");
           const previous:Bot=JSON.parse(current.data),candidate:Bot={...previous,...input};
+          if(input.executionTarget&&JSON.stringify(input.executionTarget)!==JSON.stringify(previous.executionTarget??{kind:'cloud'})) {
+            await validateDeviceTarget(this.env,input.executionTarget);
+            const state=await this.schedulerSnapshot(id,previous);
+            if(state.activeRuns||state.activeProcesses||state.pendingCancellations)throw new ApiError(409,'execution_active','Finish or stop this bot’s active work before changing its machine.');
+          }
           if(input.model!==undefined && input.model!==previous.model) {
             // Options from another model never leak into this selection.
             if(input.reasoningEffort===undefined)delete candidate.reasoningEffort;

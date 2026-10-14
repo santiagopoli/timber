@@ -1,3 +1,4 @@
+export {DevicesDO} from '../../apps/api/src/devices';
 import { DurableObject } from "cloudflare:workers";
 import { responsesFixture } from "../../packages/runtime/test/responses-fixture";
 import { BotDO as ProductionBotDO } from "../../apps/api/src/bot";

@@ -11,6 +11,7 @@ import type {ArtifactLoader} from './artifact-preview';
 import type {ChatCallbacks,ChatConnection,ChatModel,MessageDelivery} from './chat-types';
 import type {ModelSelection,ModelSettingsState} from './model-settings';
 import './tasks.css';
+import {ExecutionTargetPicker,targetFrom,targetLabel,type ExecutionTarget,type Machine} from './devices';
 
 type RequestOptions = {method?: string; body?: unknown; signal?: AbortSignal; raw?: boolean};
 export type TasksRequest = (path: string, options?: RequestOptions) => Promise<unknown>;
@@ -19,6 +20,7 @@ export type TasksProps = {
   request: TasksRequest;
   onDictateAudio?: ChatCallbacks['onDictateAudio'];
   bots: TasksBot[];
+  machines?: Machine[];
   onOpenBot?: (botId: string) => void;
   selectedTaskId?: string|null;
   active?: boolean;
@@ -33,7 +35,7 @@ export type TasksProps = {
   decorateAvatar?:(node:HTMLElement,botId:string)=>void;
 };
 type TaskStatus = 'pending'|'queued'|'running'|'waiting_approval'|'waiting_connection'|'cancelling'|'completed'|'failed'|'cancelled'|string;
-type Task = {id:string;title:string;description?:string;botId:string;botName?:string;status:TaskStatus;createdAt?:string;updatedAt?:string;lastActivity?:string;queue?:TaskQueue;computerMode?:string};
+type Task = {id:string;title:string;description?:string;botId:string;botName?:string;status:TaskStatus;createdAt?:string;updatedAt?:string;lastActivity?:string;queue?:TaskQueue;computerMode?:string;executionTarget?:ExecutionTarget};
 type TaskFilter = 'all'|'active'|'pending'|'completed';
 type TaskApproval = Approval;
 type TaskMessage = Message;
@@ -54,7 +56,7 @@ function queueValue(value:unknown):TaskQueue|undefined {
 }
 function taskList(value: unknown): Task[] {
   const source = Array.isArray(value) ? value : isRecord(value) && Array.isArray(value.tasks) ? value.tasks : [];
-  return source.filter(isRecord).map(item => ({id:text(item.id),title:text(item.title)||'Untitled task',description:text(item.description),botId:text(item.botId),botName:text(item.botName),status:text(item.status)||'pending',createdAt:text(item.createdAt),updatedAt:text(item.updatedAt),lastActivity:text(item.lastActivity),computerMode:text(item.computerMode),queue:queueValue(item.queue)})).filter(item=>item.id);
+  return source.filter(isRecord).map(item => ({id:text(item.id),title:text(item.title)||'Untitled task',description:text(item.description),botId:text(item.botId),botName:text(item.botName),status:text(item.status)||'pending',createdAt:text(item.createdAt),updatedAt:text(item.updatedAt),lastActivity:text(item.lastActivity),computerMode:text(item.computerMode),queue:queueValue(item.queue),executionTarget:targetFrom(item.executionTarget)})).filter(item=>item.id);
 }
 function taskDetail(value: unknown): Task | undefined {
   const candidate = isRecord(value) && isRecord(value.task) ? value.task : value;
@@ -118,6 +120,7 @@ function TaskView({props}:{props:TasksProps}) {
   const [partials,setPartials]=useState<Record<string,string>>({}),partialRef=useRef<Record<string,string>>({}),knownRuns=useRef(new Map<string,Run>());
   const [messageCursor,setMessageCursor]=useState<string|null>(null),[eventCursor,setEventCursor]=useState<string|null>(null),[olderBusy,setOlderBusy]=useState(false),[visibleMessages,setVisibleMessages]=useState(100),[archivedActivity,setArchivedActivity]=useState(false);
   const [title,setTitle]=useState(''),[description,setDescription]=useState(''),[botId,setBotId]=useState(props.bots[0]?.id||''),[startImmediately,setStartImmediately]=useState(true),[draft,setDraft]=useState('');
+  const [executionTarget,setExecutionTarget]=useState<ExecutionTarget|undefined>();
   const draftState=useRef({text:draft,mentions:draftMentions});draftState.current={text:draft,mentions:draftMentions};
   const createOperation=useRef<{key:string;id:string}|null>(null),sendOperation=useRef<TaskSendOperation|null>(null),mounted=useRef(true);
   const selectedRef=useRef<string|null>(null),viewVersion=useRef(0),tasksRef=useRef(tasks);
@@ -264,14 +267,14 @@ function TaskView({props}:{props:TasksProps}) {
   const refresh=()=>{void loadTasks();if(selected)void loadDetail(selected)};
   const create=async(event:FormEvent)=>{
     event.preventDefault();const trimmed=title.trim(),trimmedDescription=description.trim();if(!trimmed||!botId||creating)return;
-    const key=JSON.stringify([trimmed,trimmedDescription,botId,startImmediately]);
+    const key=JSON.stringify([trimmed,trimmedDescription,botId,startImmediately,executionTarget]);
     const operation=createOperation.current?.key===key?createOperation.current:{key,id:crypto.randomUUID()};createOperation.current=operation;
     const version=viewVersion.current;
     setCreating(true);setError('');
     try {
-      const result=await props.request('/v1/tasks',{method:'POST',body:{operationId:operation.id,title:trimmed,description:trimmedDescription,botId,startImmediately}});
+      const result=await props.request('/v1/tasks',{method:'POST',body:{operationId:operation.id,title:trimmed,description:trimmedDescription,botId,startImmediately,...(executionTarget?{executionTarget}:{})}});
       if(!mounted.current)return;
-      const created=taskDetail(result);createOperation.current=null;setTitle('');setDescription('');setShowCreate(false);setStartImmediately(true);await loadTasks();
+      const created=taskDetail(result);createOperation.current=null;setTitle('');setDescription('');setShowCreate(false);setStartImmediately(true);setExecutionTarget(undefined);await loadTasks();
       if(mounted.current&&viewVersion.current===version&&created?.id)selectTask(created.id);
     } catch(reason){if(mounted.current&&viewVersion.current===version)setError(reason instanceof Error?reason.message:'Could not create task.');}
     finally{if(mounted.current)setCreating(false);}
@@ -416,13 +419,14 @@ function TaskView({props}:{props:TasksProps}) {
     currentRun,runFilter:null,focusApproval:0,stream:streamed?{runId:streamed[0],text:streamed[1]}:null,
     historyLoading:olderBusy,historyHasMore:Boolean(messageCursor||eventCursor||messages.length>visibleMessages),historyError:loadError||undefined,
   };
+  const nativeTarget=(detail?.executionTarget||targetFrom(bot.executionTarget))?.kind==='device';
   const appLink=(event:MouseEvent<HTMLElement>)=>{
     if(event.defaultPrevented||event.button!==0||event.metaKey||event.ctrlKey||event.altKey||event.shiftKey)return;
     const anchor=(event.target as Element).closest<HTMLAnchorElement>('a[href]');if(!anchor||!selected||!detail)return;
     let url:URL;try{url=new URL(anchor.href,location.origin);}catch{return;}
     const match=/^\/apps\/([0-9a-f-]{36})\.([0-9a-f-]{36})\.([0-9a-f-]{36})\/$/i.exec(url.pathname);
     if(!match||match[1]!==detail.botId||match[2]!==selected||url.search||url.hash)return;
-    event.preventDefault();const popup=window.open('about:blank','_blank');if(!popup){setError('Allow a new tab to open this app.');return;}
+    event.preventDefault();if(nativeTarget){setError('Browser previews are unavailable on machine targets.');return;}const popup=window.open('about:blank','_blank');if(!popup){setError('Allow a new tab to open this app.');return;}
     const id=selected;void(async()=>{
       try{
         const result=await request(`/v1/tasks/${encodeURIComponent(id)}/apps/${encodeURIComponent(match[3])}/open`,{method:'POST',body:{}});
@@ -440,13 +444,13 @@ function TaskView({props}:{props:TasksProps}) {
       <span ref={setHeaderTarget}/><span className="spacer"/>
       {detail&&<span className="status timber-task-state" data-task-state data-status={detail.status} role="status">{statusName(detail.status)}</span>}
       {detail&&activeStatuses.has(detail.status)&&detail.status!=='cancelling'&&<button type="button" className="icon-button quiet timber-task-stop" disabled={busy} onClick={()=>void action('cancel')} aria-label="Cancel task" title="Cancel task"><SquareIcon/></button>}
-      <Dialog.Root open={desktopOpen} onOpenChange={setDesktopOpen}><Dialog.Trigger asChild><button type="button" className="icon-button quiet" aria-label="Task computer" title="Task computer"><MonitorIcon/></button></Dialog.Trigger><Dialog.Portal><Dialog.Overlay className="timber-memory-overlay"/><Dialog.Content className="timber-memory-dialog timber-task-desktop-dialog"><div className="timber-secure-title"><Dialog.Title>Task computer</Dialog.Title><Dialog.Close asChild><button type="button" className="quiet icon-button" aria-label="Close task computer"><XIcon/></button></Dialog.Close></div><Dialog.Description className="sr-only">The computer used by this task.</Dialog.Description><TaskDesktop taskId={selected} request={request}/></Dialog.Content></Dialog.Portal></Dialog.Root>
+      <Dialog.Root open={desktopOpen&&!nativeTarget} onOpenChange={setDesktopOpen}><Dialog.Trigger asChild><button type="button" className="icon-button quiet" aria-label="Task computer" disabled={nativeTarget} title={nativeTarget?"Desktop viewing is unavailable on machine targets":"Task computer"}><MonitorIcon/></button></Dialog.Trigger><Dialog.Portal><Dialog.Overlay className="timber-memory-overlay"/><Dialog.Content className="timber-memory-dialog timber-task-desktop-dialog"><div className="timber-secure-title"><Dialog.Title>Task computer</Dialog.Title><Dialog.Close asChild><button type="button" className="quiet icon-button" aria-label="Close task computer"><XIcon/></button></Dialog.Close></div><Dialog.Description className="sr-only">The computer used by this task.</Dialog.Description><TaskDesktop taskId={selected} request={request}/></Dialog.Content></Dialog.Portal></Dialog.Root>
       <Dialog.Root open={detailsOpen} onOpenChange={setDetailsOpen}>
         <Dialog.Trigger asChild><button type="button" className="icon-button quiet" aria-label="Task details" title="Task details"><InfoIcon/></button></Dialog.Trigger>
         <Dialog.Portal><Dialog.Overlay className="timber-memory-overlay"/><Dialog.Content className="timber-memory-dialog timber-task-details-dialog">
           <div className="timber-secure-title"><Dialog.Title>Task details</Dialog.Title><Dialog.Close asChild><button type="button" className="quiet icon-button" aria-label="Close task details"><XIcon/></button></Dialog.Close></div>
           <h3>{detail?.title||'Task'}</h3><Dialog.Description>{detail?.description||'No description.'}</Dialog.Description>
-          <dl><dt>Bot</dt><dd>{bot.name}</dd><dt>Status</dt><dd>{detail?statusName(detail.status):'Loading…'}</dd>{detail?.computerMode&&<><dt>Computer</dt><dd>{detail.computerMode==='isolated'?'This task':'Shared with bot'}</dd></>}{detail?.createdAt&&<><dt>Created</dt><dd>{date(detail.createdAt)}</dd></>}</dl>
+          <dl><dt>Bot</dt><dd>{bot.name}</dd><dt>Status</dt><dd>{detail?statusName(detail.status):'Loading…'}</dd><dt>Location</dt><dd>{targetLabel(detail?.executionTarget||targetFrom(bot.executionTarget),props.machines||[])}</dd>{detail?.computerMode&&<><dt>Computer</dt><dd>{detail.computerMode==='isolated'?'This task':'Shared with bot'}</dd></>}{detail?.createdAt&&<><dt>Created</dt><dd>{date(detail.createdAt)}</dd></>}</dl>
           {detail?.status==='cancelled'&&<p className="hint">Cancelled tasks stay stopped. Create a new task to work again.</p>}
           <div className="dialog-actions"><button type="button" className="quiet" onClick={refresh} aria-label="Refresh task"><RefreshCwIcon/>Refresh</button>{detail?.botId&&props.onOpenBot&&<button type="button" className="quiet" onClick={()=>props.onOpenBot?.(detail.botId)}>Open bot</button>}
             {archivedActivity&&<button type="button" className="quiet" onClick={()=>{latestActivity();setDetailsOpen(false);}}>Latest activity</button>}
@@ -467,7 +471,7 @@ function TaskView({props}:{props:TasksProps}) {
     <header className="section-title sidebar-heading timber-tasks-overview-heading"><h2>Tasks <span className="counter">{tasks.length}</span></h2><div className="row">
       <button type="button" className="icon-button quiet" onClick={refresh} aria-label="Refresh tasks" title="Refresh tasks"><RefreshCwIcon/></button><button type="button" className="new-bot icon-button" aria-label={showCreate?'Close create task':'New task'} title="New task" onClick={()=>{setShowCreate(value=>!value);setError('')}}><PlusIcon/></button></div></header>
     <div className="search-field timber-tasks-search"><SearchIcon aria-hidden="true"/><input className="search" aria-label="Search tasks" type="search" placeholder="Search tasks" value={search} onChange={event=>setSearch(event.currentTarget.value)}/><Popover.Root open={filtersOpen&&active} onOpenChange={setFiltersOpen}><Popover.Trigger asChild><button type="button" className="icon-button quiet timber-tasks-filter-trigger" aria-label="Filter tasks" title={filter==='all'?'Filter tasks':`Filter tasks: ${filter}`} data-filtered={filter!=='all'}><ListFilterIcon/></button></Popover.Trigger><Popover.Portal><Popover.Content className="timber-tasks-filter-popover" align="end" sideOffset={8} collisionPadding={12} aria-label="Task filters"><div className="timber-tasks-filters" role="group" aria-label="Filter tasks by status">{(['all','active','pending','completed'] as TaskFilter[]).map(value=><button type="button" key={value} aria-pressed={filter===value} onClick={()=>{setFilter(value);setFiltersOpen(false)}}>{value==='all'?'All':value==='active'?'Active':statusName(value)}</button>)}</div></Popover.Content></Popover.Portal></Popover.Root></div>
-    {showCreate&&<form className="timber-tasks-create" onSubmit={event=>void create(event)}><h3>Create a task</h3><label>Title<input autoFocus required maxLength={160} value={title} onChange={event=>setTitle(event.currentTarget.value)} placeholder="What needs to be done?"/></label><label>Description<textarea rows={3} maxLength={32000} value={description} onChange={event=>setDescription(event.currentTarget.value)} placeholder="Add context or instructions (optional)"/></label><label>Assigned bot<select required value={botId} onChange={event=>setBotId(event.currentTarget.value)}><option value="" disabled>Select a bot</option>{props.bots.map(bot=><option value={bot.id} key={bot.id}>{bot.name}</option>)}</select></label><label className="timber-tasks-checkbox"><input type="checkbox" checked={startImmediately} onChange={event=>setStartImmediately(event.currentTarget.checked)}/>Start immediately</label>{error&&<p className="timber-tasks-error" role="alert">{error}</p>}<div className="timber-tasks-form-actions"><button type="button" className="timber-tasks-quiet" onClick={()=>setShowCreate(false)}>Cancel</button><button type="submit" className="timber-tasks-action" disabled={creating||!props.bots.length||!title.trim()}>{creating&&<LoaderCircleIcon className="timber-tasks-spinner"/>}{creating?'Creating…':'Create task'}</button></div>{!props.bots.length&&<p className="timber-tasks-hint">Create a bot before assigning a task.</p>}</form>}
+    {showCreate&&<form className="timber-tasks-create" onSubmit={event=>void create(event)}><h3>Create a task</h3><label>Title<input autoFocus required maxLength={160} value={title} onChange={event=>setTitle(event.currentTarget.value)} placeholder="What needs to be done?"/></label><label>Description<textarea rows={3} maxLength={32000} value={description} onChange={event=>setDescription(event.currentTarget.value)} placeholder="Add context or instructions (optional)"/></label><label>Assigned bot<select aria-label="Assigned bot" required value={botId} onChange={event=>setBotId(event.currentTarget.value)}><option value="" disabled>Select a bot</option>{props.bots.map(bot=><option value={bot.id} key={bot.id}>{bot.name}</option>)}</select></label><ExecutionTargetPicker machines={props.machines||[]} value={executionTarget} onChange={setExecutionTarget} inherit inherited={targetFrom(props.bots.find(item=>item.id===botId)?.executionTarget)} botId={botId}/><label className="timber-tasks-checkbox"><input type="checkbox" checked={startImmediately} onChange={event=>setStartImmediately(event.currentTarget.checked)}/>Start immediately</label>{error&&<p className="timber-tasks-error" role="alert">{error}</p>}<div className="timber-tasks-form-actions"><button type="button" className="timber-tasks-quiet" onClick={()=>setShowCreate(false)}>Cancel</button><button type="submit" className="timber-tasks-action" disabled={creating||!props.bots.length||!title.trim()}>{creating&&<LoaderCircleIcon className="timber-tasks-spinner"/>}{creating?'Creating…':'Create task'}</button></div>{!props.bots.length&&<p className="timber-tasks-hint">Create a bot before assigning a task.</p>}</form>}
     {loadError&&<p className="timber-tasks-error" role="alert">{loadError} <button type="button" className="timber-tasks-link" onClick={refresh}>Retry</button></p>}
     {!tasks.length&&<div className="timber-tasks-empty">{loading?<><LoaderCircleIcon className="timber-tasks-spinner"/><span>Loading tasks…</span></>:<><strong>No tasks yet</strong><span>Create a global task and assign it to a bot. Its conversation stays separate from bot chat.</span></>}</div>}
     {!!tasks.length&&!visibleTasks.length&&<div className="timber-tasks-empty"><strong>No {filter} tasks</strong><span>Choose another filter to see other tasks.</span></div>}

@@ -1,3 +1,8 @@
+import {deviceConversationContext} from './device-history';
+import {createDeviceBotRuntime} from "./device-bot";
+import {createExecutionComputerProvider,executeDeviceDiagnostic} from "./device-computer";
+import {dispatchDeviceMemory,localMemoryTools} from "./device-memory";
+import {deviceRequest,routeDevices} from "./devices";
 import { taskProgress } from "./task-progress";
 import { DurableObject } from "cloudflare:workers";
 import type { ModelCatalog, ModelSettings, AgentDelegation, Approval, Bot, BotEvent, ComputerAction, ComputerResult, ComputerStatus, ConnectionRequest, Message, MessageProvenance, MessagePage, Run, RunDelegation, RunPage, RunStatus,TaskUpdate } from "@botspace/contracts";
@@ -57,7 +62,8 @@ async function consumeUnusedBody(request:Request):Promise<void> {
 
 export class BotDO extends DurableObject<Env> {
   private runtime!:AgentRuntime;
-  private computer:ReturnType<typeof createCloudComputerProvider>;
+  private computer:import("@botspace/contracts").ComputerProvider;
+  private deviceRuntime?:ReturnType<typeof createDeviceBotRuntime>;
   private admitting=new Map<string,Promise<void>>();
   private admissionQueue:Promise<void>=Promise.resolve();
   private admissionReservations=new Set<string>();
@@ -115,6 +121,7 @@ export class BotDO extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS admission_sources (run_id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('user','internal')));
       CREATE TABLE IF NOT EXISTS execution_claims (operation_id TEXT PRIMARY KEY,run_id TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS task_environment(id INTEGER PRIMARY KEY,mode TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS task_execution_location(id INTEGER PRIMARY KEY,target TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS capacity_waits (operation_id TEXT PRIMARY KEY,run_id TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS capacity_waits_run_idx ON capacity_waits(run_id);
       CREATE TABLE IF NOT EXISTS admission_retries (operation_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL, next_at INTEGER NOT NULL);
@@ -173,7 +180,7 @@ export class BotDO extends DurableObject<Env> {
       // verifies ownership in its tool boundary, including coordinator turns.
       getBot:async()=>this.currentBot(false),
       getTaskId:()=>this.taskId(),
-      getTaskContext:()=>this.taskContext(),
+      getTaskContext:root=>[this.taskContext(),root?deviceConversationContext(this.ctx.storage):''].filter(Boolean).join('\n\n'),
       isCoordinator:operationId=>{const row=this.findRun(operationId);return row?JSON.parse(row.data).coordinatorMode===true:false;},
       resolveToolOperationId:input=>this.toolOperationId(input),
       getApprovalContext:async()=>this.approvalContext(),
@@ -187,6 +194,40 @@ export class BotDO extends DurableObject<Env> {
       },
       onEvent:async(event)=>this.project(event),
     });
+    if(env.DEVICES) {
+      this.computer=createExecutionComputerProvider(env,{
+        cloud:this.computer,
+        scope:()=>({botId:this.bot().id,taskId:this.taskId()}),
+        targetForOperation:async(op)=>{
+          const row=op?ctx.storage.sql.exec<{run_id:string|null}>('SELECT run_id FROM computer_operations WHERE operation_id=?',op).toArray()[0]:undefined;
+          return (row?.run_id?this.getRun(row.run_id).executionTarget:undefined)??this.bot().executionTarget??{kind:'cloud'};
+        },
+        nativeOperationIdForOperation:async(op)=>{const row=ctx.storage.sql.exec<{native_operation_id:string}>("SELECT r.native_operation_id FROM computer_operations c JOIN runs r ON r.id=c.run_id WHERE c.operation_id=?",op).toArray()[0];return row?.native_operation_id;},
+        parentJobId:async(op)=>{
+          const row=ctx.storage.sql.exec<{job_id:string}>('SELECT l.job_id FROM computer_operations c JOIN runs r ON r.id=c.run_id JOIN timber_local_runtime_operations l ON l.operation_id=r.native_operation_id WHERE c.operation_id=?',op).toArray()[0];return row?.job_id;
+        },
+        approvalForOperation:async(op)=>{
+          const row=ctx.storage.sql.exec<{data:string}>('SELECT data FROM approvals WHERE operation_id=?',op).toArray()[0];
+          const approval=row?JSON.parse(row.data) as Approval:undefined;
+          return {authorized:true as const,mode:approval&&['approved','executing','completed'].includes(approval.status)?'approved' as const:'automatic' as const,...(approval?{approvalId:approval.id}:{})};
+        },
+      });
+      this.deviceRuntime=createDeviceBotRuntime(env,ctx.storage,this.runtime,{
+        bot:()=>this.bot(),taskId:()=>this.taskId(),
+        run:operationId=>{const row=this.findRun(operationId);return row&&row.native_operation_id===operationId?JSON.parse(row.data) as Run:undefined;},
+        stopped:id=>this.stopped(id)||this.taskStopped()||this.deleted||this.taskDeleting,
+        computerActive:job=>{
+          const row=ctx.storage.sql.exec<{action:string;run_id:string|null}>('SELECT action,run_id FROM computer_operations WHERE operation_id=?',job.operationId).toArray()[0];
+          if(!row?.run_id||row.action!==JSON.stringify(job.action))return false;
+          const runRow=this.getRunRow(row.run_id),run=this.getRun(row.run_id);
+          return runRow.native_operation_id===job.nativeOperationId&&!terminal.has(run.status)&&!this.stopped(run.id)&&!this.taskStopped();
+        },
+        authorize:()=>this.currentBot(false),
+        tools:{execute:input=>this.executeTool(input),call:input=>this.executeHostTool(input)},
+        project:event=>this.project(event),
+      });
+      this.runtime=this.deviceRuntime.runtime;
+    }
   }
 
   private active():void {if(this.deleted || this.taskDeleting) throw new ApiError(404,"not_found","Bot not found.");}
@@ -294,7 +335,7 @@ export class BotDO extends DurableObject<Env> {
     const id=this.taskId();
     return !!id&&this.ctx.storage.sql.exec("SELECT 1 FROM task_cancel_fences WHERE task_id=?",id).toArray().length>0;
   }
-  private configure(request:Request):void {
+  private async configure(request:Request):Promise<void> {
     const taskId=request.headers.get("x-timber-task-id");
     if(taskId) {
       if(!UUID.test(taskId)||!this.ctx.id.equals(this.env.BOT.idFromName(`owner:task:${taskId}`)))throw new ApiError(403,"task_mismatch","Task conversation identity mismatch.");
@@ -302,7 +343,21 @@ export class BotDO extends DurableObject<Env> {
     }
     const raw=request.headers.get("x-botspace-config");
     if(!raw) throw new ApiError(403,"internal_only","Missing internal configuration.");
-    this.acceptConfig(JSON.parse(decodeURIComponent(raw)) as Bot);
+    const incoming=JSON.parse(decodeURIComponent(raw)) as Bot;
+    if(taskId) {
+      let target=this.ctx.storage.sql.exec<{target:string}>('SELECT target FROM task_execution_location WHERE id=1').toArray()[0]?.target;
+      if(!target&&/^\/(?:audio|audio-messages)(?:\/|$)/.test(new URL(request.url).pathname)){this.acceptConfig(incoming);return;}
+      if(!target){
+        const response=await this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName('owner')).fetch(`https://workspace/tasks/${taskId}`);
+        if(!response.ok){await response.body?.cancel();throw new ApiError(404,'not_found','Task not found.');}
+        const {task}=await response.json<{task:import('@botspace/contracts').Task}>();
+        if(task.botId!==incoming.id)throw new ApiError(403,'task_mismatch','Task bot mismatch.');
+        this.ctx.storage.sql.exec('INSERT OR IGNORE INTO task_execution_location(id,target) VALUES(1,?)',JSON.stringify(task.executionTarget??incoming.executionTarget??{kind:'cloud'}));
+        target=this.ctx.storage.sql.exec<{target:string}>('SELECT target FROM task_execution_location WHERE id=1').one().target;
+      }
+      incoming.executionTarget=JSON.parse(target);
+    }
+    this.acceptConfig(incoming);
   }
   private async currentBot(validateExecution=true,allowTaskTerminal=false,allowTaskCancelled=false):Promise<Bot> {
     const id=this.bot().id;
@@ -321,8 +376,9 @@ export class BotDO extends DurableObject<Env> {
       if(taskId) {
         const taskResponse=await registry.fetch(`https://workspace/tasks/${taskId}`);
         if(!taskResponse.ok)throw new Error("Task configuration unavailable");
-        const {task}=await taskResponse.json<{task:{botId:string;status:string;cancelRequested?:boolean}}>();
+        const {task}=await taskResponse.json<{task:{botId:string;status:string;cancelRequested?:boolean;executionTarget?:import("@botspace/contracts").ExecutionTarget}}>();
         if(task.botId!==id)throw new Error("Task assigned bot mismatch");
+        bot.executionTarget=task.executionTarget??bot.executionTarget;
         if(!allowTaskCancelled&&(task.cancelRequested||["cancelled","cancelling"].includes(task.status))) {
           this.ctx.storage.sql.exec("INSERT OR IGNORE INTO task_cancel_fences(task_id,created_at) VALUES(?,?)",taskId,Date.now());
           throw new ApiError(409,"task_cancelled","This task was cancelled and cannot authorize new work.");
@@ -556,7 +612,7 @@ export class BotDO extends DurableObject<Env> {
     if(terminal.has(run.status) && !enrichFailure) return;
     if(Date.now()-this.lastComputerTouch>60_000) {
       this.lastComputerTouch=Date.now();
-      this.ctx.waitUntil(this.computerTaskId().then(taskId=>touchCloudComputer(this.env.COMPUTER,run.botId,taskId)).catch(()=>{}));
+      if((run.executionTarget??this.bot().executionTarget)?.kind!=="device")this.ctx.waitUntil(this.computerTaskId().then(taskId=>touchCloudComputer(this.env.COMPUTER,run.botId,taskId)).catch(()=>{}));
     }
     if(event.type==="run.started" && !this.hasPendingApproval(run.id) && !this.hasPendingConnection(run.id)) this.updateStatus(run.id,"running");
     if(event.type==="run.completed") await this.completeOperation(event.operationId!,"done",typeof event.data.text==="string"?event.data.text:undefined,undefined,event.data.kind==="progress"?"progress":"final",{answerId:typeof event.data.answerId==="string"?event.data.answerId:undefined,answerOperationId:typeof event.data.answerOperationId==="string"?event.data.answerOperationId:undefined});
@@ -619,7 +675,7 @@ export class BotDO extends DurableObject<Env> {
     const parent=this.findRun(agent.parentOperationId);
     if(!parent) throw new ApiError(409,"run_not_found","Subagent has no parent run.");
     const source=JSON.parse(parent.data) as Run;
-    const run:Run={model:agent.model??source.model,reasoningEffort:agent.reasoningEffort,fast:agent.fast,id:crypto.randomUUID(),botId:source.botId,...(source.coordinatorMode?{coordinatorMode:true}:{}),operationId:`subagent:${agent.operationId}`,subagentId:agent.id,parentRunId:source.id,...(source.delegation?{delegation:source.delegation}:{}),status:this.stopped(source.id)?"cancelled":agent.status,...(this.runCancellation(source.id)?{cancellation:this.runCancellation(source.id)}:{}),createdAt:agent.createdAt,updatedAt:agent.updatedAt};
+    const run:Run={executionTarget:source.executionTarget,model:agent.model??source.model,reasoningEffort:agent.reasoningEffort,fast:agent.fast,id:crypto.randomUUID(),botId:source.botId,...(source.coordinatorMode?{coordinatorMode:true}:{}),operationId:`subagent:${agent.operationId}`,subagentId:agent.id,parentRunId:source.id,...(source.delegation?{delegation:source.delegation}:{}),status:this.stopped(source.id)?"cancelled":agent.status,...(this.runCancellation(source.id)?{cancellation:this.runCancellation(source.id)}:{}),createdAt:agent.createdAt,updatedAt:agent.updatedAt};
     this.ctx.storage.transactionSync(()=>{
       this.ctx.storage.sql.exec("INSERT INTO runs(id,operation_id,fingerprint,native_operation_id,data) VALUES(?,?,?,?,?)",run.id,run.operationId,run.operationId,agent.operationId,JSON.stringify(run));
       this.ctx.storage.sql.exec("INSERT OR IGNORE INTO submissions(operation_id,run_id,text,admitted,subagent_id) VALUES(?,?,?,1,?)",agent.operationId,run.id,agent.task,agent.id);
@@ -745,7 +801,7 @@ export class BotDO extends DurableObject<Env> {
     this.checkInboxCapacity(source);
     if(this.taskStopped())throw new ApiError(409,"task_cancelled","This task was cancelled and cannot accept input.");
     const now=timestamp();
-    const run:Run={model:selection.model,reasoningEffort:selection.reasoningEffort,fast:selection.fast,id:crypto.randomUUID(),botId:this.bot().id,...(metadata?.parentRunId&&this.getRun(metadata.parentRunId).coordinatorMode?{coordinatorMode:true}:{}),operationId:input.operationId,...(metadata?.delegation?{delegation:metadata.delegation}:{}),...(metadata?.parentRunId?{parentRunId:metadata.parentRunId}:{}),...(metadata?.subagentId?{subagentId:metadata.subagentId}:{}),status:"queued",createdAt:now,updatedAt:now};
+    const run:Run={executionTarget:this.bot().executionTarget??{kind:"cloud"},model:selection.model,reasoningEffort:selection.reasoningEffort,fast:selection.fast,id:crypto.randomUUID(),botId:this.bot().id,...(metadata?.parentRunId&&this.getRun(metadata.parentRunId).coordinatorMode?{coordinatorMode:true}:{}),operationId:input.operationId,...(metadata?.delegation?{delegation:metadata.delegation}:{}),...(metadata?.parentRunId?{parentRunId:metadata.parentRunId}:{}),...(metadata?.subagentId?{subagentId:metadata.subagentId}:{}),status:"queued",createdAt:now,updatedAt:now};
     this.ctx.storage.transactionSync(()=>{
       if(this.taskStopped())throw new ApiError(409,"task_cancelled","This task was cancelled and cannot accept input.");
       if(metadata?.legacyRecoverySourceId&&this.legacyProviderFailure()?.id!==metadata.legacyRecoverySourceId)throw new ApiError(409,'recovery_stale','New input or Stop superseded this recovery.');
@@ -1277,7 +1333,9 @@ export class BotDO extends DurableObject<Env> {
       try {
         const result=await this.runtime.wait(nativeOperationId);
         await this.completeOperation(nativeOperationId,result.status,result.text,result.reason,result.kind,result);
-      } catch {if(!this.deleted) {const row=this.findRun(nativeOperationId);if(row?.native_operation_id===nativeOperationId) {const run=JSON.parse(row.data) as Run;if(!terminal.has(run.status) && !["waiting_approval","waiting_connection"].includes(run.status)) this.updateStatus(run.id,"interrupted","The agent run was interrupted.");}}}
+      } catch(error) {if(!this.deleted) {const row=this.findRun(nativeOperationId);
+        if((error as {code?:string})?.code==='device_wait_pending') {if(row?.native_operation_id===nativeOperationId&&!this.stopped(row.id)&&!terminal.has(this.getRun(row.id).status))await this.runtime.scheduleAdmissionRetry(nativeOperationId,30_000);return;}
+if(row?.native_operation_id===nativeOperationId) {const run=JSON.parse(row.data) as Run;if(!terminal.has(run.status) && !["waiting_approval","waiting_connection"].includes(run.status)) this.updateStatus(run.id,"interrupted","The agent run was interrupted.");}}}
       finally {this.observing.delete(nativeOperationId);}
     })());
   }
@@ -1783,17 +1841,18 @@ export class BotDO extends DurableObject<Env> {
   private async dispatchHostTool(input:RuntimeHostToolRequest):Promise<RuntimeToolResult> {
     this.active();
     input=await this.childToolInput(input);
-    validateHostArguments(input.name,input.arguments);
+    if(!localMemoryTools.some(tool=>tool.name===input.name))validateHostArguments(input.name,input.arguments);
     const row=this.findRun(input.runOperationId);
     if(!row) throw new ApiError(409,'run_not_found','Tool has no active run.');
     const run=JSON.parse(row.data) as Run;
     if(row.native_operation_id!==input.runOperationId || terminal.has(run.status) || this.taskStopped() || input.signal.aborted) return {operationId:input.operationId,status:'interrupted',error:'Run is no longer active.'};
     if(input.name==='create_task'&&(input.subagentId||run.subagentId))return {operationId:input.operationId,status:'failed',error:'Temporary agents must ask their named parent to create persistent tasks.'};
-    if(run.coordinatorMode&&!['create_task','list_tasks','inspect_task','message_task','send_to_bot','list_bots','list_secrets','load_skill','github_inspect_ci'].includes(input.name))return {operationId:input.operationId,status:'failed',error:'This chat turn can answer, inspect metadata and create tasks. Perform service or computer actions in a persistent task.'};
+    if(run.coordinatorMode&&!['create_task','list_tasks','inspect_task','message_task','send_to_bot','list_bots','list_machines','list_secrets','load_skill','github_inspect_ci','memory_list','memory_search','memory_get','recall_history','recall_conversation'].includes(input.name))return {operationId:input.operationId,status:'failed',error:'This chat turn can answer, inspect metadata and create tasks. Perform service or computer actions in a persistent task.'};
     await this.currentBot(!run.coordinatorMode);
     this.active();
     if(this.getRunRow(run.id).native_operation_id!==input.runOperationId || terminal.has(this.getRun(run.id).status) || this.taskStopped() || input.signal.aborted) return {operationId:input.operationId,status:'interrupted',error:'Run is no longer active.'};
     const args=input.arguments;
+    if((run.executionTarget??this.bot().executionTarget)?.kind==='device'&&['github_clone','github_push','publish_app','list_apps','secure_worker_deploy','secure_worker_deploy_capabilities'].includes(input.name))return {operationId:input.operationId,status:'failed',error:'This service requires a Cloudflare computer. Use local shell with the machine’s own tools and authentication, or create a cloud task.'};
     if(['request_secret','configure_secret','list_secrets','name_secret','secret_request','secure_worker_deploy','secure_worker_deploy_capabilities'].includes(input.name) && (input.subagentId || run.subagentId)) return {operationId:input.operationId,status:'failed',error:'Only the named bot can use the owner’s permitted private inputs. Ask your parent to perform this authenticated operation.'};
     if(typeof args.repository==='string') {
       const repository=args.repository.toLowerCase();
@@ -1803,7 +1862,21 @@ export class BotDO extends DurableObject<Env> {
     this.startTool(input.operationId,activity,run.id);
     const completed=(value:unknown):ComputerResult=>({operationId:input.operationId,status:'completed',output:typeof value==='string'?value:JSON.stringify(value)});
     let result:ComputerResult;
-    if(input.name==='request_secret'||input.name==='configure_secret') {
+    const memoryResult=await dispatchDeviceMemory(this.ctx.storage,run.botId,input);
+    if(memoryResult)result=memoryResult as ComputerResult;
+    else if(input.name==='list_machines') {
+      const response=await routeDevices(new Request('https://devices/v1/devices'),this.env,'owner');
+      if(!response?.ok)throw new ApiError(503,'device_unavailable','Machine registry unavailable.');
+      const {devices}=await response.json<{devices:import('@botspace/contracts').Device[]}>();
+      result=completed({machines:devices.filter(device=>device.status!=='revoked').flatMap(device=>{const grant=device.grants.find(grant=>grant.botId===run.botId);return grant?device.workspaces.filter(workspace=>grant.workspaceIds.includes(workspace.id)).map(workspace=>({name:device.name,workspace:workspace.name,online:device.online,permissions:grant.permissions,executionTarget:{kind:'device',deviceId:device.id,workspaceId:workspace.id,agentMode:'cloud'},...(grant.permissions.includes('agent.run')?{localPiTarget:{kind:'device',deviceId:device.id,workspaceId:workspace.id,agentMode:'local'}}:{})})):[];})});
+    } else if(input.name==='machine_diagnostics') {
+      const target=run.executionTarget??this.bot().executionTarget;
+      if(target?.kind!=='device')throw new ApiError(409,'device_required','Choose a permitted machine for this task.');
+      const parent=this.ctx.storage.sql.exec<{job_id:string}>('SELECT job_id FROM timber_local_runtime_operations WHERE operation_id=?',input.runOperationId).toArray()[0]?.job_id;
+      const action:import('@botspace/contracts').DeviceDiagnosticAction={type:'diagnostics',target:args.target as 'system'|'processes'|'disk',...(typeof args.limit==='number'?{limit:args.limit}:{})};
+      this.ctx.storage.sql.exec('INSERT OR IGNORE INTO computer_operations(operation_id,action,run_id) VALUES(?,?,?)',input.operationId,JSON.stringify(action),run.id);
+      result=await executeDeviceDiagnostic(this.env,{target,botId:run.botId,taskId:this.taskId(),operationId:input.operationId,nativeOperationId:input.runOperationId,action,...(parent?{parentJobId:parent}:{})});
+    } else if(input.name==='request_secret'||input.name==='configure_secret') {
       const {request}=await this.keychainTool(input.name,args,run.id,input.runOperationId,input.operationId,input.signal) as unknown as {request:SecureInputRequest};
       if(this.stopped(run.id)||terminal.has(this.getRun(run.id).status)){await this.keychainTool('cancel',{},run.id,input.runOperationId,`cancel:${request.id}`);return {operationId:input.operationId,status:'interrupted',error:'Task stopped.'};}
       this.keychain().setRequest(request);
@@ -1862,7 +1935,7 @@ export class BotDO extends DurableObject<Env> {
     } else if(input.name==='create_task') {
       if(this.bot().allowTaskCreation!==true) throw new ApiError(403,'task_creation_not_allowed','The owner has not allowed this bot to create tasks.');
       const registry=this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName('owner'));
-      const response=await registry.fetch('https://workspace/tasks/bot',{method:'POST',headers:{'content-type':'application/json','x-timber-internal':'task'},body:JSON.stringify({operationId:input.operationId,title:args.title,description:args.description,sourceBotId:run.botId,sourceRunId:run.id,...(this.taskId()?{sourceTaskId:this.taskId()}:{}),startImmediately:args.startImmediately})});
+      const response=await registry.fetch('https://workspace/tasks/bot',{method:'POST',headers:{'content-type':'application/json','x-timber-internal':'task'},body:JSON.stringify({operationId:input.operationId,title:args.title,description:args.description,sourceBotId:run.botId,sourceRunId:run.id,...(this.taskId()?{sourceTaskId:this.taskId()}:{}),startImmediately:args.startImmediately,...(args.executionTarget?{executionTarget:args.executionTarget}:{})})});
       const value=await response.json<{task?:unknown;error?:{code:string;message:string}}>();if(!response.ok)throw new ApiError(response.status,value.error?.code??'task_creation_failed',value.error?.message??'Task could not be created.');
       result=completed(value);
     } else if(input.name==='load_skill') result=completed(args.name==='github-development'?githubDevelopmentSkill:workspaceAppsSkill);
@@ -2045,12 +2118,14 @@ export class BotDO extends DurableObject<Env> {
   }
 
   private async computerView(request:Request,path:string):Promise<Response> {
+    if(this.bot().executionTarget?.kind==="device")throw new ApiError(409,"device_capability_unavailable","This machine supports files, commands and diagnostics. Cloud desktop, previews and backups are unavailable.");
     const botId=this.bot().id;
     const taskId=await this.computerTaskId();
     return this.env.COMPUTER.get(this.env.COMPUTER.idFromName(computerName(botId,taskId))).fetch(new Request(`https://computer.internal${path}`,{method:request.method,headers:{...computerHeaders(botId,taskId),"content-type":"application/json"},body:["GET","HEAD"].includes(request.method)?undefined:request.body}));
   }
 
   private async suspendComputer():Promise<ComputerStatus> {
+    if(this.bot().executionTarget?.kind==="device")throw new ApiError(409,"device_capability_unavailable","Stop jobs or disconnect the runner on this machine; Timber cannot suspend your laptop.");
     if(this.suspending) return this.suspending;
     const activeRun=this.ctx.storage.sql.exec<{id:string}>("SELECT id FROM runs WHERE json_extract(data,'$.status') IN ('queued','running') LIMIT 1").toArray()[0];
     const activeApproval=this.ctx.storage.sql.exec<{id:string}>("SELECT id FROM approvals WHERE json_extract(data,'$.status')='executing' LIMIT 1").toArray()[0];
@@ -2160,7 +2235,8 @@ export class BotDO extends DurableObject<Env> {
         await this.currentBot();
         return json({connection:await this.completeConnection(completedConnection[1])});
       }
-      this.configure(request);
+      if(path.startsWith("/device-runtime/")) {if(!this.deviceRuntime)throw new ApiError(409,"device_unavailable","Owned machine execution is unavailable.");return await this.deviceRuntime.fetch(request);}
+      await this.configure(request);
       if(path==='/_recover-legacy-provider'&&request.method==='POST') {
         if(request.headers.get('x-timber-internal')!=='scheduler')throw new ApiError(403,'internal_only','Provider recovery is scheduler-only.');
         return json(await this.recoverLegacyProviderFailure());
@@ -2270,6 +2346,7 @@ export class BotDO extends DurableObject<Env> {
       if(path==="/connections" && request.method==="GET") {await this.reconcileConnections();return json({connections:this.listConnections()});}
       const connect=/^\/connections\/([^/]+)\/connect$/.exec(path);
       if(connect && request.method==="POST") {await consumeUnusedBody(request);return json(await this.startConnection(connect[1]));}
+      if(this.bot().executionTarget?.kind==="device"&&(path==="/apps"||path.startsWith("/apps/")))throw new ApiError(409,"device_capability_unavailable","Cloud previews are unavailable on this machine.");
       if(path==="/apps/refresh" && request.method==="POST") {await consumeUnusedBody(request);return json({apps:await this.apps().refresh()});}
       if(path==="/apps" && request.method==="GET") return json({apps:await this.apps().list()});
       if(path==="/apps" && request.method==="POST") {
@@ -2340,7 +2417,7 @@ export class BotDO extends DurableObject<Env> {
         }
       }
       if(path==="/events" && request.method==="GET") return url.searchParams.get("format")==="json"?json(this.listEvents(url)):this.events(request,url);
-      if(/^\/workspace\/(tree|file|download|projects|changes|diff)$/.test(path) && request.method==="GET") return this.computerView(request,path+url.search);
+      if(/^\/workspace\/(tree|file|download|projects|changes|diff)$/.test(path) && request.method==="GET") return await this.computerView(request,path+url.search);
       if(path==="/computer/live-session" && request.method==="POST") {
         const input=await body(request);
         if(input.mode!=="view" && input.mode!=="control") throw new ApiError(400,"invalid_mode","Choose view or control.");
@@ -2359,7 +2436,7 @@ export class BotDO extends DurableObject<Env> {
         } finally {this.takingControl=false;}
       }
       const desktopSession=/^\/computer\/live-session\/([a-f0-9-]{36})(\/renew)?$/.exec(path);
-      if(desktopSession && ((request.method==="POST" && desktopSession[2]) || (request.method==="DELETE" && !desktopSession[2]))) {requestBodyForwarded=true;return this.computerView(request,`/desktop/${desktopSession[1]}${desktopSession[2]??""}`);}
+      if(desktopSession && ((request.method==="POST" && desktopSession[2]) || (request.method==="DELETE" && !desktopSession[2]))) {requestBodyForwarded=true;return await this.computerView(request,`/desktop/${desktopSession[1]}${desktopSession[2]??""}`);}
       if(path==="/computer" && request.method==="GET") return json({computer:await this.computer.status(this.bot().id)});
       if(path==="/computer/suspend" && request.method==="POST") {await consumeUnusedBody(request);return json({computer:await this.suspendComputer()});}
       if(path==="/computer/actions" && request.method==="POST") {

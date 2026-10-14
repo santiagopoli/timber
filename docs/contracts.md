@@ -1627,3 +1627,62 @@ dispatch marker and single-flight guard; it is never replayed just to wake tasks
 While a generation is in flight it does not schedule immediate sibling alarms.
 Completion clears that guard and re-arms the remaining jobs, while task leases
 continue to reconcile on their own alarms.
+
+
+### Owned machines
+
+Bots and tasks may carry `executionTarget`: `{kind:"cloud"}` or
+`{kind:"device",deviceId,workspaceId,agentMode:"cloud"|"local"}`. Cloud mode on a
+device keeps Pi in Timber and routes computer tools to the device. Local mode
+runs the portable Pi scheduler and SQLite transcript on the device, with model
+inference and memory serviced by Timber. Each admitted Run freezes its target;
+tasks retain their own target across later bot edits. Changing a bot target while
+its runs or computer processes are active returns 409.
+
+The public runner archive and SHA256 manifest are under `/console/runner/`, with
+`Cache-Control: no-store`. They contain no account data. Node 24+ macOS/Linux
+runners open only outbound HTTPS requests; no laptop port is exposed.
+
+Owner-authenticated machine routes:
+
+- `GET /v1/devices`: registry and current grants, never public keys or credentials.
+- `POST /v1/devices/pairings/approve`: approve a short-lived one-use pairing code.
+- `POST /v1/devices/:id/grants`: explicit named bot, workspace IDs and permissions.
+- `DELETE /v1/devices/:id/grants/:botId`: revoke one bot's grant.
+- `DELETE /v1/devices/:id`: revoke the entire device.
+
+`POST /v1/device-connect/pairings` accepts a public P-256 key and advertised
+workspaces. Pairing alone grants no access. Subsequent pairing polls and all
+`/v1/device-connect/:id/*` requests require ECDSA proofs over the exact method,
+path, timestamp, nonce and SHA256 body digest. Timestamp expiry and a durable
+nonce journal reject replay. Device identities never receive the owner token or
+provider credentials. macOS stores the private key in Keychain; Linux uses a
+0600 key file under a 0700 directory.
+
+Permissions are `diagnostics`, `files.read`, `files.write`, `host.shell` and
+`agent.run`; both local advertisement and current owner grant must match.
+Writes and shell retain the bot approval policy plus the runner's local approval
+mode. Shell grants the runner user's full host privileges; the selected working
+directory is not a shell sandbox. File tools reject traversal, symlinks and
+runner credential storage. Native desktop, previews and cloud backups are not
+provided by this runner.
+
+DevicesDO journals jobs before dispatch and issues a per-job claim token.
+Workspace leases remain held through uncertain results and offline execution;
+there is no fallback to Cloudflare or another device. Delivery and execution
+start recheck the originating run's Stop fence. Revocation cancels queued work
+and requests cancellation of running jobs, retaining their lease until the
+runner confirms termination. Unsafe local effects use a separate durable
+receipt journal and process guardian; a missing receipt is interrupted and is
+never automatically replayed.
+
+Local Pi uses signed job-scoped inference/tool/event callbacks. The gateway
+blocks public access to BotDO's internal callback routes. Tool callbacks resolve
+the host-owned run and follow its ordinary approval and permission checks.
+Messages/results project into the same Timber chat. Central memory tools verify
+exact evidence against canonical Timber conversation messages; assistant-only
+notes are suggestions and temporary agents cannot write parent memory.
+`list_machines` exposes permitted destinations only; `create_task` can delegate
+to one using `executionTarget`, and `machine_diagnostics` reads typed machine
+metadata under its own grant. Local Pi temporary child sessions are not included
+in this provider; use persistent tasks for machine delegation.

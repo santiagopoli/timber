@@ -6,7 +6,8 @@ protected developer console/CLI for end-to-end testing.
 
 ## Boundaries
 - TypeScript npm workspace monorepo. KISS: one API deployment, Durable Objects,
-  R2 and reusable Cloudflare computers. No local companion in this milestone.
+  R2 and reusable Cloudflare computers. Owned-machine runners are an optional
+  execution provider, paired and explicitly scoped to bots and workspaces.
 - AgentRuntime and ComputerProvider are independently replaceable.
 - No secrets in git, logs, fixtures, browser URLs, prompts, or artifacts.
 - All data/API routes are authenticated. Health and the unprivileged static

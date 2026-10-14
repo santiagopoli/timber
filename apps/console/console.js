@@ -3,6 +3,7 @@ import './src/styles.css';
 import { mountChat, mountToolActivity } from './src/chat.tsx';
 import { mountAgents } from './src/agents.tsx';
 import { mountTasks } from './src/tasks.tsx';
+import {mountDevices,mountExecutionTarget,machinesFrom,targetLabel} from './src/devices.tsx';
 import { hasBotMention } from './src/mentions.ts';
 import {agentColor} from './src/agent-colors.ts';
 import {modelBadgeLabel} from './src/model-identity.tsx';
@@ -35,6 +36,9 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   const drafts = new Map(), draftMentions = new Map(), pendingMessages = new Map(), pendingActions = new Map(), computerPending = new Map(), stopping = new Set(), approvalWork = new Map(), approvalFeedback = new Map(), connectionWork = new Map(), appWork = new Map();
   let authenticated = false, bots = [], selected = null, currentRun = null, stoppableRun = null, generation = 0, authSession = 0;
   let tasksView = null, showingTasks = false, selectedTaskId = null;
+  let devicesView=null,machines=[],machinesLoading=false,machinesError='',machinesRequest=0,machinesRead=null;
+  const executionTargets={bot:{kind:'cloud'},edit:{kind:'cloud'}},targetPickers=new Map();
+  for(const prefix of ['bot','edit'])targetPickers.set(prefix,mountExecutionTarget($(`${prefix}-execution-target`),{machines,value:executionTargets[prefix],onChange:value=>{executionTargets[prefix]=value||{kind:'cloud'};}}));
   let conversationTasks = [],knownConversationTasks=[];
   let canonicalConversationTaskIds=new Set(),conversationTasksLoadedFor=null;
   let taskProjectionSource=null,taskProjectionMessages=null,renderedTasks=[];
@@ -331,9 +335,22 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     history.pushState(null,'',`${location.pathname}${location.search}#tasks${id?`&task=${encodeURIComponent(id)}`:''}`);
   }
   function setupTasksView() {
-    const props={request:tasksRequest,bots,active:showingTasks,selectedTaskId,onSelectTask:taskSelected,onOpenBot:openAgentBot,loadArtifact:loadTaskArtifact,modelSettings:modelSettingsState(),onModelSettings:updateModelSettings,onRefreshModels:()=>void loadModelCatalog(),decorateAvatar:decorateTaskAvatar,onBotUpdated:taskBotUpdated,onOpenSettings:()=> $('settings-button').click(),listContainer:$('tasks-sidebar-root')};
+    const props={request:tasksRequest,bots,machines,active:showingTasks,selectedTaskId,onSelectTask:taskSelected,onOpenBot:openAgentBot,loadArtifact:loadTaskArtifact,modelSettings:modelSettingsState(),onModelSettings:updateModelSettings,onRefreshModels:()=>void loadModelCatalog(),decorateAvatar:decorateTaskAvatar,onBotUpdated:taskBotUpdated,onOpenSettings:()=> $('settings-button').click(),listContainer:$('tasks-sidebar-root')};
     if(tasksView)tasksView.update(props);else tasksView=mountTasks($('global-tasks-root'),props);
   }
+  function renderMachines(){
+    if(devicesView)devicesView.update({request:tasksRequest,bots,machines,active:authenticated&&$('settings-dialog').open,onChanged:loadMachines,error:machinesError,loading:machinesLoading});
+    for(const prefix of ['bot','edit'])targetPickers.get(prefix).update({machines,value:executionTargets[prefix],botId:prefix==='edit'?editBotId:undefined,onChange:value=>{executionTargets[prefix]=value||{kind:'cloud'};renderMachines();}});
+    if(tasksView)setupTasksView();
+    if(selected)renderComputerTarget();
+  }
+  async function loadMachines(){
+    if(!authenticated)return;const session=authSession,sequence=++machinesRequest;machinesRead?.abort();const controller=new AbortController();machinesRead=controller;machinesLoading=true;renderMachines();
+    try{const result=await request('/v1/devices',{signal:controller.signal});if(session!==authSession||sequence!==machinesRequest||controller.signal.aborted)return;if(!Array.isArray(result.devices))throw new Error('The machine list could not be verified.');machines=machinesFrom(result);machinesError='';}
+    catch(reason){if(session===authSession&&sequence===machinesRequest&&!controller.signal.aborted)machinesError=errorText(reason);}
+    finally{if(session===authSession&&sequence===machinesRequest&&!controller.signal.aborted){machinesLoading=false;renderMachines();}}
+  }
+  function openMachines(){if(!devicesView)devicesView=mountDevices($('devices-root'),{request:tasksRequest,bots,machines,active:true,onChanged:loadMachines,error:machinesError,loading:machinesLoading});renderMachines();void loadMachines();}
   function taskBotUpdated(bot){if(!authenticated||removedBots.has(bot.id))return;const previous=bots.find(item=>item.id===bot.id);if(!previous||previous.updatedAt>bot.updatedAt)return;bots=bots.map(item=>item.id===bot.id?bot:item);if(selected?.id===bot.id){selected=bot;updateBotHeader();}renderBots();renderMessages();}
   function decorateTaskAvatar(node,botId){const bot=bots.find(item=>item.id===botId);if(bot){node.textContent=bot.name.slice(0,1).toUpperCase();node.dataset.agentColor=agentColor(bot.id);decorateModelAvatar(node,bot,node.classList.contains('large'));decorateGlobalAvatar(node,bot.id);}}
   function openTasks(updateHistory=true,taskId=null) {
@@ -667,6 +684,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     dictationPosts.clear();chat.clear(); activity.clear(); $('toggle-bots').hidden = true;
     for (const id of ['activity-list', 'bot-list', 'run-list', 'file-list', 'workspace-app-list']) $(id).replaceChildren();
     for (const id of ['token', 'type-text', 'exec-command', 'navigate-url', 'key-name', 'file-content', 'bot-search']) $(id).value = '';
+    machinesRequest++;machinesRead?.abort();machines=[];machinesError='';machinesLoading=false;devicesView?.unmount();devicesView=null;executionTargets.bot={kind:'cloud'};executionTargets.edit={kind:'cloud'};renderMachines();
     $('create-form').reset(); $('edit-form').reset(); $('delete-error').textContent = ''; $('delete-form').reset(); renderDeleteControls(); $('file-path').value = '.'; $('computer-result').textContent = 'No actions yet.';
     $('result-raw').textContent = ''; $('result-details').hidden = true; $('computer-warning').hidden = true; $('computer-progress').hidden = true;
     $('github-status').textContent = 'Connection not checked.'; $('github-error').textContent = ''; $('disconnect-github').hidden = true; $('disconnect-github').disabled = false; $('connect-github').hidden = false; $('connect-github').disabled = false;
@@ -732,7 +750,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   }
   document.addEventListener('visibilitychange',()=>{if(document.hidden){cancelAudioSends();clearTimeout(botSummaryTimer);}else void refreshBotSummaries();});
   window.addEventListener('focus',()=>void refreshBotSummaries());
-  async function loadBots() { const session = authSession, result = await request('/v1/bots'); if (session !== authSession) return; const prior=new Map(bots.map(bot=>[bot.id,bot]));bots = result.bots.filter(bot => !removedBots.has(bot.id)).map(bot=>prior.get(bot.id)?.updatedAt>bot.updatedAt?prior.get(bot.id):bot); const refreshed=selected&&bots.find(bot=>bot.id===selected.id);if(refreshed&&refreshed.updatedAt>=selected.updatedAt&&!modelSettingsWork.has(selected.id)){selected=refreshed;updateBotHeader();}renderBots(); renderMessages();renderAgents();if(tasksView)setupTasksView();void refreshBotSummaries(); }
+  async function loadBots() { const session = authSession, result = await request('/v1/bots'); if (session !== authSession) return; const prior=new Map(bots.map(bot=>[bot.id,bot]));bots = result.bots.filter(bot => !removedBots.has(bot.id)).map(bot=>prior.get(bot.id)?.updatedAt>bot.updatedAt?prior.get(bot.id):bot); const refreshed=selected&&bots.find(bot=>bot.id===selected.id);if(refreshed&&refreshed.updatedAt>=selected.updatedAt&&!modelSettingsWork.has(selected.id)){selected=refreshed;updateBotHeader();}renderBots(); renderMessages();renderAgents();renderMachines();if(tasksView)setupTasksView();void refreshBotSummaries(); }
   const modelDescription=bot=>`${bot.model||'Model not recorded'}${bot.reasoningEffort?` · ${bot.reasoningEffort} reasoning`:''}${bot.fast?' · Fast mode':''}`;
   function decorateModelAvatar(avatar,bot,showBadge=true){
     avatar.classList.add('timber-model-avatar');avatar.title=modelDescription(bot);avatar.dataset.model=bot.model||'';
@@ -788,7 +806,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     if (selected?.id === bot.id) {
       if(wasShowingTasks){$('empty').hidden=true;$('bot-workspace').hidden=false;updateBotHeader();renderMessages();}
       history[replace ? 'replaceState' : 'pushState'](null, '', `${location.pathname}${location.search}#bot=${encodeURIComponent(bot.id)}`);
-      if (!$('panel-computer').hidden) {desktop.setActive(true); void guarded(computerStatus);}
+      if (!$('panel-computer').hidden) {desktop.setActive(!nativeComputer()); void guarded(computerStatus);}
       return;
     }
     cancelAudioSends();desktop.disconnect(); workspace.clear();
@@ -1238,7 +1256,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     void openWorkspaceApp(app);
   });
   function renderApps() {
-    const list = $('workspace-app-list'); list.replaceChildren(); $('app-count').textContent = String(workspaceApps.length);
+    const list = $('workspace-app-list'); list.replaceChildren();if(nativeComputer()){$('workspace-app-empty').hidden=true;$('app-count').textContent='0';$('refresh-apps').hidden=true;$('apps-feedback').textContent='Browser previews are unavailable on machine targets.';$('apps-feedback').dataset.machineUnavailable='true';return;}$('refresh-apps').hidden=false;if($('apps-feedback').dataset.machineUnavailable){$('apps-feedback').textContent='';delete $('apps-feedback').dataset.machineUnavailable;} $('app-count').textContent = String(workspaceApps.length);
     $('workspace-app-empty').hidden = workspaceApps.length > 0;
     for (const app of workspaceApps) {
       const work = appWork.get(`${selected.id}:${app.id}`), card = el('article', 'workspace-app'); card.dataset.appId = app.id;
@@ -1262,7 +1280,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     }
   }
   async function loadApps(version = generation) {
-    const id = selected?.id, sequence = ++appsRequest; if (!id) return;
+    const id = selected?.id, sequence = ++appsRequest; if (!id) return; if(nativeComputer()){workspaceApps=[];renderApps();return;}
     const result = await request(`${botPath(id)}/apps`);
     if (!validView(version) || sequence !== appsRequest) return;
     workspaceApps = result.apps; renderApps();
@@ -1280,7 +1298,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   }
   async function openWorkspaceApp(app) {
     const botId = selected?.id, session = authSession, key = `${botId}:${app.id}`;
-    if (!botId || !authenticated || appWork.get(key)?.busy) return;
+    if (!botId || !authenticated || appWork.get(key)?.busy) return; if(nativeComputer())throw new Error('Browser previews are unavailable on machine targets.');
     const work = {busy: 'open'}; appWork.set(key, work); let popup;
     try {
       popup = newWindow(`Opening ${app.name}`); renderApps();
@@ -1454,6 +1472,17 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   function warning(message) { $('computer-warning').textContent = message; $('computer-warning').hidden = false; }
   function stopComputerStatus() { clearTimeout(computerStatusTimer); computerStatusTimer = null; computerStatusRequest++; }
   function queueComputerStatus() { if (!selected || !authenticated || showingTasks || document.hidden || $('panel-computer').hidden) return; clearTimeout(computerStatusTimer); computerStatusTimer = setTimeout(() => { computerStatusTimer = null; void guarded(computerStatus); }, 250); }
+  function nativeComputer() { return selected?.executionTarget?.kind === 'device'; }
+  function computerWorkspace() {const target=selected?.executionTarget;return target?.kind==='device'?machines.find(item=>item.id===target.deviceId)?.workspaces.find(item=>item.id===target.workspaceId)?.path||'registered workspace':'/workspace';}
+  function renderComputerTarget() {
+    const native=nativeComputer();
+    for(const node of document.querySelectorAll('[data-cloud-computer]'))node.hidden=native;
+    for(const id of ['desktop-root','checkpoint','suspend-computer','navigate-form','screenshot-time'])$(id).hidden=native;
+    $('machine-computer-notice').hidden=!native;
+    $('computer-working-directory').textContent=`Working directory: ${computerWorkspace()}`;
+    $('computer-file-base').textContent=`relative to ${computerWorkspace()}`;
+    if(native){desktop.setActive(false);$('click-mode').checked=false;$('auto-screenshot').checked=false;}
+  }
   async function computerStatus() {
     const version = generation, id = selected?.id; if (!id || !authenticated || showingTasks || $('panel-computer').hidden) return;
     clearTimeout(computerStatusTimer); computerStatusTimer = null; const sequence = ++computerStatusRequest;
@@ -1461,18 +1490,18 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
       const { computer } = await request(`${botPath(id)}/computer`);
       if (!validView(version) || showingTasks || sequence !== computerStatusRequest || $('panel-computer').hidden) return;
       const diagnostic = computer.error?.message ? `${computer.error.message}${computer.error.code ? ` (${computer.error.code})` : ''}` : computer.state === 'unavailable' ? 'Computer health could not be confirmed. Refresh status to check again.' : '';
-      $('computer-status').textContent = `${statusLabel(computer.state)} · ${computer.provider}${computer.lastCheckpointId ? ' · checkpoint available' : ''}${diagnostic ? ` · ${diagnostic}` : ''}`;
+      renderComputerTarget(); $('computer-status').textContent = `${nativeComputer()?targetLabel(selected.executionTarget,machines)+' · ':''}${statusLabel(computer.state)} · ${computer.provider}${computer.lastCheckpointId ? ' · checkpoint available' : ''}${diagnostic ? ` · ${diagnostic}` : ''}`;
       if (computer.state === 'starting') computerStatusTimer = setTimeout(() => { computerStatusTimer = null; void guarded(computerStatus); }, 1500);
     } catch (error) { if (!validView(version) || sequence !== computerStatusRequest || $('panel-computer').hidden) return; $('computer-status').textContent = 'Status could not be refreshed. Check your connection and refresh status.'; throw error; }
   }
   function renderResult(result, action) {
     $('result-details').hidden = false; $('result-raw').textContent = JSON.stringify(redact(result), null, 2);
     const parts = [];
-    if (action.type === 'listFiles' && result.status === 'completed') parts.push(`Directory: /workspace${action.path && action.path !== '.' ? `/${action.path}` : ''}`);
+    if (action.type === 'listFiles' && result.status === 'completed') parts.push(`Directory: ${computerWorkspace()}${action.path && action.path !== '.' ? `/${action.path}` : ''}`);
     else if (result.output) parts.push(result.output);
     if (result.exitCode !== undefined) parts.push(`Exit code: ${result.exitCode}`);
     if (!parts.length) parts.push(result.status === 'completed' ? `${action.type === 'screenshot' ? 'Screenshot captured' : 'Action completed'}.` : `Action ${result.status}.`);
-    if (result.checkpointId) parts.push('Workspace checkpoint confirmed.');
+    if (result.checkpointId && !nativeComputer()) parts.push('Workspace checkpoint confirmed.');
     if (result.error) parts.push(result.error);
     $('computer-result').textContent = parts.join('\n\n');
     if (result.status === 'completed' && result.error) warning(`Action completed with a warning: ${result.error}`);
@@ -1501,7 +1530,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     const { result } = await request(`${botPath(id)}/computer/actions`, { method: 'POST', body: { operationId, action } }); pendingActions.delete(key); return result;
   }
   async function computerAction(action) {
-    if (!selected) return; const id = selected.id, version = generation, refreshScreen = guiActions.has(action.type) && $('auto-screenshot').checked && Boolean(screenUrl);
+    if (!selected) return; if(nativeComputer()&&!['exec','readFile','writeFile','listFiles','diagnostics'].includes(action.type))throw new Error('This action is unavailable on machine targets.'); const id = selected.id, version = generation, refreshScreen = !nativeComputer() && guiActions.has(action.type) && $('auto-screenshot').checked && Boolean(screenUrl);
     const labels = { exec: 'Running command', screenshot: 'Taking screenshot', readFile: 'Reading file', writeFile: 'Writing file', listFiles: 'Loading folder', checkpoint: 'Saving checkpoint', navigate: 'Opening browser URL', type: 'Typing text', click: 'Clicking screen', key: 'Pressing key', scroll: 'Scrolling' };
     const pending = beginComputer(id, labels[action.type] || 'Working'); if (!pending) return;
     try {
@@ -1517,7 +1546,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     finally { finishComputer(id, pending); }
   }
   async function suspendComputer() {
-    if (!selected) return; const id = selected.id, version = generation, pending = beginComputer(id, 'Saving workspace and suspending computer'); if (!pending) return;
+    if (!selected) return; if(nativeComputer())throw new Error('Cloud suspension is unavailable on machine targets.'); const id = selected.id, version = generation, pending = beginComputer(id, 'Saving workspace and suspending computer'); if (!pending) return;
     await desktop.disconnect();
     try { const { computer } = await request(`${botPath(id)}/computer/suspend`, { method: 'POST', body: {} }); if (!validView(version)) return; clearScreen(); renderResult({ status: 'completed', ...(computer.lastCheckpointId ? { checkpointId: computer.lastCheckpointId } : {}), output: 'Computer suspended. The next action restores its workspace.' }, { type: 'suspend' }); if (!computer.lastCheckpointId) warning('No checkpoint reference was returned. Durable storage is not confirmed.'); await computerStatus(); }
     finally { finishComputer(id, pending); }
@@ -1624,7 +1653,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     $('current-panel').textContent = ({computer:'Computer',files:'Files',apps:'Apps',agents:'Agents',runs:'Runs',activity:'Activity'})[currentPanel] || '';
     $('current-panel').hidden = !open || docked;
     $('back-to-chat').hidden = !open || docked;
-    desktop.setActive(!showingTasks && currentPanel === 'computer');
+    renderComputerTarget(); desktop.setActive(!showingTasks && currentPanel === 'computer' && !nativeComputer());
     activity.setActive(authenticated && !showingTasks && currentPanel === 'activity');
     agentsView.setActive(authenticated && !showingTasks && currentPanel === 'agents');
     syncChatDock();
@@ -1647,7 +1676,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   }
   function toggleBots() {botsCollapsed = !botsCollapsed; renderLayout(); saveLayout();}
   function bindForm(id, fn) { $(id).addEventListener('submit', (event) => { event.preventDefault(); void guarded(fn); }); }
-  function openCreate() { $('create-error').textContent = '';renderModelForm('bot'); $('bot-dialog').showModal(); $('bot-name').focus(); }
+  function openCreate() { executionTargets.bot={kind:'cloud'};renderMachines();void loadMachines();$('create-error').textContent = '';renderModelForm('bot'); $('bot-dialog').showModal(); $('bot-name').focus(); }
   for (const id of ['new-bot', 'empty-new-bot']) $(id).addEventListener('click', openCreate);
   document.querySelectorAll('[data-close-dialog]').forEach((button) => button.addEventListener('click', () => $(button.dataset.closeDialog).close()));
   async function sessionRequest(method, accessToken) {
@@ -1667,9 +1696,11 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     document.body.dataset.authenticated = 'true';
     $('connection').textContent = 'Connected'; $('empty').hidden = false; $('bot-workspace').hidden = true;
     void loadModelCatalog();
+    void loadMachines();
     void loadAvatarSettings();
     void chatGPTTask(loadChatGPT);
     if(taskHash()){openTasks(false,chosenTaskHash());return;}
+    if(location.hash==='#devices'){$('settings-button').click();return;}
     const bot = bots.find(item => item.id === chosenHash()) || (!matchMedia('(max-width: 760px)').matches ? bots[0] : null);
     // Restore layout before the workspace becomes interactive. Late initial reads
     // must not close a menu or change the panel the user has already opened.
@@ -1713,7 +1744,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
     finally {button.disabled = false;}
   });
   $('bot-search').addEventListener('input', renderBots); $('reload-bots').addEventListener('click', () => guarded(loadBots));
-  const navigateHistory = () => {if(taskHash()){openTasks(false,chosenTaskHash());return;}const bot = bots.find(item => item.id === chosenHash()); if (bot) void guarded(() => selectBot(bot, {replace: true})); else showBotList(false);};
+  const navigateHistory = () => {if(!authenticated)return;if(location.hash==='#devices'){$('settings-button').click();return;}if(taskHash()){openTasks(false,chosenTaskHash());return;}const bot = bots.find(item => item.id === chosenHash()); if (bot) void guarded(() => selectBot(bot, {replace: true})); else showBotList(false);};
   $('tasks-nav').addEventListener('click',()=>openTasks());
   $('bots-nav')?.addEventListener('click',()=>showBotList());
   window.addEventListener('hashchange', navigateHistory); window.addEventListener('popstate', navigateHistory);
@@ -1735,14 +1766,14 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   });
   $('create-form').addEventListener('submit', async (event) => {
     event.preventDefault(); const button = event.submitter || event.currentTarget.querySelector('[type=submit]'); button.disabled = true; $('create-error').textContent = '';
-    try { const { bot } = await request('/v1/bots', { method: 'POST', body: { name: $('bot-name').value.trim(), instructions: $('bot-instructions').value.trim(), ...readModelForm('bot'), computerApprovalMode: $('bot-computer-approval-mode').value, allowNamedAgents: $('bot-allow-named-agents').checked, allowTaskCreation: $('bot-allow-task-creation').checked } }); $('create-form').reset(); $('bot-dialog').close(); $('bot-search').value = ''; bots = [bot, ...bots.filter((item) => item.id !== bot.id)]; renderBots(); await guarded(() => selectBot(bot)); }
+    try { const { bot } = await request('/v1/bots', { method: 'POST', body: { name: $('bot-name').value.trim(), instructions: $('bot-instructions').value.trim(), ...readModelForm('bot'), computerApprovalMode: $('bot-computer-approval-mode').value, allowNamedAgents: $('bot-allow-named-agents').checked, allowTaskCreation: $('bot-allow-task-creation').checked,executionTarget:executionTargets.bot } }); $('create-form').reset(); $('bot-dialog').close(); $('bot-search').value = ''; bots = [bot, ...bots.filter((item) => item.id !== bot.id)]; renderBots(); await guarded(() => selectBot(bot)); }
     catch (error) { if (authenticated) $('create-error').textContent = errorText(error); } finally { button.disabled = false; }
   });
-  $('edit-bot').addEventListener('click', () => { if (!selected) return; if ($('panel-menu')) $('panel-menu').open = false; editBotId = selected.id; $('edit-name').value = selected.name; $('edit-instructions').value = selected.instructions; $('edit-computer-approval-mode').value = selected.computerApprovalMode === 'automatic' ? 'automatic' : 'ask'; $('edit-allow-named-agents').checked = selected.allowNamedAgents === true; $('edit-allow-task-creation').checked = selected.allowTaskCreation === true; $('edit-error').textContent = '';renderModelForm('edit',selected); $('edit-dialog').showModal(); $('edit-name').focus(); });
+  $('edit-bot').addEventListener('click', () => { if (!selected) return; if ($('panel-menu')) $('panel-menu').open = false; editBotId = selected.id;executionTargets.edit=selected.executionTarget||{kind:'cloud'};renderMachines();void loadMachines(); $('edit-name').value = selected.name; $('edit-instructions').value = selected.instructions; $('edit-computer-approval-mode').value = selected.computerApprovalMode === 'automatic' ? 'automatic' : 'ask'; $('edit-allow-named-agents').checked = selected.allowNamedAgents === true; $('edit-allow-task-creation').checked = selected.allowTaskCreation === true; $('edit-error').textContent = '';renderModelForm('edit',selected); $('edit-dialog').showModal(); $('edit-name').focus(); });
   for(const prefix of ['bot','edit'])for(const field of ['model','reasoning','fast'])$(`${prefix}-${field}`).addEventListener('change',()=>renderModelForm(prefix,{model:$(`${prefix}-model`).value,reasoningEffort:$(`${prefix}-reasoning`).value,fast:$(`${prefix}-fast`).checked}));
   $('edit-form').addEventListener('submit', async (event) => {
     event.preventDefault(); const button = event.submitter || event.currentTarget.querySelector('[type=submit]'), id = editBotId; if (!id) return; button.disabled = true; $('edit-error').textContent = '';
-    try { const { bot } = await request(botPath(id), { method: 'PATCH', body: { name: $('edit-name').value.trim(), instructions: $('edit-instructions').value.trim(), ...readModelForm('edit'), computerApprovalMode: $('edit-computer-approval-mode').value, allowNamedAgents: $('edit-allow-named-agents').checked, allowTaskCreation: $('edit-allow-task-creation').checked } }); bots = bots.map((item) => item.id === bot.id ? bot : item); if (selected?.id === bot.id) { selected = bot; updateBotHeader(); renderMessages(); renderApprovals(); } renderBots(); $('edit-dialog').close(); }
+    try { const { bot } = await request(botPath(id), { method: 'PATCH', body: { name: $('edit-name').value.trim(), instructions: $('edit-instructions').value.trim(), ...readModelForm('edit'), computerApprovalMode: $('edit-computer-approval-mode').value, allowNamedAgents: $('edit-allow-named-agents').checked, allowTaskCreation: $('edit-allow-task-creation').checked,executionTarget:executionTargets.edit } }); bots = bots.map((item) => item.id === bot.id ? bot : item); if (selected?.id === bot.id) { selected = bot; updateBotHeader(); renderMessages(); renderApprovals(); } renderBots(); renderLayout(); if(currentPanel==='apps')void guarded(()=>loadApps()); $('edit-dialog').close(); }
     catch (error) { if (authenticated) $('edit-error').textContent = errorText(error); } finally { button.disabled = false; }
   });
   $('delete-bot').addEventListener('click', () => {const bot = bots.find(item => item.id === editBotId); if (bot) openDelete(bot);});
@@ -1770,7 +1801,8 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   $('file-up').addEventListener('click', () => guarded(() => { const parent = directoryPath.split('/').slice(0, -1).join('/') || '.'; $('file-path').value = parent; return computerAction({ type: 'listFiles', path: parent }); }));
   $('clear-result').addEventListener('click', () => { $('computer-result').textContent = 'No actions yet.'; $('result-raw').textContent = ''; $('result-details').hidden = true; $('computer-warning').hidden = true; $('download-artifact').hidden = true; artifact = null; });
   $('download-artifact').addEventListener('click', () => guarded(async () => { if (!artifact) return; const { id, botId } = artifact, response = await request(`${botPath(botId)}/artifacts/${encodeURIComponent(id)}`, { raw: true }); const url = URL.createObjectURL(await response.blob()), anchor = el('a'); anchor.href = url; anchor.download = `artifact-${id.replaceAll(/[^a-zA-Z0-9._-]/g, '_')}`; anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 30000); }));
-  $('settings-button').addEventListener('click', () => { if ($('panel-menu')) $('panel-menu').open = false; $('settings-dialog').showModal(); avatarLoadErrors.clear(); void loadAvatarSettings(); void chatGPTTask(loadChatGPT); void loadGitHubStatus(); }); $('refresh-chatgpt').addEventListener('click', () => chatGPTTask(loadChatGPT));
+  $('settings-dialog').addEventListener('close',renderMachines);
+  $('settings-button').addEventListener('click', () => { if ($('panel-menu')) $('panel-menu').open = false; $('settings-dialog').showModal();openMachines(); avatarLoadErrors.clear(); void loadAvatarSettings(); void chatGPTTask(loadChatGPT); void loadGitHubStatus(); }); $('refresh-chatgpt').addEventListener('click', () => chatGPTTask(loadChatGPT));
   $('avatar-refresh').addEventListener('click', () => {avatarLoadErrors.clear();void loadAvatarSettings();});
   $('avatar-theme-kind').addEventListener('change', renderAvatarForm);
   $('avatar-theme-model').addEventListener('change',renderAvatarCreateReasoning);
@@ -1789,7 +1821,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   $('refresh-github').addEventListener('click', () => {void loadGitHubStatus();});
   $('disconnect-github').addEventListener('click', () => {void disconnectGitHub();});
   window.addEventListener('focus', () => {if (authenticated && $('settings-dialog').open) void loadGitHubStatus(); if (authenticated && selected && connections.some(item => item.status === 'pending')) void guarded(() => Promise.all([loadConnections(), loadRuns()]));});
-  document.addEventListener('visibilitychange', () => { desktop.setActive(!$('panel-computer').hidden && (!matchMedia('(max-width: 760px)').matches || document.body.dataset.mobileView === 'bot')); });
+  document.addEventListener('visibilitychange', () => { desktop.setActive(!nativeComputer() && !$('panel-computer').hidden && (!matchMedia('(max-width: 760px)').matches || document.body.dataset.mobileView === 'bot')); });
   window.addEventListener('pagehide', () => {cancelAudioSends();cancelStreamRender();clearTimeout(compactionsTimer);clearTimeout(historyRetryTimer);stopComputerStatus(); streamController?.abort();});
   window.addEventListener('pageshow', event => {if (event.persisted && authenticated) {startStream(); void guarded(loadBots);void loadCompactions();}});
   document.addEventListener('visibilitychange', () => {

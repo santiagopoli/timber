@@ -1,4 +1,5 @@
 export interface Env {
+  DEVICES?: DurableObjectNamespace;
   VERSION_METADATA?: { id: string; tag?: string };
   WORKSPACE: DurableObjectNamespace;
   BOT: DurableObjectNamespace;

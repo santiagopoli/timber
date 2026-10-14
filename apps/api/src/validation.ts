@@ -1,8 +1,19 @@
-import type { ComputerAction, ComputerApprovalMode } from "@botspace/contracts";
+import type { ComputerAction, ComputerApprovalMode, ExecutionTarget } from "@botspace/contracts";
 import { ApiError } from "./errors";
 
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 export const OPERATION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+export function parseExecutionTarget(value:unknown):ExecutionTarget {
+  const data=object(value);
+  if(data.kind==='cloud') {
+    if(Object.keys(data).some(key=>key!=='kind'))invalid('Cloud execution accepts only its kind.');
+    return {kind:'cloud'};
+  }
+  if(data.kind!=='device'||typeof data.deviceId!=='string'||!UUID.test(data.deviceId)||typeof data.workspaceId!=='string'||!data.workspaceId.trim()||data.workspaceId.length>128||!OPERATION_ID.test(data.workspaceId))invalid('Choose a registered machine and workspace.');
+  if(data.agentMode!==undefined&&!['cloud','local'].includes(String(data.agentMode)))invalid('Choose cloud tools or local Pi execution.');
+  if(Object.keys(data).some(key=>!['kind','deviceId','workspaceId','agentMode'].includes(key)))invalid('Unknown machine execution setting.');
+  return {kind:'device',deviceId:data.deviceId,workspaceId:data.workspaceId,agentMode:data.agentMode==='local'?'local':'cloud'};
+}
 function invalid(message:string):never {throw new ApiError(400,"invalid_request",message);}
 export function object(value:unknown):Record<string,unknown> {
   if (!value || typeof value!=="object" || Array.isArray(value)) invalid("Expected a JSON object.");
@@ -12,9 +23,9 @@ export function string(value:unknown,name:string,max:number,min=1):string {
   if(typeof value!=="string" || value.length<min || value.length>max) invalid(`${name} must contain ${min} to ${max} characters.`);
   return value as string;
 }
-export async function body(request:Request):Promise<Record<string,unknown>> {
+export async function body(request:Request,maxBytes=300_000):Promise<Record<string,unknown>> {
   const declared = request.headers.get("content-length");
-  if(declared && Number(declared)>300_000) throw new ApiError(413,"body_too_large","Request body too large.");
+  if(declared && Number(declared)>maxBytes) throw new ApiError(413,"body_too_large","Request body too large.");
   const chunks:Uint8Array[]=[];
   let size=0;
   const reader=request.body?.getReader();
@@ -23,7 +34,7 @@ export async function body(request:Request):Promise<Record<string,unknown>> {
       const part=await reader.read();
       if(part.done) break;
       size+=part.value.byteLength;
-      if(size>300_000) {await reader.cancel();throw new ApiError(413,"body_too_large","Request body too large.");}
+      if(size>maxBytes) {await reader.cancel();throw new ApiError(413,"body_too_large","Request body too large.");}
       chunks.push(part.value);
     }
   }
@@ -50,11 +61,12 @@ export function parseMessage(value:unknown):{text:string;operationId:string;ment
   return {text,operationId:operationId(data.operationId),...(ids?.length?{attachments:ids}:{}),...(data.mentions===undefined?{}:{mentions:data.mentions as string[]})};
 
 }
-export function parseBotInput(value:unknown,patch=false):{name?:string;instructions?:string;model?:string;reasoningEffort?:string;fast?:boolean;computerApprovalMode?:ComputerApprovalMode;allowNamedAgents?:boolean;allowTaskCreation?:boolean} {
+export function parseBotInput(value:unknown,patch=false):{name?:string;instructions?:string;model?:string;reasoningEffort?:string;fast?:boolean;computerApprovalMode?:ComputerApprovalMode;allowNamedAgents?:boolean;allowTaskCreation?:boolean;executionTarget?:ExecutionTarget} {
   const data=object(value);
   if(["themeId","avatarThemeId","avatarTheme","avatar"].some(key=>data[key]!==undefined)) invalid("Avatar themes belong to the owner and cannot be overridden by a bot.");
   if(data.runtime!==undefined && data.runtime!=="pi") invalid("runtime must be pi.");
-  const output:{name?:string;instructions?:string;model?:string;reasoningEffort?:string;fast?:boolean;computerApprovalMode?:ComputerApprovalMode;allowNamedAgents?:boolean;allowTaskCreation?:boolean}={};
+  const output:{name?:string;instructions?:string;model?:string;reasoningEffort?:string;fast?:boolean;computerApprovalMode?:ComputerApprovalMode;allowNamedAgents?:boolean;allowTaskCreation?:boolean;executionTarget?:ExecutionTarget}={};
+  if(data.executionTarget!==undefined)output.executionTarget=parseExecutionTarget(data.executionTarget);
   if(data.name!==undefined || !patch) {
     output.name=string(data.name,"name",80).trim();
     if(!output.name) invalid("name cannot be blank.");

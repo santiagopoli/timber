@@ -1,0 +1,12 @@
+{
+  "name": "@timber/runner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Timber runner for explicitly paired owner-managed Mac and Linux machines",
+  "engines": {"node": ">=24"},
+  "bin": {"timber-runner": "./dist/cli.mjs"},
+  "files": ["dist", "README.md"],
+  "scripts": {"build": "node build.mjs", "prepack": "node build.mjs"},
+  "dependencies": {"@earendil-works/pi-ai": "1.0.3", "@earendil-works/pi-durable": "1.0.3"}
+}

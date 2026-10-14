@@ -1,4 +1,6 @@
 import { authenticate, consoleSession } from "./auth";
+import {routeDevices} from './devices';
+export {DevicesDO} from './devices';
 import { ApiError, errorResponse, json } from "./errors";
 import type { Env } from "./env";
 import { UUID, operationId as validateOperationId, parseAction } from "./validation";
@@ -76,11 +78,17 @@ export default {
         headers.set("x-content-type-options","nosniff");
         // Always load the current shell; its fingerprinted JS/CSS retain their
         // own asset cache policy. This never reloads an active conversation.
-        if(assetUrl.pathname==="/" || assetUrl.pathname==="/sw.js" || assetUrl.pathname==="/manifest.webmanifest" || headers.get("content-type")?.includes("text/html")) headers.set("cache-control","no-store");
+        if(assetUrl.pathname==="/" || assetUrl.pathname.startsWith("/runner/") || assetUrl.pathname==="/sw.js" || assetUrl.pathname==="/manifest.webmanifest" || headers.get("content-type")?.includes("text/html")) headers.set("cache-control","no-store");
         return new Response(response.body,{status:response.status,headers});
       }
       // Provider callbacks are one-time, browser-bound flows. Git transport is
       // authenticated independently with short-lived repository-scoped capabilities.
+      if(url.pathname.startsWith('/v1/device-connect/')) {
+        requestBodyForwarded=true;
+        const response=await routeDevices(request,env);
+        if(response)return response;
+        throw new ApiError(404,'not_found','Machine connection route not found.');
+      }
       if((/^\/github\/setup\/(start|manifest|install|oauth)$/.test(url.pathname) && request.method==="GET") || url.pathname.startsWith("/github/git/")) {
         if(!env.GITHUB) throw new ApiError(503,"github_not_configured","GitHub is not configured.");
         return env.GITHUB.get(env.GITHUB.idFromName("owner")).fetch(request);
@@ -94,17 +102,25 @@ export default {
         const protocols=request.headers.get("sec-websocket-protocol")??"";
         if(protocols.length>256) throw new ApiError(403,"desktop_access_denied","Desktop access denied.");
         const registry=env.WORKSPACE.get(env.WORKSPACE.idFromName("owner"));
-        let botId=desktop[2],taskId:string|undefined;
+        let botId=desktop[2],taskId:string|undefined,taskTarget:import("@botspace/contracts").ExecutionTarget|undefined;
         if(desktop[1]==='tasks'){
           const record=await registry.fetch(`https://workspace/tasks/${desktop[2]}`);if(!record.ok)return record;
-          const {task}=await record.json<{task:{botId:string;computerMode?:string}}>();botId=task.botId;if(task.computerMode==='isolated')taskId=desktop[2];
+          const {task}=await record.json<{task:{botId:string;computerMode?:string;executionTarget?:import("@botspace/contracts").ExecutionTarget}}>();botId=task.botId;taskTarget=task.executionTarget;if(task.computerMode==='isolated')taskId=desktop[2];
         }
         const record=await registry.fetch(`https://workspace/${botId}`);
         if(!record.ok) return record;
+        const {bot}=await record.json<{bot:Bot}>();
+        if((taskTarget??bot.executionTarget)?.kind==="device")throw new ApiError(409,"device_capability_unavailable","Desktop access is unavailable on this machine.");
         return env.COMPUTER.get(env.COMPUTER.idFromName(computerName(botId,taskId))).fetch(new Request("https://computer.internal/desktop-ws",{headers:{...computerHeaders(botId,taskId),Upgrade:"websocket","sec-websocket-protocol":protocols}}));
       }
       if(url.pathname==="/v1/session") return await consoleSession(request,env.BOTSPACE_API_TOKEN);
       const owner=await authenticate(request,env.BOTSPACE_API_TOKEN);
+      if(url.pathname==='/v1/devices'||url.pathname.startsWith('/v1/devices/')) {
+        requestBodyForwarded=true;
+        const response=await routeDevices(request,env,owner);
+        if(response)return response;
+        throw new ApiError(404,'not_found','Machine route not found.');
+      }
       if(!url.pathname.startsWith("/v1/")) throw new ApiError(404,"not_found","Endpoint not found.");
       if(url.pathname==="/v1/models") {
         if(request.method!=="GET")throw new ApiError(405,"method_not_allowed","Method not allowed.");
@@ -143,10 +159,11 @@ export default {
         const [,taskId,endpoint]=taskRoute;
         const taskResponse=await registry.fetch(`https://workspace/tasks/${taskId}`);
         if(!taskResponse.ok) return taskResponse;
-        const {task}=await taskResponse.json<{task:{id:string;botId:string;status:string;description:string;title:string}}>();
+        const {task}=await taskResponse.json<{task:{id:string;botId:string;status:string;description:string;title:string;executionTarget?:import("@botspace/contracts").ExecutionTarget}}>();
         const botResponse=await registry.fetch(`https://workspace/${task.botId}`);
         if(!botResponse.ok) return botResponse;
         const {bot}=await botResponse.json<{bot:Bot}>();
+        bot.executionTarget=task.executionTarget??bot.executionTarget;
         if(!endpoint) {if(request.method!=="GET")throw new ApiError(405,"method_not_allowed","Method not allowed.");return json({task});}
         if(endpoint==='keychain'||endpoint.startsWith('keychain/')) {
           const forwarded=internalRequest(request,`https://workspace/${endpoint}${url.search}`);
@@ -289,6 +306,7 @@ export default {
         }
         return response;
       }
+      if(tail.startsWith("/device-runtime/"))throw new ApiError(404,"not_found","Endpoint not found.");
       const mutation=tail==="/computer/suspend" && request.method==="POST" || tail==="/computer/live-session" && request.method==="POST" || /^\/approvals\/[^/]+$/.test(tail) && request.method==="POST";
       if(mutation) admissionToken=await beginAdmission(env,botId,`mutation:${crypto.randomUUID()}`);
       requestBodyForwarded=true;

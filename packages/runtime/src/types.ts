@@ -106,7 +106,7 @@ export interface PiRuntimeOptions<Env extends object> {
   /** Global task identity supplied by the host, never by model input. */
   getTaskId?():string|undefined;
   /** Bounded public task status/results for future turns, without waking inference. */
-  getTaskContext?():string;
+  getTaskContext?(rootConversation?:boolean):string;
   /** Trusted host scope: a coordinating turn reports work owned elsewhere. */
   isCoordinator?(operationId:string):boolean;
   /** Host namespaces fresh effects and retains journal identities already admitted before upgrade. */

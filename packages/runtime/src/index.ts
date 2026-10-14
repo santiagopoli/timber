@@ -295,7 +295,7 @@ export function createPiRuntime<Env extends object>(options: PiRuntimeOptions<En
           }
           await maintenance.onYield(api.conversationId,Number(api.taskId));
         }}),hook(CompactionTask,{beforeCompact:async(input,api,context)=>{await maintenance.recordCompaction(input,api,context);await maintenance.beforeCompact(api.conversationId,String(api.taskId));}})],
-        sections: [{key:'durable_memory',render:input=>maintenance.prompt(input.conversationId)}, {key:'persistent_tasks',render:()=>options.getTaskContext?.()??''}, { key: 'preamble', tag: false, render: async input => {
+        sections: [{key:'durable_memory',render:input=>maintenance.prompt(input.conversationId)}, {key:'persistent_tasks',render:input=>options.getTaskContext?.(input.conversationId===ROOT_CONVERSATION_ID)??''}, { key: 'preamble', tag: false, render: async input => {
           const bot = await options.getBot();
           const child = await subagents.forConversation(input.conversationId);
           let approvalSnapshot = 'Current host approval status is unavailable. Do not infer current status from historical tool results.';

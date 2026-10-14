@@ -32,6 +32,10 @@
       {
         "name": "GITHUB",
         "class_name": "GitHubAuthDO"
+      },
+      {
+        "name": "DEVICES",
+        "class_name": "DevicesDO"
       }
     ]
   },
@@ -49,6 +53,12 @@
       "tag": "v3-github",
       "new_sqlite_classes": [
         "GitHubAuthDO"
+      ]
+    },
+    {
+      "tag": "v4-owned-machines",
+      "new_sqlite_classes": [
+        "DevicesDO"
       ]
     }
   ],

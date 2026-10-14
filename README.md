@@ -5,6 +5,27 @@ its instructions, history and a reusable computer. The product client will be a
 native iOS app; this milestone focuses on the backend and an authenticated test
 console.
 
+## Machines
+
+Connect an owner-managed Mac or Linux machine with Node.js 24 or newer:
+
+```sh
+npx --yes https://timber-api.santiagopoli.workers.dev/console/runner/timber-runner.tgz connect --url https://timber-api.santiagopoli.workers.dev --workspace "$PWD" --grant diagnostics,files.read,files.write,host.shell,agent.run
+```
+
+Approve the runner’s one-time code in **Settings → Machines**, then explicitly
+choose a bot, workspace and permissions. Pairing alone grants no bot access.
+Select that bot’s location and either a Cloud agent using machine tools or Local Pi
+on the machine. Shell commands run with your full user privileges; a working
+directory is not a sandbox. Offline work waits for the machine without switching
+to Cloud. Models, conversation and memory remain in Timber. Omit `--grant` for the
+default read-only diagnostics/files profile. See the [runner guide](packages/runner/README.md)
+for foreground lifecycle commands and credential storage.
+
+`node scripts/build-runner.mjs` builds and verifies the public runner tarball and
+SHA256 manifest in `apps/console/public/runner/`, without publishing to npm. Build
+this artifact before the console so it is included in the deployed static assets.
+
 ## Monorepo
 
 | Path | Responsibility |
@@ -18,9 +39,9 @@ console.
 | `tests` | Worker integration and security regression tests |
 | `scripts` | Cloud setup and end-to-end smoke testing |
 
-The first implementation is cloud-only. `AgentRuntime` and `ComputerProvider`
-keep engine choice separate from computer placement. Future local computers and
-other engines can implement these boundaries without changing bot identity.
+Cloudflare remains the default computer placement. `AgentRuntime` and
+`ComputerProvider` keep engine choice separate from placement; owner-paired Mac
+and Linux machines use these boundaries without changing bot identity.
 
 ## Implemented
 
