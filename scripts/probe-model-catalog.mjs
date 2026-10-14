@@ -10,10 +10,10 @@ const exec=promisify(execFile);
 
 export async function requestProbe(url,token,fetcher=fetch,wait=ms=>new Promise(resolve=>setTimeout(resolve,ms)),method='GET') {
   for(let attempt=0;attempt<6;attempt++) {
-    const response=await fetcher(url,{method,headers:{authorization:`Bearer ${token}`},redirect:'error',signal:AbortSignal.timeout(90_000)});
+    const response=await fetcher(url,{method,headers:{authorization:`Bearer ${token}`},redirect:'error',signal:AbortSignal.timeout(120_000)});
     if(response.ok)return response;
     await response.body?.cancel().catch(()=>{});
-    if(![404,503].includes(response.status)||attempt===5)throw new Error(`probe_http_${response.status}`);
+    if(!(response.status===404||response.status===503&&method==='GET')||attempt===5)throw new Error(`probe_http_${response.status}`);
     await wait(2000);
   }
 }
@@ -37,6 +37,13 @@ async function main() {
     const result=await cli(['deploy']);
     const url=result.stdout.match(new RegExp(`https://${name}\\.[a-z0-9-]+\\.workers\\.dev\\b`))?.[0];
     if(!url)throw new Error('probe_endpoint_unavailable');
+    const compare=async()=>{
+      const comparison=await (await requestProbe(`${url}/${process.env.RENEW_MODEL_CREDENTIALS==='1'?'renew-authentication':'authentication'}`,token,fetch,undefined,'POST')).json();
+      console.log(JSON.stringify({authenticationComparison:comparison}));
+    };
+    // An explicit renewal must run before discovery can automatically refresh
+    // the same credential; its once-only marker belongs to the owner.
+    if(process.env.RENEW_MODEL_CREDENTIALS==='1')await compare();
     const response=await requestProbe(`${url}/catalog`,token);
     const value=await response.json();
     // Reconstruct only the already sanitized shape before writing to CI logs.
@@ -49,10 +56,7 @@ async function main() {
     console.log(JSON.stringify(queue));
     const transport=await (await requestProbe(`${url}/transport`,token)).json();
     console.log(JSON.stringify(transport));
-    if(process.env.COMPARE_MODEL_AUTHENTICATION==='1'||process.env.RENEW_MODEL_CREDENTIALS==='1'){
-      const comparison=await (await requestProbe(`${url}/${process.env.RENEW_MODEL_CREDENTIALS==='1'?'renew-authentication':'authentication'}`,token,fetch,undefined,'POST')).json();
-      console.log(JSON.stringify({authenticationComparison:comparison}));
-    }
+    if(process.env.COMPARE_MODEL_AUTHENTICATION==='1'&&process.env.RENEW_MODEL_CREDENTIALS!=='1')await compare();
     if(process.env.VERIFY_MODEL_INFERENCE==='1'){
       const verification=await (await requestProbe(`${url}/verify`,token,fetch,undefined,'POST')).json();
       console.log(JSON.stringify({verifiedInference:verification.ok===true,status:verification.status,failure:verification.failure}));

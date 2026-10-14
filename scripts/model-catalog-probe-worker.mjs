@@ -57,8 +57,8 @@ export default {
         const credential={};
         for(const field of ['accessBytes','expiresInSeconds','renewalBlockedForSeconds'])if(Number.isSafeInteger(value.credential?.[field]))credential[field]=value.credential[field];
         for(const field of ['expiryMatches','audienceMatches','issuerMatches','subjectMatches','clientMatches','scopesMatch','renewalRequested','renewed','renewalAlreadyPerformed'])credential[field]=value.credential?.[field]===true;
-        const checks=(Array.isArray(value.checks)?value.checks:[]).slice(0,4).map(check=>({
-          variant:['timber','minimal','json','unauthenticated'].includes(check.variant)?check.variant:'unknown',
+        const checks=(Array.isArray(value.checks)?value.checks:[]).slice(0,6).map(check=>({
+          variant:['timber','minimal','json','identity','gzip','unauthenticated'].includes(check.variant)?check.variant:'unknown',
           ...(Number.isInteger(check.status)&&check.status>=100&&check.status<=599?{status:check.status}:{}),
           format:['json','html','text','other'].includes(check.format)?check.format:'other',
           bodyKind:['challenge','origin_disallowed','cloudflare_error','api_error','other'].includes(check.bodyKind)?check.bodyKind:'other',

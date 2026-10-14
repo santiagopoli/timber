@@ -112,7 +112,7 @@ describe("ChatGPT public connection boundary", () => {
     await (await stub.fetch('https://chatgpt/models')).text();
     modelCalls=[];modelHeaders=[];
     const replies=[()=>new Response('Cloudflare error code: 520 private-canary',{status:520,headers:{'content-type':'text/html','cf-ray':'private-canary'}}),
-      ()=>Response.json(defaultModels),()=>Response.json({error_category:'origin',error:{code:'server_error',message:'private-canary'}},{status:520,headers:{'x-request-id':'private-canary'}}),
+      ()=>Response.json(defaultModels),()=>Response.json({error_category:'origin',error:{code:'server_error',message:'private-canary'}},{status:520,headers:{'x-request-id':'private-canary'}}),()=>Response.json(defaultModels),()=>Response.json(defaultModels),
       ()=>Response.json({error:{code:'invalid_api_key',message:'private-canary'}},{status:401,headers:{'cf-ray':'0000000000000000-AMS'}})];
     catalogResponse=()=>replies.shift()!();
     const response=await stub.fetch('https://chatgpt/diagnostics',{method:'POST',headers:{'x-timber-internal':'model-diagnostics'}});
@@ -122,10 +122,12 @@ describe("ChatGPT public connection boundary", () => {
     expect(result.credential.expiresInSeconds).toBeGreaterThan(3500);
     expect(result.checks).toMatchObject([{variant:'timber',status:520,bodyKind:'cloudflare_error',rayPresent:true},
       {variant:'minimal',status:200,failure:null},{variant:'json',status:520,format:'json',bodyKind:'cloudflare_error',edgeCategory:'origin',requestIdPresent:true},
+      {variant:'identity',status:200},{variant:'gzip',status:200},
       {variant:'unauthenticated',status:401,rayColo:'AMS'}]);
-    expect(modelCalls).toEqual([...Array(3).fill(`Bearer ${payload.access_token}`),'']);
-    expect(modelHeaders.map(headers=>headers.get('user-agent'))).toEqual(['Timber/0.1.0',null,null,null]);
-    expect(modelHeaders.map(headers=>headers.get('accept'))).toEqual([null,null,'application/json',null]);
+    expect(modelCalls).toEqual([...Array(5).fill(`Bearer ${payload.access_token}`),'']);
+    expect(modelHeaders.map(headers=>headers.get('user-agent'))).toEqual(['Timber/0.1.0',null,null,null,null,null]);
+    expect(modelHeaders.map(headers=>headers.get('accept'))).toEqual([null,null,'application/json','application/json','application/json',null]);
+    expect(modelHeaders.map(headers=>headers.get('accept-encoding'))).toEqual([null,null,null,'identity','gzip',null]);
     for(const secret of [payload.access_token,payload.refresh_token,payload.id_token,CLIENT_ID,'test-user','private-canary'])expect(text).not.toContain(secret);
     expect(refreshCalls).toHaveLength(0);expect(responseCalls).toHaveLength(0);
   });
@@ -155,6 +157,18 @@ describe("ChatGPT public connection boundary", () => {
     expect(response.status).toBe(200);const result=await response.json<{credential:Record<string,unknown>}>();
     expect(result.credential.renewed).toBe(true);expect(Number(result.credential.renewalBlockedForSeconds)).toBeGreaterThan(7100);
     await (await stub.fetch('https://chatgpt/',{method:'DELETE'})).text();expect(revocations[0].get('token')).toBe('test-valid-rotated-token');
+  });
+  it('does not rotate twice when the operational comparison loses its response during an eviction',async()=>{
+    const stub=newStub(),payload=await credentials(String((await status(stub)).hostId));await connect(stub,payload);
+    const replacement=await credentials(payload.ext_agent_host_id,{expiresAt:Math.floor(Date.now()/1000)+7200});
+    refreshedTokens={...replacement,refresh_token:'test-rotated-before-disconnect'};
+    const request=(target=stub)=>target.fetch('https://chatgpt/diagnostics',{method:'POST',headers:{'x-timber-internal':'model-diagnostics','x-timber-diagnostics-renew':'1'}});
+    const unreceived=await request();await unreceived.body?.cancel();
+    await abortAllDurableObjects();
+    const recovered=bindings.CHATGPT.get(stub.id);
+    const result=await (await request(recovered)).json<{credential:Record<string,unknown>}>();
+    expect(result.credential).toMatchObject({renewed:false,renewalAlreadyPerformed:true});expect(refreshCalls).toEqual([payload.refresh_token]);
+    await (await recovered.fetch('https://chatgpt/',{method:'DELETE'})).text();expect(revocations[0].get('token')).toBe('test-rotated-before-disconnect');
   });
   it.each(['number','numeric-string','iso'])('honors %s renewal schedules on explicit comparison without rotating or losing credentials',async format=>{
     const stub=newStub(),payload=await credentials(String((await status(stub)).hostId));

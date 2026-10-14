@@ -77,6 +77,9 @@ test('probe tolerates route propagation but does not retry an authorization reje
   assert.equal(response.status,200);assert.deepEqual(waits,[2000,2000]);assert.equal(calls.length,3);
   for(const call of calls){assert.equal(call.redirect,'error');assert.equal(call.headers.authorization,`Bearer ${token}`);}
   await assert.rejects(requestProbe('https://probe.test/catalog',token,async()=>new Response(null,{status:401}),()=>{throw new Error('must not retry');}),/probe_http_401/);
+  let postCalls=0;
+  await assert.rejects(requestProbe('https://probe.test/renew-authentication',token,async()=>{postCalls++;return new Response(null,{status:503});},()=>{throw new Error('must not repeat a possibly dispatched renewal');},'POST'),/probe_http_503/);
+  assert.equal(postCalls,1);
 });
 test('queue projections distinguish model admission failures from computer holders without exposing messages',()=>{
   const value=queueProjection('12345678-1234-1234-1234-123456789012',{activeProcesses:1,pendingCancellations:0,lastMessage:'private-canary'},
