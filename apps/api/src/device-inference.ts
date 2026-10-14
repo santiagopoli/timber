@@ -4,7 +4,7 @@ import {classifyFailure} from '../../../packages/runtime/src/normalize';
 import type {AssistantMessageEventStream,SimpleStreamOptions,TranscriptContext} from '@earendil-works/pi-ai';
 import {createAI} from 'agents/models/pi-ai';
 import type {ModelCatalog,ModelSettings} from '@botspace/contracts';
-import {createModelSettings} from '../../../packages/runtime/src/model-settings';
+import {createModelSettings,ModelConfigurationError} from '../../../packages/runtime/src/model-settings';
 import {createChatGPTProvider} from '../../../packages/runtime/src/chatgpt';
 import {createOpenAIProvider} from '../../../packages/runtime/src/openai-api';
 import {createOpenRouterProvider,withQuotaFallback} from '../../../packages/runtime/src/model-routing';
@@ -48,6 +48,10 @@ export function createDeviceInference(env:Env,storage:DurableObjectStorage) {
       const concurrent=storage.sql.exec<{settings:string}>('SELECT settings FROM timber_device_inference WHERE operation_id=?',operationId).toArray()[0];
       if(concurrent){if(concurrent.settings!==JSON.stringify(input))throw new Error('operation_conflict');return;}
       storage.sql.exec('INSERT INTO timber_device_inference(operation_id,model_id,settings) VALUES(?,?,?)',operationId,selection.model.id,JSON.stringify(input));
+    },
+    assertImages(operationId:string):void{
+      const pinned=storage.sql.exec<{model_id:string}>('SELECT model_id FROM timber_device_inference WHERE operation_id=?',operationId).toArray()[0];
+      if(!pinned||!settings.resolve(pinned.model_id).input.includes('image'))throw new ModelConfigurationError('model_image_unsupported');
     },
     stream(operationId:string,context:TranscriptContext,options:SimpleStreamOptions={},signal?:AbortSignal):AssistantMessageEventStream{
       const pinned=storage.sql.exec<{model_id:string}>('SELECT model_id FROM timber_device_inference WHERE operation_id=?',operationId).toArray()[0];

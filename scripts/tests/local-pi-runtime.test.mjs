@@ -27,8 +27,10 @@ test('portable Pi actually infers, runs a real subprocess via scoped tools, and 
   assert.equal(await readFile(join(dir,'effect.txt'),'utf8'),'real-effect');assert.equal(effects,1);assert.equal(requests,2);
   assert.ok(events.some(event=>event.type==='tool.started'));assert.ok(events.some(event=>event.type==='tool.completed'));assert.ok(events.some(event=>event.type==='message'&&event.data.role==='assistant'));
   await runAgentJob(job('first'),options);assert.equal(requests,2,'reopening a settled durable input never calls the model again');assert.equal(effects,1);
-  await runAgentJob({...job('second'),agent:{...job('second').agent,text:'Follow up without repeating the command.'}},options);
+  await runAgentJob({...job('second'),agent:{...job('second').agent,text:'Follow up without repeating the command.',context:[{role:'user',text:job('first').agent.text,operationId:'first'},{role:'assistant',text:'The file contains real-effect.',operationId:'first'},{role:'user',text:'Cloud handoff decision not present in this local archive.',operationId:'cloud-handoff'}]}},options);
   assert.equal(requests,3);assert.ok(contexts.at(-1).messages.some(value=>value.role==='toolResult'&&JSON.stringify(value).includes('real-effect')),'the local SQLite conversation retains prior tool receipts');
+  assert.ok(!JSON.stringify(contexts.at(-1).messages.filter(message=>message.role==='system')).includes(job('first').agent.text),'represented local turns are not duplicated in the system handoff context');
+  assert.ok(JSON.stringify(contexts.at(-1).messages.filter(message=>message.role==='system')).includes('Cloud handoff decision'),'missing cloud turns remain available to the local model');
   assert.equal(effects,1,'new conversational turn never replays the prior command');
 }));
 

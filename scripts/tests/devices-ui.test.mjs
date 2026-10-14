@@ -111,7 +111,13 @@ for(const width of [390,1440])test(`machines: tasks inherit or explicitly overri
 },width));
 
 test('machines: native computer exposes only supported tools and never starts Cloud desktop or previews',async()=>withMachines(async({page,state,fixture,login,bots})=>{
-  state.devices=[machine()];fixture.state.bots[0].executionTarget=target;await login();await bots();await page.locator(`#bot-list [data-bot-id="${BOT_A}"]`).click();await page.locator('#messages').waitFor();
+  state.devices=[machine()];fixture.state.bots[0].executionTarget={...target,agentMode:'local'};await login();await bots();await page.locator(`#bot-list [data-bot-id="${BOT_A}"]`).click();await page.locator('#messages').waitFor();
+  await page.getByRole('button',{name:'Context and memory',exact:true}).click();
+  await page.getByText('Pi on your machine summarizes older context automatically. Durable memory stays in Timber.',{exact:true}).waitFor();
+  assert.equal(await page.getByRole('button',{name:'Compact now',exact:true}).count(),0);
+  assert.equal(await page.getByRole('button',{name:'Review history',exact:true}).isDisabled(),true);
+  assert.equal(await page.getByRole('button',{name:'Add memory',exact:true}).isEnabled(),true);
+  await page.getByRole('button',{name:'Close context and memory',exact:true}).click();
   await page.locator('#panel-menu').locator('summary').click();await page.locator('#tab-computer').click();await page.locator('#panel-computer').waitFor();await page.locator('#machine-computer-notice').waitFor();
   assert.equal(await page.locator('#desktop-root').isVisible(),false);assert.equal(await page.locator('#checkpoint').isVisible(),false);assert.equal(await page.locator('#suspend-computer').isVisible(),false);
   await page.locator('#computer-tools').locator('summary').first().click();assert.equal(await page.locator('#navigate-form').isVisible(),false);assert.equal(await page.locator('#take-screenshot').isVisible(),false);assert.match(await page.locator('#computer-working-directory').innerText(),/\/Users\/owner\/timber/);

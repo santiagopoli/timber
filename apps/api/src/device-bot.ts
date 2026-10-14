@@ -33,12 +33,14 @@ export function createDeviceBotRuntime(env:Env,storage:DurableObjectStorage,base
       if(!run||hooks.stopped(run.id))throw new ApiError(409,'run_cancelled','The run was stopped.');
       const modelSettings=input.modelSettings??{model:bot.model,reasoningEffort:bot.reasoningEffort,fast:bot.fast};
       await modelTransport().snapshot(input.operationId,modelSettings);
+      if(input.images?.length)modelTransport().assertImages(input.operationId);
       const recent=storage.sql.exec<{data:string}>('SELECT data FROM messages ORDER BY rowid DESC LIMIT 64').toArray().reverse().map(row=>JSON.parse(row.data) as Message);
       let remaining=48_000;
       const context=recent.filter(message=>message.runId!==run.id&&['user','assistant','system'].includes(message.role)).reverse().flatMap(message=>{
         if(remaining<=0)return [];
         const text=message.text.slice(-Math.min(remaining,8000));remaining-=text.length;
-        return [{role:message.role as 'user'|'assistant'|'system',text}];
+        const source=message.runId?storage.sql.exec<{native_operation_id:string}>('SELECT native_operation_id FROM runs WHERE id=?',message.runId).toArray()[0]:undefined;
+        return [{role:message.role as 'user'|'assistant'|'system',text,...(source?{operationId:source.native_operation_id}:{})}];
       }).reverse();
       const memory=await snapshotDeviceMemory(storage,bot.id);
       if(hooks.stopped(run.id))throw new ApiError(409,"run_cancelled","The run was stopped.");

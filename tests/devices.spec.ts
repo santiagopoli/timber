@@ -153,6 +153,39 @@ async function enqueue(
   expect(response.status).toBe(202);
   return (await response.json<{ job: DeviceJob }>()).job;
 }
+async function agent(context: Awaited<ReturnType<typeof pair>>, botId: string) {
+  const configured = await api(
+    `/v1/bots/${botId}`,
+    {
+      model: "@cf/zai-org/glm-4.7-flash",
+      executionTarget: {
+        kind: "device",
+        deviceId: context.device.id,
+        workspaceId: "project",
+        agentMode: "local",
+      },
+    },
+    "PATCH",
+  );
+  expect(configured.status).toBe(200);
+  await configured.text();
+  const operationId = crypto.randomUUID();
+  const receipt = await api(`/v1/bots/${botId}/messages`, {
+    operationId,
+    text: "Inspect the project.",
+  });
+  expect(receipt.status).toBe(202);
+  await receipt.text();
+  for (let attempt = 0; attempt < 80; attempt++) {
+    const response = await internal(
+      `/operations?deviceId=${context.device.id}&scopeId=${botId}&operationId=${operationId}`,
+    );
+    const { job } = await response.json<{ job: DeviceJob | null }>();
+    if (job) return job;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error("Local agent admission was not durably queued.");
+}
 const poll = async (context: Awaited<ReturnType<typeof pair>>) =>
   (
     await signed(
@@ -191,6 +224,195 @@ async function result(
 }
 
 describe("owned machine proof, grants and durable effects", () => {
+  it("keeps managed commands observable after their agent ends and isolates computer effects while another agent can infer", async () => {
+    const context = await pair(),
+      a = await bot(),
+      b = await bot();
+    await grant(context.device, a.id);
+    await grant(context.device, b.id);
+    const submittedAgent = await agent(context, a.id);
+    const activeAgent = (await poll(context)).jobs.find(
+      (job) => job.id === submittedAgent.id,
+    )!;
+    expect(activeAgent).toBeDefined();
+    await start(context, activeAgent);
+    const status = await (
+      await internal(`/devices/${context.device.id}`)
+    ).json<{ heldWorkspaces: unknown[] }>();
+    expect(status.heldWorkspaces).toEqual([]);
+    const submittedExec = await enqueue(
+      context.device,
+      a.id,
+      { type: "exec", command: "sleep 60" },
+      {
+        parentJobId: activeAgent.id,
+        approval: { authorized: true, mode: "automatic" },
+      },
+    );
+    const command = (await poll(context)).jobs.find(
+      (job) => job.id === submittedExec.id,
+    )!;
+    await start(context, command);
+    const processId = "device-process:" + command.id;
+    expect(
+      (
+        await result(context, command, "running", {
+          processId,
+          processKnown: true,
+        })
+      ).status,
+    ).toBe(200);
+    for (const [actor, id] of [
+      [a.id, "device-process:forged"],
+      [b.id, processId],
+    ]) {
+      expect(
+        (
+          await internal("/jobs", {
+            deviceId: context.device.id,
+            botId: actor,
+            workspaceId: "project",
+            operationId: crypto.randomUUID(),
+            type: "computer",
+            action: { type: "execPoll", processId: id },
+          })
+        ).status,
+      ).toBe(403);
+    }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const queued = await enqueue(
+        context.device,
+        a.id,
+        { type: "execPoll", processId },
+        { parentJobId: activeAgent.id },
+      );
+      expect(queued.parentJobId).toBe(command.id);
+      const control = (await poll(context)).jobs.find(
+        (job) => job.id === queued.id,
+      )!;
+      expect(control).toBeDefined();
+      await start(context, control);
+      expect(
+        (
+          await result(context, control, "running", {
+            processId,
+            processKnown: true,
+          })
+        ).status,
+      ).toBe(200);
+      const receipt = await (
+        await internal(`/jobs/${control.id}`)
+      ).json<{ job: DeviceJob }>();
+      expect(receipt.job.state).toBe("completed");
+      expect(receipt.job.result?.status).toBe("running");
+    }
+    const ownRead = await enqueue(context.device, a.id, undefined, {
+      parentJobId: activeAgent.id,
+    });
+    const reading = (await poll(context)).jobs.find(
+      (job) => job.id === ownRead.id,
+    )!;
+    await start(context, reading);
+    expect((await result(context, reading)).status).toBe(200);
+    const secondSubmitted = await enqueue(
+      context.device,
+      a.id,
+      { type: "exec", command: "sleep 90" },
+      {
+        parentJobId: activeAgent.id,
+        approval: { authorized: true, mode: "automatic" },
+      },
+    );
+    const secondCommand = (await poll(context)).jobs.find(
+      (job) => job.id === secondSubmitted.id,
+    )!;
+    await start(context, secondCommand);
+    const secondProcessId = "device-process:" + secondCommand.id;
+    expect(
+      (
+        await result(context, secondCommand, "running", {
+          processId: secondProcessId,
+          processKnown: true,
+        })
+      ).status,
+    ).toBe(200);
+    const ended = await signed(
+      context.device.id,
+      context.keys.privateKey,
+      `/v1/device-connect/${context.device.id}/jobs/${activeAgent.id}/result`,
+      {
+        claimToken: activeAgent.claimToken,
+        agentResult: {
+          status: "done",
+          text: "Background command started.",
+          kind: "final",
+        },
+      },
+    );
+    expect(ended.status).toBe(200);
+    await ended.text();
+    const submittedOtherAgent = await agent(context, b.id);
+    const otherAgent = (await poll(context)).jobs.find(
+      (job) => job.id === submittedOtherAgent.id,
+    )!;
+    expect(otherAgent).toBeDefined();
+    await start(context, otherAgent);
+    const otherRead = await enqueue(context.device, b.id, undefined, {
+      parentJobId: otherAgent.id,
+    });
+    expect((await poll(context)).jobs).toEqual([]);
+    const finalPoll = await enqueue(
+      context.device,
+      a.id,
+      { type: "execPoll", processId },
+      { parentJobId: activeAgent.id },
+    );
+    expect(finalPoll.parentJobId).toBe(command.id);
+    const control = (await poll(context)).jobs.find(
+      (job) => job.id === finalPoll.id,
+    )!;
+    await start(context, control);
+    expect(
+      (
+        await result(context, control, "completed", {
+          processId,
+          processKnown: true,
+          exitCode: 0,
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (await (await internal(`/jobs/${command.id}`)).json<{ job: DeviceJob }>())
+        .job.state,
+    ).toBe("completed");
+    expect((await poll(context)).jobs).toEqual([]);
+    const holder = await (
+      await internal(`/devices/${context.device.id}`)
+    ).json<{ heldWorkspaces: Array<{ jobId: string }> }>();
+    expect(holder.heldWorkspaces[0]?.jobId).toBe(secondCommand.id);
+    const secondFinal = await enqueue(
+      context.device,
+      a.id,
+      { type: "execPoll", processId: secondProcessId },
+      { parentJobId: activeAgent.id },
+    );
+    const secondControl = (await poll(context)).jobs.find(
+      (job) => job.id === secondFinal.id,
+    )!;
+    await start(context, secondControl);
+    expect(
+      (
+        await result(context, secondControl, "completed", {
+          processId: secondProcessId,
+          processKnown: true,
+          exitCode: 0,
+        })
+      ).status,
+    ).toBe(200);
+    expect((await poll(context)).jobs.map((job) => job.id)).toEqual([
+      otherRead.id,
+    ]);
+  }, 30_000);
   it("rejects oversized unauthenticated pairing bodies before parsing or persistence", async () => {
     const response = await exports.default.fetch(
       "https://timber.test/v1/device-connect/pairings",
@@ -284,8 +506,16 @@ describe("owned machine proof, grants and durable effects", () => {
         (item) => item.jobId === active.id,
       ),
     ).toBe(true);
+    const submitted = await enqueue(context.device, a.id, {
+      type: "execCancel",
+      processId: active.operationId,
+    });
+    const control = (await poll(context)).jobs.find(
+      (job) => job.id === submitted.id,
+    )!;
+    await start(context, control);
     expect(
-      (await result(context, active, "cancelled", { processKnown: true }))
+      (await result(context, control, "cancelled", { processKnown: true }))
         .status,
     ).toBe(200);
     expect((await poll(context)).jobs.map((j) => j.id)).toEqual([other.id]);
@@ -304,6 +534,14 @@ describe("owned machine proof, grants and durable effects", () => {
     );
     const parent = (await poll(context)).jobs[0];
     await start(context, parent);
+    expect(
+      (
+        await result(context, parent, "running", {
+          processId: "device-process:" + parent.id,
+          processKnown: true,
+        })
+      ).status,
+    ).toBe(200);
     expect(
       (
         await internal("/jobs", {

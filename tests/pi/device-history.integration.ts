@@ -50,6 +50,16 @@ it('resumes native cloud Pi with the original local conversation as reference da
     const recalled=await dispatchDeviceMemory(state.storage,bot.id,{...common,name:'recall_conversation',operationId:'fixture-canonical-recall',arguments:{query:answer}});expect(recalled?.status).toBe('completed');expect(JSON.parse(recalled!.output!).messages).toContainEqual(expect.objectContaining({id:original.id,role:'assistant',text:answer}));
     const child=await dispatchDeviceMemory(state.storage,bot.id,{...common,subagentId:'foreign-child',name:'recall_conversation',operationId:'fixture-child-recall',arguments:{query:answer}});expect(child?.status).toBe('failed');
   });
+  // Cloud Pi on owned-machine tools must receive the machine's real workspace,
+  // rather than the cloud Linux /workspace instructions.
+  expect((await api(`/v1/bots/${bot.id}`,{executionTarget:{kind:'device',deviceId:device.id,workspaceId:'project',agentMode:'cloud'}},'PATCH')).status).toBe(200);
+  const machineText=`Owned tools continuation ${crypto.randomUUID()}`,machineReceipt=await api(`/v1/bots/${bot.id}/messages`,{operationId:crypto.randomUUID(),text:machineText});expect(machineReceipt.status).toBe(202);
+  const {run:machineRun}=await machineReceipt.json<{run:Run}>();
+  await until(async()=>(await (await api(`/v1/bots/${bot.id}/runs/${machineRun.id}`)).json<{run:Run}>()).run,run=>run.status==='completed');
+  const ownedCalls=await runInDurableObject(bindings.CHATGPT!.get(bindings.CHATGPT!.idFromName('owner')),(_,state)=>state.storage.sql.exec<{input:string}>('SELECT input FROM inference_calls').toArray().map(row=>JSON.parse(row.input) as {input:Array<{role?:string}>}));
+  const ownedRequest=ownedCalls.find(call=>call.input.some(item=>item.role==='user'&&JSON.stringify(item).includes(machineText)))!;
+  const ownedSystem=JSON.stringify(ownedRequest.input.filter(item=>['system','developer'].includes(item.role??'')));
+  expect(ownedSystem).toContain('/Users/fixture/project');expect(ownedSystem).toContain('darwin');expect(ownedSystem).not.toContain('Your computer is a reusable cloud Linux desktop.');
 },30000);
 
 it('bounds indexed local history and excludes native-only, child and delegated messages',async()=>{

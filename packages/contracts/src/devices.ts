@@ -56,7 +56,7 @@ export interface DeviceAgentInput {
   instructions: string;
   modelSettings: ModelSettings;
   images?: Array<{ data: string; mimeType: string }>;
-  context?: Array<{ role: "user" | "assistant" | "system"; text: string }>;
+  context?: Array<{ role: "user" | "assistant" | "system"; text: string; operationId?: string }>;
   tools?: Array<{
     name: string;
     description: string;

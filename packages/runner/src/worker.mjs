@@ -91,5 +91,5 @@ export class Runner {
   }
   await this.stop();await this.sessions.reconcile();await this.flush();
  }
- async stop(){this.stopped=true;for(const item of this.active.values())item.controller.abort();await this.sessions.cancelAll();await Promise.all([...this.active.values()].map(item=>item.done));}
+ async stop(){this.stopped=true;for(const item of this.active.values()){this.journal.fenceEvents(item.job.id);item.controller.abort();}await this.sessions.cancelAll();await Promise.all([...this.active.values()].map(item=>item.done));}
 }

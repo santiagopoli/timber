@@ -48,3 +48,11 @@ test('pending event reporting cannot block computer polling or cancellation term
   const cancellation=runner.cancel({jobId:agent.id,operationId:agent.operationId});agentRelease();await cancellation;assert.equal(runner.journal.hasEvents(agent.id),false);eventRelease();await runner.flush();await runner.flush();assert.ok(server.results.some(result=>result.agentResult?.reason==='aborted'));
  },{agentRunner:async(_job,options)=>{started=true;await options.emit({type:'message.delta',data:{delta:'working'}});await agentPending;options.signal.throwIfAborted();return {status:'done',text:'done'};}});
 });
+test('foreground Stop fences aborted agent activity so a revoked event route cannot hold its terminal acknowledgment',async()=>{
+ let started=false;
+ await setup(async({server,runner,client})=>{
+  const original=client.request;client.request=async(path,body,options)=>{if(path.endsWith('/agent/event'))throw new RunnerError('device_revoked','Revoked event fixture');return original(path,body,options);};
+  const agent=job(undefined,{type:'agent',permission:'agent.run',agent:{operationId:'stopped-agent',text:'Work',instructions:'Keep effects scoped',modelSettings:{model:'fixture'}}});server.jobs.push(agent);await runner.poll();await waitFor(()=>started);
+  await runner.stop();assert.equal(runner.journal.hasEvents(agent.id),false);await runner.flush();assert.equal(server.results.at(-1).agentResult.reason,'aborted');assert.equal(runner.journal.outbox().length,0);
+ },{agentRunner:async(_job,options)=>{started=true;await options.emit({type:'message.delta',data:{delta:'working'}});await new Promise(resolve=>options.signal.addEventListener('abort',resolve,{once:true}));await options.emit({type:'run.aborted',data:{operationId:_job.operationId}});options.signal.throwIfAborted();}});
+});

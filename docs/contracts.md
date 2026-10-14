@@ -1668,9 +1668,14 @@ runner credential storage. Native desktop, previews and cloud backups are not
 provided by this runner.
 
 DevicesDO journals jobs before dispatch and issues a per-job claim token.
+Computer effects reserve a workspace for their bot/task actor. Pi inference does
+not reserve the filesystem. A confirmed running managed command permits its
+actor to perform additional effects; another actor's effects wait. Process polls
+complete their own observation jobs while the original process remains running,
+and exact scoped process controls remain available after its inference turn ends.
 Workspace leases remain held through uncertain results and offline execution;
 there is no fallback to Cloudflare or another device. Delivery and execution
-start recheck the originating run's Stop fence. Revocation cancels queued work
+start of new effects recheck the originating run's Stop fence. Revocation cancels queued work
 and requests cancellation of running jobs, retaining their lease until the
 runner confirms termination. Unsafe local effects use a separate durable
 receipt journal and process guardian; a missing receipt is interrupted and is
@@ -1686,3 +1691,8 @@ notes are suggestions and temporary agents cannot write parent memory.
 to one using `executionTarget`, and `machine_diagnostics` reads typed machine
 metadata under its own grant. Local Pi temporary child sessions are not included
 in this provider; use persistent tasks for machine delegation.
+
+Pi on the owned machine compacts its context automatically. Cloud compaction and
+automated cloud history-review endpoints return 409 for local Pi targets; these
+controls do not manipulate the device's separate native session. Owner memory
+editing/search and sourced local memory tools remain available in Timber.

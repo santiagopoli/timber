@@ -29,10 +29,22 @@ async function machine(){
   return {device,bot,target,signed};
 }
 describe('owned machine BotDO integration',()=>{
+  it('rejects image admission for a text-only model before dispatching a local agent',async()=>{
+    const {bot,signed}=await machine(),imageId=crypto.randomUUID();
+    const png=Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII='),char=>char.charCodeAt(0));
+    const uploaded=await exports.default.fetch(`https://timber.test/v1/bots/${bot.id}/attachments/${imageId}`,{method:'PUT',headers:{...owner,'content-type':'image/png'},body:png});expect(uploaded.status).toBe(200);await uploaded.body?.cancel();
+    const accepted=await api(`/v1/bots/${bot.id}/messages`,{operationId:crypto.randomUUID(),text:'Inspect this image',attachments:[imageId]});expect(accepted.status).toBe(202);const {run}=await accepted.json<{run:Run}>();
+    let current=run;
+    for(let attempt=0;attempt<50&&current.status!=='failed';attempt++){await new Promise(resolve=>setTimeout(resolve,25));current=(await (await api(`/v1/bots/${bot.id}/runs/${run.id}`)).json<{run:Run}>()).run;}
+    expect(current.status).toBe('failed');expect(current.error).toContain('does not accept images');
+    const polled=await signed('jobs/poll');expect(polled.status).toBe(200);expect((await polled.json<{jobs:DeviceJob[]}>()).jobs).toHaveLength(0);
+  },30000);
   it('queues real local Pi admission offline, projects signed results into Timber and rejects cross-run callbacks',async()=>{
     const {bot,device,target,signed}=await machine(),operationId=crypto.randomUUID();
     const receipt=await api(`/v1/bots/${bot.id}/messages`,{operationId,text:'Inspect my project'});expect(receipt.status).toBe(202);
     const {run}=await receipt.json<{run:Run}>();expect(run.executionTarget).toEqual(target);
+    expect((await api(`/v1/bots/${bot.id}/context/compact`,{operationId:crypto.randomUUID()})).status).toBe(409);
+    expect((await api(`/v1/bots/${bot.id}/memory/review`,{operationId:crypto.randomUUID()})).status).toBe(409);
     // Selecting a machine never starts a Cloudflare computer or uses cloud Pi.
     expect((await api(`/v1/bots/${bot.id}/computer`)).status).toBe(200);
     const botStub=bindings.BOT.get(bindings.BOT.idFromName(`owner:${bot.id}`));

@@ -179,6 +179,7 @@ import { applyAvatarFrame, normalizeAvatarHead } from './src/avatar-framing.ts';
   }
   function loadCompactions(version = generation, force = false) {
     const id = selected?.id;
+    if(selected?.executionTarget?.kind==='device'&&selected.executionTarget.agentMode==='local')return Promise.resolve();
     if (!id || !validView(version) || document.hidden && !force) return Promise.resolve();
     if (compactionsInFlight?.version === version) return compactionsInFlight.promise;
     if (!force && compactionsLastLoaded && Date.now() - compactionsLastLoaded < 15000) {scheduleCompactions(version); return Promise.resolve();}

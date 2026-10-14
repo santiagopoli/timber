@@ -180,6 +180,16 @@ export class BotDO extends DurableObject<Env> {
       // verifies ownership in its tool boundary, including coordinator turns.
       getBot:async()=>this.currentBot(false),
       getTaskId:()=>this.taskId(),
+      getComputerContext:async()=>{
+        const bot=this.bot(),target=bot.executionTarget;
+        if(target?.kind!=='device')return {kind:'cloud' as const};
+        try{
+          const {device}=await deviceRequest<{device:import('@botspace/contracts').Device}>(this.env,`/devices/${target.deviceId}`);
+          const grant=device.grants.find(grant=>grant.botId===bot.id&&grant.workspaceIds.includes(target.workspaceId));
+          const workspace=grant?device.workspaces.find(workspace=>workspace.id===target.workspaceId):undefined;
+          return {kind:'device' as const,...(workspace?{name:device.name,platform:device.platform,workspace:workspace.path}:{})};
+        }catch{return {kind:'device' as const};}
+      },
       getTaskContext:root=>[this.taskContext(),root?deviceConversationContext(this.ctx.storage):''].filter(Boolean).join('\n\n'),
       isCoordinator:operationId=>{const row=this.findRun(operationId);return row?JSON.parse(row.data).coordinatorMode===true:false;},
       resolveToolOperationId:input=>this.toolOperationId(input),
@@ -2310,6 +2320,8 @@ if(row?.native_operation_id===nativeOperationId) {const run=JSON.parse(row.data)
       if(path==='/_keychain/resume'&&request.method==='POST'){
         const input=await body(request);await this.resumeSecureInput(input.request as SecureInputRequest,input.entries as SecretMetadata[]);return json({received:true});
       }
+      const maintenanceTarget=this.bot().executionTarget;
+      if(maintenanceTarget?.kind==='device'&&maintenanceTarget.agentMode==='local'&&['/context/compact','/memory/review'].includes(path))throw new ApiError(409,'device_maintenance_unavailable','Local Pi compacts automatically and saves memory through its tools. Manual cloud compaction and history review do not operate on a local session.');
       if(["/context","/context/compact","/memory"].includes(path)||path.startsWith('/memory/')) return await maintenanceRequest(request,path,this.runtime);
       this.ctx.waitUntil(this.recover());
       if(["/agent-messages","/agent-results","/agent-cancel"].includes(path)) {

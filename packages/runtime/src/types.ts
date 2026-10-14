@@ -105,6 +105,8 @@ export interface PiRuntimeOptions<Env extends object> {
   getBot(): Promise<Pick<Bot, 'name' | 'instructions' | 'model' | 'reasoningEffort' | 'fast' | 'computerApprovalMode' | 'allowTaskCreation'>>;
   /** Global task identity supplied by the host, never by model input. */
   getTaskId?():string|undefined;
+  /** Public provider metadata; never file contents, credentials or authority. */
+  getComputerContext?():Promise<{kind:'cloud'}|{kind:'device';name?:string;platform?:string;workspace?:string}>;
   /** Bounded public task status/results for future turns, without waking inference. */
   getTaskContext?(rootConversation?:boolean):string;
   /** Trusted host scope: a coordinating turn reports work owned elsewhere. */

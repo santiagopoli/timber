@@ -239,20 +239,93 @@ export class DevicesDO extends DurableObject<DeviceEnv> {
   }
   private release(job: StoredJob) {
     if (job.uncertain) return;
-    if (
-      this.ctx.storage.sql
-        .exec(
-          "SELECT 1 FROM device_jobs WHERE json_extract(data,'$.parentJobId')=? AND (state IN ('queued','delivered','running') OR json_extract(data,'$.uncertain')=1) LIMIT 1",
-          job.id,
-        )
-        .toArray().length
-    )
+    const replacement = this.activeWorkspaceJobs(job).find(
+      (other) => other.id !== job.id && this.sameActor(job, other),
+    );
+    if (replacement) {
+      this.ctx.storage.sql.exec(
+        "UPDATE device_workspace_leases SET job_id=? WHERE device_id=? AND workspace_id=? AND job_id=?",
+        replacement.id,
+        job.deviceId,
+        job.workspaceId,
+        job.id,
+      );
       return;
+    }
     this.ctx.storage.sql.exec(
       "DELETE FROM device_workspace_leases WHERE device_id=? AND workspace_id=? AND job_id=?",
       job.deviceId,
       job.workspaceId,
       job.id,
+    );
+  }
+  private control(job: Pick<DeviceJob, "action">): boolean {
+    return job.action?.type === "execPoll" || job.action?.type === "execCancel";
+  }
+  private sameActor(a: DeviceJob, b: DeviceJob): boolean {
+    return (
+      a.deviceId === b.deviceId &&
+      a.workspaceId === b.workspaceId &&
+      a.botId === b.botId &&
+      a.taskId === b.taskId
+    );
+  }
+  private activeWorkspaceJobs(job: DeviceJob): StoredJob[] {
+    return this.ctx.storage.sql
+      .exec<{ data: string }>(
+        "SELECT data FROM device_jobs WHERE device_id=? AND json_extract(data,'$.workspaceId')=? AND json_extract(data,'$.type')='computer' AND (state IN ('delivered','running') OR json_extract(data,'$.uncertain')=1)",
+        job.deviceId,
+        job.workspaceId,
+      )
+      .toArray()
+      .map((row) => JSON.parse(row.data) as StoredJob)
+      .filter((other) => !this.control(other));
+  }
+  private parentActive(job: StoredJob): boolean {
+    if (!job.parentJobId) return true;
+    const parent = this.job(job.parentJobId);
+    if (!this.sameActor(job, parent)) return false;
+    if (this.control(job))
+      return parent.type === "computer" && parent.action?.type === "exec";
+    return (
+      parent.state === "running" && !parent.cancelRequested && !parent.uncertain
+    );
+  }
+  private workspaceAvailable(job: StoredJob): boolean {
+    if (job.type === "agent" || this.control(job)) return true;
+    const held = this.ctx.storage.sql
+      .exec<{
+        job_id: string;
+      }>(
+        "SELECT job_id FROM device_workspace_leases WHERE device_id=? AND workspace_id=?",
+        job.deviceId,
+        job.workspaceId,
+      )
+      .toArray()[0];
+    if (!held) return true;
+    const holder = this.job(held.job_id);
+    // Older live actors may still hold a pre-upgrade agent lease. Only actual
+    // computer effects own workspace exclusion; inference never reserves it.
+    if (holder.type === "agent") {
+      this.release(holder);
+      return this.workspaceAvailable(job);
+    }
+    if (
+      !holder.uncertain &&
+      ["completed", "failed", "cancelled", "interrupted"].includes(holder.state)
+    ) {
+      this.release(holder);
+      return this.workspaceAvailable(job);
+    }
+    if (!this.sameActor(holder, job)) return false;
+    return this.activeWorkspaceJobs(job).every(
+      (active) =>
+        !active.uncertain &&
+        !active.cancelRequested &&
+        active.state === "running" &&
+        active.action?.type === "exec" &&
+        active.result?.status === "running" &&
+        active.result.processKnown !== false,
     );
   }
   private releaseParent(job: StoredJob) {
@@ -702,8 +775,14 @@ export class DevicesDO extends DurableObject<DeviceEnv> {
           "device_process_mismatch",
           "This process belongs to another conversation.",
         );
-      if (parent.state === "running")
-        parentJobId ??= parent.parentJobId ?? parent.id;
+      if (parent.type !== "computer" || parent.action?.type !== "exec")
+        throw new ApiError(
+          403,
+          "device_process_mismatch",
+          "This receipt does not identify a managed command.",
+        );
+      // Process controls belong to the process, even after its inference turn ends.
+      parentJobId = parent.id;
     }
     if (parentJobId) {
       const parent = this.job(parentJobId);
@@ -712,7 +791,10 @@ export class DevicesDO extends DurableObject<DeviceEnv> {
         parent.workspaceId !== workspaceId ||
         parent.botId !== botId ||
         (parent.taskId ?? undefined) !== taskId ||
-        parent.state !== "running"
+        (!this.control({ action }) &&
+          (parent.state !== "running" ||
+            parent.cancelRequested ||
+            parent.uncertain))
       )
         throw new ApiError(
           403,
@@ -854,6 +936,9 @@ export class DevicesDO extends DurableObject<DeviceEnv> {
     return result;
   }
   private async hostAlive(job: StoredJob): Promise<boolean> {
+    // These actions only observe/cancel the exact scoped process established
+    // during enqueue; they must remain available after the originating turn.
+    if (this.control(job)) return this.parentActive(job);
     if (!job.nativeOperationId && job.type !== "agent") return true;
     const response = await this.env.BOT.get(
       this.env.BOT.idFromName(
@@ -927,66 +1012,20 @@ export class DevicesDO extends DurableObject<DeviceEnv> {
         this.cancel(job);
         continue;
       }
-      const held = this.ctx.storage.sql
-        .exec<{
-          job_id: string;
-        }>(
-          "SELECT job_id FROM device_workspace_leases WHERE device_id=? AND workspace_id=?",
-          device.id,
-          job.workspaceId,
-        )
-        .toArray()[0];
-      if (held && held.job_id !== job.parentJobId) continue;
-      if (
-        job.parentJobId &&
-        (!held || this.job(job.parentJobId).state !== "running")
-      ) {
+      if (!this.parentActive(job)) {
         this.cancel(job);
         continue;
       }
-      const childActive =
-        job.parentJobId &&
-        this.ctx.storage.sql
-          .exec(
-            "SELECT 1 FROM device_jobs WHERE device_id=? AND (state IN ('delivered','running') OR json_extract(data,'$.uncertain')=1) AND json_extract(data,'$.parentJobId')=? AND json_extract(data,'$.workspaceId')=? LIMIT 1",
-            device.id,
-            job.parentJobId,
-            job.workspaceId,
-          )
-          .toArray().length > 0;
-      if (childActive) continue;
+      if (!this.workspaceAvailable(job)) continue;
       const wire = await this.wireJob(job);
       if (this.job(job.id).state !== "queued") continue;
       const admitted = this.ctx.storage.transactionSync(() => {
         this.grant(this.device(device.id), job);
-        const currentHolder = this.ctx.storage.sql
-          .exec<{
-            job_id: string;
-          }>(
-            "SELECT job_id FROM device_workspace_leases WHERE device_id=? AND workspace_id=?",
-            device.id,
-            job.workspaceId,
-          )
-          .toArray()[0];
-        if (currentHolder && currentHolder.job_id !== job.parentJobId)
+        if (!this.parentActive(job) || !this.workspaceAvailable(job))
           return false;
-        if (
-          job.parentJobId &&
-          (!currentHolder ||
-            this.job(job.parentJobId).state !== "running" ||
-            this.ctx.storage.sql
-              .exec(
-                "SELECT 1 FROM device_jobs WHERE device_id=? AND (state IN ('delivered','running') OR json_extract(data,'$.uncertain')=1) AND json_extract(data,'$.parentJobId')=? AND json_extract(data,'$.workspaceId')=? LIMIT 1",
-                device.id,
-                job.parentJobId,
-                job.workspaceId,
-              )
-              .toArray().length)
-        )
-          return false;
-        if (!currentHolder)
+        if (job.type === "computer" && !this.control(job))
           this.ctx.storage.sql.exec(
-            "INSERT INTO device_workspace_leases(device_id,workspace_id,job_id) VALUES(?,?,?)",
+            "INSERT OR IGNORE INTO device_workspace_leases(device_id,workspace_id,job_id) VALUES(?,?,?)",
             device.id,
             job.workspaceId,
             job.id,
@@ -1062,7 +1101,8 @@ export class DevicesDO extends DurableObject<DeviceEnv> {
             job.operationId,
           );
         }
-        if (result.status !== "running") job.state = result.status;
+        if (this.control(job)) job.state = "completed";
+        else if (result.status !== "running") job.state = result.status;
         else job.state = "running";
       } else {
         const result = input.agentResult as DeviceAgentResult;
@@ -1093,40 +1133,51 @@ export class DevicesDO extends DurableObject<DeviceEnv> {
       }
       this.saveJob(job);
       if (job.state !== "running") this.releaseParent(job);
-      if (
-        job.action &&
-        ["execPoll", "execCancel"].includes(job.action.type) &&
-        job.result?.status !== "running"
-      ) {
+      if (job.action && this.control(job) && job.result) {
         const processId = (job.action as { processId: string }).processId;
         for (const row of this.ctx.storage.sql
           .exec<{
             data: string;
           }>(
-            "SELECT data FROM device_jobs WHERE device_id=? AND state='running'",
+            "SELECT data FROM device_jobs WHERE device_id=? AND (state='running' OR json_extract(data,'$.uncertain')=1)",
             job.deviceId,
           )
           .toArray()) {
           const original = JSON.parse(row.data) as StoredJob;
           if (
+            original.id === job.parentJobId &&
             original.workspaceId === job.workspaceId &&
             original.botId === job.botId &&
             (original.result?.processId === processId ||
               original.operationId === processId) &&
-            original.type === "computer"
+            original.type === "computer" &&
+            original.action?.type === "exec" &&
+            original.taskId === job.taskId
           ) {
             original.result = {
               ...job.result!,
               operationId: original.operationId,
             };
             original.state = job.result!.status as StoredJob["state"];
+            original.uncertain = job.result?.processKnown === false;
+            if (original.uncertain) {
+              original.cancelRequested = true;
+              this.ctx.storage.sql.exec(
+                "INSERT OR IGNORE INTO device_cancellations(job_id,device_id,operation_id) VALUES(?,?,?)",
+                original.id,
+                original.deviceId,
+                original.operationId,
+              );
+            }
             this.saveJob(original);
-            this.release(original);
-            this.releaseParent(original);
-            this.ctx.storage.sql.exec(
-              "DELETE FROM device_cancellations WHERE job_id=?",
-              original.id,
-            );
+            if (original.state !== "running" && !original.uncertain) {
+              this.release(original);
+              this.releaseParent(original);
+              this.ctx.storage.sql.exec(
+                "DELETE FROM device_cancellations WHERE job_id=?",
+                original.id,
+              );
+            }
           }
         }
       }
@@ -1486,6 +1537,26 @@ export class DevicesDO extends DurableObject<DeviceEnv> {
           }
           job = this.job(job.id);
           this.alive(job, device.id, input);
+          if (!this.parentActive(job))
+            throw new ApiError(
+              409,
+              "device_job_inactive",
+              "The parent work is no longer active.",
+            );
+          if (
+            job.type === "computer" &&
+            !this.control(job) &&
+            this.activeWorkspaceJobs(job).some(
+              (other) => other.id !== job.id && other.uncertain,
+            )
+          ) {
+            this.cancel(job);
+            throw new ApiError(
+              409,
+              "device_workspace_uncertain",
+              "Confirm or cancel the unknown managed process before starting new effects.",
+            );
+          }
           if (job.state === "running")
             return json({ job: this.publicJob(job) });
           if (job.state !== "delivered")
