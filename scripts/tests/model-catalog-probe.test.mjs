@@ -34,6 +34,21 @@ test('optional inference verification uses only the fixed plan verification rout
   assert.deepEqual(await result.json(),{ok:true,status:200,failure:null});
   assert.equal((await worker.fetch(new Request('https://probe.test/verify',{headers:{authorization:`Bearer ${token}`}}),env)).status,404);
 });
+test('transport comparison contacts only fixed OpenAI endpoints without account authorization',async()=>{
+  const original=globalThis.fetch,calls=[];
+  globalThis.fetch=async(url,options)=>{
+    calls.push({url,method:options.method});
+    assert.equal(new Headers(options.headers).has('authorization'),false);
+    assert.equal(options.redirect,'manual');
+    assert.equal(options.body,url.endsWith('/responses')?'{}':undefined);
+    return new Response('private-canary',{status:401});
+  };
+  try {
+    const result=await worker.fetch(new Request('https://probe.test/transport',{headers:{authorization:`Bearer ${token}`}}),{PROBE_TOKEN_SHA256:hash});
+    assert.deepEqual(await result.json(),{unauthenticatedTransport:[{endpoint:'models',status:401},{endpoint:'responses',status:401}]});
+    assert.deepEqual(calls,[{url:'https://api.openai.com/v1/models',method:'GET'},{url:'https://api.openai.com/v1/responses',method:'POST'}]);
+  }finally{globalThis.fetch=original;}
+});
 test('probe tolerates route propagation but does not retry an authorization rejection',async()=>{
   const statuses=[404,503,200],waits=[],calls=[];
   const response=await requestProbe('https://probe.test/catalog',token,async(url,options)=>{calls.push(options);return new Response(null,{status:statuses.shift()});},async ms=>{waits.push(ms);});

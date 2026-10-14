@@ -42,8 +42,20 @@ export default {
     if(digest!==env.PROBE_TOKEN_SHA256)return new Response(null,{status:401});
     const path=new URL(request.url).pathname;
     const verify=path==='/verify'&&request.method==='POST';
-    if(!verify&&(request.method!=='GET'||!['/catalog','/queue'].includes(path)))return new Response(null,{status:404});
+    if(!verify&&(request.method!=='GET'||!['/catalog','/queue','/transport'].includes(path)))return new Response(null,{status:404});
     try {
+      if(path==='/transport') {
+        const checks=await Promise.all(['models','responses'].map(async endpoint=>{
+          try {
+            const response=await fetch(`https://api.openai.com/v1/${endpoint}`,{method:endpoint==='responses'?'POST':'GET',
+              headers:{'User-Agent':'Timber/0.1.0','content-type':'application/json'},...(endpoint==='responses'?{body:'{}'}:{}),
+              redirect:'manual',signal:AbortSignal.timeout(15_000)});
+            await response.body?.cancel().catch(()=>{});
+            return {endpoint,status:response.status};
+          }catch{return {endpoint,failure:'transport_failed'};}
+        }));
+        return Response.json({unauthenticatedTransport:checks},{headers:{'cache-control':'no-store'}});
+      }
       if(verify) {
         const account=env.CHATGPT.get(env.CHATGPT.idFromName('owner'));
         const response=await account.fetch('https://chatgpt/verify',{method:'POST'});

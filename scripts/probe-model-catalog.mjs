@@ -47,6 +47,8 @@ async function main() {
     const queue=await (await requestProbe(`${url}/queue`,token)).json();
     if(!Array.isArray(queue.bots)||queue.bots.length>20)throw new Error('probe_invalid_projection');
     console.log(JSON.stringify(queue));
+    const transport=await (await requestProbe(`${url}/transport`,token)).json();
+    console.log(JSON.stringify(transport));
     if(process.env.VERIFY_MODEL_INFERENCE==='1'){
       const verification=await (await requestProbe(`${url}/verify`,token,fetch,undefined,'POST')).json();
       console.log(JSON.stringify({verifiedInference:verification.ok===true,status:verification.status,failure:verification.failure}));
