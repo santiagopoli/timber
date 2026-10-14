@@ -1,6 +1,6 @@
 const states=new Set(['verified','connected_unverified','reauthorization_required','disconnected']);
 const runStates=new Set(['queued','running','waiting_approval','waiting_connection']);
-const runErrors=new Set(['model_catalog_unavailable','chatgpt_not_connected','model_unavailable','reasoning_unsupported','fast_unsupported','model_image_unsupported','model_provider_settings_unsupported']);
+const runErrors=new Set(['model_catalog_unavailable','chatgpt_not_connected','model_unavailable','reasoning_unsupported','fast_unsupported','model_image_unsupported','model_provider_settings_unsupported','model_provider_unavailable','model_rate_limited','model_timeout','model_connection_interrupted','chatgpt_allowance_exhausted','chatgpt_usage_unavailable','model_access_denied']);
 const count=value=>Number.isSafeInteger(value)&&value>=0?value:null;
 const failures=new Map([
   ['Using cached ChatGPT model catalogue while discovery is unavailable.','model_catalog_transport_failed'],
@@ -28,10 +28,15 @@ export function projection(status,catalog) {
 }
 
 export function queueProjection(botId,summary,page,slot) {
+  const failed=(Array.isArray(page?.runs)?page.runs:[]).filter(run=>run.status==='failed').slice(0,5);
+  const errorCode=run=>run.errorCode?runErrors.has(run.errorCode)?run.errorCode:'other':null;
+  const waiting=run=>run.error==='Message saved. Waiting for this bot’s shared computer.'?'computer':run.error==='Message saved. Waiting for space in the agent inbox.'?'inbox':run.admissionRetryable===true?'admission_retry':run.error?'other':null;
   return {bot:botId.slice(0,8),activeProcesses:count(summary?.activeProcesses),pendingCancellations:count(summary?.pendingCancellations),
     lease:!slot?.holder?'none':slot.holder==='@bot'?'bot':slot.holder.startsWith('@direct:')?'owner_action':'task',
     runs:(Array.isArray(page?.activeRuns)?page.activeRuns:[]).slice(0,10).map(run=>({status:runStates.has(run.status)?run.status:'unknown',
-      error:run.errorCode?runErrors.has(run.errorCode)?run.errorCode:'other':null,coordinator:run.coordinatorMode===true}))};
+      error:errorCode(run),coordinator:run.coordinatorMode===true,
+      ...(waiting(run)?{waiting:waiting(run)}:{}),...(run.admissionRetryable===true?{admissionRetryable:true}:{})})),
+    ...(failed.length?{recentFailures:failed.map(run=>({error:errorCode(run)}))}:{})};
 }
 
 export default {
@@ -80,6 +85,7 @@ export default {
             if(!s.ok||!r.ok||!l.ok)throw new Error('invalid state');
             const [{summary},runs,slot]=await Promise.all([s.json(),r.json(),l.json()]);
             const value=queueProjection(bot.id,summary,runs,slot);
+            if(bot.name==='Polibot')value.matchesScreenshotBot=true;
             if(value.lease==='task'&&/^[a-f0-9-]{36}$/.test(slot.holder)) {
               const receipt=await workspace.fetch(`https://workspace/tasks/${slot.holder}`);
               const {task}=await receipt.json();

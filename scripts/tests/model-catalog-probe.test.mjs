@@ -60,7 +60,15 @@ test('queue projections distinguish model admission failures from computer holde
   const value=queueProjection('12345678-1234-1234-1234-123456789012',{activeProcesses:1,pendingCancellations:0,lastMessage:'private-canary'},
     {activeRuns:[{status:'queued',errorCode:'model_catalog_unavailable',error:'private-canary',text:'private-canary'},{status:'private-canary',errorCode:'private-canary'}]},
     {holder:'@direct:private-canary'});
-  assert.deepEqual(value,{bot:'12345678',activeProcesses:1,pendingCancellations:0,lease:'owner_action',runs:[{status:'queued',error:'model_catalog_unavailable',coordinator:false},{status:'unknown',error:'other',coordinator:false}]});
+  assert.deepEqual(value,{bot:'12345678',activeProcesses:1,pendingCancellations:0,lease:'owner_action',runs:[{status:'queued',error:'model_catalog_unavailable',coordinator:false,waiting:'other'},{status:'unknown',error:'other',coordinator:false}]});
+  assert.doesNotMatch(JSON.stringify(value),/private-canary/);
+});
+test('queue diagnostics distinguish retryable unadmitted inputs from computer waits and actual provider failures',()=>{
+  const value=queueProjection('12345678-1234-1234-1234-123456789012',{},
+    {activeRuns:[{status:'queued',admissionRetryable:true,error:'private-canary'},{status:'queued',error:'Message saved. Waiting for this bot’s shared computer.'}],
+      runs:[{status:'failed',errorCode:'model_provider_unavailable',error:'private-canary',operationId:'private-canary'}]},{});
+  assert.deepEqual(value.runs,[{status:'queued',error:null,coordinator:false,waiting:'admission_retry',admissionRetryable:true},{status:'queued',error:null,coordinator:false,waiting:'computer'}]);
+  assert.deepEqual(value.recentFailures,[{error:'model_provider_unavailable'}]);
   assert.doesNotMatch(JSON.stringify(value),/private-canary/);
 });
 test('queue probe uses passive registry and bot routes with scheduler headers',async()=>{
