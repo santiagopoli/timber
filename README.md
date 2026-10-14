@@ -370,11 +370,15 @@ chat. The CLI retains only registration metadata, not OAuth tokens.
 For a network comparison during a fresh sign-in, run
 `npm run chatgpt:login -- --compare-route`. It requests the catalogue locally
 before handing the same fresh credential to Timber, then performs the existing
-cloud verification. It reports only HTTP statuses, model counts and fixed failure
-codes. It does not retrieve a token from the server or retain one locally.
+cloud verification. It also compares the exact server headers, checks discovery
+again after the cloud attempt, and performs one tiny local plan-only response
+using an actually discovered model. It reports only HTTP statuses, model counts
+and completion. It does not retrieve a token from the server or retain one locally.
 
-Production uses `CHATGPT_API_TRANSPORT=container` for account model discovery and
-Responses API requests. A dedicated `ChatGPTTransportDO` starts only a private
+An optional `CHATGPT_API_TRANSPORT=container` selects Node for account model discovery
+and Responses API requests. It is disabled by default: the current investigation
+observed authenticated HTTP 520 through both Workers and Node on Cloudflare.
+A dedicated `ChatGPTTransportDO` starts only a private
 Node HTTPS transport, using the verified image with a fixed entrypoint. It is
 separate from bot computers and has no shell, workspace, checkpoint or public
 endpoint. The credential owner still validates, encrypts and refreshes OAuth;

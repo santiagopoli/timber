@@ -85,31 +85,71 @@ export async function cloudRequest(config, { method = 'GET', suffix = '', body, 
   return value;
 }
 
-/** Runs only before the existing local-to-cloud handoff. It never retrieves a
- * server credential, retains tokens or prints account/model metadata. */
-export async function localModelDiscovery(accessToken,fetchImpl=fetch) {
+const comparisonHeaders=(accessToken,serverHeaders=false)=>({authorization:`Bearer ${accessToken}`,accept:'application/json',
+  ...(serverHeaders?{'user-agent':'Timber/0.1.0','accept-encoding':'identity'}:{})});
+
+/** Private local catalogues remain in memory for the one tiny verification. */
+async function readLocalCatalogue(accessToken,fetchImpl=fetch,serverHeaders=false) {
   if(!opaque(accessToken,65536))fail('The local comparison requires the freshly issued access token.');
   let receivedStatus;
   try {
-    const response=await fetchImpl(`${RESOURCE}/models`,{headers:{authorization:`Bearer ${accessToken}`,accept:'application/json'},redirect:'error',signal:AbortSignal.timeout(30_000)});
+    const response=await fetchImpl(`${RESOURCE}/models`,{headers:comparisonHeaders(accessToken,serverHeaders),redirect:'error',signal:AbortSignal.timeout(30_000)});
     receivedStatus=response.status;
-    if(!response.ok){await response.body?.cancel().catch(()=>{});return {status:response.status,models:null,failure:'http_error'};}
+    if(!response.ok){await response.body?.cancel().catch(()=>{});return {summary:{status:response.status,models:null,failure:'http_error'}};}
     const reader=response.body?.getReader();let text='',bytes=0;
     try {const decoder=new TextDecoder();if(!reader)throw new Error('empty');for(;;){const part=await reader.read();if(part.done)break;bytes+=part.value.byteLength;if(bytes>2_000_000)throw new Error('large');text+=decoder.decode(part.value,{stream:true});}text+=decoder.decode();}
     finally{await reader?.cancel().catch(()=>{});}
-    let raw;try{raw=JSON.parse(text);}catch{return {status:response.status,models:null,failure:'invalid_model_catalog'};}
-    if(!Array.isArray(raw?.models))return {status:response.status,models:null,failure:'invalid_model_catalog'};
+    let raw;try{raw=JSON.parse(text);}catch{return {summary:{status:response.status,models:null,failure:'invalid_model_catalog'}};}
+    if(!Array.isArray(raw?.models))return {summary:{status:response.status,models:null,failure:'invalid_model_catalog'}};
     const listed=raw.models.filter(model=>model&&model.visibility==='list');
-    if(listed.some(model=>typeof model.slug!=='string'||!model.slug.trim()||model.slug.length>200||typeof model.display_name!=='string'||!model.display_name.trim()||model.display_name.length>200))return {status:response.status,models:null,failure:'invalid_model_catalog'};
-    return {status:response.status,models:listed.length};
-  }catch{return {status:receivedStatus??null,models:null,failure:receivedStatus===undefined?'transport_failed':'catalog_read_failed'};}
+    if(listed.some(model=>typeof model.slug!=='string'||!model.slug.trim()||model.slug.length>200||typeof model.display_name!=='string'||!model.display_name.trim()||model.display_name.length>200))return {summary:{status:response.status,models:null,failure:'invalid_model_catalog'}};
+    const model=listed.find(item=>item.slug===MODEL)?.slug??listed[0]?.slug;
+    return {summary:{status:response.status,models:listed.length},...(model?{model}:{})};
+  }catch{return {summary:{status:receivedStatus??null,models:null,failure:receivedStatus===undefined?'transport_failed':'catalog_read_failed'}};}
 }
 
-export function modelRouteComparison(local,cloud) {
+export async function localModelDiscovery(accessToken,fetchImpl=fetch,serverHeaders=false) {
+  return (await readLocalCatalogue(accessToken,fetchImpl,serverHeaders)).summary;
+}
+
+/** One plan-only request, using an actually discovered model. No replay or logs. */
+export async function localModelInference(accessToken,model,fetchImpl=fetch) {
+  if(!opaque(accessToken,65536)||typeof model!=='string'||!/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,199}$/.test(model))return {status:null,completed:false,failure:'catalog_unavailable'};
+  let status;
+  try {
+    const response=await fetchImpl(`${RESOURCE}/responses`,{method:'POST',headers:{...comparisonHeaders(accessToken,true),'content-type':'application/json'},
+      body:JSON.stringify({model,input:[{role:'user',content:'Reply with exactly OK.'}],store:false,stream:true}),redirect:'error',signal:AbortSignal.timeout(45_000)});
+    status=response.status;
+    if(!response.ok){await response.body?.cancel().catch(()=>{});return {status,completed:false,failure:'http_error'};}
+    const reader=response.body?.getReader();let bytes=0,pending='';
+    try {
+      if(!reader)throw new Error('empty');const decoder=new TextDecoder();
+      for(;;){
+        const part=await reader.read();if(part.done)break;bytes+=part.value.byteLength;
+        if(bytes>256_000)return {status,completed:false,failure:'response_too_large'};
+        pending+=decoder.decode(part.value,{stream:true});
+        let end;
+        while((end=pending.indexOf('\n'))>=0){
+          const line=pending.slice(0,end).replace(/\r$/,'');pending=pending.slice(end+1);
+          if(!line.startsWith('data:'))continue;
+          let event;try{event=JSON.parse(line.slice(5).trim());}catch{continue;}
+          if(event?.type==='response.completed'&&event.response?.status==='completed')return {status,completed:true};
+          if(['response.failed','response.incomplete','error'].includes(event?.type))return {status,completed:false,failure:'response_failed'};
+        }
+      }
+      return {status,completed:false,failure:'response_incomplete'};
+    }finally{await reader?.cancel().catch(()=>{});}
+  }catch{return {status:status??null,completed:false,failure:status===undefined?'transport_failed':'stream_interrupted'};}
+}
+
+export function modelRouteComparison(local,cloud,controls) {
   const status=value=>Number.isInteger(value)&&value>=100&&value<=599?value:null;
+  const discovery=value=>({status:status(value?.status),models:Number.isSafeInteger(value?.models)&&value.models>=0?value.models:null});
   return {local:{status:status(local?.status),models:Number.isSafeInteger(local?.models)&&local.models>=0?local.models:null},
     cloud:{status:status(cloud?.status),completed:cloud?.completed===true,failure:ROUTE_ERRORS.has(cloud?.code)?cloud.code:cloud?.completed===true?null:'unknown',
-      ...(status(cloud?.upstreamStatus)?{upstreamStatus:status(cloud.upstreamStatus)}:{})}};
+      ...(status(cloud?.upstreamStatus)?{upstreamStatus:status(cloud.upstreamStatus)}:{})},
+    ...(controls?{controls:{sameHeaders:discovery(controls.sameHeaders),afterCloud:discovery(controls.afterCloud),
+      localInference:{status:status(controls.localInference?.status),completed:controls.localInference?.completed===true}}}:{}),};
 }
 
 export async function readRegistration(config, hostId, metadataUrl = REGISTRATION_URL) {
@@ -309,7 +349,17 @@ export async function runLogin({ noOpen = false,compareRoute=false } = {}) {
     await saveRegistration(config, status.hostId, identity);
     checkCancelled();
     const payload = prepareImport(tokens, callback.clientId, attempt);
-    const local=compareRoute?await localModelDiscovery(tokens.access_token):undefined;
+    const discovered=compareRoute?await readLocalCatalogue(tokens.access_token):undefined;
+    const local=discovered?.summary;
+    const controls=compareRoute?{sameHeaders:await localModelDiscovery(tokens.access_token,fetch,true)}:undefined;
+    const reportComparison=async cloud=>{
+      if(!compareRoute||cancelled)return;
+      controls.afterCloud=await localModelDiscovery(tokens.access_token,fetch,true);
+      if(cancelled)return;
+      console.log('Checking one tiny local ChatGPT-plan response with the server headers; only status and completion are reported.');
+      controls.localInference=await localModelInference(tokens.access_token,discovered?.model);
+      console.log(JSON.stringify({modelRouteComparison:modelRouteComparison(local,cloud,controls)}));
+    };
     if(local)console.log(`Local model discovery: HTTP ${local.status??'unavailable'}${local.models===null?'':` (${local.models} listed models)`}. Only counts and status are reported.`);
     let imported;
     try { imported = await cloudRequest(config, { method: 'POST', body: payload }); }
@@ -320,10 +370,10 @@ export async function runLogin({ noOpen = false,compareRoute=false } = {}) {
     console.log('Verifying access with one small request to an available account model…');
     let verified;
     try{verified=await cloudRequest(config, { method: 'POST', suffix: '/verify', body: {} });}
-    catch(error){if(compareRoute)console.log(JSON.stringify({modelRouteComparison:modelRouteComparison(local,error)}));throw error;}
+    catch(error){await reportComparison(error);throw error;}
     if (verified.ok !== true || typeof verified.model !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(verified.model)) fail('ChatGPT is connected, but model access was not confirmed.');
     console.log(`Verified: ${verified.model} completed a real request using the connected ChatGPT plan.`);
-    if(compareRoute)console.log(JSON.stringify({modelRouteComparison:modelRouteComparison(local,{status:200,completed:true})}));
+    await reportComparison({status:200,completed:true});
   } finally {
     listener.stop(); process.removeListener('SIGINT', cancel); process.removeListener('SIGTERM', cancel);
     if (tokens) for (const key of Object.keys(tokens)) delete tokens[key];
@@ -333,7 +383,7 @@ export async function runLogin({ noOpen = false,compareRoute=false } = {}) {
 async function main() {
   const args = new Set(process.argv.slice(2));
   if (args.has('--help')) {
-    console.log('Run locally on the computer with your browser:\n  npm run access:setup\n  npm run chatgpt:login [-- --no-open] [--compare-route]\n\nUses official ChatGPT authorization with a temporary 127.0.0.1 callback. Transfers credentials securely to your configured Timber backend, which owns refresh. Saves only registration metadata locally. Performs one small verification request using an available account model after connecting. --compare-route also checks local model discovery before sending the same fresh credential to Timber; outputs only statuses and counts.');
+    console.log('Run locally on the computer with your browser:\n  npm run access:setup\n  npm run chatgpt:login [-- --no-open] [--compare-route]\n\nUses official ChatGPT authorization with a temporary 127.0.0.1 callback. Transfers credentials securely to your configured Timber backend, which owns refresh. Saves only registration metadata locally. Performs one small verification request using an available account model after connecting. --compare-route checks local discovery before and after the cloud attempt, compares the server headers and performs one tiny local ChatGPT-plan response. Outputs only statuses, counts and completion.');
     return;
   }
   for (const arg of args) if (!['--no-open','--compare-route'].includes(arg)) fail('Unknown option. Use npm run chatgpt:login -- --help.');

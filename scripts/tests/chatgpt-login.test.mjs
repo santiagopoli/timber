@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from 'jose';
-import { authorizationUrl, cloudRequest, createAttempt, discoverOpenAI, exchangeCode, localModelDiscovery, modelRouteComparison, OPENAI_ISSUER, parseCallback, prepareImport, readRegistration, RESOURCE, saveRegistration, SCOPES, startCallbackListener, validateIdentity } from '../chatgpt-login.mjs';
+import { authorizationUrl, cloudRequest, createAttempt, discoverOpenAI, exchangeCode, localModelDiscovery, localModelInference, modelRouteComparison, OPENAI_ISSUER, parseCallback, prepareImport, readRegistration, RESOURCE, saveRegistration, SCOPES, startCallbackListener, validateIdentity } from '../chatgpt-login.mjs';
 
 const hostId = 'urn:uuid:11111111-1111-4111-8111-111111111111';
 const clientId = 'oaiapp_test_client';
@@ -137,4 +137,39 @@ test('route comparison retains safe upstream status without exposing server diag
   assert.equal(failure.status,503);assert.equal(failure.upstreamStatus,520);assert.doesNotMatch(failure.message,/private-canary/);
   assert.deepEqual(modelRouteComparison({status:200,models:7,secret:'private-canary'},failure),{local:{status:200,models:7},cloud:{status:503,completed:false,failure:'model_catalog_unavailable',upstreamStatus:520}});
   assert.doesNotMatch(JSON.stringify(modelRouteComparison({status:200,models:7},{status:520,code:'private-canary',message:'private-canary'})),/private-canary/);
+});
+
+test('local header control matches the server and all controls suppress credentials and catalogue metadata',async()=>{
+  const sameHeaders=await localModelDiscovery('test-only-access',async(url,options)=>{
+    assert.equal(url,`${RESOURCE}/models`);assert.equal(options.headers['user-agent'],'Timber/0.1.0');assert.equal(options.headers['accept-encoding'],'identity');
+    return Response.json({models:[{slug:'test-model',display_name:'Test',visibility:'list',private:'private-canary'}]});
+  },true);
+  const value=modelRouteComparison({status:200,models:1},{status:503,code:'model_catalog_unavailable',upstreamStatus:520},
+    {sameHeaders:{...sameHeaders,token:'private-canary'},afterCloud:{status:200,models:1,secret:'private-canary'},localInference:{status:200,completed:true,model:'private-canary',output:'private-canary'}});
+  assert.deepEqual(value.controls,{sameHeaders:{status:200,models:1},afterCloud:{status:200,models:1},localInference:{status:200,completed:true}});
+  assert.doesNotMatch(JSON.stringify(value),/private-canary/);
+});
+
+test('local inference calls only the fixed plan endpoint once and requires a completed SSE event',async()=>{
+  let calls=0;
+  const result=await localModelInference('test-only-access','test-discovered-model',async(url,options)=>{
+    calls++;assert.equal(url,`${RESOURCE}/responses`);assert.equal(options.method,'POST');assert.equal(options.redirect,'error');
+    const body=JSON.parse(options.body);assert.equal(body.model,'test-discovered-model');assert.equal(body.store,false);assert.equal(body.stream,true);
+    assert.equal(options.headers['user-agent'],'Timber/0.1.0');assert.equal(options.headers['accept-encoding'],'identity');
+    return new Response(new ReadableStream({start(controller){
+      controller.enqueue(new TextEncoder().encode('event: response.completed\ndata: {"type":"response.comp'));
+      controller.enqueue(new TextEncoder().encode('leted","response":{"status":"completed","output":"private-canary"}}\n\n'));controller.close();
+    }}),{headers:{'content-type':'text/event-stream'}});
+  });
+  assert.deepEqual(result,{status:200,completed:true});assert.equal(calls,1);assert.doesNotMatch(JSON.stringify(result),/private-canary/);
+});
+
+test('local inference never retries failures or treats an incomplete stream as success',async()=>{
+  let calls=0;
+  const failed=await localModelInference('test-only-access','test-discovered-model',async()=>{calls++;return new Response('private-canary',{status:520});});
+  assert.deepEqual(failed,{status:520,completed:false,failure:'http_error'});assert.equal(calls,1);
+  const partial=await localModelInference('test-only-access','test-discovered-model',async()=>new Response('data: {"type":"response.created"}\n\n'));
+  assert.equal(partial.completed,false);assert.equal(partial.failure,'response_incomplete');
+  const unknown=await localModelInference('test-only-access',undefined,async()=>{throw new Error('must not send an undiscovered model');});
+  assert.equal(unknown.failure,'catalog_unavailable');
 });
