@@ -2,6 +2,10 @@ name: Probe the connected ChatGPT model catalogue
 on:
   workflow_dispatch:
     inputs:
+      inspect_transport:
+        description: Read private transport provisioning metadata only, without model calls or credentials
+        type: boolean
+        default: false
       renew_credentials:
         description: Request one serialized token renewal if allowed, preserving provider renewal limits
         type: boolean
@@ -38,4 +42,10 @@ jobs:
           VERIFY_MODEL_INFERENCE: ${{ inputs.verify_inference && '1' || '' }}
           COMPARE_MODEL_AUTHENTICATION: ${{ inputs.compare_authentication && '1' || '' }}
           RENEW_MODEL_CREDENTIALS: ${{ inputs.renew_credentials && '1' || '' }}
-        run: node scripts/probe-model-catalog.mjs
+          INSPECT_MODEL_TRANSPORT: ${{ inputs.inspect_transport && '1' || '' }}
+        run: |
+          if [ "$INSPECT_MODEL_TRANSPORT" = '1' ]; then
+            node scripts/inspect-model-transport.mjs
+          else
+            node scripts/probe-model-catalog.mjs
+          fi
