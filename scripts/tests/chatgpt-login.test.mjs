@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from 'jose';
-import { authorizationUrl, cloudRequest, createAttempt, discoverOpenAI, exchangeCode, OPENAI_ISSUER, parseCallback, prepareImport, readRegistration, RESOURCE, saveRegistration, SCOPES, startCallbackListener, validateIdentity } from '../chatgpt-login.mjs';
+import { authorizationUrl, cloudRequest, createAttempt, discoverOpenAI, exchangeCode, localModelDiscovery, modelRouteComparison, OPENAI_ISSUER, parseCallback, prepareImport, readRegistration, RESOURCE, saveRegistration, SCOPES, startCallbackListener, validateIdentity } from '../chatgpt-login.mjs';
 
 const hostId = 'urn:uuid:11111111-1111-4111-8111-111111111111';
 const clientId = 'oaiapp_test_client';
@@ -121,4 +121,20 @@ test('local registration is private metadata only and scoped to deployment plus 
 test('discovery rejects substituted signing-key origin and errors never echo provider payloads', async () => {
   await assert.rejects(discoverOpenAI(async () => Response.json({ issuer: OPENAI_ISSUER, jwks_uri: 'https://attacker.invalid/jwks' })), /trusted issuer/);
   await assert.rejects(cloudRequest({ apiUrl: 'https://timber.example', apiToken: 'test-api' }, { fetchImpl: async () => Response.json({ error: { code: 'unknown', message: 'must-not-display' } }, { status: 403 }) }), (error) => !error.message.includes('must-not-display'));
+});
+test('local route comparison sends the fresh credential only to fixed OpenAI discovery and emits counts',async()=>{
+  const result=await localModelDiscovery('test-fresh-access',async(url,options)=>{
+    assert.equal(url,`${RESOURCE}/models`);assert.equal(options.headers.authorization,'Bearer test-fresh-access');assert.equal(options.redirect,'error');
+    return Response.json({account:'private-canary',models:[{slug:'private-canary',display_name:'Private model',visibility:'list'},{slug:'hidden',visibility:'hide'}]});
+  });
+  assert.deepEqual(result,{status:200,models:1});assert.doesNotMatch(JSON.stringify(result),/private-canary|test-fresh-access/);
+  const error=await localModelDiscovery('test-fresh-access',async()=>new Response('private-canary',{status:520}));assert.deepEqual(error,{status:520,models:null,failure:'http_error'});
+  const invalid=await localModelDiscovery('test-fresh-access',async()=>Response.json({models:[{visibility:'list',slug:'private-canary'}]}));assert.deepEqual(invalid,{status:200,models:null,failure:'invalid_model_catalog'});
+});
+test('route comparison retains safe upstream status without exposing server diagnostics or unknown codes',async()=>{
+  let failure;
+  try{await cloudRequest({apiUrl:'https://timber.test',apiToken:'test-owner'}, {suffix:'/verify',method:'POST',body:{},fetchImpl:async()=>Response.json({error:{code:'model_catalog_unavailable',message:'ChatGPT model catalogue unavailable (HTTP 520; model_provider_unavailable). private-canary'}},{status:503})});}catch(error){failure=error;}
+  assert.equal(failure.status,503);assert.equal(failure.upstreamStatus,520);assert.doesNotMatch(failure.message,/private-canary/);
+  assert.deepEqual(modelRouteComparison({status:200,models:7,secret:'private-canary'},failure),{local:{status:200,models:7},cloud:{status:503,completed:false,failure:'model_catalog_unavailable',upstreamStatus:520}});
+  assert.doesNotMatch(JSON.stringify(modelRouteComparison({status:200,models:7},{status:520,code:'private-canary',message:'private-canary'})),/private-canary/);
 });

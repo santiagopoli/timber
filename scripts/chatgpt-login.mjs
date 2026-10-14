@@ -18,6 +18,7 @@ const REGISTRATION_URL = new URL('../.local/chatgpt-registration.json', import.m
 const SAFE_ALGORITHMS = ['RS256', 'PS256', 'ES256', 'EdDSA'];
 
 export class LoginError extends Error {}
+const ROUTE_ERRORS=new Set(['model_catalog_unavailable','model_provider_unavailable','model_unavailable','chatgpt_not_connected','chatgpt_reauthorization_required','chatgpt_scope_missing','chatgpt_refresh_failed','chatgpt_refresh_pending','chatgpt_connection_changed','model_access_denied','model_rate_limited','chatgpt_allowance_exhausted','chatgpt_usage_unavailable','unauthorized','not_found','chatgpt_verification_incomplete']);
 const fail = (message) => { throw new LoginError(message); };
 const opaque = (value, max = 512) => typeof value === 'string' && value.length > 0 && value.length <= max && !/[\x00-\x20\x7f]/.test(value);
 const issuedClient = (value) => opaque(value, 256) && /^[A-Za-z0-9_-]+$/.test(value) && value !== DYNAMIC_CLIENT;
@@ -75,9 +76,40 @@ export async function cloudRequest(config, { method = 'GET', suffix = '', body, 
       chatgpt_rate_limited: 'ChatGPT usage is currently limited. Review your plan usage and try verification later.',
       chatgpt_identity_mismatch: 'The returned ChatGPT account differs from the saved registration. The connection was not replaced.',
     };
-    fail(messages[code] || (response.status === 401 ? messages.unauthorized : `Timber could not complete this request (HTTP ${response.status}). Inspect the connection status in the console.`));
+    const error=new LoginError(messages[code] || (response.status === 401 ? messages.unauthorized : `Timber could not complete this request (HTTP ${response.status}). Inspect the connection status in the console.`));
+    error.status=response.status;error.code=ROUTE_ERRORS.has(code)?code:'unknown';
+    const upstream=typeof value?.error?.message==='string'?value.error.message.match(/^ChatGPT model catalogue unavailable \(HTTP ([1-5]\d{2}); [a-z_]+\)\./):null;
+    if(upstream)error.upstreamStatus=Number(upstream[1]);
+    throw error;
   }
   return value;
+}
+
+/** Runs only before the existing local-to-cloud handoff. It never retrieves a
+ * server credential, retains tokens or prints account/model metadata. */
+export async function localModelDiscovery(accessToken,fetchImpl=fetch) {
+  if(!opaque(accessToken,65536))fail('The local comparison requires the freshly issued access token.');
+  let receivedStatus;
+  try {
+    const response=await fetchImpl(`${RESOURCE}/models`,{headers:{authorization:`Bearer ${accessToken}`,accept:'application/json'},redirect:'error',signal:AbortSignal.timeout(30_000)});
+    receivedStatus=response.status;
+    if(!response.ok){await response.body?.cancel().catch(()=>{});return {status:response.status,models:null,failure:'http_error'};}
+    const reader=response.body?.getReader();let text='',bytes=0;
+    try {const decoder=new TextDecoder();if(!reader)throw new Error('empty');for(;;){const part=await reader.read();if(part.done)break;bytes+=part.value.byteLength;if(bytes>2_000_000)throw new Error('large');text+=decoder.decode(part.value,{stream:true});}text+=decoder.decode();}
+    finally{await reader?.cancel().catch(()=>{});}
+    let raw;try{raw=JSON.parse(text);}catch{return {status:response.status,models:null,failure:'invalid_model_catalog'};}
+    if(!Array.isArray(raw?.models))return {status:response.status,models:null,failure:'invalid_model_catalog'};
+    const listed=raw.models.filter(model=>model&&model.visibility==='list');
+    if(listed.some(model=>typeof model.slug!=='string'||!model.slug.trim()||model.slug.length>200||typeof model.display_name!=='string'||!model.display_name.trim()||model.display_name.length>200))return {status:response.status,models:null,failure:'invalid_model_catalog'};
+    return {status:response.status,models:listed.length};
+  }catch{return {status:receivedStatus??null,models:null,failure:receivedStatus===undefined?'transport_failed':'catalog_read_failed'};}
+}
+
+export function modelRouteComparison(local,cloud) {
+  const status=value=>Number.isInteger(value)&&value>=100&&value<=599?value:null;
+  return {local:{status:status(local?.status),models:Number.isSafeInteger(local?.models)&&local.models>=0?local.models:null},
+    cloud:{status:status(cloud?.status),completed:cloud?.completed===true,failure:ROUTE_ERRORS.has(cloud?.code)?cloud.code:cloud?.completed===true?null:'unknown',
+      ...(status(cloud?.upstreamStatus)?{upstreamStatus:status(cloud.upstreamStatus)}:{})}};
 }
 
 export async function readRegistration(config, hostId, metadataUrl = REGISTRATION_URL) {
@@ -250,7 +282,7 @@ async function openBrowser(url) {
   });
 }
 
-export async function runLogin({ noOpen = false } = {}) {
+export async function runLogin({ noOpen = false,compareRoute=false } = {}) {
   const config = await loadConnectionConfig();
   const status = await cloudRequest(config);
   if (!opaque(status.hostId)) fail('Timber has no persistent ChatGPT host ID. Deploy the current backend first.');
@@ -277,6 +309,8 @@ export async function runLogin({ noOpen = false } = {}) {
     await saveRegistration(config, status.hostId, identity);
     checkCancelled();
     const payload = prepareImport(tokens, callback.clientId, attempt);
+    const local=compareRoute?await localModelDiscovery(tokens.access_token):undefined;
+    if(local)console.log(`Local model discovery: HTTP ${local.status??'unavailable'}${local.models===null?'':` (${local.models} listed models)`}. Only counts and status are reported.`);
     let imported;
     try { imported = await cloudRequest(config, { method: 'POST', body: payload }); }
     catch (error) { throw new LoginError(`${error.message} Credentials were not saved locally. Run npm run chatgpt:status to check whether the cloud import completed.`); }
@@ -284,9 +318,12 @@ export async function runLogin({ noOpen = false } = {}) {
     console.log('ChatGPT connected. The cloud backend now owns token refresh; no tokens were saved on this computer.');
     checkCancelled();
     console.log('Verifying access with one small request to an available account model…');
-    const verified = await cloudRequest(config, { method: 'POST', suffix: '/verify', body: {} });
+    let verified;
+    try{verified=await cloudRequest(config, { method: 'POST', suffix: '/verify', body: {} });}
+    catch(error){if(compareRoute)console.log(JSON.stringify({modelRouteComparison:modelRouteComparison(local,error)}));throw error;}
     if (verified.ok !== true || typeof verified.model !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(verified.model)) fail('ChatGPT is connected, but model access was not confirmed.');
     console.log(`Verified: ${verified.model} completed a real request using the connected ChatGPT plan.`);
+    if(compareRoute)console.log(JSON.stringify({modelRouteComparison:modelRouteComparison(local,{status:200,completed:true})}));
   } finally {
     listener.stop(); process.removeListener('SIGINT', cancel); process.removeListener('SIGTERM', cancel);
     if (tokens) for (const key of Object.keys(tokens)) delete tokens[key];
@@ -296,11 +333,11 @@ export async function runLogin({ noOpen = false } = {}) {
 async function main() {
   const args = new Set(process.argv.slice(2));
   if (args.has('--help')) {
-    console.log('Run locally on the computer with your browser:\n  npm run access:setup\n  npm run chatgpt:login [-- --no-open]\n\nUses official ChatGPT authorization with a temporary 127.0.0.1 callback. Transfers credentials securely to your configured Timber backend, which owns refresh. Saves only registration metadata locally. Performs one small verification request using an available account model after connecting.');
+    console.log('Run locally on the computer with your browser:\n  npm run access:setup\n  npm run chatgpt:login [-- --no-open] [--compare-route]\n\nUses official ChatGPT authorization with a temporary 127.0.0.1 callback. Transfers credentials securely to your configured Timber backend, which owns refresh. Saves only registration metadata locally. Performs one small verification request using an available account model after connecting. --compare-route also checks local model discovery before sending the same fresh credential to Timber; outputs only statuses and counts.');
     return;
   }
-  for (const arg of args) if (arg !== '--no-open') fail('Unknown option. Use npm run chatgpt:login -- --help.');
-  await runLogin({ noOpen: args.has('--no-open') });
+  for (const arg of args) if (!['--no-open','--compare-route'].includes(arg)) fail('Unknown option. Use npm run chatgpt:login -- --help.');
+  await runLogin({ noOpen: args.has('--no-open'),compareRoute:args.has('--compare-route') });
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error) => { console.error(error instanceof LoginError ? error.message : 'ChatGPT sign-in failed. Check local file permissions and connectivity, then try again.'); process.exitCode = 1; });

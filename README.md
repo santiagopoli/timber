@@ -367,6 +367,12 @@ Timber backend and tests a real response using an available account model. A suc
 alone does not mark model access as verified. No password or token is pasted into
 chat. The CLI retains only registration metadata, not OAuth tokens.
 
+For a network comparison during a fresh sign-in, run
+`npm run chatgpt:login -- --compare-route`. It requests the catalogue locally
+before handing the same fresh credential to Timber, then performs the existing
+cloud verification. It reports only HTTP statuses, model counts and fixed failure
+codes. It does not retrieve a token from the server or retain one locally.
+
 One dedicated Durable Object owns the encrypted credentials for this deployment
 and serializes refresh-token rotation across bots. Credentials are never stored
 in bot histories, computer workspaces, R2 checkpoints or browser storage. The

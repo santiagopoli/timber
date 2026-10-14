@@ -81,12 +81,11 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
     this.key=await crypto.subtle.importKey("raw",Uint8Array.from(value.match(/../g)!,x=>parseInt(x,16)),"AES-GCM",false,["encrypt","decrypt"]);
     return this.key;
   }
-  private async saveTokens(tokens:Tokens,connection?:Connection):Promise<void> {
+  private async saveTokens(tokens:Tokens,connection?:Connection,renewal?:{revision:string;expiresAt:number}):Promise<void> {
     const iv=crypto.getRandomValues(new Uint8Array(12));
     const ciphertext=await crypto.subtle.encrypt({name:"AES-GCM",iv,additionalData:encoder.encode(this.hostId)},await this.encryptionKey(),encoder.encode(JSON.stringify(tokens)));
     const credentials:Ciphertext={iv:encode(iv),ciphertext:encode(new Uint8Array(ciphertext))};
-    if(connection) await this.ctx.storage.put({credentials,connection});
-    else await this.ctx.storage.put("credentials",credentials);
+    await this.ctx.storage.put({credentials,...(connection?{connection}:{}),...(renewal?{diagnosticRenewal:renewal}:{})});
   }
   private async readTokens():Promise<Tokens> {
     const record=await this.ctx.storage.get<Ciphertext>("credentials");
@@ -169,7 +168,7 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
     const granted=scopes(access.scope);
     const earliestRefreshAt=refreshTime(data.earliest_refresh_at,access.exp!*1000);
     const replacement:Tokens={accessToken,refreshToken,idToken:typeof data.id_token==="string"?data.id_token:tokens.idToken,scopes:granted,expiresAt:access.exp!*1000,...(earliestRefreshAt===undefined?{}:{earliestRefreshAt})};
-    await this.saveTokens(replacement);
+    await this.saveTokens(replacement,undefined,renew?{revision:this.revision(connection),expiresAt:replacement.expiresAt}:undefined);
     return accessToken;
   }
   private revision(connection:Connection):string {return connection.revision??`${connection.account.clientId}:${connection.account.subject}`;}
@@ -265,7 +264,6 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
       const performed=await this.ctx.storage.get<{revision:string;expiresAt:number}>('diagnosticRenewal');
       const mayRenew=renew&&!(performed?.revision===this.revision(connection)&&performed.expiresAt===previous.expiresAt);
       const token=await this.token(mayRenew),tokens=await this.readTokens();
-      if(renew&&token!==previous.accessToken)await this.ctx.storage.put('diagnosticRenewal',{revision:this.revision(connection),expiresAt:tokens.expiresAt});
       const claims=decodeJwt(token),granted=typeof claims.scope==='string'?claims.scope.split(/\s+/):[];
       this.active.add(controller);
       return {token,revision:this.revision(connection),credential:{
@@ -281,7 +279,8 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
         ...(tokens.earliestRefreshAt===undefined?{}:{renewalBlockedForSeconds:Math.max(0,Math.ceil((tokens.earliestRefreshAt-Date.now())/1000))}),
       }};
     });
-    const variants:[string,Record<string,string>][]=[['timber',{'User-Agent':'Timber/0.1.0'}],['minimal',{}],['json',{Accept:'application/json'}],['unauthenticated',{}]];
+    const variants:[string,Record<string,string>][]=[['timber',{'User-Agent':'Timber/0.1.0'}],['minimal',{}],['json',{Accept:'application/json'}],
+      ['identity',{Accept:'application/json','Accept-Encoding':'identity'}],['gzip',{Accept:'application/json','Accept-Encoding':'gzip'}],['unauthenticated',{}]];
     const checks=[];
     try {
       for(const [variant,headers] of variants) {
