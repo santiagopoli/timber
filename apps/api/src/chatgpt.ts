@@ -33,6 +33,15 @@ function scopes(value:unknown):string[] {
   if(!items.includes(PLAN_SCOPE) || !items.includes("resource.invoke")) throw new ApiError(400,"chatgpt_scope_missing","ChatGPT plan permission was not granted. Sign in again and authorize plan usage.");
   return items;
 }
+function refreshTime(value:unknown,expiresAt:number):number|undefined {
+  if(value===undefined||value===null)return;
+  const seconds=typeof value==='number'?value:typeof value==='string'&&/^\d+(?:\.\d+)?$/.test(value)?Number(value):undefined;
+  const time=seconds===undefined&&typeof value==='string'&&/^\d{4}-\d{2}-\d{2}T/.test(value)?Date.parse(value):seconds===undefined?NaN:seconds*1000;
+  // Retain a successfully rotated credential even if this optional scheduling
+  // field is malformed; conservatively wait until expiry before renewing it.
+  if(!Number.isFinite(time)||time<0)return expiresAt;
+  return time;
+}
 function authURL(value:unknown):string {
   if(typeof value!=="string") throw new ApiError(502,"chatgpt_discovery_failed","OpenAI authentication configuration is unavailable.");
   const url=new URL(value);
@@ -121,7 +130,7 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
     const granted=scopes(access.scope);
     const previous=await this.ctx.storage.get<Connection>("connection");
     if(previous && await this.ctx.storage.get("credentials") && (previous.account.subject!==identity.sub || previous.account.clientId!==clientId)) throw new ApiError(409,"chatgpt_account_mismatch","Disconnect the existing ChatGPT account before connecting another registration.");
-    const earliestRefreshAt=typeof data.earliest_refresh_at==="number"?data.earliest_refresh_at*1000:undefined;
+    const earliestRefreshAt=refreshTime(data.earliest_refresh_at,access.exp!*1000);
     const tokens:Tokens={accessToken,refreshToken,idToken,scopes:granted,expiresAt:access.exp!*1000,...(earliestRefreshAt?{earliestRefreshAt}:{})};
     await this.ctx.storage.delete("modelCatalog");this.catalogPending=undefined;this.staleCatalog=undefined;
     await this.saveTokens(tokens,{revision:crypto.randomUUID(),account:{clientId,subject:identity.sub!,...(typeof identity.email==="string"?{email:identity.email}:{})}});
@@ -133,12 +142,12 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
     const credentials=await this.ctx.storage.get<Ciphertext>("credentials");
     return {connected:Boolean(credentials && !connection?.needsReauth),hostId:this.hostId,model:MODEL,status:connection?.needsReauth?"reauthorization_required":!credentials?"disconnected":connection?.verifiedAt?"verified":"connected_unverified",...(connection?{account:connection.account,verifiedAt:connection.verifiedAt}:{})};
   }
-  private async token():Promise<string> {
+  private async token(renew=false):Promise<string> {
     // Called only under lock. One owner rotates a session even across many bots.
     const tokens=await this.readTokens();
     const connection=await this.ctx.storage.get<Connection>("connection");
     if(!connection || connection.needsReauth) throw new ApiError(401,"chatgpt_reauthorization_required","Sign in to ChatGPT again.");
-    if(tokens.expiresAt>Date.now()+60_000) return tokens.accessToken;
+    if(!renew&&tokens.expiresAt>Date.now()+60_000) return tokens.accessToken;
     if(tokens.earliestRefreshAt && tokens.earliestRefreshAt>Date.now()) {
       if(tokens.expiresAt>Date.now()+5_000) return tokens.accessToken;
       throw new ApiError(503,"chatgpt_refresh_pending","OpenAI has not allowed token renewal yet. Try again shortly.");
@@ -158,7 +167,8 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
     const access=await this.verifyToken(accessToken,RESOURCE);
     if(access.sub!==connection.account.subject || access.client_id!==connection.account.clientId) throw new ApiError(401,"chatgpt_invalid_identity","The refreshed ChatGPT identity did not match.");
     const granted=scopes(access.scope);
-    const replacement:Tokens={accessToken,refreshToken,idToken:typeof data.id_token==="string"?data.id_token:tokens.idToken,scopes:granted,expiresAt:access.exp!*1000,...(typeof data.earliest_refresh_at==="number"?{earliestRefreshAt:data.earliest_refresh_at*1000}:{})};
+    const earliestRefreshAt=refreshTime(data.earliest_refresh_at,access.exp!*1000);
+    const replacement:Tokens={accessToken,refreshToken,idToken:typeof data.id_token==="string"?data.id_token:tokens.idToken,scopes:granted,expiresAt:access.exp!*1000,...(earliestRefreshAt===undefined?{}:{earliestRefreshAt})};
     await this.saveTokens(replacement);
     return accessToken;
   }
@@ -248,10 +258,14 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
   }
   /** Private operational comparison. Credentials never leave this owner and
    * every variant contacts the same fixed public model endpoint. */
-  private async diagnostics():Promise<Response> {
+  private async diagnostics(renew=false):Promise<Response> {
     const controller=new AbortController();
     const initial=await this.lock(async()=>{
-      const token=await this.token(),tokens=await this.readTokens(),connection=(await this.ctx.storage.get<Connection>('connection'))!;
+      const previous=await this.readTokens(),connection=(await this.ctx.storage.get<Connection>('connection'))!;
+      const performed=await this.ctx.storage.get<{revision:string;expiresAt:number}>('diagnosticRenewal');
+      const mayRenew=renew&&!(performed?.revision===this.revision(connection)&&performed.expiresAt===previous.expiresAt);
+      const token=await this.token(mayRenew),tokens=await this.readTokens();
+      if(renew&&token!==previous.accessToken)await this.ctx.storage.put('diagnosticRenewal',{revision:this.revision(connection),expiresAt:tokens.expiresAt});
       const claims=decodeJwt(token),granted=typeof claims.scope==='string'?claims.scope.split(/\s+/):[];
       this.active.add(controller);
       return {token,revision:this.revision(connection),credential:{
@@ -262,14 +276,17 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
         issuerMatches:claims.iss===ISSUER,subjectMatches:claims.sub===connection.account.subject,
         clientMatches:claims.client_id===connection.account.clientId,
         scopesMatch:granted.includes(PLAN_SCOPE)&&granted.includes('resource.invoke'),
+        renewalRequested:renew,renewed:token!==previous.accessToken,
+        renewalAlreadyPerformed:renew&&!mayRenew,
+        ...(tokens.earliestRefreshAt===undefined?{}:{renewalBlockedForSeconds:Math.max(0,Math.ceil((tokens.earliestRefreshAt-Date.now())/1000))}),
       }};
     });
-    const variants:[string,Record<string,string>][]=[['timber',{'User-Agent':'Timber/0.1.0'}],['minimal',{}],['json',{Accept:'application/json'}]];
+    const variants:[string,Record<string,string>][]=[['timber',{'User-Agent':'Timber/0.1.0'}],['minimal',{}],['json',{Accept:'application/json'}],['unauthenticated',{}]];
     const checks=[];
     try {
       for(const [variant,headers] of variants) {
         try {
-          const response=await fetch(`${RESOURCE}/models`,{headers:{Authorization:`Bearer ${initial.token}`,...headers},redirect:'manual',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(15_000)])});
+          const response=await fetch(`${RESOURCE}/models`,{headers:{...(variant==='unauthenticated'?{}:{Authorization:`Bearer ${initial.token}`}),...headers},redirect:'manual',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10_000)])});
           const reader=response.body?.getReader();let text='',bytes=0;
           try {const decoder=new TextDecoder();if(reader)for(;;){const part=await reader.read();if(part.done)break;bytes+=part.value.byteLength;if(bytes>32_000)break;text+=decoder.decode(part.value,{stream:true});}}
           finally{await reader?.cancel().catch(()=>{});}
@@ -283,6 +300,7 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
             bodyKind:response.headers.get('cf-mitigated')==='challenge'?'challenge':text.trim()==='Origin is disallowed'?'origin_disallowed':/error code: 520|cloudflare.*(?:error|ray)|error_category/i.test(text)?'cloudflare_error':detail?'api_error':'other',
             failure:response.ok?null:publicProviderError(response.status,detail).code,
             requestIdPresent:response.headers.has('x-request-id'),rayPresent:response.headers.has('cf-ray'),
+            ...(response.headers.get('cf-ray')?.match(/-([A-Z]{3})$/)?.[1]?{rayColo:response.headers.get('cf-ray')!.match(/-([A-Z]{3})$/)![1]}:{}),
             ...(['origin','cloudflare','ssl'].includes(String(category))?{edgeCategory:category}:{}),
           });
         }catch{checks.push({variant,failure:'model_connection_interrupted'});}
@@ -401,7 +419,7 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
       if(path==="/" && request.method==="POST") return await this.lock(()=>this.import(request));
       if(path==="/" && request.method==="DELETE") return await this.lock(()=>this.disconnect());
       if(path==="/models" && request.method==="GET") return json(await this.catalog());
-      if(path==='/diagnostics'&&request.method==='POST'&&request.headers.get('x-timber-internal')==='model-diagnostics')return await this.diagnostics();
+      if(path==='/diagnostics'&&request.method==='POST'&&request.headers.get('x-timber-internal')==='model-diagnostics')return await this.diagnostics(request.headers.get('x-timber-diagnostics-renew')==='1');
       if(path==="/validate-model" && request.method==="POST") {
         const data=await body(request);
         if(typeof data.model!=="string" || (data.reasoningEffort!==undefined && typeof data.reasoningEffort!=="string") || (data.fast!==undefined && typeof data.fast!=="boolean")) throw new ApiError(400,"invalid_model_settings","Invalid model settings.");

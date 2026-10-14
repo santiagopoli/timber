@@ -46,6 +46,16 @@ test('authentication comparison filters credentials, claim values and arbitrary 
   const value=JSON.parse(text);assert.equal(value.credential.accessBytes,2000);assert.equal(value.checks[0].failure,'model_provider_unavailable');assert.equal(value.checks[1].variant,'unknown');
   assert.equal((await worker.fetch(new Request('https://probe.test/authentication',{method:'POST'}),env)).status,401);
 });
+test('explicit renewal stays behind the probe guard and uses only the private owner comparison',async()=>{
+  let calls=0;
+  const env={PROBE_TOKEN_SHA256:hash,CHATGPT:{idFromName(name){assert.equal(name,'owner');return name;},get(){return {async fetch(url,options){
+    calls++;assert.equal(url,'https://chatgpt/diagnostics');assert.equal(options.method,'POST');assert.equal(options.headers['x-timber-diagnostics-renew'],'1');
+    return Response.json({credential:{renewalRequested:true,renewed:true},checks:[{variant:'unauthenticated',status:401,rayColo:'AMS',failure:'chatgpt_not_connected'}]});
+  }};}}};
+  const denied=await worker.fetch(new Request('https://probe.test/renew-authentication',{method:'POST'}),env);assert.equal(denied.status,401);assert.equal(calls,0);
+  const result=await worker.fetch(new Request('https://probe.test/renew-authentication',{method:'POST',headers:{authorization:`Bearer ${token}`}}),env);
+  const value=await result.json();assert.equal(calls,1);assert.equal(value.credential.renewed,true);assert.equal(value.checks[0].rayColo,'AMS');
+});
 test('transport comparison contacts only fixed OpenAI endpoints without account authorization',async()=>{
   const original=globalThis.fetch,calls=[];
   globalThis.fetch=async(url,options)=>{

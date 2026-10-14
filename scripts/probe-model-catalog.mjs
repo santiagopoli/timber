@@ -10,7 +10,7 @@ const exec=promisify(execFile);
 
 export async function requestProbe(url,token,fetcher=fetch,wait=ms=>new Promise(resolve=>setTimeout(resolve,ms)),method='GET') {
   for(let attempt=0;attempt<6;attempt++) {
-    const response=await fetcher(url,{method,headers:{authorization:`Bearer ${token}`},redirect:'error',signal:AbortSignal.timeout(60_000)});
+    const response=await fetcher(url,{method,headers:{authorization:`Bearer ${token}`},redirect:'error',signal:AbortSignal.timeout(90_000)});
     if(response.ok)return response;
     await response.body?.cancel().catch(()=>{});
     if(![404,503].includes(response.status)||attempt===5)throw new Error(`probe_http_${response.status}`);
@@ -49,8 +49,8 @@ async function main() {
     console.log(JSON.stringify(queue));
     const transport=await (await requestProbe(`${url}/transport`,token)).json();
     console.log(JSON.stringify(transport));
-    if(process.env.COMPARE_MODEL_AUTHENTICATION==='1'){
-      const comparison=await (await requestProbe(`${url}/authentication`,token,fetch,undefined,'POST')).json();
+    if(process.env.COMPARE_MODEL_AUTHENTICATION==='1'||process.env.RENEW_MODEL_CREDENTIALS==='1'){
+      const comparison=await (await requestProbe(`${url}/${process.env.RENEW_MODEL_CREDENTIALS==='1'?'renew-authentication':'authentication'}`,token,fetch,undefined,'POST')).json();
       console.log(JSON.stringify({authenticationComparison:comparison}));
     }
     if(process.env.VERIFY_MODEL_INFERENCE==='1'){

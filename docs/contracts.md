@@ -752,6 +752,13 @@ Timber, minimal and JSON Accept headers. Results contain token byte length,
 remaining lifetime and identity/grant matching booleans, plus fixed HTTP/body
 categories. Tokens, claim values, provider prose and request identifiers remain
 inside the credential owner; the probe also filters the returned shape.
+It includes an unauthenticated control from the same Durable Object and safe
+Cloudflare colo labels. An explicit operator comparison can request one serialized
+credential renewal per access-token lifetime; this is never an inference retry or
+automatic paid fallback. It respects numeric, numeric-string and RFC 3339 renewal
+times and persists the completed renewal marker across eviction. An unreadable
+optional time conservatively defers further renewal until expiry while retaining
+the valid rotating replacement.
 
 `Bot.model`, `Bot.reasoningEffort?` and `Bot.fast?` are persisted configuration.
 Explicit selections on creation or PATCH must be available in a connected

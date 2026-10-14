@@ -112,7 +112,8 @@ describe("ChatGPT public connection boundary", () => {
     await (await stub.fetch('https://chatgpt/models')).text();
     modelCalls=[];modelHeaders=[];
     const replies=[()=>new Response('Cloudflare error code: 520 private-canary',{status:520,headers:{'content-type':'text/html','cf-ray':'private-canary'}}),
-      ()=>Response.json(defaultModels),()=>Response.json({error_category:'origin',error:{code:'server_error',message:'private-canary'}},{status:520,headers:{'x-request-id':'private-canary'}})];
+      ()=>Response.json(defaultModels),()=>Response.json({error_category:'origin',error:{code:'server_error',message:'private-canary'}},{status:520,headers:{'x-request-id':'private-canary'}}),
+      ()=>Response.json({error:{code:'invalid_api_key',message:'private-canary'}},{status:401,headers:{'cf-ray':'0000000000000000-AMS'}})];
     catalogResponse=()=>replies.shift()!();
     const response=await stub.fetch('https://chatgpt/diagnostics',{method:'POST',headers:{'x-timber-internal':'model-diagnostics'}});
     expect(response.status).toBe(200);
@@ -120,12 +121,50 @@ describe("ChatGPT public connection boundary", () => {
     expect(result.credential).toMatchObject({accessBytes:new TextEncoder().encode(payload.access_token).byteLength,expiryMatches:true,audienceMatches:true,issuerMatches:true,subjectMatches:true,clientMatches:true,scopesMatch:true});
     expect(result.credential.expiresInSeconds).toBeGreaterThan(3500);
     expect(result.checks).toMatchObject([{variant:'timber',status:520,bodyKind:'cloudflare_error',rayPresent:true},
-      {variant:'minimal',status:200,failure:null},{variant:'json',status:520,format:'json',bodyKind:'cloudflare_error',edgeCategory:'origin',requestIdPresent:true}]);
-    expect(modelCalls).toEqual(Array(3).fill(`Bearer ${payload.access_token}`));
-    expect(modelHeaders.map(headers=>headers.get('user-agent'))).toEqual(['Timber/0.1.0',null,null]);
-    expect(modelHeaders.map(headers=>headers.get('accept'))).toEqual([null,null,'application/json']);
+      {variant:'minimal',status:200,failure:null},{variant:'json',status:520,format:'json',bodyKind:'cloudflare_error',edgeCategory:'origin',requestIdPresent:true},
+      {variant:'unauthenticated',status:401,rayColo:'AMS'}]);
+    expect(modelCalls).toEqual([...Array(3).fill(`Bearer ${payload.access_token}`),'']);
+    expect(modelHeaders.map(headers=>headers.get('user-agent'))).toEqual(['Timber/0.1.0',null,null,null]);
+    expect(modelHeaders.map(headers=>headers.get('accept'))).toEqual([null,null,'application/json',null]);
     for(const secret of [payload.access_token,payload.refresh_token,payload.id_token,CLIENT_ID,'test-user','private-canary'])expect(text).not.toContain(secret);
     expect(refreshCalls).toHaveLength(0);expect(responseCalls).toHaveLength(0);
+  });
+  it('renews once on explicit operator comparison and retains the replacement through eviction',async()=>{
+    const stub=newStub(),payload=await credentials(String((await status(stub)).hostId));
+    await connect(stub,payload);
+    const replacement=await credentials(payload.ext_agent_host_id,{expiresAt:Math.floor(Date.now()/1000)+7200});
+    refreshedTokens={...replacement,refresh_token:'test-refresh-token-replacement',earliest_refresh_at:new Date(Date.now()+3600_000).toISOString()};
+    const request=(target=stub)=>target.fetch('https://chatgpt/diagnostics',{method:'POST',headers:{'x-timber-internal':'model-diagnostics','x-timber-diagnostics-renew':'1'}});
+    const first=await (await request()).json<{credential:Record<string,unknown>}>();
+    expect(first.credential).toMatchObject({renewalRequested:true,renewed:true,renewalAlreadyPerformed:false});
+    expect(Number(first.credential.renewalBlockedForSeconds)).toBeGreaterThan(3500);
+    expect(refreshCalls).toEqual([payload.refresh_token]);
+    await abortAllDurableObjects();
+    const recovered=bindings.CHATGPT.get(stub.id);
+    const again=await (await request(recovered)).json<{credential:Record<string,unknown>}>();
+    expect(again.credential).toMatchObject({renewalRequested:true,renewed:false,renewalAlreadyPerformed:true});
+    expect(refreshCalls).toHaveLength(1);
+    await (await recovered.fetch('https://chatgpt/',{method:'DELETE'})).text();
+    expect(revocations[0].get('token')).toBe('test-refresh-token-replacement');
+  });
+  it('retains a valid replacement when its optional renewal schedule is malformed',async()=>{
+    const stub=newStub(),payload=await credentials(String((await status(stub)).hostId));await connect(stub,payload);
+    const replacement=await credentials(payload.ext_agent_host_id,{expiresAt:Math.floor(Date.now()/1000)+7200});
+    refreshedTokens={...replacement,refresh_token:'test-valid-rotated-token',earliest_refresh_at:'unreadable-time'};
+    const response=await stub.fetch('https://chatgpt/diagnostics',{method:'POST',headers:{'x-timber-internal':'model-diagnostics','x-timber-diagnostics-renew':'1'}});
+    expect(response.status).toBe(200);const result=await response.json<{credential:Record<string,unknown>}>();
+    expect(result.credential.renewed).toBe(true);expect(Number(result.credential.renewalBlockedForSeconds)).toBeGreaterThan(7100);
+    await (await stub.fetch('https://chatgpt/',{method:'DELETE'})).text();expect(revocations[0].get('token')).toBe('test-valid-rotated-token');
+  });
+  it.each(['number','numeric-string','iso'])('honors %s renewal schedules on explicit comparison without rotating or losing credentials',async format=>{
+    const stub=newStub(),payload=await credentials(String((await status(stub)).hostId));
+    const seconds=Math.floor(Date.now()/1000)+1800;
+    const earliest_refresh_at=format==='number'?seconds:format==='numeric-string'?String(seconds):new Date(seconds*1000).toISOString();
+    const supplied={...payload,earliest_refresh_at};await connect(stub,supplied);
+    const before=await stored(stub);
+    const result=await (await stub.fetch('https://chatgpt/diagnostics',{method:'POST',headers:{'x-timber-internal':'model-diagnostics','x-timber-diagnostics-renew':'1'}})).json<{credential:Record<string,unknown>}>();
+    expect(result.credential).toMatchObject({renewalRequested:true,renewed:false});expect(Number(result.credential.renewalBlockedForSeconds)).toBeGreaterThan(1700);
+    expect(refreshCalls).toHaveLength(0);expect((await stored(stub)).credentials).toEqual(before.credentials);
   });
   it("requires owner authentication for every connection action", async () => {
     for (const [path, method] of [["", "GET"], ["", "POST"], ["", "DELETE"], ["/verify", "POST"]]) {

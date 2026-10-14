@@ -46,24 +46,25 @@ export default {
     const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(token))),byte=>byte.toString(16).padStart(2,'0')).join('');
     if(digest!==env.PROBE_TOKEN_SHA256)return new Response(null,{status:401});
     const path=new URL(request.url).pathname;
-    const verify=path==='/verify'&&request.method==='POST',diagnostics=path==='/authentication'&&request.method==='POST';
+    const verify=path==='/verify'&&request.method==='POST',diagnostics=['/authentication','/renew-authentication'].includes(path)&&request.method==='POST';
     if(!verify&&!diagnostics&&(request.method!=='GET'||!['/catalog','/queue','/transport'].includes(path)))return new Response(null,{status:404});
     try {
       if(diagnostics) {
         const account=env.CHATGPT.get(env.CHATGPT.idFromName('owner'));
-        const response=await account.fetch('https://chatgpt/diagnostics',{method:'POST',headers:{'x-timber-internal':'model-diagnostics'}});
+        const response=await account.fetch('https://chatgpt/diagnostics',{method:'POST',headers:{'x-timber-internal':'model-diagnostics',...(path==='/renew-authentication'?{'x-timber-diagnostics-renew':'1'}:{})}});
         if(!response.ok)return Response.json({failure:'authentication_probe_unavailable'},{status:502,headers:{'cache-control':'no-store'}});
         const value=await response.json();
         const credential={};
-        for(const field of ['accessBytes','expiresInSeconds'])if(Number.isSafeInteger(value.credential?.[field]))credential[field]=value.credential[field];
-        for(const field of ['expiryMatches','audienceMatches','issuerMatches','subjectMatches','clientMatches','scopesMatch'])credential[field]=value.credential?.[field]===true;
-        const checks=(Array.isArray(value.checks)?value.checks:[]).slice(0,3).map(check=>({
-          variant:['timber','minimal','json'].includes(check.variant)?check.variant:'unknown',
+        for(const field of ['accessBytes','expiresInSeconds','renewalBlockedForSeconds'])if(Number.isSafeInteger(value.credential?.[field]))credential[field]=value.credential[field];
+        for(const field of ['expiryMatches','audienceMatches','issuerMatches','subjectMatches','clientMatches','scopesMatch','renewalRequested','renewed','renewalAlreadyPerformed'])credential[field]=value.credential?.[field]===true;
+        const checks=(Array.isArray(value.checks)?value.checks:[]).slice(0,4).map(check=>({
+          variant:['timber','minimal','json','unauthenticated'].includes(check.variant)?check.variant:'unknown',
           ...(Number.isInteger(check.status)&&check.status>=100&&check.status<=599?{status:check.status}:{}),
           format:['json','html','text','other'].includes(check.format)?check.format:'other',
           bodyKind:['challenge','origin_disallowed','cloudflare_error','api_error','other'].includes(check.bodyKind)?check.bodyKind:'other',
           failure:check.failure===null?null:runErrors.has(check.failure)?check.failure:'other',
           requestIdPresent:check.requestIdPresent===true,rayPresent:check.rayPresent===true,
+          ...(typeof check.rayColo==='string'&&/^[A-Z]{3}$/.test(check.rayColo)?{rayColo:check.rayColo}:{}),
           ...(['origin','cloudflare','ssl'].includes(check.edgeCategory)?{edgeCategory:check.edgeCategory}:{}),
         }));
         return Response.json({credential,checks},{headers:{'cache-control':'no-store'}});

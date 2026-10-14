@@ -2,6 +2,10 @@ name: Probe the connected ChatGPT model catalogue
 on:
   workflow_dispatch:
     inputs:
+      renew_credentials:
+        description: Request one serialized token renewal if allowed, preserving provider renewal limits
+        type: boolean
+        default: false
       compare_authentication:
         description: Compare fixed authenticated model requests and safe token invariants
         type: boolean
@@ -33,4 +37,5 @@ jobs:
           CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
           VERIFY_MODEL_INFERENCE: ${{ inputs.verify_inference && '1' || '' }}
           COMPARE_MODEL_AUTHENTICATION: ${{ inputs.compare_authentication && '1' || '' }}
+          RENEW_MODEL_CREDENTIALS: ${{ inputs.renew_credentials && '1' || '' }}
         run: node scripts/probe-model-catalog.mjs
