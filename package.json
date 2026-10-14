@@ -37,7 +37,7 @@
     "test:secure-deploy": "node --test scripts/tests/secure-deploy.test.mjs scripts/tests/secure-deploy-do.test.mjs",
     "test:pwa": "npm run build:console && node --test scripts/tests/pwa.test.mjs",
     "test:audio": "vitest run --maxWorkers=1 --config tests/vitest.config.ts tests/audio-formats.spec.ts tests/audio-messages.spec.ts tests/audio-admission.spec.ts tests/audio-scope.spec.ts tests/audio-download.spec.ts tests/audio-console.spec.ts tests/audio-upload-cleanup.spec.ts tests/audio-dictation.spec.ts tests/dictation-draft.spec.ts && npm run build:console && node --test scripts/tests/audio-ui.test.mjs scripts/tests/audio-mic-lifecycle.test.mjs scripts/tests/audio-dictation-ui.test.mjs scripts/tests/compact-voice-ui.test.mjs",
-    "test:runner": "node --test scripts/tests/local-runner*.test.mjs scripts/tests/local-pi-runtime.test.mjs packages/runtime/test/local-runtime.test.ts"
+    "test:runner": "npm run build --workspace @timber/runner && node --test scripts/tests/local-runner*.test.mjs scripts/tests/local-pi-runtime.test.mjs packages/runtime/test/local-runtime.test.ts"
   },
   "dependencies": {
     "@cloudflare/sandbox": "1.0.0",
