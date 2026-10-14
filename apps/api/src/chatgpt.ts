@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { classifyModelFailure, normalizeModelCatalog, resolveModelSettings, type ModelCatalog, type ModelOption, type ModelSettings } from "@botspace/contracts";
-import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
+import { createRemoteJWKSet, decodeJwt, jwtVerify, type JWTPayload } from "jose";
 import type { Env } from "./env";
 import { ApiError, errorResponse, json } from "./errors";
 import { body, string } from "./validation";
@@ -246,6 +246,52 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
       return {models:[],connected:(await this.status()).connected,defaultModel:fallback,error:error instanceof ApiError?error.message:"The model catalogue is unavailable. Refresh and try again."};
     }
   }
+  /** Private operational comparison. Credentials never leave this owner and
+   * every variant contacts the same fixed public model endpoint. */
+  private async diagnostics():Promise<Response> {
+    const controller=new AbortController();
+    const initial=await this.lock(async()=>{
+      const token=await this.token(),tokens=await this.readTokens(),connection=(await this.ctx.storage.get<Connection>('connection'))!;
+      const claims=decodeJwt(token),granted=typeof claims.scope==='string'?claims.scope.split(/\s+/):[];
+      this.active.add(controller);
+      return {token,revision:this.revision(connection),credential:{
+        accessBytes:encoder.encode(token).byteLength,
+        expiresInSeconds:Math.floor((tokens.expiresAt-Date.now())/1000),
+        expiryMatches:claims.exp!==undefined&&claims.exp*1000===tokens.expiresAt,
+        audienceMatches:claims.aud===RESOURCE||Array.isArray(claims.aud)&&claims.aud.includes(RESOURCE),
+        issuerMatches:claims.iss===ISSUER,subjectMatches:claims.sub===connection.account.subject,
+        clientMatches:claims.client_id===connection.account.clientId,
+        scopesMatch:granted.includes(PLAN_SCOPE)&&granted.includes('resource.invoke'),
+      }};
+    });
+    const variants:[string,Record<string,string>][]=[['timber',{'User-Agent':'Timber/0.1.0'}],['minimal',{}],['json',{Accept:'application/json'}]];
+    const checks=[];
+    try {
+      for(const [variant,headers] of variants) {
+        try {
+          const response=await fetch(`${RESOURCE}/models`,{headers:{Authorization:`Bearer ${initial.token}`,...headers},redirect:'manual',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(15_000)])});
+          const reader=response.body?.getReader();let text='',bytes=0;
+          try {const decoder=new TextDecoder();if(reader)for(;;){const part=await reader.read();if(part.done)break;bytes+=part.value.byteLength;if(bytes>32_000)break;text+=decoder.decode(part.value,{stream:true});}}
+          finally{await reader?.cancel().catch(()=>{});}
+          let raw:Record<string,unknown>|undefined;
+          try{raw=JSON.parse(text);}catch{/* Only fixed body categories are returned. */}
+          const detail=raw?.error&&typeof raw.error==='object'?raw.error as {code?:unknown;message?:unknown;param?:unknown}:undefined;
+          const contentType=response.headers.get('content-type')??'';
+          const category=raw?.error_category;
+          checks.push({variant,status:response.status,
+            format:contentType.includes('json')?'json':contentType.includes('html')?'html':contentType.startsWith('text/')?'text':'other',
+            bodyKind:response.headers.get('cf-mitigated')==='challenge'?'challenge':text.trim()==='Origin is disallowed'?'origin_disallowed':/error code: 520|cloudflare.*(?:error|ray)|error_category/i.test(text)?'cloudflare_error':detail?'api_error':'other',
+            failure:response.ok?null:publicProviderError(response.status,detail).code,
+            requestIdPresent:response.headers.has('x-request-id'),rayPresent:response.headers.has('cf-ray'),
+            ...(['origin','cloudflare','ssl'].includes(String(category))?{edgeCategory:category}:{}),
+          });
+        }catch{checks.push({variant,failure:'model_connection_interrupted'});}
+        const current=await this.ctx.storage.get<Connection>('connection');
+        if(controller.signal.aborted||!current||current.needsReauth||this.revision(current)!==initial.revision)throw new ApiError(409,'chatgpt_connection_changed','The ChatGPT connection changed during diagnostics.');
+      }
+      return json({credential:initial.credential,checks});
+    }finally{this.active.delete(controller);}
+  }
   private async validateSettings(input:ModelSettings):Promise<{settings:ModelSettings;model:ModelOption}> {
     const models=await this.modelList();
     let settings:ModelSettings;
@@ -355,6 +401,7 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
       if(path==="/" && request.method==="POST") return await this.lock(()=>this.import(request));
       if(path==="/" && request.method==="DELETE") return await this.lock(()=>this.disconnect());
       if(path==="/models" && request.method==="GET") return json(await this.catalog());
+      if(path==='/diagnostics'&&request.method==='POST'&&request.headers.get('x-timber-internal')==='model-diagnostics')return await this.diagnostics();
       if(path==="/validate-model" && request.method==="POST") {
         const data=await body(request);
         if(typeof data.model!=="string" || (data.reasoningEffort!==undefined && typeof data.reasoningEffort!=="string") || (data.fast!==undefined && typeof data.fast!=="boolean")) throw new ApiError(400,"invalid_model_settings","Invalid model settings.");

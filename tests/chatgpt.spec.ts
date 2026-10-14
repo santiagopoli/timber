@@ -20,6 +20,7 @@ let inference: () => Response;
 let refreshError: string | undefined;
 let revocationFails: boolean;
 let modelCalls: string[];
+let modelHeaders:Headers[];
 let catalogResponse:()=>Response|Promise<Response>;
 const defaultModels={models:[
   {slug:"gpt-6.1-sol",display_name:"GPT-6.1 Sol",visibility:"list",supported_reasoning_levels:[{effort:"low"},{effort:"medium"},{effort:"high"},{effort:"max"}],default_reasoning_level:"medium",service_tiers:[{id:"fast"}],input_modalities:["text","image"]},
@@ -70,7 +71,7 @@ beforeAll(async () => {
   jwk = {...await exportJWK(keys.publicKey), kid: "test-key", alg: "ES256", use: "sig"};
 });
 beforeEach(() => {
-  refreshCalls = []; responseCalls = []; revocations = []; refreshedTokens = {};modelCalls=[];catalogResponse=()=>Response.json(defaultModels);
+  refreshCalls = []; responseCalls = []; revocations = []; refreshedTokens = {};modelCalls=[];modelHeaders=[];catalogResponse=()=>Response.json(defaultModels);
   refreshError = undefined; revocationFails = false; inference = completedStream;
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
@@ -83,7 +84,7 @@ beforeEach(() => {
       refreshCalls.push(params.get("refresh_token")!);
       return refreshError ? Response.json({error: refreshError}, {status: 400}) : Response.json(refreshedTokens);
     }
-    if(url===`${RESOURCE}/models`) {modelCalls.push(new Headers(init?.headers).get("authorization")??"");return catalogResponse();}
+    if(url===`${RESOURCE}/models`) {const headers=new Headers(init?.headers);modelHeaders.push(headers);modelCalls.push(headers.get("authorization")??"");return catalogResponse();}
     if (url === `${RESOURCE}/responses`) {
       responseCalls.push({authorization: new Headers(init?.headers).get("authorization") ?? "", payload: JSON.parse(String(init?.body)), signal: init?.signal ?? undefined,sessionId:new Headers(init?.headers).get("session_id")});
       return inference();
@@ -98,6 +99,34 @@ beforeEach(() => {
 afterEach(() => {vi.restoreAllMocks();});
 
 describe("ChatGPT public connection boundary", () => {
+  it('keeps credential comparisons private even for an authenticated public caller',async()=>{
+    const response=await exports.default.fetch('https://timber.test/v1/connections/chatgpt/diagnostics',{method:'POST',headers:{authorization:`Bearer ${API_TOKEN}`,'x-timber-internal':'model-diagnostics'}});
+    expect(response.status).toBe(404);await response.text();expect(modelCalls).toHaveLength(0);
+    const stub=newStub();
+    const privateResponse=await stub.fetch('https://chatgpt/diagnostics',{method:'POST'});
+    expect(privateResponse.status).toBe(404);await privateResponse.text();
+  });
+  it('compares live fixed requests with one owner token and projects only safe credential invariants',async()=>{
+    const stub=newStub(),payload=await credentials(String((await status(stub)).hostId));
+    await connect(stub,payload);
+    await (await stub.fetch('https://chatgpt/models')).text();
+    modelCalls=[];modelHeaders=[];
+    const replies=[()=>new Response('Cloudflare error code: 520 private-canary',{status:520,headers:{'content-type':'text/html','cf-ray':'private-canary'}}),
+      ()=>Response.json(defaultModels),()=>Response.json({error_category:'origin',error:{code:'server_error',message:'private-canary'}},{status:520,headers:{'x-request-id':'private-canary'}})];
+    catalogResponse=()=>replies.shift()!();
+    const response=await stub.fetch('https://chatgpt/diagnostics',{method:'POST',headers:{'x-timber-internal':'model-diagnostics'}});
+    expect(response.status).toBe(200);
+    const text=await response.text(),result=JSON.parse(text);
+    expect(result.credential).toMatchObject({accessBytes:new TextEncoder().encode(payload.access_token).byteLength,expiryMatches:true,audienceMatches:true,issuerMatches:true,subjectMatches:true,clientMatches:true,scopesMatch:true});
+    expect(result.credential.expiresInSeconds).toBeGreaterThan(3500);
+    expect(result.checks).toMatchObject([{variant:'timber',status:520,bodyKind:'cloudflare_error',rayPresent:true},
+      {variant:'minimal',status:200,failure:null},{variant:'json',status:520,format:'json',bodyKind:'cloudflare_error',edgeCategory:'origin',requestIdPresent:true}]);
+    expect(modelCalls).toEqual(Array(3).fill(`Bearer ${payload.access_token}`));
+    expect(modelHeaders.map(headers=>headers.get('user-agent'))).toEqual(['Timber/0.1.0',null,null]);
+    expect(modelHeaders.map(headers=>headers.get('accept'))).toEqual([null,null,'application/json']);
+    for(const secret of [payload.access_token,payload.refresh_token,payload.id_token,CLIENT_ID,'test-user','private-canary'])expect(text).not.toContain(secret);
+    expect(refreshCalls).toHaveLength(0);expect(responseCalls).toHaveLength(0);
+  });
   it("requires owner authentication for every connection action", async () => {
     for (const [path, method] of [["", "GET"], ["", "POST"], ["", "DELETE"], ["/verify", "POST"]]) {
       const response = await exports.default.fetch(`https://timber.test/v1/connections/chatgpt${path}`, {method});

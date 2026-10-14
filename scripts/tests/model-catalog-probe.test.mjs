@@ -34,6 +34,18 @@ test('optional inference verification uses only the fixed plan verification rout
   assert.deepEqual(await result.json(),{ok:true,status:200,failure:null});
   assert.equal((await worker.fetch(new Request('https://probe.test/verify',{headers:{authorization:`Bearer ${token}`}}),env)).status,404);
 });
+test('authentication comparison filters credentials, claim values and arbitrary provider metadata',async()=>{
+  const env={PROBE_TOKEN_SHA256:hash,CHATGPT:{idFromName(name){assert.equal(name,'owner');return name;},get(){return {async fetch(url,options){
+    assert.equal(url,'https://chatgpt/diagnostics');assert.equal(options.method,'POST');assert.equal(options.headers['x-timber-internal'],'model-diagnostics');
+    return Response.json({credential:{accessBytes:2000,expiresInSeconds:1800,expiryMatches:true,accessToken:'private-canary',clientId:'private-canary'},
+      checks:[{variant:'timber',status:520,format:'html',bodyKind:'cloudflare_error',failure:'model_provider_unavailable',rayPresent:true,rawBody:'private-canary',requestId:'private-canary'},
+        {variant:'private-canary',status:'private-canary',edgeCategory:'private-canary',failure:'private-canary'}]});
+  }};}}};
+  const result=await worker.fetch(new Request('https://probe.test/authentication',{method:'POST',headers:{authorization:`Bearer ${token}`}}),env);
+  assert.equal(result.status,200);const text=await result.text();assert.doesNotMatch(text,/private-canary|accessToken|clientId|rawBody/);
+  const value=JSON.parse(text);assert.equal(value.credential.accessBytes,2000);assert.equal(value.checks[0].failure,'model_provider_unavailable');assert.equal(value.checks[1].variant,'unknown');
+  assert.equal((await worker.fetch(new Request('https://probe.test/authentication',{method:'POST'}),env)).status,401);
+});
 test('transport comparison contacts only fixed OpenAI endpoints without account authorization',async()=>{
   const original=globalThis.fetch,calls=[];
   globalThis.fetch=async(url,options)=>{

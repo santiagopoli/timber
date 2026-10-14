@@ -49,6 +49,10 @@ async function main() {
     console.log(JSON.stringify(queue));
     const transport=await (await requestProbe(`${url}/transport`,token)).json();
     console.log(JSON.stringify(transport));
+    if(process.env.COMPARE_MODEL_AUTHENTICATION==='1'){
+      const comparison=await (await requestProbe(`${url}/authentication`,token,fetch,undefined,'POST')).json();
+      console.log(JSON.stringify({authenticationComparison:comparison}));
+    }
     if(process.env.VERIFY_MODEL_INFERENCE==='1'){
       const verification=await (await requestProbe(`${url}/verify`,token,fetch,undefined,'POST')).json();
       console.log(JSON.stringify({verifiedInference:verification.ok===true,status:verification.status,failure:verification.failure}));

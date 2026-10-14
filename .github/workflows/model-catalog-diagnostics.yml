@@ -2,6 +2,10 @@ name: Probe the connected ChatGPT model catalogue
 on:
   workflow_dispatch:
     inputs:
+      compare_authentication:
+        description: Compare fixed authenticated model requests and safe token invariants
+        type: boolean
+        default: false
       verify_inference:
         description: Complete one tiny real ChatGPT-plan request (uses plan allowance)
         type: boolean
@@ -28,4 +32,5 @@ jobs:
           CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
           CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
           VERIFY_MODEL_INFERENCE: ${{ inputs.verify_inference && '1' || '' }}
+          COMPARE_MODEL_AUTHENTICATION: ${{ inputs.compare_authentication && '1' || '' }}
         run: node scripts/probe-model-catalog.mjs

@@ -746,6 +746,12 @@ source errors remain visible without inventing models or capabilities.
 Failed catalogue HTTP responses retain the upstream status and a fixed shared
 failure classification in the public diagnostic. Provider error bodies are read
 only within a 32 KB bound for classification and are never returned or logged.
+The private operational comparison is not exposed by the public API. It checks
+only fixed authenticated `/v1/models` requests with the same owner token, comparing
+Timber, minimal and JSON Accept headers. Results contain token byte length,
+remaining lifetime and identity/grant matching booleans, plus fixed HTTP/body
+categories. Tokens, claim values, provider prose and request identifiers remain
+inside the credential owner; the probe also filters the returned shape.
 
 `Bot.model`, `Bot.reasoningEffort?` and `Bot.fast?` are persisted configuration.
 Explicit selections on creation or PATCH must be available in a connected
