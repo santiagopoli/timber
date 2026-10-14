@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && chmod 0700 /state
 
 COPY server.py /opt/botspace/server.py
+COPY chatgpt-transport.mjs /opt/botspace/chatgpt-transport.mjs
 COPY secure_deploy.py /opt/botspace/secure_deploy.py
 COPY secure_deploy_runner.py /opt/botspace/secure_deploy_runner.py
 COPY workspace_archive.py /opt/botspace/workspace_archive.py

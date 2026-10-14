@@ -373,6 +373,18 @@ before handing the same fresh credential to Timber, then performs the existing
 cloud verification. It reports only HTTP statuses, model counts and fixed failure
 codes. It does not retrieve a token from the server or retain one locally.
 
+Production uses `CHATGPT_API_TRANSPORT=container` for account model discovery and
+Responses API requests. A dedicated `ChatGPTTransportDO` starts only a private
+Node HTTPS transport, using the verified image with a fixed entrypoint. It is
+separate from bot computers and has no shell, workspace, checkpoint or public
+endpoint. The credential owner still validates, encrypts and refreshes OAuth;
+the transport holds a bearer only in request memory and contacts only
+`api.openai.com/v1/models` or `/v1/responses`, without redirects or POST retries.
+It stops after three idle minutes, preserving active streams. OAuth renewal
+continues through the credential owner. Transport choice does not change billing
+or enable an API-credit fallback. Private diagnostics compare Workers and Node
+using the same current access token.
+
 One dedicated Durable Object owns the encrypted credentials for this deployment
 and serializes refresh-token rotation across bots. Credentials are never stored
 in bot histories, computer workspaces, R2 checkpoints or browser storage. The

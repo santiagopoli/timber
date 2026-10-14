@@ -18,6 +18,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - run: node --test scripts/tests/chatgpt-transport.test.mjs
       - run: npm ci
       - run: npm run check
       - name: Exercise admin console in Chromium
@@ -52,6 +53,13 @@ jobs:
           docker run -d --name timber-image-smoke --shm-size=512m -p 127.0.0.1:8080:8080 -e BOTSPACE_COMPUTER_TOKEN="$COMPUTER_TEST_TOKEN" timber-computer:ci
           node scripts/smoke-computer.mjs
           docker exec -i timber-image-smoke python3 - < infra/computer/smoke_desktop.py
+      - name: Exercise the isolated ChatGPT transport entrypoint
+        shell: bash
+        run: |
+          export TRANSPORT_TEST_TOKEN="$(openssl rand -hex 32)"
+          trap 'docker rm -f timber-transport-smoke >/dev/null 2>&1 || true' EXIT
+          docker run -d --name timber-transport-smoke -p 127.0.0.1:8082:8080 -e "TIMBER_TRANSPORT_TOKEN=$TRANSPORT_TEST_TOKEN" --entrypoint /usr/local/bin/node timber-computer:ci /opt/botspace/chatgpt-transport.mjs
+          node scripts/smoke-chatgpt-transport.mjs
       - name: Export the verified production image
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         run: docker save timber-computer:ci | gzip -1 > timber-computer.tar.gz

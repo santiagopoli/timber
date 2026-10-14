@@ -13,6 +13,7 @@ export { BotDO } from "./bot";
 export { GitHubAuthDO } from "./github";
 export { WorkspacePreviewGateway } from "./workspace-apps";
 export { ChatGPTAuthDO } from "./chatgpt";
+export { ChatGPTTransportDO } from "./chatgpt-transport";
 export { ComputerDO } from "@botspace/computer";
 
 /** Drain or cancel an incoming body when a route rejects before forwarding it.

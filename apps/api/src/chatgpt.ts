@@ -172,6 +172,13 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
     return accessToken;
   }
   private revision(connection:Connection):string {return connection.revision??`${connection.account.clientId}:${connection.account.subject}`;}
+  private apiFetch(endpoint:'models'|'responses',init:RequestInit,container=this.env.CHATGPT_API_TRANSPORT==='container'):Promise<Response> {
+    if(!container)return fetch(`${RESOURCE}/${endpoint}`,init);
+    const binding=this.env.CHATGPT_TRANSPORT;
+    if(!binding)throw new ApiError(503,'model_transport_unavailable','The ChatGPT server transport is unavailable.');
+    const headers=new Headers(init.headers);headers.set('x-timber-internal','chatgpt-transport');
+    return binding.get(binding.idFromName('owner')).fetch(new Request(`https://transport/v1/${endpoint}`,{...init,headers}));
+  }
   private async modelList():Promise<ModelOption[]> {
     const initial=await this.lock(async()=>{
       const token=await this.token();
@@ -200,7 +207,7 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
       const controller=new AbortController();this.active.add(controller);
       try {
         let response:Response;
-        try {response=await fetch(`${RESOURCE}/models`,{headers:{Authorization:`Bearer ${initial.token}`,"User-Agent":"Timber/0.1.0"},redirect:"manual",signal:AbortSignal.any([controller.signal,AbortSignal.timeout(15_000)])});}
+        try {response=await this.apiFetch('models',{headers:{Authorization:`Bearer ${initial.token}`,"User-Agent":"Timber/0.1.0"},redirect:"manual",signal:AbortSignal.any([controller.signal,AbortSignal.timeout(this.env.CHATGPT_API_TRANSPORT==='container'?45_000:15_000)])});}
         catch {const cached=await useLastKnown();if(cached)return cached;throw new ApiError(503,"model_catalog_unavailable","The connected account's model catalogue could not be loaded. Refresh and try again.");}
         if(!response.ok) {
           // A catalogue failure used to discard the upstream status/body, making
@@ -255,8 +262,8 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
       return {models:[],connected:(await this.status()).connected,defaultModel:fallback,error:error instanceof ApiError?error.message:"The model catalogue is unavailable. Refresh and try again."};
     }
   }
-  /** Private operational comparison. Credentials never leave this owner and
-   * every variant contacts the same fixed public model endpoint. */
+  /** Private operational comparison. Credentials remain in server-owned
+   * transports; every variant contacts the same fixed public model endpoint. */
   private async diagnostics(renew=false):Promise<Response> {
     const controller=new AbortController();
     const initial=await this.lock(async()=>{
@@ -281,11 +288,12 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
     });
     const variants:[string,Record<string,string>][]=[['timber',{'User-Agent':'Timber/0.1.0'}],['minimal',{}],['json',{Accept:'application/json'}],
       ['identity',{Accept:'application/json','Accept-Encoding':'identity'}],['gzip',{Accept:'application/json','Accept-Encoding':'gzip'}],['unauthenticated',{}]];
+    if(this.env.CHATGPT_TRANSPORT)variants.push(['container',{Accept:'application/json'}]);
     const checks=[];
     try {
       for(const [variant,headers] of variants) {
         try {
-          const response=await fetch(`${RESOURCE}/models`,{headers:{...(variant==='unauthenticated'?{}:{Authorization:`Bearer ${initial.token}`}),...headers},redirect:'manual',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10_000)])});
+          const response=await this.apiFetch('models',{headers:{...(variant==='unauthenticated'?{}:{Authorization:`Bearer ${initial.token}`}),...headers},redirect:'manual',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(variant==='container'?45_000:10_000)])},variant==='container');
           const reader=response.body?.getReader();let text='',bytes=0;
           try {const decoder=new TextDecoder();if(reader)for(;;){const part=await reader.read();if(part.done)break;bytes+=part.value.byteLength;if(bytes>32_000)break;text+=decoder.decode(part.value,{stream:true});}}
           finally{await reader?.cancel().catch(()=>{});}
@@ -340,7 +348,7 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
     const signal=AbortSignal.any([request.signal,controller.signal]);
     const cleanup=()=>{clearTimeout(timer);this.active.delete(controller);};
     let response:Response;
-    try {response=await fetch(`${RESOURCE}/responses`,{method:"POST",headers:{Authorization:`Bearer ${token}`,"content-type":"application/json","User-Agent":"Timber/0.1.0",...(typeof payload.prompt_cache_key==='string'?{session_id:payload.prompt_cache_key}:{})},body:JSON.stringify(payload),redirect:"manual",signal});}
+    try {response=await this.apiFetch('responses',{method:"POST",headers:{Authorization:`Bearer ${token}`,"content-type":"application/json","User-Agent":"Timber/0.1.0",...(typeof payload.prompt_cache_key==='string'?{session_id:payload.prompt_cache_key}:{})},body:JSON.stringify(payload),redirect:"manual",signal});}
     catch {cleanup();throw new ApiError(502,"model_connection_interrupted","Connection lost while contacting ChatGPT. Try again later.");}
     if(!response.ok) {
       const data=await response.json<{error?:{code?:unknown;message?:unknown;param?:unknown}}>().catch(()=>({error:undefined}));

@@ -19,6 +19,10 @@ const image = Array.isArray(digests) && digests.find(value => typeof value === '
   && value.startsWith(`${repository}@`) && /^sha256:[a-f0-9]{64}$/.test(value.slice(repository.length + 1)));
 if (!image) throw new Error('The verified image has no digest in the configured computer repository.');
 computer.images.base.image = image;
+// The private ChatGPT transport uses the same verified image in a separate
+// container with a fixed Node entrypoint, without launching the bot computer.
+const transport = config.containers?.find(value => value.class_name === 'ChatGPTTransportDO');
+if (transport) transport.images.base.image = image;
 await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`);
 await writeFile(receiptPath, `${JSON.stringify({sourceCommit: commit, computerImage: image}, null, 2)}\n`);
 console.log(`Production computer image: ${image}`);

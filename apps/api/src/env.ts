@@ -8,6 +8,8 @@ export interface Env {
   GITHUB_PUBLIC_ORIGIN?: string;
   PREVIEW_ORIGIN?: string;
   CHATGPT?: DurableObjectNamespace;
+  CHATGPT_TRANSPORT?: DurableObjectNamespace;
+  CHATGPT_API_TRANSPORT?: 'container';
   CHATGPT_CREDENTIAL_KEY?: string;
   /** Server-only Worker secret. Enables paid OpenAI model inference, Image API and audio transcription. */
   OPENAI_API_KEY?: string;

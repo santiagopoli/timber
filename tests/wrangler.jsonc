@@ -38,6 +38,9 @@
         "name": "KEYLESS_CHATGPT",
         "class_name": "KeylessChatGPTAuthDO"
       },
+      {"name":"CONTAINER_CHATGPT","class_name":"ContainerChatGPTAuthDO"},
+      {"name":"TEST_CHATGPT_TRANSPORT","class_name":"MockChatGPTTransportDO"},
+      {"name":"REAL_CHATGPT_TRANSPORT","class_name":"ChatGPTTransportDO"},
       {
         "name": "GITHUB",
         "class_name": "GitHubAuthDO"
@@ -58,6 +61,7 @@
         "RealComputerDO",
         "ChatGPTAuthDO",
         "KeylessChatGPTAuthDO"
+        ,"ContainerChatGPTAuthDO","MockChatGPTTransportDO","ChatGPTTransportDO"
       ]
     },
     {

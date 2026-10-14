@@ -9,7 +9,7 @@ const RESOURCE = "https://api.openai.com/v1";
 const PLAN_SCOPES = "openid email offline_access resource.invoke chatgpt.tokens.use.direct";
 const CLIENT_ID = "timber-test-client";
 const API_TOKEN = "test-only-botspace-owner-token-000000";
-const bindings = env as unknown as {CHATGPT: DurableObjectNamespace; KEYLESS_CHATGPT: DurableObjectNamespace};
+const bindings = env as unknown as {CHATGPT: DurableObjectNamespace; KEYLESS_CHATGPT: DurableObjectNamespace;CONTAINER_CHATGPT:DurableObjectNamespace};
 let keys: Awaited<ReturnType<typeof generateKeyPair>>;
 let jwk: Awaited<ReturnType<typeof exportJWK>>;
 let refreshedTokens: Record<string, unknown>;
@@ -99,6 +99,26 @@ beforeEach(() => {
 afterEach(() => {vi.restoreAllMocks();});
 
 describe("ChatGPT public connection boundary", () => {
+  it('uses the same validated owner credential on Node while the Workers route fails, without paid fallback',async()=>{
+    const stub=bindings.CONTAINER_CHATGPT.get(bindings.CONTAINER_CHATGPT.idFromName(crypto.randomUUID()));
+    const payload=await credentials(String((await status(stub)).hostId));expect((await connect(stub,payload)).status).toBe(200);
+    catalogResponse=()=>modelHeaders.at(-1)?.get('x-test-chatgpt-transport')==='node'?Response.json(defaultModels):new Response('error code: 520',{status:520});
+    const comparison=await (await stub.fetch('https://chatgpt/diagnostics',{method:'POST',headers:{'x-timber-internal':'model-diagnostics'}})).json<{checks:{variant:string;status:number}[]}>();
+    expect(comparison.checks.at(0)).toMatchObject({variant:'timber',status:520});
+    expect(comparison.checks.at(-1)).toMatchObject({variant:'container',status:200});
+    expect(modelCalls.filter(Boolean).every(value=>value===`Bearer ${payload.access_token}`)).toBe(true);
+    const response=await infer(stub,{prompt_cache_key:'a'.repeat(64)});expect(response.status).toBe(200);await response.text();
+    expect(responseCalls).toHaveLength(1);expect(responseCalls[0].authorization).toBe(`Bearer ${payload.access_token}`);
+    expect(responseCalls[0].sessionId).toBe('a'.repeat(64));expect(refreshCalls).toHaveLength(0);
+    const data=await stored(stub);expect(JSON.stringify(data)).not.toContain(payload.access_token);
+  });
+  it('does not retry or switch to Workers when a dispatched Node inference fails',async()=>{
+    const stub=bindings.CONTAINER_CHATGPT.get(bindings.CONTAINER_CHATGPT.idFromName(crypto.randomUUID()));
+    expect((await connect(stub)).status).toBe(200);
+    inference=()=>{throw new Error('test-only-uncertain-dispatch');};
+    const response=await infer(stub);expect(response.status).toBe(502);await response.text();
+    expect(responseCalls).toHaveLength(1);expect(refreshCalls).toHaveLength(0);
+  });
   it('keeps credential comparisons private even for an authenticated public caller',async()=>{
     const response=await exports.default.fetch('https://timber.test/v1/connections/chatgpt/diagnostics',{method:'POST',headers:{authorization:`Bearer ${API_TOKEN}`,'x-timber-internal':'model-diagnostics'}});
     expect(response.status).toBe(404);await response.text();expect(modelCalls).toHaveLength(0);

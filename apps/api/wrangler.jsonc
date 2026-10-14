@@ -25,7 +25,8 @@
   "vars": {
     "BOTSPACE_DEFAULT_MODEL": "gpt-6.1-sol",
     "GITHUB_PUBLIC_ORIGIN": "https://timber-api.santiagopoli.workers.dev",
-    "PREVIEW_ORIGIN": "https://timber-preview.santiagopoli.workers.dev"
+    "PREVIEW_ORIGIN": "https://timber-preview.santiagopoli.workers.dev",
+    "CHATGPT_API_TRANSPORT": "container"
   },
   "durable_objects": {
     "bindings": [
@@ -52,6 +53,10 @@
       {
         "name": "DEVICES",
         "class_name": "DevicesDO"
+      },
+      {
+        "name": "CHATGPT_TRANSPORT",
+        "class_name": "ChatGPTTransportDO"
       }
     ]
   },
@@ -81,6 +86,12 @@
       "new_sqlite_classes": [
         "DevicesDO"
       ]
+    },
+    {
+      "tag": "v5-chatgpt-transport",
+      "new_sqlite_classes": [
+        "ChatGPTTransportDO"
+      ]
     }
   ],
   "r2_buckets": [
@@ -92,6 +103,16 @@
   "containers": [
     {
       "class_name": "ComputerDO",
+      "scheduling_policy": "durable_object",
+      "images": {
+        "base": {
+          "dockerfile": "../../infra/computer/Dockerfile",
+          "build_context": "../../infra/computer"
+        }
+      }
+    },
+    {
+      "class_name": "ChatGPTTransportDO",
       "scheduling_policy": "durable_object",
       "images": {
         "base": {

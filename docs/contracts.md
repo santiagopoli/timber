@@ -14,6 +14,13 @@ computers. Previously admitted legacy tasks retain the assigned bot’s shared c
   Workers AI. When OPENROUTER_API_KEY is configured, the same concrete model can
   use separately billed OpenRouter inference after subscription quota exhaustion.
 - ComputerDO owns one reusable Linux desktop container, lazily started.
+- ChatGPTTransportDO owns a separate private Node HTTPS transport for the fixed
+  account models and Responses API endpoints. It runs no bot code, shell or
+  workspace and has no public API. ChatGPTAuthDO remains the only OAuth storage
+  and refresh writer; access tokens exist in transport memory only during an
+  authenticated request. Redirects and automatic inference replays are disabled.
+  Idle shutdown checks active response streams. This changes transport only,
+  preserving ChatGPT-plan billing and existing paid-fallback rules.
 - Private single-owner MVP. BOTSPACE_API_TOKEN is a Worker secret; every /v1
   data API request requires Authorization: Bearer token or a valid same-origin
   console session, except the scoped live desktop WebSocket upgrade below.

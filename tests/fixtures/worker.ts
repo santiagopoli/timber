@@ -6,6 +6,22 @@ import type { Env } from "../../apps/api/src/env";
 import {WorkspaceDO as ProductionWorkspaceDO} from '../../apps/api/src/workspace';
 import {ComputerDO as ProductionComputerDO,computerName} from '../../packages/computer/src/index';
 export { ChatGPTAuthDO };
+export {ChatGPTTransportDO} from '../../apps/api/src/chatgpt-transport';
+export class ContainerChatGPTAuthDO extends ChatGPTAuthDO {
+  constructor(ctx:DurableObjectState, env:Env & {TEST_CHATGPT_TRANSPORT:DurableObjectNamespace}) {
+    super(ctx,{...env,CHATGPT_API_TRANSPORT:'container',CHATGPT_TRANSPORT:env.TEST_CHATGPT_TRANSPORT});
+  }
+}
+/** Fixed network fixture; never starts a container or uses real credentials. */
+export class MockChatGPTTransportDO extends DurableObject {
+  async fetch(request:Request):Promise<Response> {
+    const url=new URL(request.url);
+    if(request.headers.get('x-timber-internal')!=='chatgpt-transport'||url.search||!['/v1/models','/v1/responses'].includes(url.pathname))return new Response(null,{status:404});
+    const headers=new Headers(request.headers);headers.delete('x-timber-internal');headers.set('x-test-chatgpt-transport','node');
+    try{return await fetch(`https://api.openai.com${url.pathname}`,{method:request.method,headers,body:request.method==='POST'?await request.text():undefined,signal:request.signal});}
+    catch{return Response.json({error:{code:'model_connection_interrupted',message:'Connection lost while contacting ChatGPT. Try again later.'}},{status:502});}
+  }
+}
 export { GitHubAuthDO } from "../../apps/api/src/github";
 export class KeylessChatGPTAuthDO extends ChatGPTAuthDO {
   constructor(ctx: DurableObjectState, env: Env) {super(ctx, {...env, CHATGPT_CREDENTIAL_KEY: undefined});}
