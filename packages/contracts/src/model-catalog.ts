@@ -87,7 +87,7 @@ export function mergeModelCatalogs(sources:readonly ModelCatalogSource[],default
   const connected=sources.some(source=>source.catalog.connected);
   const choices=[...models.values()];
   return {models:choices,connected,defaultModel:choices.find(model=>model.id===canonicalModelId(defaultModel))?.id??choices[0]?.id??defaultModel,
-    sources:sources.map(source=>({id:source.id,connected:source.catalog.connected,...(source.catalog.error?{error:source.catalog.error}:{})})),
+    sources:sources.map(source=>({id:source.id,connected:source.catalog.connected,...(source.catalog.error||source.catalog.warning?{error:source.catalog.error||source.catalog.warning}:{})})),
     ...(!choices.length&&sources.some(source=>source.catalog.error)?{error:'The model catalog is temporarily unavailable. Refresh and try again.'}:{})};
 }
 

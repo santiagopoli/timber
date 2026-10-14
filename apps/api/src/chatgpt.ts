@@ -9,6 +9,8 @@ const ISSUER = "https://auth.openai.com";
 const RESOURCE = "https://api.openai.com/v1";
 const MODEL = "gpt-6.1-sol";
 const MODEL_CACHE_MS = 5 * 60_000;
+const MODEL_STALE_MS = 24 * 60 * 60_000;
+const MODEL_DISCOVERY_RETRY_MS = 30_000;
 const INFERENCE_TIMEOUT_MS = 30 * 60_000;
 interface CachedModels {revision:string;expiresAt:number;models:ModelOption[];}
 const TOKEN_ENDPOINT = `${ISSUER}/api/accounts/oauth/token`;
@@ -51,6 +53,7 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
   private key?:CryptoKey;
   private active=new Set<AbortController>();
   private catalogPending?:{revision:string;promise:Promise<ModelOption[]>};
+  private staleCatalog?:{revision:string;warning:string;retryAt:number};
 
   constructor(ctx:DurableObjectState,env:Env) {
     super(ctx,env);
@@ -120,7 +123,7 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
     if(previous && await this.ctx.storage.get("credentials") && (previous.account.subject!==identity.sub || previous.account.clientId!==clientId)) throw new ApiError(409,"chatgpt_account_mismatch","Disconnect the existing ChatGPT account before connecting another registration.");
     const earliestRefreshAt=typeof data.earliest_refresh_at==="number"?data.earliest_refresh_at*1000:undefined;
     const tokens:Tokens={accessToken,refreshToken,idToken,scopes:granted,expiresAt:access.exp!*1000,...(earliestRefreshAt?{earliestRefreshAt}:{})};
-    await this.ctx.storage.delete("modelCatalog");this.catalogPending=undefined;
+    await this.ctx.storage.delete("modelCatalog");this.catalogPending=undefined;this.staleCatalog=undefined;
     await this.saveTokens(tokens,{revision:crypto.randomUUID(),account:{clientId,subject:identity.sub!,...(typeof identity.email==="string"?{email:identity.email}:{})}});
     for(const controller of this.active) controller.abort();this.active.clear();
     return json(await this.status());
@@ -165,16 +168,31 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
       const token=await this.token();
       const connection=(await this.ctx.storage.get<Connection>("connection"))!;
       const revision=this.revision(connection),cached=await this.ctx.storage.get<CachedModels>("modelCatalog");
-      return {token,revision,cached:cached?.revision===revision && cached.expiresAt>Date.now()?cached.models:undefined};
+      const sameConnection=cached?.revision===revision;
+      return {token,revision,cached:sameConnection&&cached.expiresAt>Date.now()?cached.models:undefined,
+        lastKnownUntil:sameConnection?cached.expiresAt-MODEL_CACHE_MS+MODEL_STALE_MS:0,
+        lastKnown:sameConnection&&cached.expiresAt-MODEL_CACHE_MS+MODEL_STALE_MS>Date.now()?cached.models:undefined};
     });
     if(initial.cached) return initial.cached;
+    if(initial.lastKnown&&this.staleCatalog?.revision===initial.revision&&this.staleCatalog.retryAt>Date.now())return initial.lastKnown;
     if(this.catalogPending?.revision===initial.revision) return this.catalogPending.promise;
+    const useLastKnown=async(status?:number,code='model_provider_unavailable'):Promise<ModelOption[]|undefined>=>{
+      if(!initial.lastKnown?.length)return;
+      return this.lock(async()=>{
+        const current=await this.ctx.storage.get<Connection>('connection');
+        if(!current||current.needsReauth||this.revision(current)!==initial.revision||!await this.ctx.storage.get('credentials'))throw new ApiError(409,'chatgpt_connection_changed','The ChatGPT connection changed. Refresh the model catalogue.');
+        if(initial.lastKnownUntil<=Date.now())return;
+        this.staleCatalog={revision:initial.revision,retryAt:Date.now()+MODEL_DISCOVERY_RETRY_MS,
+          warning:status?`Using cached ChatGPT model catalogue (HTTP ${status}; ${code}).`:'Using cached ChatGPT model catalogue while discovery is unavailable.'};
+        return initial.lastKnown;
+      });
+    };
     const promise=(async()=>{
       const controller=new AbortController();this.active.add(controller);
       try {
         let response:Response;
         try {response=await fetch(`${RESOURCE}/models`,{headers:{Authorization:`Bearer ${initial.token}`,"User-Agent":"Timber/0.1.0"},redirect:"manual",signal:AbortSignal.any([controller.signal,AbortSignal.timeout(15_000)])});}
-        catch {throw new ApiError(503,"model_catalog_unavailable","The connected account's model catalogue could not be loaded. Refresh and try again.");}
+        catch {const cached=await useLastKnown();if(cached)return cached;throw new ApiError(503,"model_catalog_unavailable","The connected account's model catalogue could not be loaded. Refresh and try again.");}
         if(!response.ok) {
           // A catalogue failure used to discard the upstream status/body, making
           // quota, authorization and provider outages indistinguishable. Inspect
@@ -190,6 +208,9 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
           finally{await reader?.cancel().catch(()=>{});}
           const failure=publicProviderError(response.status,detail);
           console.warn(JSON.stringify({event:'model.catalog.failure',stage:'catalog',status:response.status,errorCode:failure.code}));
+          if(response.status>=500&&['model_provider_unavailable','model_timeout'].includes(failure.code)){
+            const cached=await useLastKnown(response.status,failure.code);if(cached)return cached;
+          }
           throw new ApiError(503,"model_catalog_unavailable",`ChatGPT model catalogue unavailable (HTTP ${response.status}; ${failure.code}). ${failure.message}`);
         }
         let raw:unknown;
@@ -207,6 +228,7 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
           const current=await this.ctx.storage.get<Connection>("connection");
           if(!current || current.needsReauth || this.revision(current)!==initial.revision || !await this.ctx.storage.get("credentials")) throw new ApiError(409,"chatgpt_connection_changed","The ChatGPT connection changed. Refresh the model catalogue.");
           await this.ctx.storage.put<CachedModels>("modelCatalog",{revision:initial.revision,expiresAt:Date.now()+MODEL_CACHE_MS,models});
+          this.staleCatalog=undefined;
         });
         return models;
       } finally {this.active.delete(controller);}
@@ -219,7 +241,7 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
     if(!current.connected)return {models:[],connected:false,defaultModel:fallback};
     try {
       const models=await this.modelList();
-      return {models,connected:true,defaultModel:models.find(model=>model.id===fallback)?.id??models[0]?.id??fallback};
+      return {models,connected:true,defaultModel:models.find(model=>model.id===fallback)?.id??models[0]?.id??fallback,...(this.staleCatalog?{warning:this.staleCatalog.warning}:{})};
     } catch(error) {
       return {models:[],connected:(await this.status()).connected,defaultModel:fallback,error:error instanceof ApiError?error.message:"The model catalogue is unavailable. Refresh and try again."};
     }
@@ -322,7 +344,7 @@ export class ChatGPTAuthDO extends DurableObject<Env> {
       }
     } catch { /* Local disconnection must still succeed. Report unconfirmed revocation. */ }
     await this.ctx.storage.delete("credentials");
-    await this.ctx.storage.delete("modelCatalog");this.catalogPending=undefined;
+    await this.ctx.storage.delete("modelCatalog");this.catalogPending=undefined;this.staleCatalog=undefined;
     if(connection) await this.ctx.storage.put("connection",{account:connection.account});
     return json({...await this.status(),revoked});
   }

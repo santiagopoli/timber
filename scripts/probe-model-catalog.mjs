@@ -8,9 +8,9 @@ import {promisify} from 'node:util';
 import {pathToFileURL} from 'node:url';
 const exec=promisify(execFile);
 
-export async function requestProbe(url,token,fetcher=fetch,wait=ms=>new Promise(resolve=>setTimeout(resolve,ms))) {
+export async function requestProbe(url,token,fetcher=fetch,wait=ms=>new Promise(resolve=>setTimeout(resolve,ms)),method='GET') {
   for(let attempt=0;attempt<6;attempt++) {
-    const response=await fetcher(url,{headers:{authorization:`Bearer ${token}`},redirect:'error',signal:AbortSignal.timeout(60_000)});
+    const response=await fetcher(url,{method,headers:{authorization:`Bearer ${token}`},redirect:'error',signal:AbortSignal.timeout(60_000)});
     if(response.ok)return response;
     await response.body?.cancel().catch(()=>{});
     if(![404,503].includes(response.status)||attempt===5)throw new Error(`probe_http_${response.status}`);
@@ -42,10 +42,15 @@ async function main() {
     // Reconstruct only the already sanitized shape before writing to CI logs.
     if(typeof value.connected!=='boolean'||!Number.isSafeInteger(value.models)||value.models<0||typeof value.connection!=='string'||!/^\w{1,64}$/.test(value.connection)||value.failure!==null&&!/^\w{1,64}$/.test(value.failure))throw new Error('probe_invalid_projection');
     console.log(JSON.stringify({connection:value.connection,connected:value.connected,models:value.models,failure:value.failure,
+      ...(value.cached===true?{cached:true}:{}),
       ...(Number.isInteger(value.upstreamStatus)&&value.upstreamStatus>=100&&value.upstreamStatus<=599?{upstreamStatus:value.upstreamStatus}:{})}));
     const queue=await (await requestProbe(`${url}/queue`,token)).json();
     if(!Array.isArray(queue.bots)||queue.bots.length>20)throw new Error('probe_invalid_projection');
     console.log(JSON.stringify(queue));
+    if(process.env.VERIFY_MODEL_INFERENCE==='1'){
+      const verification=await (await requestProbe(`${url}/verify`,token,fetch,undefined,'POST')).json();
+      console.log(JSON.stringify({verifiedInference:verification.ok===true,status:verification.status,failure:verification.failure}));
+    }
   } finally {
     try {if(attempted)await cli(['delete','--force']);}
     catch {console.error(JSON.stringify({error:'probe_cleanup_failed',worker:name}));process.exitCode=1;}

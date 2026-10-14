@@ -1,6 +1,11 @@
 name: Probe the connected ChatGPT model catalogue
 on:
   workflow_dispatch:
+    inputs:
+      verify_inference:
+        description: Complete one tiny real ChatGPT-plan request (uses plan allowance)
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -22,4 +27,5 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
           CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
+          VERIFY_MODEL_INFERENCE: ${{ inputs.verify_inference && '1' || '' }}
         run: node scripts/probe-model-catalog.mjs

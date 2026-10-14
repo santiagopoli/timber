@@ -3,6 +3,7 @@ const runStates=new Set(['queued','running','waiting_approval','waiting_connecti
 const runErrors=new Set(['model_catalog_unavailable','chatgpt_not_connected','model_unavailable','reasoning_unsupported','fast_unsupported','model_image_unsupported','model_provider_settings_unsupported']);
 const count=value=>Number.isSafeInteger(value)&&value>=0?value:null;
 const failures=new Map([
+  ['Using cached ChatGPT model catalogue while discovery is unavailable.','model_catalog_transport_failed'],
   ['The model catalogue rejected this ChatGPT connection. Reconnect ChatGPT.','chatgpt_catalog_authorization_rejected'],
   ['ChatGPT token renewal failed. The connection was retained; try again later.','chatgpt_refresh_failed'],
   ['OpenAI has not allowed token renewal yet. Try again shortly.','chatgpt_refresh_pending'],
@@ -17,10 +18,12 @@ const failures=new Map([
 ]);
 
 export function projection(status,catalog) {
-  const upstream=typeof catalog?.error==='string'?catalog.error.match(/^ChatGPT model catalogue unavailable \(HTTP ([1-5]\d{2}); ([a-z_]{1,64})\)\. /):null;
+  const diagnostic=catalog?.error||catalog?.warning;
+  const upstream=typeof diagnostic==='string'?diagnostic.match(/^(?:ChatGPT model catalogue unavailable|Using cached ChatGPT model catalogue) \(HTTP ([1-5]\d{2}); ([a-z_]{1,64})\)\./):null;
   return {connection:states.has(status?.status)?status.status:'unknown',connected:catalog?.connected===true,
     models:Array.isArray(catalog?.models)?catalog.models.length:0,
-    failure:catalog?.error?upstream?.[2]||failures.get(catalog.error)||'catalog_failure_unclassified':null,
+    failure:diagnostic?upstream?.[2]||failures.get(diagnostic)||'catalog_failure_unclassified':null,
+    ...(catalog?.warning?{cached:true}:{}),
     ...(upstream?{upstreamStatus:Number(upstream[1])}:{})};
 }
 
@@ -38,8 +41,16 @@ export default {
     const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(token))),byte=>byte.toString(16).padStart(2,'0')).join('');
     if(digest!==env.PROBE_TOKEN_SHA256)return new Response(null,{status:401});
     const path=new URL(request.url).pathname;
-    if(request.method!=='GET'||!['/catalog','/queue'].includes(path))return new Response(null,{status:404});
+    const verify=path==='/verify'&&request.method==='POST';
+    if(!verify&&(request.method!=='GET'||!['/catalog','/queue'].includes(path)))return new Response(null,{status:404});
     try {
+      if(verify) {
+        const account=env.CHATGPT.get(env.CHATGPT.idFromName('owner'));
+        const response=await account.fetch('https://chatgpt/verify',{method:'POST'});
+        const result=await response.json();
+        const code=result?.error?.code;
+        return Response.json({ok:response.ok&&result.ok===true,status:response.status,failure:response.ok?null:typeof code==='string'&&/^(?:chatgpt|model)_[a-z_]{1,64}$/.test(code)?code:'model_verify_failed'},{headers:{'cache-control':'no-store'}});
+      }
       if(path==='/queue') {
         const workspace=env.WORKSPACE.get(env.WORKSPACE.idFromName('owner'));
         const {bots}=await (await workspace.fetch('https://workspace/')).json();

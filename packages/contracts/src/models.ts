@@ -17,7 +17,7 @@ export interface ModelRoute extends Omit<ModelOption,'routes'|'canonicalId'> {
   modelId:string;
   pricing?:{input:number;output:number;cachedInput?:number};
 }
-export interface ModelCatalog {models:ModelOption[];connected:boolean;defaultModel:string;error?:string;sources?:{id:string;connected:boolean;error?:string}[];}
+export interface ModelCatalog {models:ModelOption[];connected:boolean;defaultModel:string;error?:string;warning?:string;sources?:{id:string;connected:boolean;error?:string}[];}
 const record=(value:unknown):Record<string,unknown>=>value&&typeof value==='object'&&!Array.isArray(value)?value as Record<string,unknown>:{};
 const token=(value:unknown):value is string=>typeof value==='string'&&/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(value);
 const positive=(value:unknown)=>typeof value==='number'&&Number.isSafeInteger(value)&&value>0?value:undefined;

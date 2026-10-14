@@ -24,8 +24,15 @@ test('probe projects fixed failure labels and suppresses unknown provider prose 
   assert.deepEqual(projection({status:'private-canary'},{connected:true,models:[],error:'private-canary'}),{connection:'unknown',connected:true,models:0,failure:'catalog_failure_unclassified'});
   assert.equal(projection({status:'verified'},{error:'ChatGPT token renewal failed. The connection was retained; try again later.'}).failure,'chatgpt_refresh_failed');
   assert.deepEqual(projection({status:'verified'},{connected:true,models:[],error:'ChatGPT model catalogue unavailable (HTTP 403; model_access_denied). private-canary'}),{connection:'verified',connected:true,models:0,failure:'model_access_denied',upstreamStatus:403});
+  assert.deepEqual(projection({status:'verified'},{connected:true,models:[{}],warning:'Using cached ChatGPT model catalogue (HTTP 520; model_provider_unavailable).'}),{connection:'verified',connected:true,models:1,failure:'model_provider_unavailable',cached:true,upstreamStatus:520});
   const result=await worker.fetch(new Request('https://probe.test/catalog',{headers:{authorization:`Bearer ${token}`}}),{PROBE_TOKEN_SHA256:hash,CHATGPT:{idFromName(){throw new Error('private-canary');}}});
   assert.equal(result.status,502);assert.equal(await result.text(),'{"failure":"catalog_probe_failed"}');
+});
+test('optional inference verification uses only the fixed plan verification route and hides model and provider prose',async()=>{
+  const env={PROBE_TOKEN_SHA256:hash,CHATGPT:{idFromName(name){assert.equal(name,'owner');return name;},get(){return {async fetch(url,options){assert.equal(url,'https://chatgpt/verify');assert.equal(options.method,'POST');return Response.json({ok:true,model:'private-canary'});}};}}};
+  const result=await worker.fetch(new Request('https://probe.test/verify',{method:'POST',headers:{authorization:`Bearer ${token}`}}),env);
+  assert.deepEqual(await result.json(),{ok:true,status:200,failure:null});
+  assert.equal((await worker.fetch(new Request('https://probe.test/verify',{headers:{authorization:`Bearer ${token}`}}),env)).status,404);
 });
 test('probe tolerates route propagation but does not retry an authorization rejection',async()=>{
   const statuses=[404,503,200],waits=[],calls=[];

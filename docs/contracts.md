@@ -731,6 +731,13 @@ capabilities; raw account metadata and credentials are never returned. This is
 the account's catalogue, not a hardcoded list of model or effort names.
 
 The catalogue cache lasts five minutes and belongs to a connection revision.
+On a discovery transport failure or provider 5xx, the same connection can use its
+last verified catalogue for at most 24 hours, with an explicit warning and a
+30-second rediscovery cooldown. This retains the ChatGPT route: discovery outages
+never activate paid inference. It does not reuse another connection's catalogue,
+extend its verification age, suppress authentication/permission errors or invent
+models; actual Responses authorization remains authoritative. Unknown OpenAI
+models offered only by paid sources remain paused while discovery is unavailable.
 Import and disconnect invalidate it. Network discovery runs outside the token
 refresh lock; a delayed response from an old connection cannot populate the new
 cache or authorize inference under a replacement account. Catalogue failures are

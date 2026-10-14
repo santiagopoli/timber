@@ -2,6 +2,7 @@ import { env, exports } from "cloudflare:workers";
 import { abortAllDurableObjects, runInDurableObject } from "cloudflare:test";
 import { exportJWK, generateKeyPair, SignJWT, type JWTPayload } from "jose";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type {ModelCatalog} from '@botspace/contracts';
 
 const ISSUER = "https://auth.openai.com";
 const RESOURCE = "https://api.openai.com/v1";
@@ -463,6 +464,70 @@ describe('account model catalogues and model settings',()=>{
     expect(oversized.error).not.toContain('private-canary');
     catalogResponse=()=>Response.json(defaultModels);
     expect((await (await stub.fetch('https://chatgpt/models')).json<{models:unknown[]}>()).models).toHaveLength(2);
+  });
+
+  it('keeps verified subscription models usable during a 520 discovery outage and recovers live discovery after eviction',async()=>{
+    const stub=newStub();await connect(stub);
+    await (await stub.fetch('https://chatgpt/models')).text();
+    await runInDurableObject(stub,async(_instance,state)=>{
+      const cached=(await state.storage.get<{expiresAt:number}>('modelCatalog'))!;
+      await state.storage.put('modelCatalog',{...cached,expiresAt:Date.now()-12*60*60_000});
+    });
+    catalogResponse=()=>new Response('private provider edge error',{status:520});
+    const result=await (await stub.fetch('https://chatgpt/models')).json<ModelCatalog>();
+    expect(result.models.map(model=>model.id)).toEqual(['gpt-6.1-sol','gpt-6-luna']);
+    expect(result.warning).toContain('Using cached ChatGPT model catalogue (HTTP 520; model_provider_unavailable)');
+    expect(result).not.toHaveProperty('error');expect(JSON.stringify(result)).not.toContain('private provider');
+    const before=modelCalls.length;
+    const inference=await infer(stub);expect(inference.status).toBe(200);await inference.text();
+    expect(responseCalls).toHaveLength(1);expect(modelCalls).toHaveLength(before);
+    // A successful live read replaces the old snapshot rather than extending
+    // its age on every outage. Eviction also reattempts discovery normally.
+    await abortAllDurableObjects();catalogResponse=()=>Response.json(defaultModels);
+    const recovered=await (await bindings.CHATGPT.get(stub.id).fetch('https://chatgpt/models')).json<ModelCatalog>();
+    expect(recovered.models).toHaveLength(2);expect(recovered).not.toHaveProperty('warning');
+  });
+
+  it('never uses stale discovery for authentication errors, another connection or a catalogue older than one day',async()=>{
+    const stub=newStub();await connect(stub);await (await stub.fetch('https://chatgpt/models')).text();
+    const expire=async(age:number)=>runInDurableObject(stub,async(_instance,state)=>{
+      const cached=(await state.storage.get<{expiresAt:number}>('modelCatalog'))!;
+      await state.storage.put('modelCatalog',{...cached,expiresAt:Date.now()-age});
+    });
+    await expire(1000);
+    for(const status of [401,403,429]){
+      catalogResponse=()=>Response.json({error:{message:'private-canary'}},{status});
+      const result=await (await stub.fetch('https://chatgpt/models')).json<ModelCatalog>();
+      expect(result.models).toEqual([]);expect(result.error).toContain(`HTTP ${status}`);expect(result).not.toHaveProperty('warning');
+    }
+    await expire(24*60*60_000);catalogResponse=()=>new Response(null,{status:520});
+    expect((await (await stub.fetch('https://chatgpt/models')).json<ModelCatalog>()).models).toEqual([]);
+    await expire(1000);
+    await runInDurableObject(stub,async(_instance,state)=>{
+      const connection=(await state.storage.get<Record<string,unknown>>('connection'))!;
+      await state.storage.put('connection',{...connection,revision:crypto.randomUUID()});
+    });
+    expect((await (await stub.fetch('https://chatgpt/models')).json<ModelCatalog>()).models).toEqual([]);
+  });
+
+  it('uses verified models on a discovery network outage without exposing the transport exception',async()=>{
+    const stub=newStub();await connect(stub);await (await stub.fetch('https://chatgpt/models')).text();
+    await runInDurableObject(stub,async(_instance,state)=>{const cached=(await state.storage.get<{expiresAt:number}>('modelCatalog'))!;await state.storage.put('modelCatalog',{...cached,expiresAt:Date.now()-1000});});
+    catalogResponse=()=>{throw new Error('private network canary');};
+    const result=await (await stub.fetch('https://chatgpt/models')).json<ModelCatalog>();
+    expect(result.models).toHaveLength(2);expect(result.warning).toContain('Using cached ChatGPT');expect(JSON.stringify(result)).not.toContain('private network');
+  });
+
+  it('rejects an old fallback snapshot if the connection changes during the failed live discovery',async()=>{
+    const stub=newStub();await connect(stub);await (await stub.fetch('https://chatgpt/models')).text();
+    await runInDurableObject(stub,async(_instance,state)=>{const cached=(await state.storage.get<{expiresAt:number}>('modelCatalog'))!;await state.storage.put('modelCatalog',{...cached,expiresAt:Date.now()-1000});});
+    let release!:(value:Response)=>void;
+    catalogResponse=()=>new Promise<Response>(resolve=>{release=resolve;});
+    const pending=stub.fetch('https://chatgpt/models');await expect.poll(()=>modelCalls.length).toBe(2);
+    await (await stub.fetch('https://chatgpt/',{method:'DELETE'})).text();
+    await runInDurableObject(stub,()=>release(new Response(null,{status:520})));
+    const changed=await (await pending).json<ModelCatalog>();
+    expect(changed.models).toEqual([]);expect(changed.error).toContain('connection changed');expect(changed).not.toHaveProperty('warning');
   });
 
   it('cannot send an already validated request under a replacement account',async()=>{

@@ -1,5 +1,5 @@
 import {afterEach,describe,expect,it,vi} from 'vitest';
-import {mergeModelCatalogs,normalizeModelCatalog,normalizeOpenRouterCatalog,type ModelCatalog} from '@botspace/contracts';
+import {mergeModelCatalogs,normalizeModelCatalog,normalizeOpenRouterCatalog,subscriptionDiscoveryBlocked,type ModelCatalog} from '@botspace/contracts';
 import {modelCatalog,openRouterRequest,validateModelSettings} from '../apps/api/src/model-catalog';
 import {parseBotInput} from '../apps/api/src/validation';
 import type {Env} from '../apps/api/src/env';
@@ -12,6 +12,13 @@ const combined=()=>mergeModelCatalogs([{id:'openrouter',priority:10,catalog:rout
 afterEach(()=>vi.restoreAllMocks());
 
 describe('multiple concrete model catalogs',()=>{
+  it('keeps cached subscription routes preferred, exposes the warning and pauses unknown paid-only OpenAI identities',()=>{
+    const cached={...plan([subscription]),warning:'Using cached ChatGPT model catalogue (HTTP 520; model_provider_unavailable).'};
+    const result=mergeModelCatalogs([{id:'chatgpt',priority:0,catalog:cached},{id:'openrouter',priority:10,catalog:router([rawRouter('openai/gpt-6.1-sol'),rawRouter('openai/gpt-new-unknown')])}],'gpt-6.1-sol');
+    expect(result.models[0].routes?.[0].source).toBe('chatgpt');expect(result.sources?.[0].error).toBe(cached.warning);
+    expect(subscriptionDiscoveryBlocked(result,result.models[0])).toBe(false);
+    expect(subscriptionDiscoveryBlocked(result,result.models[1])).toBe(true);
+  });
   it('deduplicates exact identity, prefers subscription capabilities, and retains priced alternate routes',()=>{
     const catalog=combined();expect(catalog.models.map(model=>model.id)).toEqual(['gpt-6.1-sol','moonshotai/kimi-k3']);
     const model=catalog.models[0];expect(model).toMatchObject({name:'GPT-6.1 Sol',provider:'openai',publisher:'openai',reasoningEfforts:['medium'],defaultReasoningEffort:'medium'});
