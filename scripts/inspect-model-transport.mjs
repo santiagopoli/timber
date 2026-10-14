@@ -19,7 +19,7 @@ async function main(){
     return JSON.parse(result.stdout);
   };
   const list=await cli(['list']);
-  const applications=list.filter(item=>typeof item?.name==='string'&&/timber.*chatgpttransport/i.test(item.name)&&/^[a-f0-9-]{36}$/i.test(item.id));
+  const applications=list.filter(item=>typeof item?.name==='string'&&/timber.*chatgpttransport/i.test(item.name)&&/^(?:[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/i.test(item.id));
   const output=[];
   for(const app of applications.slice(0,2)){
     const info=await cli(['info',app.id]),instances=await cli(['instances',app.id]);
