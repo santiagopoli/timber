@@ -20,7 +20,8 @@ async function main(){
   try{
     let source=await readFile(new URL('../apps/api/src/chatgpt-transport.ts',import.meta.url),'utf8');
     source=source.replace("import {ApiError, errorResponse} from './errors';",`class ApiError extends Error {constructor(public status:number,public code:string,message:string){super(message);}}\nconst errorResponse=(error:ApiError)=>Response.json({error:{code:error.code}},{status:error.status});`)
-      .replace("import type {Env} from './env';",'interface Env {}');
+      .replace("import type {Env} from './env';",'interface Env {}')
+      .replace("instance: 'standard-1'","instance: 'lite'");
     const standard=source.replace(/ChatGPTTransportDO/g,'StandardTransportDO').replace("instance: 'lite'","instance: 'standard-1'");
     await writeFile(join(dir,'lite.ts'),source);await writeFile(join(dir,'standard.ts'),standard);
     await writeFile(join(dir,'worker.ts'),`import {ChatGPTTransportDO} from './lite';
@@ -33,7 +34,7 @@ export default {async fetch(request:Request,env:any){
  const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(token))),v=>v.toString(16).padStart(2,'0')).join('');
  if(digest!==env.PROBE_TOKEN_SHA256)return new Response(null,{status:401});
  const path=new URL(request.url).pathname;
- if(path==='/stop'&&request.method==='POST'){for(const key of ['LITE','STANDARD'])await env[key].get(env[key].idFromName('probe')).stopProbe();return Response.json({stopped:true});}
+ if(path==='/stop'&&request.method==='POST'){const settled=await Promise.allSettled(['LITE','STANDARD'].map(key=>env[key].get(env[key].idFromName('probe')).stopProbe()));return Response.json({stopped:settled.every(value=>value.status==='fulfilled')});}
  if(path!=='/compare'||request.method!=='GET')return new Response(null,{status:404});
  const results=[];
  for(const key of ['LITE','STANDARD']){

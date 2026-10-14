@@ -3,12 +3,12 @@ import {runInDurableObject} from 'cloudflare:test';
 import {describe, expect, it} from 'vitest';
 
 const namespace=(env as unknown as {REAL_CHATGPT_TRANSPORT:DurableObjectNamespace}).REAL_CHATGPT_TRANSPORT;
-async function fixture() {
+async function fixture(running=false) {
   const stub=namespace.get(namespace.idFromName(crypto.randomUUID()));
-  const state={starts:0,stops:0,active:0,requests:[] as {path:string;method:string;headers:Headers;body:string}[],running:false};
+  const state={starts:0,stops:0,active:0,sizes:[] as string[],requests:[] as {path:string;method:string;headers:Headers;body:string}[],running};
   await runInDurableObject(stub,async instance=>{
     const container={images:{base:'test-only-image'},get running(){return state.running;},
-      start(){state.starts++;state.running=true;},async setInactivityTimeout(){},async destroy(){state.stops++;state.running=false;},
+      start(options:{instance:string}){state.starts++;state.sizes.push(options.instance);state.running=true;},async setInactivityTimeout(){},async destroy(){state.stops++;state.running=false;},
       getTcpPort(){return {async fetch(input:Request|string,init?:RequestInit){
         const request=input instanceof Request?input:new Request(input,init);const path=new URL(request.url).pathname;
         if(path==='/health')return Response.json({ok:true,active:state.active});
@@ -22,6 +22,14 @@ async function fixture() {
 }
 
 describe('private ChatGPT server transport',()=>{
+  it('retires the known unready lite instance once and keeps the standard transport across requests',async()=>{
+    const {stub,state}=await fixture(true);
+    for(let attempt=0;attempt<2;attempt++){
+      const response=await stub.fetch('https://transport/v1/models',{headers:{'x-timber-internal':'chatgpt-transport',authorization:'Bearer test-only-oauth'}});
+      expect(response.status).toBe(200);await response.text();
+    }
+    expect(state.stops).toBe(1);expect(state.starts).toBe(1);expect(state.sizes).toEqual(['standard-1']);
+  });
   it('blocks public access, other paths, missing internal authority and wrong methods before boot',async()=>{
     const {stub,state}=await fixture();
     for(const [path,method,headers] of [['/v1/models','GET',{}],['/exec','POST',{'x-timber-internal':'chatgpt-transport'}],['/v1/models?url=other','GET',{'x-timber-internal':'chatgpt-transport'}],['/v1/models','POST',{'x-timber-internal':'chatgpt-transport'}]] as const){

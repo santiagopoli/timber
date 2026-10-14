@@ -29,7 +29,13 @@ export class ChatGPTTransportDO extends DurableObject<Env> {
     if (this.starting) return this.starting;
     const work = (async () => {
       if (!this.container?.images.base) throw new ApiError(503, 'model_transport_unavailable', 'The ChatGPT server transport is unavailable.');
-      if (!this.container.running) this.container.start({image: this.container.images.base, instance: 'lite', enableInternet: true,
+      // The previous lite transport never became ready. Retire that dedicated
+      // instance once; it has no bot processes, workspace or admitted inference.
+      if (await this.ctx.storage.get<string>('resourceVersion') !== 'standard-1-v1') {
+        if (this.container.running) await this.container.destroy();
+        await this.ctx.storage.put('resourceVersion', 'standard-1-v1');
+      }
+      if (!this.container.running) this.container.start({image: this.container.images.base, instance: 'standard-1', enableInternet: true,
         entrypoint: ['/usr/local/bin/node', '/opt/botspace/chatgpt-transport.mjs'], env: {TIMBER_TRANSPORT_TOKEN: this.token}});
       // Safety cap; the alarm stops idle instances sooner and never interrupts
       // an active response. No OAuth values or conversations are checkpointed.
